@@ -76,7 +76,11 @@ impl FastCgiListener {
     ///
     /// Binding happens here rather than inside `run`, so a port conflict is
     /// reported before any backend is started.
-    pub fn bind(address: &str, dispatcher: Dispatcher, limits: Limits) -> Result<Self> {
+    ///
+    /// The dispatcher arrives behind an `Arc<Mutex<_>>` because it is shared: the
+    /// HTTP front-end serves the same backends, so there is one set of processes
+    /// behind one routing decision, whichever protocol a request arrived on.
+    pub fn bind(address: &str, dispatcher: Arc<Mutex<Dispatcher>>, limits: Limits) -> Result<Self> {
         let listener = TcpListener::bind(address).map_err(|source| ServerError::Misconfigured {
             backend: "<listener>".to_string(),
             reason: format!("cannot bind {address}: {source}"),
@@ -85,7 +89,7 @@ impl FastCgiListener {
 
         Ok(FastCgiListener {
             listener,
-            dispatcher: Arc::new(Mutex::new(dispatcher)),
+            dispatcher,
             shutdown: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Stats::default()),
             limits,
@@ -336,9 +340,13 @@ mod tests {
         let dispatcher = Dispatcher::from_config(&config, stokehold_fcgi::Routing::default())
             .expect("dispatcher");
 
-        let err = FastCgiListener::bind(&address, dispatcher, Limits::default())
-            .err()
-            .unwrap_or_else(|| panic!("binding {address} should have failed"));
+        let err = FastCgiListener::bind(
+            &address,
+            std::sync::Arc::new(Mutex::new(dispatcher)),
+            Limits::default(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("binding {address} should have failed"));
         assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");
         assert!(err.to_string().contains("cannot bind"), "{err}");
     }

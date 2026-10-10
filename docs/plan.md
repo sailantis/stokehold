@@ -101,6 +101,7 @@ opt-in and only when configured.
 | Config format | **TOML** (`serde`) — no YAML dependency, better tooling |
 | Front-end scope | HTTP listener **in v1**; TLS/ACME/HTTP-2 as a later milestone |
 | Prefork | **deferred**, Unix-only, forked from a PHP boot parent — never from the Tokio runtime |
+| HTTP front-end runtime | **`hyper` on `tokio`, confined to `crates/stokehold-http`** — the target is the public-facing case (static files, HTTP/2 now, HTTP/3 later), and HTTP/3 needs `quinn`, which is itself a `tokio` program. So the runtime was arriving anyway; this is that bet made earlier rather than a second one. Every backend stays blocking and is reached only through `spawn_blocking` |
 
 ## 4. Worker protocol (own protocol)
 
@@ -244,6 +245,17 @@ against the specification and secondary implementations, and are confirmed by fi
    line that will never come. It must be `std::thread::spawn`ed, and the failure looks like a
    startup hang with no error at all — found here by tracing the pool's boot path, not by reading
    the code.
+9. **`hyper` panics rather than silently skipping a deadline when no timer is set.** Configuring
+   any timeout — `header_read_timeout`, for instance — requires a `Timer` to be supplied first, and
+   the panic ("no timer") happens per connection, inside the runtime, so it looks like every
+   request failing rather than a missing line of setup. `TokioTimer::new()` on the HTTP/1 builder
+   is what makes the timeout real.
+10. **An async front-end must never call a blocking backend directly.** A worker slot serves one
+    request at a time and `php-cgi` processes sequentially, so every backend blocks. Calling one
+    from an async context stalls a runtime worker thread; enough stalls starve every other
+    connection, and the symptom is latency, not an error. The dispatcher is therefore reached only
+    through `spawn_blocking` — `crates/stokehold-http/src/listener.rs`, and the rule is stated in
+    that crate's module docs so it is not rediscovered.
 
 ## 6. Phases
 
@@ -295,22 +307,29 @@ Phase 5 — worker pool
 Phase 6 — front-ends
 18. `fastcgi-frontend` — accept FastCGI from nginx, translate to the selected backend, re-frame
     the response, pass-through fast path.
-19. `http-frontend` — `hyper` listener, request parsing, route → backend selection, error pages
-    (502/504 mapping), body streaming.
-20. `config-cli` — `stokehold serve|check|version`, TOML loading, validation and diagnostics.
+19. `http-frontend` — **done**, in `crates/stokehold-http`: a `hyper` listener speaking HTTP/1.1
+    and HTTP/2 over the same dispatcher as the FastCGI front-end, with route → backend selection
+    and the 404/403/413/502/503/504 mappings. This is the project's only async code, and the
+    boundary is `spawn_blocking`; see the crate docs for why.
+20. `static-files` — serve files under the document root without a backend: MIME types,
+    `ETag`/`Last-Modified` and 304s, `Range` requests, precompressed variants, directory indexes,
+    dotfile denial. Split out of step 19 because it is a feature rather than a translation layer —
+    and because it is what turns "serves PHP" into "can front a site".
+21. `config-cli` — `stokehold serve|check|version`, TOML loading, validation and diagnostics.
 
 Phase 7 — packaging
-21. `packaging-ci` — release artifacts per target, systemd unit, Windows service notes, CI
+22. `packaging-ci` — release artifacts per target, systemd unit, Windows service notes, CI
     matrix, README and docs.
-22. `bench-harness` — load generator plus comparison against nginx+php-fpm, RoadRunner and
+23. `bench-harness` — load generator plus comparison against nginx+php-fpm, RoadRunner and
     php-cgi, to state realistic expectations rather than claims.
 
 Later milestone
-23. `tls-acme` — `rustls` + `rustls-acme`, HTTP/2, optional HTTP/3; this is the nginx
-    replacement, deliberately decoupled from the PHP work.
-24. `prefork-optional` — Unix-only prefork to cut worker bootstrap cost, forked from a PHP boot
+24. `tls-acme` — `rustls` + `rustls-acme`, ALPN for HTTP/2 over TLS, optional HTTP/3. HTTP/3 is
+    `quinn` + `h3` + `rustls`, not `hyper`; `quinn` runs on `tokio`, which the HTTP front-end
+    already has.
+25. `prefork-optional` — Unix-only prefork to cut worker bootstrap cost, forked from a PHP boot
     parent (never the Tokio runtime).
-25. `rpc-sidechannel` — only if a v2 need appears (background jobs, websockets) that the
+26. `rpc-sidechannel` — only if a v2 need appears (background jobs, websockets) that the
     request/response protocol genuinely cannot express.
 
 ## 7. Testing strategy

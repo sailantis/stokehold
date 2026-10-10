@@ -27,4 +27,4 @@ pub mod error;
 pub mod listener;
 
 pub use error::HttpError;
-pub use listener::{HttpLimits, HttpListener, HttpShutdown, HttpStats};
+pub use listener::{HttpLimits, HttpListener, HttpShutdown, HttpStats, RunningHttp};

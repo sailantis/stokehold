@@ -7,7 +7,7 @@
 //! Skipped, with a printed reason, when `php-cgi` is unavailable or the binary
 //! has not been built.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -95,6 +95,8 @@ fn free_port_run(count: usize) -> Option<u16> {
 struct Server {
     child: Child,
     address: String,
+    /// The HTTP listener's address, when the configuration asked for one.
+    http_address: Option<String>,
 }
 
 impl Server {
@@ -111,6 +113,7 @@ impl Server {
         let mut server = Server {
             child,
             address: String::new(),
+            http_address: None,
         };
         let stdout = server.child.stdout.take().expect("piped stdout");
         let mut reader = BufReader::new(stdout);
@@ -121,12 +124,23 @@ impl Server {
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                 break;
             }
-            // `stokehold listening for FastCGI on 127.0.0.1:PORT`
-            if let Some(rest) = line
-                .trim()
-                .strip_prefix("stokehold listening for FastCGI on ")
-            {
-                server.address = rest.to_string();
+            // The banner is read line by line and parsed by field name rather than
+            // by whole line, so the surrounding text can grow without breaking
+            // every test that starts a server. Reading stops at the line that says
+            // the server is up, which is also the last thing printed before it
+            // starts serving.
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("fastcgi:") {
+                let address = rest.trim();
+                if !address.is_empty() && address != "(disabled)" {
+                    server.address = address.to_string();
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("http:") {
+                let address = rest.trim();
+                if !address.is_empty() && address != "(disabled)" {
+                    server.http_address = Some(address.to_string());
+                }
+            } else if trimmed.starts_with("press Ctrl-C") && !server.address.is_empty() {
                 return Some(server);
             }
         }
@@ -291,6 +305,117 @@ fn start_worker_server(binary: &Path, root: &Path) -> Option<Server> {
     );
     std::fs::write(&config_path, config).expect("write the config");
     Server::start(binary, &config_path)
+}
+
+/// Start the server with both listeners and a worker backend.
+fn start_dual_listener_server(binary: &Path, root: &Path) -> Option<Server> {
+    let config_path = root.join("stokehold.toml");
+    let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let config = format!(
+        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+    Server::start(binary, &config_path)
+}
+
+#[test]
+fn serve_answers_an_http_request_and_a_fastcgi_request_at_once() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built (run `cargo build`)");
+        return;
+    };
+    if find_php().is_none() {
+        eprintln!("skipping: no php on PATH");
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!("stokehold-http-smoke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the temp root");
+
+    let Some(server) = start_dual_listener_server(&binary, &root) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let Some(http_address) = server.http_address.clone() else {
+        panic!("the HTTP listener did not report an address; the banner was not parsed");
+    };
+
+    // The HTTP front-end, over a real socket, against the shipped binary and the
+    // shipped PHP SDK.
+    let response = http_get(&http_address, "/health");
+    assert_eq!(response.status, 200, "{response:?}");
+    assert!(
+        response.text().contains("ok"),
+        "the worker's body did not arrive over HTTP: {}",
+        response.text()
+    );
+
+    // The FastCGI listener on the same process must still serve, which is the
+    // property the dual listener exists for: one dispatcher, two protocols.
+    let body = b"";
+    let params = params_for(&root, "/health", 0);
+    let (status, _, fastcgi_body) =
+        request(&server.address, &params, body).expect("the FastCGI request completed");
+    // The worker backend has no front controller to resolve against the temp
+    // root, so the environment is what matters here rather than the status: a
+    // response proves the listener answered at all.
+    assert!(
+        status == 200 || status == 404 || status == 500,
+        "the FastCGI listener produced no response: {status} {fastcgi_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A minimal HTTP response reader, for the dual-listener smoke test.
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+fn http_get(address: &str, path: &str) -> HttpResponse {
+    let mut stream = TcpStream::connect(address).expect("connect to the HTTP listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write the HTTP request");
+    stream.flush().expect("flush");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read the response");
+
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or_else(|| {
+            panic!(
+                "no header terminator in {:?}",
+                String::from_utf8_lossy(&raw)
+            )
+        });
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {head:?}"));
+
+    HttpResponse {
+        status,
+        body: raw[split + 4..].to_vec(),
+    }
 }
 
 #[test]

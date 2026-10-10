@@ -132,11 +132,7 @@ impl Server {
     }
 
     /// Start a listener around an already-built dispatcher.
-    fn start(
-        dispatcher: Dispatcher,
-        routing: Routing,
-        limits: HttpLimits,
-    ) -> Option<Server> {
+    fn start(dispatcher: Dispatcher, routing: Routing, limits: HttpLimits) -> Option<Server> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -238,12 +234,7 @@ fn parse(raw: &[u8]) -> Exchange {
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .unwrap_or_else(|| {
-            panic!(
-                "no header terminator in {:?}",
-                String::from_utf8_lossy(raw)
-            )
-        });
+        .unwrap_or_else(|| panic!("no header terminator in {:?}", String::from_utf8_lossy(raw)));
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();
     let body = raw[split + 4..].to_vec();
 
@@ -288,7 +279,10 @@ fn a_get_reaches_the_php_worker_and_comes_back() {
 
     assert_eq!(response.status, 200, "{response:?}");
     let body = response.text();
-    assert!(body.contains("ok"), "the worker's body did not arrive: {body}");
+    assert!(
+        body.contains("ok"),
+        "the worker's body did not arrive: {body}"
+    );
     // The body was produced by PHP, so Content-Length has to describe it.
     assert_eq!(
         response.header("content-length").expect("a content length"),
@@ -436,8 +430,7 @@ fn an_unreachable_backend_is_a_502() {
 fn an_oversized_body_is_refused_with_a_413() {
     let config = unreachable_config();
     let routing = front_controller_routing();
-    let dispatcher =
-        Dispatcher::from_config(&config, routing.clone()).expect("a dispatcher");
+    let dispatcher = Dispatcher::from_config(&config, routing.clone()).expect("a dispatcher");
 
     // A tiny limit, so the refusal is observable without sending megabytes.
     let limits = HttpLimits {

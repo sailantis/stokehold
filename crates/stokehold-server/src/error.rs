@@ -52,8 +52,11 @@ pub enum ServerError {
     #[error(transparent)]
     Config(#[from] stokehold_core::Error),
 
-    #[error("no listener is configured; set server.fastcgi (server.http is not implemented yet)")]
+    #[error("no listener is configured; set server.fastcgi or server.http")]
     NoListener,
+
+    #[error("a listener could not start: {reason}")]
+    Listener { reason: String },
 
     #[error(transparent)]
     Fcgi(#[from] stokehold_fcgi::FcgiError),

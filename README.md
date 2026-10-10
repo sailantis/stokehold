@@ -14,14 +14,20 @@ are spawned as ordinary external processes. That matters most on **Windows**, wh
 supervises it for you.
 
 > **Status: early but working.** The configuration model, PHP discovery, FastCGI codec and
-> client, CGI environment, `php-cgi` pool, backend dispatch and the FastCGI front-end are all
+> client, CGI environment, `php-cgi` pool, backend dispatch and both front-ends are all
 > implemented, with integration tests driving real `php-cgi` processes end to end. The worker
 > protocol is specified in [docs/worker-protocol.md](docs/worker-protocol.md), implemented in
 > `crates/stokehold-worker`, and the PHP worker SDK in [sdk/php](sdk/php) implements the other
 > end — proven by tests that drive a live `php worker.php` over pipes. The worker pool that
 > supervises those workers is implemented in `crates/stokehold-server`, so `kind = "worker"` now
 > serves for real: `stokehold serve` boots the pool, handshakes each worker, and serves through it.
-> The HTTP listener is next — see [docs/plan.md](docs/plan.md) for the phase order.
+> The HTTP front-end is implemented in `crates/stokehold-http` — a `hyper` listener speaking
+> HTTP/1.1 and HTTP/2 over the same dispatcher as the FastCGI one. Static file serving, TLS and
+> HTTP/3 are not there yet; see [docs/plan.md](docs/plan.md) for the phase order.
+>
+> **The async boundary.** `stokehold-http` is the only place with a `tokio` runtime, because
+> `hyper` needs one. Every backend stays blocking, and the dispatcher is reached only through
+> `spawn_blocking` — see [the crate docs](crates/stokehold-http/src/lib.rs) for why.
 
 ## Why
 
@@ -128,7 +134,8 @@ cargo run -- serve --config stokehold.example.toml \
   --document-root /srv/app --front-controller index.php
 ```
 
-`stokehold` prints the address it bound, then serves FastCGI until Ctrl-C. Point nginx at it:
+`stokehold` prints both addresses it bound, then serves HTTP and FastCGI side by side until
+Ctrl-C. Open `http://127.0.0.1:8080/` in a browser, or point nginx at the FastCGI listener:
 
 ```nginx
 location ~ \.php$ {
@@ -138,12 +145,42 @@ location ~ \.php$ {
 }
 ```
 
+Set `server.http` or `server.fastcgi` to run only one of them. Both feed the same dispatcher, so
+a request gets the same backend whichever protocol carried it.
+
 Pass an empty `--front-controller` to serve only real `.php` files, which matches nginx's
 `location ~ \.php$` behaviour; the default resolves everything else through `index.php` with
 `PATH_INFO`, which is what most frameworks want.
 
 `stokehold` answers nginx's `GET_VALUES` health probe, so it stays in rotation rather than being
 marked down.
+
+Failures map to the status the client needs: **404** for a path that resolves to no script,
+**403** for a forbidden extension, **413** for an oversized request body, **502** for a backend
+that cannot be reached, **504** for one that does not answer in time, and **503** when no backend
+slot is free.
+
+## Routing
+
+A route selects a backend, so one process can serve a worker-backed API and a php-fpm-backed
+admin area at once:
+
+```toml
+default_backend = "app"
+
+[[routes]]
+path_prefix = "/api"        # a textual prefix, like nginx's `location`
+backend = "app"
+
+[[routes]]
+host = "admin.example.com"  # a bare host name: no port, case-insensitive
+path_prefix = "/"
+backend = "fpm"
+```
+
+The **most specific** matching route wins — a route stating both a host and a path beats one
+stating only a path — and ties go to the earlier entry. That is deliberately the whole rule: a
+table whose winner depended on something cleverer could not be predicted by reading the file.
 
 ## Layout
 
@@ -153,6 +190,7 @@ marked down.
 | `crates/stokehold-fcgi` | FastCGI record codec, client, transport and CGI environment |
 | `crates/stokehold-worker` | The worker protocol: framed codec and message set over a worker's pipes |
 | `crates/stokehold-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |
+| `crates/stokehold-http` | The HTTP front-end: a `hyper` listener, the only async code in the project |
 | `crates/stokehold-cli` | The `stokehold` binary |
 | `sdk/php` | The PHP worker SDK — the other end of the worker protocol |
 | `docs/plan.md` | The design and the phase plan |
@@ -184,6 +222,16 @@ worker processes: it boots a pool, serves through every worker in rotation, repl
 was killed or asked to be recycled, recycles on `max_requests` and on `memory_limit_mb`, and
 checks that dropping the pool leaves no processes behind. It skips itself when no `php` is on
 `PATH`.
+
+`crates/stokehold-http/tests/frontend.rs` drives the HTTP listener over a real socket against a
+real worker pool: a GET, a POST body verified byte for byte, request headers landing in the CGI
+environment, an application error becoming a 500 while the worker survives, `Content-Length`
+agreeing with the body that was sent, keep-alive serving two requests on one connection, four
+concurrent requests, and the error mappings that do not need a backend (404, 413, 502).
+
+`crates/stokehold-cli/tests/serve.rs` is the end-to-end one: it runs the shipped `stokehold`
+binary with both listeners configured on port 0, then drives it over HTTP *and* over FastCGI in
+the same process, which is what proves the two front-ends really do share one dispatcher.
 
 The PHP SDK's own suite needs no Rust and no PHPUnit:
 

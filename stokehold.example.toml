@@ -44,6 +44,23 @@ socket = "unix:/run/php/php8.3-fpm.sock"
 # socket = "unix:/run/stokehold-fpm.sock"
 
 # ---------------------------------------------------------------------------
+# Routes. The most specific matching route wins: a route stating both a host and
+# a path beats one stating only a path, and ties go to the earlier entry. A
+# request that matches no route goes to default_backend.
+#
+# `path_prefix` is a textual prefix, like nginx's `location`. `host` is a bare
+# host name with no port, and is compared case-insensitively.
+# ---------------------------------------------------------------------------
+# [[routes]]
+# path_prefix = "/api"
+# backend = "cgi"
+#
+# [[routes]]
+# host = "admin.example.com"
+# path_prefix = "/"
+# backend = "fpm"
+
+# ---------------------------------------------------------------------------
 # php-cgi pool: N processes on N ports. The only option on Windows, where
 # php-fpm does not exist. Each process gets full per-request SAPI reset.
 # ---------------------------------------------------------------------------

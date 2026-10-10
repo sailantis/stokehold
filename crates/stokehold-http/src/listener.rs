@@ -138,6 +138,95 @@ pub struct HttpListener {
     front_end: Arc<FrontEnd>,
 }
 
+/// A running HTTP listener on a dedicated runtime thread.
+///
+/// This is how a blocking caller — `stokehold serve`, whose FastCGI listener owns
+/// the main thread — runs an HTTP front-end: the runtime is created here, lives on
+/// a thread that exists only for it, and is torn down by [`RunningHttp::stop`].
+/// The alternative would be an async `main`, which drags the whole program into
+/// the runtime instead of leaving it at this boundary.
+///
+/// The runtime is deliberately *not* stored: it is moved onto the listener's
+/// thread and dropped there, which is what the runtime requires. The handle kept
+/// here is the shutdown flag and the thread, which is all a caller needs.
+pub struct RunningHttp {
+    shutdown: HttpShutdown,
+    thread: Option<std::thread::JoinHandle<()>>,
+    address: SocketAddr,
+    stats: Arc<HttpStats>,
+}
+
+impl RunningHttp {
+    /// Bind a listener and start it on a dedicated runtime thread.
+    ///
+    /// Returns once the listener is bound and the thread is accepting, so a port
+    /// conflict is reported to the caller rather than to a thread.
+    pub fn start(
+        address: &str,
+        dispatcher: Arc<Mutex<Dispatcher>>,
+        routing: Routing,
+        limits: HttpLimits,
+    ) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(HttpError::Runtime)?;
+
+        let listener =
+            runtime.block_on(HttpListener::bind(address, dispatcher, routing, limits))?;
+        let bound = listener.local_addr()?;
+        let shutdown = listener.shutdown_handle();
+        let stats = listener.stats();
+
+        let thread = std::thread::spawn(move || {
+            // The runtime is owned by this thread and dropped when the listener
+            // stops, which is the order `tokio` requires.
+            if let Err(err) = runtime.block_on(listener.run()) {
+                tracing::warn!(%err, "http listener stopped with an error");
+            }
+        });
+
+        Ok(RunningHttp {
+            shutdown,
+            thread: Some(thread),
+            address: bound,
+            stats,
+        })
+    }
+
+    /// The address actually bound.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Statistics, for logging at shutdown.
+    pub fn stats(&self) -> Arc<HttpStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// Stop the listener and wait for its thread to finish.
+    ///
+    /// Waiting matters: the dispatcher lives inside the listener, and the worker
+    /// pool reaps its processes when it is dropped. Returning before that would
+    /// leave PHP processes behind.
+    pub fn stop(self) {
+        drop(self);
+    }
+
+    fn stop_inner(&mut self) {
+        self.shutdown.shutdown();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for RunningHttp {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
 impl HttpListener {
     /// Bind a listener.
     ///
@@ -151,13 +240,12 @@ impl HttpListener {
         routing: Routing,
         limits: HttpLimits,
     ) -> Result<Self> {
-        let listener =
-            tokio::net::TcpListener::bind(address)
-                .await
-                .map_err(|source| HttpError::Bind {
-                    address: address.to_string(),
-                    source,
-                })?;
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|source| HttpError::Bind {
+                address: address.to_string(),
+                source,
+            })?;
         let bound = listener.local_addr().map_err(|source| HttpError::Bind {
             address: address.to_string(),
             source,
@@ -178,10 +266,12 @@ impl HttpListener {
 
     /// The address actually bound, which matters when port 0 was requested.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener.local_addr().map_err(|source| HttpError::Bind {
-            address: "<listener>".to_string(),
-            source,
-        })
+        self.listener
+            .local_addr()
+            .map_err(|source| HttpError::Bind {
+                address: "<listener>".to_string(),
+                source,
+            })
     }
 
     /// A handle that stops the listener from another thread.
@@ -364,8 +454,8 @@ async fn read_body(body: Incoming, limit: usize) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
 
     while let Some(frame) = body.frame().await {
-        let frame =
-            frame.map_err(|err| HttpError::BadRequest(format!("reading the request body: {err}")))?;
+        let frame = frame
+            .map_err(|err| HttpError::BadRequest(format!("reading the request body: {err}")))?;
         if let Some(data) = frame.data_ref() {
             if out.len().saturating_add(data.len()) > limit {
                 return Err(HttpError::BodyTooLarge { limit });
@@ -390,7 +480,11 @@ fn to_cgi(
     remote_addr: &str,
 ) -> Result<stokehold_fcgi::Request> {
     let path = parts.uri.path();
-    let target = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let target = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
     let query = parts.uri.query().unwrap_or("");
 
     // Resolved before building the environment so a missing or forbidden path
@@ -403,7 +497,10 @@ fn to_cgi(
         Route::Script { .. } => {}
     }
 
-    let host = parts.headers.get(HOST).and_then(|value| value.to_str().ok());
+    let host = parts
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok());
     let (server_name, server_port) = split_host(host, server_port);
 
     let body_len = body.len();
@@ -693,14 +790,8 @@ mod tests {
             .into_parts()
             .0;
 
-        let built = to_cgi(
-            &request,
-            b"{}".to_vec(),
-            &routing(),
-            80,
-            "127.0.0.1",
-        )
-        .expect("a request that routes");
+        let built = to_cgi(&request, b"{}".to_vec(), &routing(), 80, "127.0.0.1")
+            .expect("a request that routes");
 
         assert_eq!(param(&built, "HTTP_X_CUSTOM"), b"yes");
         // Content-Type keeps its CGI name; it is not a hop-by-hop header.
@@ -782,10 +873,7 @@ mod tests {
         };
         let built = from_cgi(response).expect("a well-formed response");
 
-        assert_eq!(
-            built.headers().get(CONTENT_LENGTH).expect("a length"),
-            "5"
-        );
+        assert_eq!(built.headers().get(CONTENT_LENGTH).expect("a length"), "5");
         assert_eq!(built.status(), 200, "no Status header means 200");
     }
 

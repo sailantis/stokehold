@@ -511,7 +511,10 @@ backend = "legacy"
             config.route_backend(Some("Admin.Example:8080"), "/"),
             Some("legacy")
         );
-        assert_eq!(config.route_backend(Some("admin.example"), "/x"), Some("legacy"));
+        assert_eq!(
+            config.route_backend(Some("admin.example"), "/x"),
+            Some("legacy")
+        );
         assert_eq!(config.route_backend(Some("public.example"), "/x"), None);
     }
 

@@ -50,6 +50,10 @@ pub enum HttpError {
         #[source]
         source: std::io::Error,
     },
+
+    /// The `tokio` runtime could not be created.
+    #[error("cannot start the async runtime: {0}")]
+    Runtime(#[source] std::io::Error),
 }
 
 impl HttpError {
@@ -63,9 +67,9 @@ impl HttpError {
             HttpError::BadGateway(_) => 502,
             HttpError::Overloaded => 503,
             HttpError::GatewayTimeout(_) => 504,
-            // A bind failure never reaches a client: it stops the listener before
-            // it accepts anything. Reported as a 500 rather than panicking.
-            HttpError::Bind { .. } => 500,
+            // Neither of these reaches a client: they stop the listener before it
+            // accepts anything. Reported as a 500 rather than panicking.
+            HttpError::Bind { .. } | HttpError::Runtime(_) => 500,
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! FastCGI client (standing in for nginx)
-//!     ──FastCGI──► stokehold front-end ──► dispatcher ──FastCGI──► php-cgi
+//!     â”€â”€FastCGIâ”€â”€â–º stokehold front-end â”€â”€â–º dispatcher â”€â”€FastCGIâ”€â”€â–º php-cgi
 //! ```
 //!
 //! This is the Phase 6 milestone from `docs/plan.md`. The client role is played
@@ -119,6 +119,7 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
         .into_iter()
         .collect(),
         default_backend: Some("cgi".to_string()),
+        routes: Vec::new(),
     };
     config.validate().expect("the config is valid");
 
@@ -254,6 +255,7 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
         .into_iter()
         .collect(),
         default_backend: Some("dead".to_string()),
+        routes: Vec::new(),
     };
     config.validate().expect("valid config");
     let mut dispatcher =

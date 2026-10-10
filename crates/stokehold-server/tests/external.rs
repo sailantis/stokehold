@@ -75,6 +75,7 @@ fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
         .into_iter()
         .collect(),
         default_backend: Some("fpm".to_string()),
+        routes: Vec::new(),
     };
     config.validate().expect("the config is valid");
 

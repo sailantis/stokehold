@@ -16,10 +16,11 @@ supervises it for you.
 > **Status: early but working.** The configuration model, PHP discovery, FastCGI codec and
 > client, CGI environment, `php-cgi` pool, backend dispatch and the FastCGI front-end are all
 > implemented, with integration tests driving real `php-cgi` processes end to end. The worker
-> protocol is specified in [docs/worker-protocol.md](docs/worker-protocol.md) and implemented in
-> `crates/stokehold-worker`, with its wire format pinned by tests. The HTTP listener, the PHP
-> worker SDK and the worker pool that would use those frames are next — see
-> [docs/plan.md](docs/plan.md) for the phase order.
+> protocol is specified in [docs/worker-protocol.md](docs/worker-protocol.md), implemented in
+> `crates/stokehold-worker`, and the PHP worker SDK in [sdk/php](sdk/php) implements the other
+> end — proven by tests that drive a live `php worker.php` over pipes. The HTTP listener and the
+> worker pool that supervises those workers are next — see [docs/plan.md](docs/plan.md) for the
+> phase order.
 
 ## Why
 
@@ -138,9 +139,9 @@ marked down.
 | `crates/stokehold-worker` | The worker protocol: framed codec and message set over a worker's pipes |
 | `crates/stokehold-server` | Backend abstraction, `php-cgi` pool, process lifecycle, dispatch |
 | `crates/stokehold-cli` | The `stokehold` binary |
+| `sdk/php` | The PHP worker SDK — the other end of the worker protocol |
 | `docs/plan.md` | The design and the phase plan |
 | `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements |
-| `sdk/php` | The PHP worker SDK (later phase) |
 
 ## Development
 
@@ -158,6 +159,16 @@ The worker protocol tests — `crates/stokehold-worker/src/codec.rs` and
 `crates/stokehold-worker/tests/wire_format.rs` — need no PHP. They drive the codec over an
 in-memory stream and assert the exact wire bytes, so the protocol stays frozen without depending
 on a PHP install.
+
+`crates/stokehold-worker/tests/php_worker.rs` does the opposite: it starts a real
+`sdk/php/example/worker.php` process and speaks the protocol to it over pipes, so the Rust codec
+and the PHP SDK are checked against each other rather than only against their own fixtures.
+
+The PHP SDK's own suite needs no Rust and no PHPUnit:
+
+```bash
+php sdk/php/tests/run.php
+```
 
 ## License
 

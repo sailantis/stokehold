@@ -1,0 +1,25 @@
+{
+    "name": "sailantis/stokehold-worker",
+    "description": "The PHP worker SDK for stokehold: serves requests over the stokehold worker protocol.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["stokehold", "worker", "php-fpm", "application-server", "roadrunner"],
+    "require": {
+        "php": ">=8.1",
+        "ext-hash": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Stokehold\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Stokehold\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "php tests/run.php"
+    }
+}

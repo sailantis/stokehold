@@ -95,6 +95,14 @@ The numbering is part of the protocol. These values must never be reordered or r
 An unknown type number is rejected rather than skipped: skipping it would silently misalign the
 reader from the sender's expectations.
 
+### Which types a worker may receive
+
+A worker only ever handles `HELLO`, `REQUEST`, `PING` and `CONTROL`, and answers each of them. It
+does not handle `RESPONSE`, `BODY`, `END`, `HELLO_ACK`, `CONTROL_ACK`, `PONG` or `ERROR` — a
+server sending any of those is a protocol error, and both the Rust codec and the PHP SDK refuse
+them rather than guessing. `LOG`, `METRIC` and `EVENT` are absorbed and ignored wherever they
+appear, because a peer echoing telemetry back must not derail the loop.
+
 ### Correlation
 
 `request_id` is meaningful only for `REQUEST`, `RESPONSE`, `BODY` and `END`. Every other type is
@@ -228,11 +236,17 @@ Everything else means the reader can no longer trust its position in the stream.
 
 1. **Worker stdout *is* the protocol channel.** The SDK must rebind PHP's own output — `echo`,
    warnings, notices — away from stdout, or application output corrupts the framing. The SDK
-   captures output per request with `ob_start()` / `ob_get_clean()`, routes diagnostics to the
-   `STDERR` constant, and sets `display_errors` to `stderr`.
+   **captures** rather than bans it: `ob_start()` per request collects `echo` and template
+   output (and turns it into the response body when the handler returns null), `ini_set('display_errors', 'stderr')`
+   sends warnings to stderr, and `emitLog`/`emitMetric` are the supported way to speak outside a
+   request. See `sdk/php/src/Worker.php`.
 2. **Graceful shutdown by construction.** Closing the child's stdin makes the worker's read
    return EOF and `waitRequest()` return `false`; the worker exits on its own. Only after a grace
-   period does the supervisor kill it.
+   period does the supervisor kill it. There is no signal to catch and no flag to poll, which is
+   why the server never has to ask twice.
+
+Both rules are implemented in `sdk/php/` and tested against a real PHP process by
+`crates/stokehold-worker/tests/php_worker.rs`, which drives a live `php worker.php` over pipes.
 
 ## Versioning
 

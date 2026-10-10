@@ -33,6 +33,77 @@ pub struct Config {
     /// Backend used when a request does not match a route.
     #[serde(default)]
     pub default_backend: Option<String>,
+
+    /// Route table, in the order written. See [`RouteConfig`] for the
+    /// precedence rule.
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
+}
+
+/// A route entry, selecting a backend for matching requests.
+///
+/// Both matchers are optional, but at least one must be present — a route with
+/// neither is just `default_backend` written the long way, and it would make the
+/// precedence rule meaningless. Constraints within one route are **all** of
+/// ("and"), not any of.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RouteConfig {
+    /// Match a request whose path starts with this string, e.g. `/api`.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+
+    /// Match a request whose `Host` header is exactly this, ignoring the
+    /// `:port` suffix. Case-insensitive.
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// The backend to dispatch to.
+    pub backend: String,
+}
+
+impl RouteConfig {
+    /// How specific this route is: the number of constraints it states.
+    ///
+    /// Used to pick a winner when several routes match, so a route naming a host
+    /// and a path beats one naming only the path.
+    pub fn specificity(&self) -> usize {
+        self.host.is_some() as usize + self.path_prefix.is_some() as usize
+    }
+
+    /// Whether this route's constraints all match the given host and path.
+    pub fn matches(&self, host: Option<&str>, path: &str) -> bool {
+        if let Some(wanted) = &self.path_prefix {
+            if !path.starts_with(wanted.as_str()) {
+                return false;
+            }
+        }
+        if let Some(wanted) = &self.host {
+            let host = host.unwrap_or_default();
+            // A Host header may carry a port; the route names a host.
+            let host = host.split(':').next().unwrap_or(host);
+            if !host.eq_ignore_ascii_case(wanted) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Config {
+    /// The backend that should serve this request, if a route matches it.
+    ///
+    /// The most specific matching route wins (see [`RouteConfig::specificity`]);
+    /// ties are broken by order of declaration, so the earlier entry wins. This
+    /// is deliberately the whole rule: anything more clever becomes
+    /// unguessable, and a reader of the file should be able to predict it.
+    pub fn route_backend(&self, host: Option<&str>, path: &str) -> Option<&str> {
+        self.routes
+            .iter()
+            .filter(|route| route.matches(host, path))
+            .max_by_key(|route| route.specificity())
+            .map(|route| route.backend.as_str())
+    }
 }
 
 /// Listeners. Both are optional, but at least one must be configured.
@@ -205,6 +276,35 @@ impl Config {
             Some(_) => {}
         }
 
+        for (index, route) in self.routes.iter().enumerate() {
+            if !self.backends.contains_key(&route.backend) {
+                return Err(Error::Config(format!(
+                    "routes[{index}].backend {:?} does not match any configured backend",
+                    route.backend
+                )));
+            }
+            if route.path_prefix.is_none() && route.host.is_none() {
+                return Err(Error::Config(format!(
+                    "routes[{index}] has neither path_prefix nor host, so it would match every \
+                     request; set default_backend instead"
+                )));
+            }
+            if let Some(prefix) = &route.path_prefix {
+                if !prefix.starts_with('/') {
+                    return Err(Error::Config(format!(
+                        "routes[{index}].path_prefix {prefix:?} must start with '/'"
+                    )));
+                }
+            }
+            if let Some(host) = &route.host {
+                if host.is_empty() || host.contains(':') {
+                    return Err(Error::Config(format!(
+                        "routes[{index}].host {host:?} must be a bare host name without a port"
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -364,5 +464,146 @@ bind_host = "0.0.0.0"
         assert!(parse_listener("unix:").is_err());
         assert!(parse_listener("").is_err());
         assert!(parse_listener("nonsense").is_err());
+    }
+
+    fn routed_config() -> Config {
+        let text = r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[backends.legacy]
+kind = "worker"
+command = "php legacy.php"
+
+[[routes]]
+path_prefix = "/api"
+backend = "legacy"
+
+[[routes]]
+host = "admin.example"
+path_prefix = "/"
+backend = "legacy"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    #[test]
+    fn a_route_selects_a_backend_by_path_prefix() {
+        let config = routed_config();
+        assert_eq!(config.route_backend(None, "/api/users"), Some("legacy"));
+        assert_eq!(config.route_backend(None, "/other"), None);
+        // A prefix match is textual, matching how nginx `location` behaves.
+        assert_eq!(config.route_backend(None, "/apix"), Some("legacy"));
+    }
+
+    #[test]
+    fn a_host_route_ignores_the_port_and_the_case() {
+        let config = routed_config();
+        assert_eq!(
+            config.route_backend(Some("Admin.Example:8080"), "/"),
+            Some("legacy")
+        );
+        assert_eq!(config.route_backend(Some("admin.example"), "/x"), Some("legacy"));
+        assert_eq!(config.route_backend(Some("public.example"), "/x"), None);
+    }
+
+    #[test]
+    fn the_most_specific_matching_route_wins() {
+        // Both routes match `admin.example/api`; the one that states two
+        // constraints beats the one that states a path alone.
+        let text = r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[backends.path_only]
+kind = "worker"
+command = "php path.php"
+
+[backends.both]
+kind = "worker"
+command = "php both.php"
+
+[[routes]]
+path_prefix = "/api"
+backend = "path_only"
+
+[[routes]]
+host = "admin.example"
+path_prefix = "/"
+backend = "both"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("config validates");
+        assert_eq!(
+            config.route_backend(Some("admin.example"), "/api/x"),
+            Some("both")
+        );
+    }
+
+    #[test]
+    fn rejects_a_route_naming_an_unknown_backend() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[[routes]]
+path_prefix = "/api"
+backend = "missing"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("routes[0].backend"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_route_that_matches_everything() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[[routes]]
+backend = "app"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("neither"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_path_prefix_without_a_leading_slash() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+[[routes]]
+path_prefix = "api"
+backend = "app"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("must start with"), "{err}");
     }
 }

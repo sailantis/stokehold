@@ -331,6 +331,7 @@ mod tests {
             .into_iter()
             .collect(),
             default_backend: Some("fpm".to_string()),
+            routes: Vec::new(),
         };
         let dispatcher = Dispatcher::from_config(&config, stokehold_fcgi::Routing::default())
             .expect("dispatcher");

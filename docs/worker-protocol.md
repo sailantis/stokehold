@@ -193,9 +193,9 @@ behave differently. PHP's `memory_get_peak_usage(true)` is a high-water mark tha
 process start and never falls, so reporting it raw would mean a worker that peaked once — during
 bootstrap, or during one large request — reports a figure above the configured limit on *every*
 request thereafter, and is recycled after each one. The SDK reads the figure and then calls
-`memory_reset_peak_usage()` (PHP 8.2+; on 8.1 the function is absent and the figure stays
-monotonic, which is the old behaviour rather than a failure), so the number describes the request
-that just finished. A worker implementation that does not reset is free to report a cumulative
+`memory_reset_peak_usage()` (PHP 8.2+, the supported floor; below it the function is absent and the
+figure stays monotonic, which is the old behaviour rather than a failure), so the number describes
+the request that just finished. A worker implementation that does not reset is free to report a cumulative
 figure — the server acts on whatever it is told — but it will be recycled more eagerly.
 
 ### Control

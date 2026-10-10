@@ -140,9 +140,10 @@ never has to choose between responding and being cleaned up.
 
 Each `END` frame reports `peak_memory_bytes` for **that request**, not for the process. The worker
 reads `memory_get_peak_usage(true)` and then calls `memory_reset_peak_usage()`, so a spike in one
-request does not make the server recycle the worker after every later one. On PHP 8.2+ that reset
-exists; on 8.1 the reported figure is cumulative, so a `memory_limit_mb` threshold recycles more
-eagerly there. The same figure is available between requests via the `report` control.
+request does not make the server recycle the worker after every later one. That reset exists on
+PHP 8.2+, which is the SDK's floor; a version below the stated minimum would leave the figure cumulative, so a
+`memory_limit_mb` threshold recycles more eagerly there. The same figure is available between
+requests via the `report` control.
 
 ## Example
 
@@ -188,9 +189,11 @@ failure: the warning went to stderr instead of into a frame.
 
 ## Requirements and versions
 
-- PHP **8.1+** — `readonly` constructor promotion is the floor, and PHP 8.0 fails to parse the
-  SDK (verified: 8.0 errors, 8.1 not tested, **8.2.23, 8.3.31, 8.4.24 and 8.5.9 all pass the
-  full suite**).
+- PHP **8.2+** — the floor is `memory_reset_peak_usage()`, which the SDK calls to make each `END`
+  report that request's peak rather than a figure that never falls (see above); `readonly`
+  constructor promotion is the syntax floor and is older. Verified passing the full suite on
+  **8.2.23, 8.3.31, 8.4.24 and 8.5.9**. PHP 8.0 and 8.1 are below the floor and untested; 8.0
+  additionally fails to parse the SDK.
 - `ext-hash` for `hash('crc32c', …)` — that is how the checksum is computed without
   reimplementing the polynomial, and it matches `crc32c` in Rust exactly.
 - `ext-json`.

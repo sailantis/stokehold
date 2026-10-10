@@ -290,10 +290,11 @@ final class Worker
      *
      * `memory_reset_peak_usage()` re-baselines the high-water mark to the current
      * usage, so the number in the `END` frame measures the request that just
-     * finished. The reset happens *after* the figure is read, and only when the
-     * function exists: it arrived in PHP 8.2, and the SDK's stated minimum is 8.1,
-     * where the reported figure stays monotonic — the old, over-eager behaviour
-     * rather than a fatal error.
+     * finished. The reset happens *after* the figure is read. It arrived in PHP
+     * 8.2, which is also the SDK's stated minimum, so the `function_exists` guard
+     * below is not a supported path: it exists so that running on something older
+     * degrades to a monotonic figure — the old, over-eager behaviour — instead of
+     * a fatal error on the first request.
      *
      * @see https://www.php.net/manual/en/function.memory-reset-peak-usage.php
      */

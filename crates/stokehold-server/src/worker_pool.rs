@@ -386,10 +386,11 @@ struct Slot {
     /// its own it would make this a "has this worker *ever* peaked" flag — a worker
     /// that legitimately peaked once would be recycled after every subsequent
     /// request, one application boot per request. The SDK avoids that by calling
-    /// `memory_reset_peak_usage()` after reading the figure (present from PHP 8.2;
-    /// absent on 8.1, where the report stays monotonic rather than failing), so the
-    /// number in `END` measures the request that just finished. Verified in the PHP
-    /// source: `zend_memory_reset_peak_usage` sets `real_peak = real_size`.
+    /// `memory_reset_peak_usage()` after reading the figure (present from PHP 8.2,
+    /// which is the SDK's floor; a version below it leaves the report monotonic
+    /// rather than failing), so the number in `END` measures the request that just
+    /// finished. Verified in the PHP source: `zend_memory_reset_peak_usage` sets
+    /// `real_peak = real_size`.
     ///
     /// A worker that does not use the SDK, or speaks an older protocol revision,
     /// may still report a cumulative figure. The pool acts on what it is told.

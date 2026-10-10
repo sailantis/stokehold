@@ -5,6 +5,7 @@ members = [
     "crates/stokehold-worker",
     "crates/stokehold-fcgi",
     "crates/stokehold-server",
+    "crates/stokehold-http",
     "crates/stokehold-cli",
 ]
 
@@ -20,10 +21,16 @@ stokehold-core = { path = "crates/stokehold-core" }
 stokehold-worker = { path = "crates/stokehold-worker" }
 stokehold-fcgi = { path = "crates/stokehold-fcgi" }
 stokehold-server = { path = "crates/stokehold-server" }
+stokehold-http = { path = "crates/stokehold-http" }
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

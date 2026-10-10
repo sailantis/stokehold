@@ -44,6 +44,18 @@ pub enum FcgiError {
     BadRequest(String),
 }
 
+impl FcgiError {
+    /// Whether this failure means the backend was reached but did not answer in
+    /// time.
+    ///
+    /// A front-end needs the distinction to choose between a 504 and a 502, and
+    /// the knowledge belongs here rather than in each front-end: only this module
+    /// knows which I/O error a deadline produces.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, FcgiError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut)
+    }
+}
+
 /// Convenience alias for codec and client results.
 pub type Result<T> = std::result::Result<T, FcgiError>;
 

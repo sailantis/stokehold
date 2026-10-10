@@ -143,6 +143,35 @@ pub fn parse_response_headers(stdout: &[u8]) -> (u16, Vec<(String, String)>) {
     (status, headers)
 }
 
+/// Split a FastCGI `STDOUT` payload into its header block and its body.
+///
+/// The inverse of [`parse_response_headers`], and used by anything that has to
+/// speak a different protocol on the other side: the front-end needs the body
+/// alone, because it writes its own header block.
+///
+/// A payload with no blank line is all body, which is what the specification's
+/// "no headers" case looks like.
+pub fn split_response_body(stdout: &[u8]) -> &[u8] {
+    // Located on the bytes rather than on a lossy `String`, because the body is
+    // arbitrary application bytes and a lossy conversion would corrupt it.
+    let crlf = find_subslice(stdout, b"\r\n\r\n").map(|index| (index, 4));
+    let lf = find_subslice(stdout, b"\n\n").map(|index| (index, 2));
+
+    match (crlf, lf) {
+        (Some((index, len)), Some((other, _))) if index <= other => &stdout[index + len..],
+        (Some((index, len)), None) => &stdout[index + len..],
+        (_, Some((index, len))) => &stdout[index + len..],
+        (None, None) => &[],
+    }
+}
+
+/// The offset of `needle` in `haystack`, if present.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 /// A client bound to one backend connection.
 ///
 /// Generic over the transport so the protocol can be tested without a socket.

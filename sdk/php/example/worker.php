@@ -56,6 +56,16 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         return null;
     }
 
+    // Which headers arrived, as the CGI environment rebuilt them. Worth having as
+    // a route: a header that a front-end forwards but the SDK misnames is
+    // invisible until an application looks for it by the name it expects.
+    if ($path === '/headers') {
+        echo 'host: ', htmlspecialchars((string) $request->header('Host'), ENT_QUOTES), "\n";
+        echo 'x-marker: ', htmlspecialchars((string) $request->header('X-Marker'), ENT_QUOTES), "\n";
+
+        return null;
+    }
+
     // Ask the server to replace this worker once the request is done. The SDK
     // reports `keep_alive = false` in END and the pool boots a fresh process,
     // which is what an application does when it has put itself into a state it

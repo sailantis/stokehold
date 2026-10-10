@@ -65,4 +65,33 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
 }
 
+impl ServerError {
+    /// Whether the backend was reached but did not answer in time.
+    ///
+    /// A front-end needs this to choose between a 504 and a 502, and the
+    /// knowledge belongs here rather than in each front-end: only this crate knows
+    /// which failure a deadline produces for each backend kind.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            ServerError::WorkerProtocol { source, .. } => {
+                matches!(source, stokehold_worker::WorkerError::Timeout(_))
+            }
+            ServerError::Worker { source, .. } | ServerError::Fcgi(source) => source.is_timeout(),
+            ServerError::Io(io) => io.kind() == std::io::ErrorKind::TimedOut,
+            _ => false,
+        }
+    }
+
+    /// Whether no backend could take the request at all.
+    ///
+    /// Distinct from a backend that failed: nothing was attempted, so the honest
+    /// answer is a 503 rather than a 502.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            ServerError::NoWorker { .. } | ServerError::AllBusy { .. }
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ServerError>;

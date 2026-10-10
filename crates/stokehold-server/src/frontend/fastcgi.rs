@@ -35,6 +35,8 @@ pub struct IncomingRequest {
     pub body: Vec<u8>,
     /// Whether the client asked for keep-alive.
     pub keep_conn: bool,
+    /// Whether the client aborted the request in flight.
+    pub aborted: bool,
 }
 
 impl IncomingRequest {
@@ -75,25 +77,38 @@ pub enum ConnectionOutcome {
     Aborted,
 }
 
-/// Read one request from a connection.
+/// What arrived on a connection.
+#[derive(Debug, Clone)]
+pub enum NextRequest {
+    /// A real request to serve.
+    Request(IncomingRequest),
+    /// A `GET_VALUES` probe. nginx uses it to decide whether this server is
+    /// usable, so answering it keeps stokehold in rotation instead of marked
+    /// down.
+    GetValues(Vec<(Vec<u8>, Vec<u8>)>),
+}
+
+/// Read one request, or a management probe, from a connection.
 ///
 /// Returns `Ok(None)` for a clean end of stream, which is how nginx closes an
 /// idle keep-alive connection.
-pub fn read_request<R: Read>(reader: &mut R) -> Result<Option<IncomingRequest>> {
-    // A management record can arrive at any point; `GET_VALUES` is answered by
-    // the caller, because only it knows what to report.
+pub fn read_next<R: Read>(reader: &mut R) -> Result<Option<NextRequest>> {
     let begin = loop {
         let Some(record) = record::read_record(reader)? else {
             return Ok(None);
         };
         match record.record_type() {
             RecordType::BeginRequest => break record,
-            // nginx probes with GET_VALUES before deciding to use a server.
             RecordType::GetValues => {
-                return Err(ServerError::UnsupportedManagementRecord);
+                let names = nvpair::decode_pairs(&record.content).map_err(|source| {
+                    ServerError::BadProtocol {
+                        reason: format!("malformed GET_VALUES: {source}"),
+                    }
+                })?;
+                return Ok(Some(NextRequest::GetValues(names)));
             }
-            // Anything else before a BEGIN_REQUEST is a protocol error, but
-            // skipping is kinder than tearing the connection down.
+            // Anything else before a BEGIN_REQUEST is unexpected, but skipping is
+            // kinder than tearing the connection down.
             other => {
                 tracing::debug!(record = ?other, "ignoring a record before BEGIN_REQUEST");
                 continue;
@@ -136,11 +151,14 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<Option<IncomingRequest>> 
                 body.extend_from_slice(&record.content);
             }
             RecordType::AbortRequest => {
-                return Ok(Some(IncomingRequest {
+                // There is no partial response to abandon, so an abort is simply
+                // a request that will not be served.
+                return Ok(Some(NextRequest::Request(IncomingRequest {
                     params,
                     body,
                     keep_conn: false,
-                }))
+                    aborted: true,
+                })));
             }
             other => {
                 tracing::debug!(record = ?other, "ignoring an unexpected record");
@@ -150,11 +168,24 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<Option<IncomingRequest>> 
     }
 
     let _ = begin_request.role;
-    Ok(Some(IncomingRequest {
+    Ok(Some(NextRequest::Request(IncomingRequest {
         params,
         body,
         keep_conn: begin_request.keep_conn,
-    }))
+        aborted: false,
+    })))
+}
+
+/// Read one request, treating a management probe as an error.
+///
+/// Kept for callers that only serve requests; the listener uses [`read_next`] so
+/// it can answer probes.
+pub fn read_request<R: Read>(reader: &mut R) -> Result<Option<IncomingRequest>> {
+    match read_next(reader)? {
+        None => Ok(None),
+        Some(NextRequest::Request(request)) => Ok(Some(request)),
+        Some(NextRequest::GetValues(_)) => Err(ServerError::UnsupportedManagementRecord),
+    }
 }
 
 /// Write a backend response back to the FastCGI client.

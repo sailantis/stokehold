@@ -223,6 +223,14 @@ against the specification and secondary implementations, and are confirmed by fi
    environment builder must always send it, derived from the body it is about to frame. This was
    found by the `php-cgi` integration test in
    `crates/stokehold-fcgi/tests/php_cgi.rs`, which is why that test exists.
+6. **On Windows an accepted socket inherits the listener's non-blocking mode.** A listener put
+   into non-blocking mode so `accept` can be polled hands every accepted connection the same
+   flag, and Rust does not reset it. Every read then returns `WSAEWOULDBLOCK` immediately and the
+   connection is dropped after the first record. The listener must call
+   `set_nonblocking(false)` on each accepted stream. This hid for a while because a
+   single-request test passes either way — all the bytes are already buffered, so the
+   non-blocking read succeeds. It only surfaced on an *interactive* exchange (a `GET_VALUES`
+   probe followed by a request), which is why the probe test exists.
 
 ## 6. Phases
 

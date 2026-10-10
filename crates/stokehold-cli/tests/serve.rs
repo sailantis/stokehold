@@ -1,0 +1,446 @@
+//! Smoke test for `stokehold serve`: start the real binary, talk FastCGI to it,
+//! and check that a request reaches a real PHP process and comes back.
+//!
+//! This proves the shipped binary works, as opposed to the library functions
+//! being correct in isolation.
+//!
+//! Skipped, with a printed reason, when `php-cgi` is unavailable or the binary
+//! has not been built.
+
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use stokehold_fcgi::{message::BeginRequest, nvpair, protocol::RecordType, record};
+
+/// The `stokehold` binary, found next to this test's own executable.
+fn stokehold_binary() -> Option<PathBuf> {
+    // target/<profile>/deps/<test>.exe -> target/<profile>/stokehold[.exe]
+    let mut dir = std::env::current_exe().ok()?;
+    dir.pop();
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    let name = if cfg!(windows) {
+        "stokehold.exe"
+    } else {
+        "stokehold"
+    };
+    let candidate = dir.join(name);
+    candidate.is_file().then_some(candidate)
+}
+
+fn find_php_cgi() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let names: &[&str] = &["php-cgi.exe", "php-cgi"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["php-cgi"];
+
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// A run of consecutive free ports, since the pool increments from `base_port`.
+fn free_port_run(count: usize) -> Option<u16> {
+    for _ in 0..64 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let base = probe.local_addr().ok()?.port();
+        drop(probe);
+        let mut held = Vec::with_capacity(count);
+        for offset in 0..count {
+            let port = base.checked_add(offset as u16)?;
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => held.push(listener),
+                Err(_) => break,
+            }
+        }
+        if held.len() == count {
+            drop(held);
+            return Some(base);
+        }
+    }
+    None
+}
+
+/// A `stokehold serve` process that is killed when the test ends.
+struct Server {
+    child: Child,
+    address: String,
+}
+
+impl Server {
+    fn start(binary: &Path, config: &Path) -> Option<Self> {
+        let child = Command::new(binary)
+            .arg("serve")
+            .arg("--config")
+            .arg(config)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        let mut server = Server {
+            child,
+            address: String::new(),
+        };
+        let stdout = server.child.stdout.take().expect("piped stdout");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            // `stokehold listening for FastCGI on 127.0.0.1:PORT`
+            if let Some(rest) = line
+                .trim()
+                .strip_prefix("stokehold listening for FastCGI on ")
+            {
+                server.address = rest.to_string();
+                return Some(server);
+            }
+        }
+        let _ = server.child.kill();
+        None
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn io_err(err: stokehold_fcgi::FcgiError) -> std::io::Error {
+    match err {
+        stokehold_fcgi::FcgiError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    }
+}
+
+/// A decoded response: status, headers and body.
+type Decoded = (u16, Vec<(String, String)>, String);
+
+/// Send one request over a fresh connection and read the response back.
+fn request(address: &str, params: &[(Vec<u8>, Vec<u8>)], body: &[u8]) -> std::io::Result<Decoded> {
+    let mut stream = TcpStream::connect(address)?;
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+
+    let mut wire = Vec::new();
+    let header = record::Header::new(RecordType::BeginRequest, 1, 8);
+    header.write(&mut wire).map_err(io_err)?;
+    wire.write_all(&BeginRequest::responder(false).encode())?;
+    let payload = nvpair::encode_pairs(
+        params
+            .iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice())),
+    );
+    record::write_records(&mut wire, RecordType::Params, 1, &payload, true).map_err(io_err)?;
+    record::write_records(&mut wire, RecordType::Stdin, 1, body, true).map_err(io_err)?;
+    stream.write_all(&wire)?;
+    stream.flush()?;
+
+    let mut stdout = Vec::new();
+    while let Some(record) = record::read_record(&mut stream).map_err(io_err)? {
+        match record.record_type() {
+            RecordType::Stdout => stdout.extend_from_slice(&record.content),
+            RecordType::EndRequest => break,
+            _ => continue,
+        }
+    }
+
+    Ok(parse(&stdout))
+}
+
+/// Split a FastCGI response into status, headers and body.
+fn parse(stdout: &[u8]) -> Decoded {
+    let text = String::from_utf8_lossy(stdout);
+    let (head, body) = match text.split_once("\r\n\r\n") {
+        Some((head, body)) => (head, body),
+        None => match text.split_once("\n\n") {
+            Some((head, body)) => (head, body),
+            None => (text.as_ref(), ""),
+        },
+    };
+
+    let mut status = 200u16;
+    let mut headers = Vec::new();
+    for (index, line) in head.split('\n').enumerate() {
+        let line = line.trim_end_matches('\r');
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if index == 0 && name.eq_ignore_ascii_case("status") {
+            status = value
+                .split_whitespace()
+                .next()
+                .and_then(|code| code.parse().ok())
+                .unwrap_or(200);
+        } else {
+            headers.push((name.trim().to_string(), value.to_string()));
+        }
+    }
+    (status, headers, body.to_string())
+}
+
+fn params_for(root: &Path, uri: &str, body_len: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let routing = stokehold_fcgi::Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..stokehold_fcgi::Routing::default()
+    };
+    let info = stokehold_fcgi::RequestInfo {
+        method: if body_len > 0 { "POST" } else { "GET" }.to_string(),
+        uri: uri.to_string(),
+        body_len,
+        ..stokehold_fcgi::RequestInfo::default()
+    };
+    stokehold_fcgi::build_params(&info, &routing).expect("params build")
+}
+
+/// Write the config the server will read, then start it.
+fn start_server(
+    binary: &Path,
+    php_cgi: &Path,
+    root: &Path,
+    workers: u32,
+    base_port: u16,
+) -> Option<Server> {
+    let config_path = root.join("stokehold.toml");
+    let config = format!(
+        "default_backend = \"cgi\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {binary:?}\nworkers = {workers}\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
+        binary = php_cgi.display().to_string(),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+    Server::start(binary, &config_path)
+}
+
+#[test]
+fn serve_answers_a_fastcgi_request_from_a_real_php_process() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built (run `cargo build`)");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(2) else {
+        eprintln!("skipping: no run of two free ports");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("stokehold-smoke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    std::fs::write(
+        root.join("index.php"),
+        r#"<?php
+header('X-Smoke: yes');
+echo "URI=", $_SERVER['REQUEST_URI'] ?? '-', "\n";
+echo "PATH=", $_SERVER['PATH_INFO'] ?? '-', "\n";
+echo "BODY=", file_get_contents('php://input');
+"#,
+    )
+    .expect("write the front controller");
+
+    let server = start_server(&binary, &php_cgi, &root, 2, base_port).expect("the server started");
+    assert!(!server.address.is_empty());
+
+    let body = b"hello-body";
+    let params = params_for(&root, "/deep/route?x=1", body.len());
+    let (status, headers, response_body) =
+        request(&server.address, &params, body).expect("the request completed");
+
+    assert_eq!(status, 200, "{response_body}");
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("X-Smoke") && value == "yes"),
+        "the script's header is missing: {headers:?}"
+    );
+    assert!(
+        response_body.contains("URI=/deep/route?x=1"),
+        "{response_body}"
+    );
+    assert!(
+        response_body.contains("PATH=/deep/route"),
+        "{response_body}"
+    );
+    assert!(response_body.contains("BODY=hello-body"), "{response_body}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn serve_keeps_serving_across_several_requests() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(2) else {
+        eprintln!("skipping: no run of two free ports");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("stokehold-smoke-many-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    std::fs::write(
+        root.join("index.php"),
+        r#"<?php echo "N="; echo file_get_contents('php://input');"#,
+    )
+    .expect("write the front controller");
+
+    let server = start_server(&binary, &php_cgi, &root, 2, base_port).expect("the server started");
+
+    for index in 0..6 {
+        let body = format!("req{index}");
+        let params = params_for(&root, "/", body.len());
+        let (status, _, response_body) =
+            request(&server.address, &params, body.as_bytes()).expect("the request completed");
+        assert_eq!(status, 200, "{response_body}");
+        assert!(
+            response_body.contains(&format!("N=req{index}")),
+            "{response_body}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_nginx_get_values_probe_is_answered_without_ending_the_connection() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("stokehold-smoke-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    std::fs::write(root.join("index.php"), r#"<?php echo "OK";"#).expect("write the script");
+
+    let server = start_server(&binary, &php_cgi, &root, 1, base_port).expect("the server started");
+
+    // This is exactly what nginx does before deciding to use a FastCGI server.
+    let mut stream = TcpStream::connect(&server.address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set timeout");
+
+    let payload = nvpair::encode_pairs([(&b"max_connections"[..], &b""[..])]);
+    let mut wire = Vec::new();
+    record::write_records(&mut wire, RecordType::GetValues, 0, &payload, false)
+        .expect("frame the probe");
+    stream.write_all(&wire).expect("write the probe");
+    stream.flush().expect("flush");
+
+    let response = record::read_record(&mut stream)
+        .map_err(io_err)
+        .expect("a reply")
+        .expect("a record");
+    assert_eq!(
+        response.record_type(),
+        RecordType::GetValuesResult,
+        "a probe must be answered with a result, never an END_REQUEST"
+    );
+    let values = nvpair::decode_pairs(&response.content).expect("decode the result");
+    assert!(
+        values.iter().any(|(name, _)| name == b"max_connections"),
+        "the requested value should be present: {values:?}"
+    );
+
+    // The connection must still be usable for a real request afterwards, which
+    // is the part that matters: a probe that closed the connection would make
+    // nginx mark the server down.
+    let params = params_for(&root, "/", 0);
+    let mut wire = Vec::new();
+    let header = record::Header::new(RecordType::BeginRequest, 1, 8);
+    header.write(&mut wire).map_err(io_err).expect("header");
+    wire.write_all(&BeginRequest::responder(true).encode())
+        .expect("begin");
+    let payload = nvpair::encode_pairs(
+        params
+            .iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice())),
+    );
+    record::write_records(&mut wire, RecordType::Params, 1, &payload, true).expect("params");
+    record::write_records(&mut wire, RecordType::Stdin, 1, b"", true).expect("stdin");
+    stream.write_all(&wire).expect("write the request");
+    stream.flush().expect("flush");
+
+    let mut body = Vec::new();
+    while let Some(record) = record::read_record(&mut stream)
+        .map_err(io_err)
+        .expect("a record")
+    {
+        match record.record_type() {
+            RecordType::Stdout => body.extend_from_slice(&record.content),
+            RecordType::EndRequest => break,
+            _ => continue,
+        }
+    }
+    let (status, _, text) = parse(&body);
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("OK"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_missing_script_is_an_error_response_not_a_hang() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("stokehold-smoke-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+
+    let server = start_server(&binary, &php_cgi, &root, 1, base_port).expect("the server started");
+
+    // No front controller exists in this root, so PHP cannot find the script.
+    let params = params_for(&root, "/nope.php", 0);
+    let (status, _, body) = request(&server.address, &params, b"").expect("the request completed");
+    assert!(
+        status == 404 || status == 500 || body.contains("No input file"),
+        "expected an error, got {status}: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

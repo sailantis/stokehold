@@ -7,6 +7,7 @@
 pub mod fastcgi;
 
 pub use fastcgi::{
-    read_management_request, read_request, split_response, write_error, write_get_values,
-    write_response, ConnectionOutcome, IncomingRequest, ServerErrorKind, Timing,
+    read_management_request, read_next, read_request, split_response, write_error,
+    write_get_values, write_response, ConnectionOutcome, IncomingRequest, NextRequest,
+    ServerErrorKind, Timing,
 };

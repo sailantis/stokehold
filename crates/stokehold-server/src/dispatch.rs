@@ -75,6 +75,13 @@ impl Dispatcher {
         self.dispatch_to(&name, request)
     }
 
+    /// Send a request to the default backend.
+    ///
+    /// An alias used by the listener, where "default" is the meaningful word.
+    pub fn dispatch_to_default(&mut self, request: &Request) -> Result<Response> {
+        self.dispatch(request)
+    }
+
     /// Send a request to a named backend.
     pub fn dispatch_to(&mut self, name: &str, request: &Request) -> Result<Response> {
         let backend = self

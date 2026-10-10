@@ -102,6 +102,30 @@ That prints the configured listeners, each backend and whether it resets per req
 PHP binary discovered (role, version, ZTS/NTS flavour and path). Extra search directories can be
 added with `--php-dir <dir>`.
 
+Then serve it:
+
+```bash
+cargo run -- serve --config stokehold.example.toml \
+  --document-root /srv/app --front-controller index.php
+```
+
+`stokehold` prints the address it bound, then serves FastCGI until Ctrl-C. Point nginx at it:
+
+```nginx
+location ~ \.php$ {
+    fastcgi_pass 127.0.0.1:9080;
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+}
+```
+
+Pass an empty `--front-controller` to serve only real `.php` files, which matches nginx's
+`location ~ \.php$` behaviour; the default resolves everything else through `index.php` with
+`PATH_INFO`, which is what most frameworks want.
+
+`stokehold` answers nginx's `GET_VALUES` health probe, so it stays in rotation rather than being
+marked down.
+
 ## Layout
 
 | Path | Contents |

@@ -43,6 +43,12 @@ pub enum ServerError {
     BadProtocol { reason: String },
 
     #[error(transparent)]
+    Config(#[from] stokehold_core::Error),
+
+    #[error("no listener is configured; set server.fastcgi (server.http is not implemented yet)")]
+    NoListener,
+
+    #[error(transparent)]
     Fcgi(#[from] stokehold_fcgi::FcgiError),
 
     #[error("the peer sent a management record where a request was expected")]

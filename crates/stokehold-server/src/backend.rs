@@ -89,30 +89,7 @@ impl Backend {
     /// Send a request to this backend.
     pub fn request(&mut self, request: &Request) -> Result<Response> {
         match self {
-            Backend::External {
-                name,
-                endpoint,
-                client,
-            } => {
-                // Reconnect when the previous request declined keep-alive, or on
-                // first use. `php-fpm` normally honours keep-alive, but the code
-                // must not depend on that.
-                if client.as_ref().map(|c| !c.is_reusable()).unwrap_or(true) {
-                    *client = Some(stokehold_fcgi::Client::connect(endpoint, None).map_err(
-                        |source| ServerError::Worker {
-                            backend: name.clone(),
-                            source,
-                        },
-                    )?);
-                }
-                let connection = client.as_mut().expect("connected above");
-                connection
-                    .request(request)
-                    .map_err(|source| ServerError::Worker {
-                        backend: name.clone(),
-                        source,
-                    })
-            }
+            Backend::External { .. } => self.request_external(request),
             Backend::SpawnCgi { pool, .. } => pool.request(request),
             Backend::Worker { name } => Err(ServerError::Misconfigured {
                 backend: name.clone(),
@@ -122,11 +99,92 @@ impl Backend {
         }
     }
 
+    /// Serve a request from an externally managed FastCGI server.
+    ///
+    /// The retry is not belt-and-braces: `FCGI_KEEP_CONN` is only a *request*,
+    /// and `php-cgi` in particular closes the connection after each response
+    /// even when keep-alive was asked for. Verified against php-cgi 8.3.31: the
+    /// second request on a reused connection fails with a connection reset. So a
+    /// reused connection that fails at the transport level is re-established
+    /// once, which is indistinguishable from the client's point of view and
+    /// immune to the backend's choice.
+    fn request_external(&mut self, request: &Request) -> Result<Response> {
+        let Backend::External {
+            name,
+            endpoint,
+            client,
+        } = self
+        else {
+            unreachable!("only called for the external backend")
+        };
+
+        for attempt in 0..2 {
+            let reused = client.is_some();
+            if client.as_ref().map(|c| !c.is_reusable()).unwrap_or(true) {
+                let connection =
+                    stokehold_fcgi::Client::connect(endpoint, None).map_err(|source| {
+                        ServerError::Worker {
+                            backend: name.clone(),
+                            source,
+                        }
+                    })?;
+                *client = Some(connection);
+            }
+
+            let connection = client.as_mut().expect("connected above");
+            match connection.request(request) {
+                Ok(response) => return Ok(response),
+                Err(source) if reused && attempt == 0 && is_transport_error(&source) => {
+                    tracing::debug!(
+                        backend = %name,
+                        "the backend closed a reused connection; reconnecting"
+                    );
+                    *client = None;
+                }
+                Err(source) => {
+                    return Err(ServerError::Worker {
+                        backend: name.clone(),
+                        source,
+                    })
+                }
+            }
+        }
+
+        Err(ServerError::Worker {
+            backend: name.clone(),
+            source: stokehold_fcgi::FcgiError::IncompleteResponse {
+                request_id: stokehold_fcgi::REQUEST_ID,
+                complete: false,
+            },
+        })
+    }
+
     /// Stop the backend and everything it started.
     pub fn shutdown(&mut self) {
         if let Backend::SpawnCgi { pool, .. } = self {
             pool.shutdown();
         }
+    }
+}
+
+/// Whether a failure means the connection is gone rather than the request being
+/// refused.
+///
+/// Shared so both backends treat a dropped connection the same way.
+pub fn is_transport_error(err: &stokehold_fcgi::FcgiError) -> bool {
+    match err {
+        stokehold_fcgi::FcgiError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+        ),
+        stokehold_fcgi::FcgiError::IncompleteResponse { .. } => true,
+        _ => false,
     }
 }
 

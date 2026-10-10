@@ -201,10 +201,15 @@ against the specification and secondary implementations, and are confirmed by fi
 1. **Drain `STDERR` for every backend, always.** One reader task per backend, non-negotiable —
    if nobody reads it, the pipe buffer fills and the backend blocks forever. This is the
    classic "why did every worker hang" bug.
-2. **Never assume connection reuse.** `FCGI_KEEP_CONN` is a request *and* a server may refuse;
-   php-fpm honours it, php-cgi's behaviour must be measured. Model each backend as a slot-level
-   connection state machine rather than assuming persistence. Loopback connect is cheap but it
-   is still a state to model.
+2. **Never assume connection reuse.** `FCGI_KEEP_CONN` is a request *and* a server may refuse.
+   **Verified against php-cgi 8.3.31: it closes the connection after every response even when
+   keep-alive was requested** — the second request on a reused connection fails with a
+   connection reset. `php-fpm` does honour it. So the only correct design is: attempt reuse,
+   and on a transport-level failure re-establish the connection once and replay the request.
+   The replay is safe because a connection that dies mid-frame never reached the application as
+   a complete request. Both `external` and `spawn_cgi` share one `is_transport_error` predicate
+   so they behave identically; the `external` backend integration test asserts recovery after
+   the server behind the socket is replaced.
 3. **Windows process hygiene.** Loopback TCP only (no unix sockets); create a **Job Object**
    with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so `php-cgi` children are reaped when the master
    dies. Unix equivalent: process group plus `PR_SET_PDEATHSIG`, or kill the group. Do this

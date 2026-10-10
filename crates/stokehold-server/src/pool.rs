@@ -77,9 +77,10 @@ impl Slot {
                     self.served += 1;
                     return Ok(response);
                 }
-                // One retry on a transport error: the slot may have recycled
-                // between requests without the port changing.
-                Err(err) if attempt == 0 && is_connection_error(&err) => {
+                // One retry on a transport error: a slot may have recycled
+                // between requests without the port changing, and php-cgi closes
+                // the connection even when keep-alive was requested.
+                Err(err) if attempt == 0 && retryable(&err) => {
                     attempt += 1;
                     *client =
                         Client::connect(&endpoint, Some(REQUEST_TIMEOUT)).map_err(|source| {
@@ -101,18 +102,12 @@ impl Slot {
 }
 
 fn is_connection_error(err: &stokehold_fcgi::FcgiError) -> bool {
-    match err {
-        stokehold_fcgi::FcgiError::Io(io) => matches!(
-            io.kind(),
-            std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::NotConnected
-        ),
-        stokehold_fcgi::FcgiError::IncompleteResponse { .. } => true,
-        _ => false,
-    }
+    crate::backend::is_transport_error(err)
+}
+
+/// The retry predicate, kept named so the intent is visible at the call site.
+fn retryable(err: &stokehold_fcgi::FcgiError) -> bool {
+    is_connection_error(err)
 }
 
 /// A pool of `php-cgi` processes.

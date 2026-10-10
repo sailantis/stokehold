@@ -39,6 +39,15 @@ pub enum ServerError {
         source: stokehold_fcgi::FcgiError,
     },
 
+    #[error("bad FastCGI protocol: {reason}")]
+    BadProtocol { reason: String },
+
+    #[error(transparent)]
+    Fcgi(#[from] stokehold_fcgi::FcgiError),
+
+    #[error("the peer sent a management record where a request was expected")]
+    UnsupportedManagementRecord,
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }

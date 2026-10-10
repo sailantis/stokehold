@@ -6,11 +6,13 @@
 pub mod backend;
 pub mod dispatch;
 pub mod error;
+pub mod frontend;
 pub mod lifecycle;
 pub mod pool;
 
 pub use backend::Backend;
 pub use dispatch::Dispatcher;
 pub use error::{Result, ServerError};
+pub use frontend::fastcgi::{self, IncomingRequest};
 pub use lifecycle::LifecycleGuard;
 pub use pool::CgiPool;

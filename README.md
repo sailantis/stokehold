@@ -13,9 +13,10 @@ are spawned as ordinary external processes. That matters most on **Windows**, wh
 `php-fpm` at all — `php-cgi` is the only FastCGI-capable PHP binary there, and nothing
 supervises it for you.
 
-> **Status: early.** The workspace, configuration model, PHP discovery and the FastCGI codec
-> and client are implemented, including integration tests against a real `php-cgi`. The
-> supervisor and the listeners are next — see [docs/plan.md](docs/plan.md) for the phase order.
+> **Status: early but working.** The configuration model, PHP discovery, FastCGI codec and
+> client, CGI environment, `php-cgi` pool, backend dispatch and the FastCGI front-end are all
+> implemented, with integration tests driving real `php-cgi` processes end to end. The HTTP
+> listener and the worker pool are next — see [docs/plan.md](docs/plan.md) for the phase order.
 
 ## Why
 

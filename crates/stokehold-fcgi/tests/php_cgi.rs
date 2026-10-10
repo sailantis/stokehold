@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use stokehold_fcgi::{Client, Endpoint, Request};
+use stokehold_fcgi::{build_params, Client, Endpoint, Request, RequestInfo, Routing};
 
 /// Find `php-cgi` on `PATH`.
 fn find_php_cgi() -> Option<PathBuf> {
@@ -294,4 +294,83 @@ fn get_values_is_answered_or_declined_without_hanging() {
         Ok(values) => eprintln!("php-cgi answered GET_VALUES with {values:?}"),
         Err(err) => eprintln!("php-cgi declined GET_VALUES: {err}"),
     }
+}
+
+/// A request served through the real CGI environment builder rather than
+/// hand-written params: this is the end-to-end path a listener will take.
+#[test]
+fn the_cgi_environment_builder_produces_a_working_request() {
+    let Some(server) = PhpCgi::start() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+
+    // A front controller that reports what PHP actually received.
+    let root = std::env::temp_dir().join(format!("stokehold-cgi-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    std::fs::write(
+        root.join("index.php"),
+        r#"<?php
+echo "METHOD=", $_SERVER['REQUEST_METHOD'] ?? '?', "\n";
+echo "URI=", $_SERVER['REQUEST_URI'] ?? '?', "\n";
+echo "PATH_INFO=", $_SERVER['PATH_INFO'] ?? '-', "\n";
+echo "QUERY=", $_SERVER['QUERY_STRING'] ?? '-', "\n";
+echo "HOST=", $_SERVER['HTTP_X_CUSTOM'] ?? '-', "\n";
+echo "POST=", $_POST['field'] ?? '-', "\n";
+echo "INPUT=", file_get_contents('php://input');
+"#,
+    )
+    .expect("write the front controller");
+
+    let routing = Routing {
+        document_root: root.clone(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+
+    let body = b"field=value".to_vec();
+    let info = RequestInfo {
+        method: "POST".to_string(),
+        // A route that must reach the front controller with PATH_INFO.
+        uri: "/some/deep/route?x=1".to_string(),
+        query_string: "x=1".to_string(),
+        headers: vec![
+            ("X-Custom".to_string(), "present".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+        ],
+        body_len: body.len(),
+        ..RequestInfo::default()
+    };
+
+    let params = build_params(&info, &routing).expect("params build");
+
+    let mut client = Client::connect(&server.endpoint(), Some(Duration::from_secs(5)))
+        .expect("connect to php-cgi");
+
+    let response = client
+        .request(&Request {
+            params,
+            body,
+            keep_conn: true,
+        })
+        .expect("php-cgi answered");
+
+    response.check_protocol().expect("completed");
+    let stdout = String::from_utf8_lossy(&response.stdout);
+
+    assert!(stdout.contains("METHOD=POST"), "{stdout}");
+    assert!(stdout.contains("URI=/some/deep/route?x=1"), "{stdout}");
+    assert!(stdout.contains("PATH_INFO=/some/deep/route"), "{stdout}");
+    assert!(stdout.contains("QUERY=x=1"), "{stdout}");
+    assert!(stdout.contains("HOST=present"), "{stdout}");
+    // The two that prove CONTENT_LENGTH and CONTENT_TYPE did their job: PHP
+    // parsed the body into $_POST *and* left the raw bytes on php://input.
+    assert!(stdout.contains("POST=value"), "{stdout}");
+    assert!(stdout.contains("INPUT=field=value"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&root);
 }

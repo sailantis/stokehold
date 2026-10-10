@@ -39,6 +39,9 @@ pub enum FcgiError {
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("invalid request: {0}")]
+    BadRequest(String),
 }
 
 /// Convenience alias for codec and client results.

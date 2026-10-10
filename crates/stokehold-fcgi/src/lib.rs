@@ -8,6 +8,7 @@
 //! ever buffered whole: see `docs/plan.md` for why the client relays `STDOUT`
 //! verbatim instead of parsing it.
 
+pub mod cgi;
 pub mod client;
 pub mod error;
 pub mod message;
@@ -16,6 +17,7 @@ pub mod protocol;
 pub mod record;
 pub mod transport;
 
+pub use cgi::{build_params, route, RequestInfo, Route, Routing};
 pub use client::{
     parse_response_headers, Client, Request, Response, MANAGEMENT_REQUEST_ID, REQUEST_ID,
 };

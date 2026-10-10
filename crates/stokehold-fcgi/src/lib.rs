@@ -1,11 +1,23 @@
-//! FastCGI protocol support: record codec and client.
+//! FastCGI protocol support: the record codec.
 //!
-//! Nothing is implemented yet beyond the crate's public surface; the codec
-//! lands next. See `docs/plan.md` for the phase order.
+//! stokehold speaks FastCGI in both directions — as a client to `php-cgi` and
+//! `php-fpm`, and as a server to nginx — so the codec is deliberately symmetric:
+//! [`record::read_record`] reads what [`record::write_records`] wrote.
+//!
+//! Nothing here allocates per record beyond the payload itself, and no record is
+//! ever buffered whole: see `docs/plan.md` for why the client relays `STDOUT`
+//! verbatim instead of parsing it.
 
-use stokehold_core::error::{Error, Result};
+pub mod error;
+pub mod message;
+pub mod nvpair;
+pub mod protocol;
+pub mod record;
 
-/// Placeholder until the record codec lands.
-pub fn not_implemented_yet(what: &str) -> Result<()> {
-    Err(Error::Config(format!("{what} is not implemented yet")))
-}
+pub use error::{FcgiError, Result};
+pub use message::{BeginRequest, EndRequest};
+pub use nvpair::{decode_pairs, encode_pair, encode_pairs};
+pub use protocol::{
+    flags, ProtocolStatus, RecordType, Role, HEADER_LEN, MAX_CONTENT_LEN, VERSION_1,
+};
+pub use record::{padding_for, read_record, write_records, Header, Record};

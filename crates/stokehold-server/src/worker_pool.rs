@@ -378,10 +378,20 @@ struct Slot {
     served: u64,
     /// The peak resident set the worker last reported, in bytes.
     ///
-    /// The peak, not the current usage: PHP's `memory_get_peak_usage` is a
-    /// high-water mark since the process started, which is exactly the figure a
-    /// leak threshold wants. Recycling resets it, so a worker that once peaked
-    /// above the limit is replaced once rather than on every request.
+    /// The peak, not the current usage, because a high-water mark is what a leak
+    /// threshold wants: a transient spike during one request is the interesting
+    /// event, and it is exactly what a spot check between requests would miss.
+    ///
+    /// PHP's `memory_get_peak_usage(true)` is monotonic from process start, so
+    /// the figure only ever rises — which means a worker that once legitimately
+    /// peaked above the limit is recycled after *every* subsequent request. That
+    /// is correct but wasteful (one application boot per request). The SDK can
+    /// call `memory_reset_peak_usage()` (present from PHP 8.2 — verified absent
+    /// on 8.0.8 and present on 8.2.23 and later) to re-baseline the peak to
+    /// `memory_get_usage()`, turning the threshold into "a single request pushed
+    /// this worker over the limit". Verified in the PHP source too:
+    /// `zend_memory_reset_peak_usage` sets `real_peak = real_size`. Worth doing in
+    /// the SDK if a deployment finds the recycling too eager.
     peak_memory_bytes: u64,
 }
 

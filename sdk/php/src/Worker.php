@@ -305,9 +305,14 @@ final class Worker
     /**
      * Ask the server to replace this worker after the current request.
      *
-     * For an application that has put itself into a state it cannot clean up.
-     * The server sees `keep_alive = false` in END and recycles instead of
-     * reusing.
+     * For an application that has put itself into a state it cannot clean up —
+     * a leaked global, a stuck connection, a fat static cache. The server sees
+     * `keep_alive = false` in the END frame and boots a replacement instead of
+     * reusing this process.
+     *
+     * The current request is still answered normally, so a handler never has to
+     * choose between responding and being cleaned up: this only affects what
+     * happens *after* it.
      */
     public function recycle(): void
     {

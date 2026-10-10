@@ -63,10 +63,28 @@ pub enum WorkerError {
 impl WorkerError {
     /// Whether the failure makes the stream unusable.
     ///
-    /// A checksum mismatch means framing has already desynchronised, a bad
-    /// payload means the peer contradicts itself, and either way the safe
-    /// response is to discard the worker. A wrong request id or a remote error
-    /// leaves the stream aligned and usable.
+    /// Two different things justify this, and it is worth being precise about
+    /// which, because a reader will otherwise assume the wrong one:
+    ///
+    /// - **Framing has desynchronised.** A checksum mismatch means we cannot know
+    ///   where the next header begins, and every subsequent read is guesswork.
+    ///   This is the strong case.
+    /// - **The peer contradicted itself, or is gone.** A payload that is not
+    ///   valid UTF-8 or not valid JSON was *fully consumed* — our position in the
+    ///   stream is fine — but the worker's own frame is unusable, and an SDK
+    ///   whose payloads do not decode is not one to keep serving from. An I/O
+    ///   error, a closed pipe or a timeout means there is no peer left to serve
+    ///   from at all.
+    ///
+    /// What is deliberately *not* fatal: a wrong request id, and a remote error
+    /// the worker labelled recoverable. Both leave the stream aligned and the
+    /// worker otherwise healthy, so discarding it would trade a good worker for a
+    /// bad request.
+    ///
+    /// The two cases above are collapsed into one predicate because they have one
+    /// consequence — the pool must replace the worker — and because a caller that
+    /// needed to tell them apart would have to ask why, which the error already
+    /// says.
     pub fn is_fatal(&self) -> bool {
         match self {
             WorkerError::UnsupportedVersion { .. }
@@ -131,6 +149,39 @@ mod tests {
         };
         assert!(!err.is_fatal());
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+
+    #[test]
+    fn a_wrong_request_id_is_not_fatal() {
+        // The one case where the worker is healthy and only the request was
+        // wrong, so replacing the worker would trade a good one for a bad id.
+        let err = WorkerError::WrongRequestId {
+            expected: 7,
+            actual: 8,
+        };
+        assert!(!err.is_fatal());
+        assert!(!err.is_transport());
+    }
+
+    #[test]
+    fn an_unreadable_payload_is_fatal_for_the_worker_not_the_framing() {
+        // The frame was consumed whole, so our position is intact — but an SDK
+        // whose payloads do not decode is not one to keep serving from.
+        let from_json = WorkerError::Json(serde_json::from_str::<u32>("nope").unwrap_err());
+        assert!(from_json.is_fatal());
+        assert!(!from_json.is_transport());
+
+        // Reached through `String::from_utf8` rather than `str::from_utf8` with a
+        // literal, so this is a genuine runtime decode failure: the `str` form
+        // with an invalid literal is rejected at compile time, which would make
+        // the test assert nothing.
+        let from_utf8 = WorkerError::NotUtf8(
+            String::from_utf8(vec![0xffu8, 0xfe, 0xfd])
+                .expect_err("invalid UTF-8")
+                .utf8_error(),
+        );
+        assert!(from_utf8.is_fatal());
+        assert!(!from_utf8.is_transport());
     }
 
     #[test]

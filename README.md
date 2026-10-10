@@ -15,8 +15,11 @@ supervises it for you.
 
 > **Status: early but working.** The configuration model, PHP discovery, FastCGI codec and
 > client, CGI environment, `php-cgi` pool, backend dispatch and the FastCGI front-end are all
-> implemented, with integration tests driving real `php-cgi` processes end to end. The HTTP
-> listener and the worker pool are next — see [docs/plan.md](docs/plan.md) for the phase order.
+> implemented, with integration tests driving real `php-cgi` processes end to end. The worker
+> protocol is specified in [docs/worker-protocol.md](docs/worker-protocol.md) and implemented in
+> `crates/stokehold-worker`, with its wire format pinned by tests. The HTTP listener, the PHP
+> worker SDK and the worker pool that would use those frames are next — see
+> [docs/plan.md](docs/plan.md) for the phase order.
 
 ## Why
 
@@ -132,9 +135,11 @@ marked down.
 | --- | --- |
 | `crates/stokehold-core` | Configuration model, backend types, PHP discovery |
 | `crates/stokehold-fcgi` | FastCGI record codec, client, transport and CGI environment |
+| `crates/stokehold-worker` | The worker protocol: framed codec and message set over a worker's pipes |
 | `crates/stokehold-server` | Backend abstraction, `php-cgi` pool, process lifecycle, dispatch |
 | `crates/stokehold-cli` | The `stokehold` binary |
 | `docs/plan.md` | The design and the phase plan |
+| `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements |
 | `sdk/php` | The PHP worker SDK (later phase) |
 
 ## Development
@@ -148,6 +153,11 @@ cargo fmt --all
 The FastCGI integration tests in `crates/stokehold-fcgi/tests/php_cgi.rs` start a real
 `php-cgi -b` process and speak the protocol to it. They skip themselves, with a printed reason,
 when no `php-cgi` binary is on `PATH`.
+
+The worker protocol tests — `crates/stokehold-worker/src/codec.rs` and
+`crates/stokehold-worker/tests/wire_format.rs` — need no PHP. They drive the codec over an
+in-memory stream and assert the exact wire bytes, so the protocol stays frozen without depending
+on a PHP install.
 
 ## License
 

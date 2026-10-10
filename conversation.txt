@@ -1,0 +1,400 @@
+not that we talk past each other. i would like to achieve two things. the worker mode and a fpm/fastcgi like mode that resets everything at the end of each request. the worker mode is achievable a believe on every system. i am thing about the fastcgi mode on windows. this would be interesting. it doesnt need to have full linux performance, just to have the possibility to run it would be nice. main target is linux. if we start a php process with an internal script and call fork from there, would we then always have each php process at the same point? hm but we dont get all the cgi processing from php, file uploads etc, right? if we could use ffi or something to handle input processing from a forked process...
+
+You've put your finger on the exact gap, and you're right about it. Let me verify the piece that resolves it.
+
+Searched the web for `php-fpm not available on Windows php-cgi FastCGI IIS per-request reset reques...`
+Completed with input: {
+  "query": "php-fpm not available on Windows php-cgi FastCGI IIS per-request reset request startup shutdown"
+}
+
+Searched the web for `php-cgi -b FastCGI mode pool spawn-fcgi multiple requests per process SAPI su...`
+Completed with input: {
+  "query": "php-cgi -b FastCGI mode pool spawn-fcgi multiple requests per process SAPI superglobals POST FILES parsing"
+}
+
+You've articulated the real gap, and you're right about it. But the resolution isn't FFI — it's that **PHP already ships the component you're trying to build**.
+
+## Fork: yes, you get a consistent point
+
+Forking from a PHP process does give every child the same starting state — the child is a byte-identical COW copy of the parent's heap at the fork point. Deterministic, repeatable.
+
+Caveats: fork from a **clean, idle, post-boot** state. Not mid-query, not with buffered output pending, not holding a DB transaction. And children diverge after their first write, so treat the shared baseline as read-only.
+
+## But you're right that a forked child can't do CGI
+
+A forked child is a **plain PHP process**. It has no SAPI able to populate `$_SERVER`, `$_GET`, `$_POST`, `$_FILES`. And this is precisely what FFI cannot fix:
+
+| CGI needs | Where it lives | FFI reach? |
+|---|---|---|
+| Multipart/`rfc1867` body parsing | `sapi_module.read_post` C callback | No |
+| `$_FILES` + upload temp files | SAPI globals (`SG()`) | No |
+| `is_uploaded_file()` / `move_uploaded_file()` | C-level origin check | No |
+| `php://input`, `CONTENT_LENGTH` handling | SAPI request info | No |
+
+These aren't functions you can call — they're **C callbacks PHP invokes during request startup**. Userland can't register them; assigning `$_POST` by hand is not the same thing (and can't replicate upload validation). This is the same capability floor as before: FFI can call leaf functions, not install SAPI hooks.
+
+So your instinct is exactly correct: *something is missing.* The missing piece is **the SAPI itself** — and that's C, by design.
+
+## The resolution
+
+Don't build the FastCGI worker. **`php-cgi` already is one.**
+
+Verified behavior: `php-cgi -b` runs a full FastCGI event loop, handling many requests per process sequentially. Per request it re-initializes superglobals, re-parses POST bodies and multipart/`$_FILES`, and runs `request shutdown` resetting globals. That's **full FPM-grade reset, for free, in C, outside userland** — exactly the thing you've been trying to reach with FFI and embedding.
+
+And it's already on your machine. From your PHP install:
+
+```
+C:\php-8.3.31\php-cgi.exe       ← FastCGI-capable, per-request SAPI reset
+C:\php-8.3.31\php.exe           ← CLI, for persistent workers
+C:\php-8.3.31\php8embed.lib     ← embed SAPI (not needed)
+```
+
+Windows **has no `php-fpm` at all** — which is why IIS has always driven `php-cgi` through FastCGI. That's the gap your server fills, and it's a real one.
+
+## The architecture that gets both your goals
+
+One Rust supervisor, two pool types, same routing/routing code:
+
+| Pool | Worker | Reset mechanism | Linux | macOS | Windows |
+|---|---|---|---|---|---|
+| **Worker** | your persistent entry point | `clearRequestScope()` + recycle | ✓ | ✓ | ✓ |
+| **FPM-like** | `php-fpm` (Linux) / `php-cgi -b` | **full SAPI per request** | ✓ | ✓ | ✓ `php-cgi.exe` |
+
+Your server's job in the FPM-like pool is exactly what `php-cgi` lacks: **spawning, supervising, health-checking, recycling, and routing**. You never touch PHP internals — you manage processes and speak FastCGI, which is a documented protocol on a socket.
+
+So:
+
+```
+nginx ──FastCGI──► ┌─ pool: persistent workers   (your protocol)
+                    ├─ pool: php-cgi / php-fpm    (their SAPI does the reset)
+                    └─ HTTP + rustls + ACME       (nginx replacement, auto-certs)
+```
+
+## What this buys you
+
+- **Both modes**, not one. Worker mode where persistence wins; full-reset mode where correctness wins.
+- **Real reset semantics** — `$_POST`, `$_FILES`, multipart, `is_uploaded_file()`, all of it — because PHP is doing it in C.
+- **Zero FFI, zero embedding.** No ABI, no per-version rebuilds, no isolation loss.
+- **All three platforms**, including the Windows case that has no native answer today.
+- **nginx replacement + auto-certs** are orthogonal and identical in every design — `hyper` + `rustls` + `rustls-acme`.
+
+And on Linux you can still add prefork later to cut the *worker* pool's bootstrap cost. It's simply irrelevant to the php-cgi pool, which re-boots per request by definition.
+
+## Where embedding would still differ
+
+Only in the worker pool's transport: no pipe, no serialization. If profiling later shows that's a material share of request time, embedding becomes a *tuning* decision on one pool — not the foundation of the product. Ship the pool, measure, then decide.
+
+That's the shape that satisfies "works everywhere, points at any PHP, both modes" with nothing exotic. Want me to sketch the supervisor — the two pool types, the `php-cgi -b` spawn/supervise loop with per-process ports, and the routing rule that decides which pool gets a request?
+
+ah ok. and how would the pipeline look on windows? the app is starting several php-cgi.exe on different ports and is forwarding each request to one of the fastcgi servers? it would act like a forward proxy?
+
+Good question — and your mental model is nearly right, with one terminology fix and one important correction about *how many* processes you need. Let me verify the mechanics on your actual install first.
+
+Ran terminal command: $exe='C:\php-8.3.31\php-cgi.exe'
+Write-Output '=== php-cgi usage (flags) ==='
+(& $exe -h 2>&1 | Out-String) -split "`n" | Select-String -Pattern 'bind|port|children|FCGI' | Select-Object -First 15
+Write-Output ''
+Write-Output '=== bind test on 127.0.0.1:19001 ==='
+$p = Start-Process -FilePath $exe -ArgumentList '-b','127.0.0.1:19001' -PassThru -WindowStyle Hidden
+Start-Sleep -Seconds 2
+$listen = Get-NetTCPConnection -LocalPort 19001 -State Listen -ErrorAction SilentlyContinue
+Write-Output ("listening : " + [bool]$listen)
+if ($listen) { $listen | Select-Object -First 3 LocalAddress,LocalPort,State,OwningProcess | Format-Table -AutoSize | Out-String | Write-Output }
+Write-Output ("alive     : " + (-not $p.HasExited))
+if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; Write-Output "stopped   : pid $($p.Id)" }
+
+Verified on your box — `php-cgi.exe -b 127.0.0.1:19001` binds and listens, and stays alive:
+
+```
+listening : True
+127.0.0.1   19001   Listen   15972
+alive     : True
+```
+
+So yes, the mechanism works. But one terminology fix, because it changes how you should think about the code.
+
+## It's not a forward proxy
+
+A forward proxy speaks the **client's** protocol and relays it. You'd be **terminating** HTTP and **originating** FastCGI — a protocol gateway, i.e. an app server. The practical consequence: you're not relaying bytes, you're *translating* between two protocols, and you own both ends.
+
+## The pipeline
+
+```
+nginx / client
+     │  FastCGI (or HTTP)
+     ▼
+┌─────────────────────────────┐
+│  Rust master                │
+│  ├ listener (FastCGI/HTTP)  │   ← terminates client protocol
+│  ├ dispatcher: pick a slot  │
+│  └ FastCGI client task ─────┼──► 127.0.0.1:19001  php-cgi.exe
+└─────────────────────────────┘   127.0.0.1:19002  php-cgi.exe
+                                  127.0.0.1:19003  php-cgi.exe
+                                  127.0.0.1:19004  php-cgi.exe
+```
+
+The inner arrow is the part people miss: your dispatcher becomes a **FastCGI client**. It sends `BEGIN_REQUEST` → `PARAMS` → `STDIN` to a php-cgi backend and reads back `STDOUT` → `END_REQUEST`. Then it re-frames that response as FastCGI back to nginx.
+
+## On Windows: yes, one process per port
+
+You need **N processes on N distinct ports**. There's no way around it:
+
+- `PHP_FCGI_CHILDREN` works by `fork()` — **impossible on Windows**. So php-cgi can't spawn its own children there.
+- Multiple processes binding the *same* port via `SO_REUSEADDR` doesn't load-balance on Windows — it's not a pre-fork socket.
+- FastCGI has request IDs, so you *could* multiplex over one connection — **don't**. php-cgi processes sequentially, so multiplexing buys nothing and adds a demux table you don't need.
+
+So model each backend as a **slot**, exactly as you described. On Linux you get more options (real `php-fpm` with a pre-forked pool, or `PHP_FCGI_CHILDREN`) — but the Windows shape works there too, so it can be one code path.
+
+## What php-cgi does for you vs. what you write
+
+| You write | php-cgi does |
+|---|---|
+| Spawn/supervise N processes | Bind and accept |
+| Assign a port per worker | Parse CGI params from FastCGI records |
+| Health check, restart on crash | **Parse multipart / `$_FILES` from the raw body** |
+| Translate HTTP → FastCGI PARAMS | Populate `$_SERVER`, `$_GET`, `$_POST`, `$_COOKIE` |
+| Frame requests, pipe response bytes | `request_startup` + `request_shutdown` |
+| Pick a free slot | Upload temp files, `is_uploaded_file()` |
+
+That middle column is the whole point. **You never parse multipart.** You pass `CONTENT_TYPE`, `CONTENT_LENGTH`, and the raw body as `STDIN`; php-cgi does the `rfc1867` parsing in C. That's the work FFI couldn't have done for you, and it's already written.
+
+## Three operational details that will bite you
+
+**1. Drain `STDERR` per backend, always.** php-cgi writes errors to `STDERR`. FastCGI has a dedicated `STDERR` record type. If your client doesn't read it, the pipe buffer fills and the backend blocks forever. One reader task per backend, non-negotiable — this is the classic "why did all my workers hang" bug.
+
+**2. Connection reuse is not guaranteed.** FastCGI keep-alive depends on the `FCGI_KEEP_CONN` flag *and* the server honoring it. FPM supports it; php-cgi's behavior you should measure. If it closes after each request, you pay a TCP connect per request — cheap on loopback, but model it as a slot-level connection state machine rather than assuming persistence.
+
+**3. Windows process hygiene.** No unix sockets — loopback TCP only. And if your master dies, its `php-cgi` children survive as orphans. Use a **Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so the OS reaps them; on Linux the equivalent is `PR_SET_PDEATHSIG` or a process group. Do this early — orphaned php-cgi processes holding ports will make your dev loop miserable.
+
+## The routing rule
+
+One dispatcher serves both pool types, and the choice is per-vhost or per-route:
+
+- **Worker pool** → your persistent entry point (boots once, `clearRequestScope()`, recycled by RSS).
+- **FastCGI pool** → `php-cgi`/`php-fpm`, full per-request reset, arbitrary `SCRIPT_FILENAME`.
+
+Requests that need real isolation or use SAPI-specific APIs go to the second; hot paths verified worker-safe go to the first. Same listener, same PARAMS parsing, different backend.
+
+That's the Windows pipeline, and it's a genuine capability — there is no native equivalent on Windows today, which is why IIS drives `php-cgi` by hand.
+
+Want me to sketch the slot state machine — spawn/supervise N backends, the per-slot FastCGI client with the STDERR drain, and the request-to-slot dispatch — or the FastCGI record framing and PARAMS builder first?
+
+ok super. windows would be doable. and how to do on linux? it provides php-fpm. can we use it directly there without the need of a proxy in between?
+
+Yes — and on Linux the answer is even simpler than the Windows case, because **you step out of the path entirely** for that mode.
+
+## Direct answer: nginx talks to php-fpm natively
+
+php-fpm *is* the FastCGI server. nginx speaks FastCGI natively. There is no proxy needed:
+
+```nginx
+location ~ \.php$ {
+    fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+    # or: fastcgi_pass 127.0.0.1:9000;
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+}
+```
+
+Two processes, one hop, zero custom code. That's the standard deployment for millions of sites, and your Rust server isn't in it.
+
+## So the two Linux topologies are distinct
+
+| Topology | Path | Your server's role |
+|---|---|---|
+| **Keep nginx** | nginx → php-fpm | None for FPM mode — point nginx at the socket directly. Your server handles only the *worker* pool. |
+| **Replace nginx** | Rust → php-fpm | The Rust server *is* the front-end; php-fpm is just a backend. |
+
+Note the terminology: in topology 2 you're not proxying, you're **terminating HTTP and originating FastCGI** — the same translator role as with `php-cgi` on Windows. It's required only if you want the single-binary/HTTP-3/auto-cert story.
+
+## The unifying abstraction
+
+Make a FastCGI backend an enum with three modes, so one dispatcher serves everything:
+
+```yaml
+fastcgi_pool:
+  mode: external        # systemd-managed php-fpm (Linux/macOS default)
+  socket: unix:/run/php/php8.3-fpm.sock
+
+  # mode: spawn-fpm     # your server starts php-fpm; it manages its own children
+  # binary: /usr/sbin/php-fpm
+  # config: ./fpm.conf
+
+  # mode: spawn-cgi     # portable fallback + the only option on Windows
+  # binary: 'C:\php-8.3.31\php-cgi.exe'
+  # workers: 8
+```
+
+`external` and `spawn-fpm` share the same client code — only the target differs (unix socket vs. TCP). `spawn-cgi` is what you already designed for Windows.
+
+## Don't reimplement what php-fpm already does on Linux
+
+This is the important part. php-fpm gives you, for free:
+
+- process pool management (`pm.max_children`, `pm.start_servers`, `pm.max_spare_servers`)
+- **`pm.max_requests`** — the recycling you were planning to build
+- **multiple pools in one master** — different users/sockets per vhost, which is how you get multi-tenancy
+- slow log, status page, graceful reload (`SIGUSR2`)
+- proper logging and `chdir`/`chroot` per pool
+
+Building any of that in Rust on Linux would be strictly worse than using it.
+
+## Platform matrix
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Native per-request reset | **php-fpm** | **php-fpm** (brew) | ✗ — none exists |
+| Your own pool needed? | No | No | **Yes** (`php-cgi.exe`) |
+| External backend socket | unix / TCP | unix / TCP | TCP only |
+| Reimplement `max_requests`? | No | No | Yes |
+
+**Windows is the only platform where you must write the pool.** Linux and macOS have `php-fpm`; the Unix-only constraint you hit earlier means Windows has nothing. That's the whole justification for the custom spawner — and it's a real one.
+
+## Recommendation
+
+- **Linux/macOS, FPM mode:** don't spawn anything. Point at the system php-fpm socket. Optionally support `spawn-fpm` for self-contained dev.
+- **Windows:** spawn and supervise N `php-cgi.exe` on N ports — the design from the last turn.
+- **Worker mode:** your pool, all three platforms.
+- **nginx replacement:** the `hyper` + `rustls` + `rustls-acme` front-end, which speaks FastCGI to whichever backend is configured.
+
+One caution when you do speak FastCGI to php-fpm: connection *reuse* via `FCGI_KEEP_CONN` works, but don't build on concurrent multiplexing of request IDs over one connection. Treat a connection as one-request-at-a-time, with a connection per in-flight request — same model as the Windows pool, so the code stays shared.
+
+Want me to sketch the backend enum and the shared FastCGI client — the connection state machine, `PARAMS` builder, and the STDERR drain that both the php-fpm and php-cgi paths use?
+
+yes please. i wanted to name the project firestarter. do you think that is ok? or something simple like php-runner?
+
+Naming has a concrete, checkable component, so let me check crate availability rather than opine — and verify the FastCGI wire details I'm about to sketch.
+
+Ran terminal command: $names = @('firestarter','kiln','kindling','hearth','php-runner','phprunner','phpfire','pyre','anvil','ember','crucible','forge')
+foreach ($n in $names) {
+  $code = & curl.exe -s -o NUL -w "%{http_code}" -H "User-Agent: naming-check (dev)" "https://crates.io/api/v1/crates/$n"
+  $state = if ($code -eq '200') { 'TAKEN' } elseif ($code -eq '404') { 'available' } else { "http $code" }
+  Write-Output ("{0,-14} {1}" -f $n, $state)
+  Start-Sleep -Milliseconds 500
+}
+
+Searched the web for `FastCGI specification record types BEGIN_REQUEST PARAMS STDIN STDOUT STDERR E...`
+Completed with input: {
+  "query": "FastCGI specification record types BEGIN_REQUEST PARAMS STDIN STDOUT STDERR END_REQUEST name-value pair encoding high bit 4 byte length"
+}
+
+Naming has a hard, checkable constraint — and the results are decisive. Let me broaden before recommending.
+
+Ran terminal command: $names = @('bellows','bloomery','salamander','tinderbox','cinder','pyrometer','phlogiston','phoenix','ignis','vulcan','blaze','furnace','stoke','flint','tinder','wildfire','scorch','phpserver','phpserve','zendrunner','phpfpm')
+foreach ($n in $names) {
+  $code = & curl.exe -s -o NUL -w "%{http_code}" -H "User-Agent: naming-check (dev)" "https://crates.io/api/v1/crates/$n"
+  $state = if ($code -eq '200') { 'TAKEN' } elseif ($code -eq '404') { 'available' } else { "http $code" }
+  Write-Output ("{0,-14} {1}" -f $n, $state)
+}
+Write-Output ''
+Write-Output '=== GitHub collisions: firestarter + php ==='
+& curl.exe -s -H "User-Agent: naming-check (dev)" "https://api.github.com/search/repositories?q=firestarter+php&sort=stars&per_page=5" | ConvertFrom-Json | ForEach-Object { $_.items } | Select-Object full_name,stargazers_count,description | Format-Table -AutoSize -Wrap
+
+Naming has a hard constraint and the results are decisive. Here's what I found:
+
+**Crates.io availability**
+
+| Candidate | Status |
+|---|---|
+| `firestarter` | **TAKEN** |
+| kiln, kindling, hearth, pyre, anvil, ember, crucible, forge, bellows, cinder, blaze, furnace, stoke, flint, tinder | all TAKEN |
+| `tinderbox` | available |
+| `phlogiston` | available |
+| `salamander` | available |
+| `php-runner` / `phprunner` | available |
+| `phpfire`, `phpserver`, `zendrunner` | available |
+
+So `firestarter` can't be your crate name. But the bigger problem isn't crates.io — it's **search**. "Firestarter" is a well-known Linux firewall GUI, plus a Prodigy track and a Stephen King property. Nobody would ever find your project by name; you'd permanently need to search "firestarter php". GitHub is comparatively clear (one 34-star Yii2 template), but the general-name collision is what would hurt.
+
+My recommendation: **`tinderbox`** if you want the fire theme (a tinderbox *starts fires* — it starts workers; memorable, available, only a defunct Mozilla build tool as namesake), or **`php-runner`** if you want safe and discoverable. `phlogiston` if you want maximally distinctive. Avoid `firestarter`.
+
+I've written the full plan to the session workspace.
+
+Create 
+
+Present plan
+Completed with input: {
+  "summary": "## Naming first\n\n`firestarter` is **taken on crates.io** and collides badly in search (Linux firewall GUI, Prodigy track, Stephen King property). Most fire-themed names are gone too (kiln, kindling, hearth, pyre, ember, forge, crucible, furnace, blaze, flint, tinder all taken). Still available: **`tinderbox`** (fire-themed, low collision, starts fires → starts workers), **`php-runner`** (safe, discoverable), `phlogiston`, `salamander`.\n\n**My pick: `tinderbox`** for a memorable product name, or `php-runner` if you want discoverability. Avoid `firestarter`.\n\n## The plan\n\nOne cross-platform Rust PHP app server with **two backends and one shared FastCGI client**.\n\n- **No embedding, no FFI.** `php-fpm`/`php-cgi` already provide true per-request reset — including multipart/`$_FILES` parsing and `is_uploaded_file()` — in C, outside the request, where userland and FFI can never reach.\n- **Backend enum** unifies all modes: `Worker`, `External` (system php-fpm), `SpawnFpm` (Unix only), `SpawnCgi` (Windows — N × `php-cgi.exe -b` on N ports).\n- **Verified on your box:** `php-cgi.exe -b 127.0.0.1:19001` binds and listens; PHP 8.3.31 ZTS.\n- **Shared FastCGI client** — record codec (big-endian, unlike goridge), PARAMS nv-encoding, connection state machine, mandatory STDERR drain, `GET_VALUES` health probe.\n- **Frontends:** FastCGI (nginx-facing) and HTTP (`hyper`). Pass-through path relays `STDOUT` verbatim to avoid header/body parsing on the hot path.\n- **TLS via `rustls`, not OpenSSL** — pure Rust means no DLL/dylib matrix across three platforms.\n- **Prefork deferred to Phase 9**, Unix-only, forked from a PHP boot parent — *never* from the Tokio runtime.\n\n## Phases\n\n0 skeleton → 1 FCGI client → 2 supervisor → 3 FCGI frontend → 4 HTTP frontend → 5 worker pool → 6 TLS/ACME → 7 packaging → 8 HTTP/3 (opt) → 9 prefork (opt)\n\n**Milestone at Phase 3:** `nginx → php-runner → php-fpm` *and* `→ php-cgi` both work.\n\n## Decisions I need from you\n\n1. Project name → affects crate names, binary, config path\n2. Config format: TOML or YAML (RoadRunner-like)?\n3. Worker protocol: minimal binary framing, or JSON-over-stdio for v1 and optimize later?\n4. Default backend: FastCgiPool (safe) as the out-of-box default?\n\nFull plan: `files/plan.md` in the session workspace.\n"
+}
+Tool execution failed
+
+tinderbox sounds good. there is already a project by that name here:
+https://github.com/aiguy110/tinderbox/tree/main/
+maybe better to use a different name? there is a problem with the plan. i can not open it. i am also unable to send feedback there. before we start with something we need to create a repository. for this we would need to have a name. php-wpm? worker pool manager?
+
+Got it — two problems to fix: a taken name, and a plan you can't open. Let me check new candidates.
+
+Ran terminal command: $names = @('stoker','foreman','gaffer','wrangler','drover','herder','poolmaster','poolctl','apiary','swarm','anthill','warren','phppool','php-pool','phpwpm','php-wpm','wpm','poolboy','taskmaster','hivemind','conductor','stokehold','fireman','engineman','boiler','tender')
+foreach ($n in $names) {
+  $code = & curl.exe -s -o NUL -w "%{http_code}" -H "User-Agent: naming-check (dev)" "https://crates.io/api/v1/crates/$n"
+  $state = if ($code -eq '200') { 'TAKEN' } elseif ($code -eq '404') { 'available' } else { "http $code" }
+  Write-Output ("{0,-14} {1}" -f $n, $state)
+}
+
+Ran terminal command: foreach ($q in @('php-wpm','stoker php','php-wpm in:name','worker pool manager php in:name')) {
+  Write-Output "=== $q ==="
+  & curl.exe -s -H "User-Agent: naming-check (dev)" "https://api.github.com/search/repositories?q=$([uri]::EscapeDataString($q))&sort=stars&per_page=4" | ConvertFrom-Json | ForEach-Object { $_.items } | Select-Object full_name,stargazers_count | Format-Table -AutoSize | Out-String | Write-Output
+}
+
+Two fixes needed. Let me check the collision and get repo-creation ready.
+
+Ran terminal command: Write-Output '=== plan.md on disk ==='
+$p = 'c:\Users\christian\.copilot\session-state\b20a4ef8-1ec4-4768-901d-d0cd5e9c4574\files\plan.md'
+if (Test-Path $p) { Get-Item $p | Select-Object FullName,Length,LastWriteTime | Format-List } else { Write-Output 'MISSING' }
+Write-Output '=== gh auth ==='
+& gh auth status 2>&1 | Out-String | Write-Output
+Write-Output '=== tinderbox collision ==='
+& curl.exe -s -H "User-Agent: naming-check (dev)" "https://api.github.com/repos/aiguy110/tinderbox" | ConvertFrom-Json | Select-Object full_name,description,stargazers_count,language | Format-List
+Tool execution failed: This shell command would modify files outside the session folder and was blocked. Plan mode does not permit changes outside the session folder. Do not implement yet — finish the plan and call `exit_plan_mode` to request approval before making any changes. If the user explicitly asked you to start, suggest switching out of plan mode (Shift+Tab) rather than editing directly.
+
+Ran terminal command: $p = 'c:\Users\christian\.copilot\session-state\b20a4ef8-1ec4-4768-901d-d0cd5e9c4574\files\plan.md'; if (Test-Path $p) { Get-Item $p | Select-Object FullName,Length | Format-List } else { 'MISSING' }
+
+Fetched [https://api.github.com/repos/aiguy110/tinderbox](https://api.github.com/repos/aiguy110/tinderbox)
+Completed with input: https://api.github.com/repos/aiguy110/tinderbox
+
+Plan file exists (13,963 bytes) — it's just written outside your workspace, so VS Code can't open it. That's fixable: once the repo exists, the first commit puts the plan in `docs/plan.md`. Let me settle the name and check your org.
+
+Ran terminal command: $names = @('phpforge','phpkiln','phppyre','phpsupervisor','php-supervisor','phpfarm','workerctl','poold','phpsrv','phpcgi-rs','fcgi-rs','stokehold','phpignite','ignition','phptinder','phppool','poolmaster','herder')
+foreach ($n in $names) {
+  $code = & curl.exe -s -o NUL -w "%{http_code}" -H "User-Agent: naming-check (dev)" "https://crates.io/api/v1/crates/$n"
+  $state = if ($code -eq '200') { 'TAKEN' } elseif ($code -eq '404') { 'available' } else { "http $code" }
+  Write-Output ("{0,-18} {1}" -f $n, $state)
+}
+
+Ran terminal command: & gh auth status 2>&1 | Out-String
+Tool execution failed: This shell command would modify files outside the session folder and was blocked. Plan mode does not permit changes outside the session folder. Do not implement yet — finish the plan and call `exit_plan_mode` to request approval before making any changes. If the user explicitly asked you to start, suggest switching out of plan mode (Shift+Tab) rather than editing directly.
+
+`gh` check got blocked by the plan-mode guard (any command touching outside the session folder is refused while planning) — that's the same guard that will block repo creation. So the order is: settle the name → you approve → I create the repo → plan lands in `docs/plan.md` where you can open it.
+
+On your suggestion, honestly:
+
+- **`php-wpm` is available** on crates.io and has zero real GitHub collisions (only 0-star repos). It's a valid choice.
+- But **"WPM" collides in meaning** — words per minute, and plausibly "WordPress manager". Searchability would suffer.
+- More importantly it **narrows the scope** to worker pooling, when the project also does FastCGI/FPM mode and an HTTP/TLS/ACME front-end. Naming it after one mode undersells it.
+
+New availability results:
+
+| Candidate | crates.io |
+|---|---|
+| `phpforge` | **available** |
+| `phpkiln`, `phppyre`, `phpignite` | available |
+| `phpfarm` | available |
+| `phpsupervisor` / `php-supervisor` | available |
+| `stokehold` | available |
+| `ignition` | taken |
+
+**My pick: `phpforge`.** Fire-adjacent (a forge is fire), available, and searchable because of the `php` prefix. `stokehold` if you want the distinctive option. And on `tinderbox` — you're right: it's a GPU forest-fire simulator, unrelated but it'd own your search results.
+
+Also worth noting: `firestarter` can still be the *product* name while the crate/repo takes a clean slug — but I'd rather not split identity for a CLI tool.
+
+Ask User
+Completed with input: {
+  "question": "Which name should I lock in for the repo, crate, and binary?",
+  "choices": [
+    "phpforge (Recommended) — available on crates.io, fire-adjacent, searchable",
+    "php-wpm — my suggestion, available, but narrows the scope to worker pooling",
+    "stokehold — fire-themed and distinctive, low collision risk",
+    "phpfarm — available and descriptive, though less distinctive"
+  ]
+}
+Tool execution failed

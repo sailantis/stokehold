@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/stokehold-core",
+    "crates/stokehold-fcgi",
+    "crates/stokehold-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/sailantis/stokehold"
+
+[workspace.dependencies]
+stokehold-core = { path = "crates/stokehold-core" }
+stokehold-fcgi = { path = "crates/stokehold-fcgi" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,20 @@
+[package]
+name = "stokehold-cli"
+description = "The stokehold command line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "stokehold"
+path = "src/main.rs"
+
+[dependencies]
+stokehold-core.workspace = true
+stokehold-fcgi.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

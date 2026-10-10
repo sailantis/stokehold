@@ -52,6 +52,12 @@ by a browser and spoken to by nginx at the same time.
 | `spawn_fpm` | `stokehold` starts `php-fpm`, which still manages its own children | Yes | Linux, macOS |
 | `spawn_cgi` | N `php-cgi` processes on N ports | Yes, by php-cgi's SAPI | all, **required on Windows** |
 
+`spawn_cgi` is implemented: the pool starts the processes, assigns ports, health-checks each
+slot, restarts one that died, and recycles on `max_requests` — the equivalent of php-fpm's
+`pm.max_requests`, which does not exist on Windows. On Unix the processes are placed in their
+own process group; on Windows they are adopted into a job object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so nothing is left running if `stokehold` dies.
+
 ```toml
 default_backend = "app"
 
@@ -100,7 +106,8 @@ added with `--php-dir <dir>`.
 | Path | Contents |
 | --- | --- |
 | `crates/stokehold-core` | Configuration model, backend types, PHP discovery |
-| `crates/stokehold-fcgi` | FastCGI record codec and client |
+| `crates/stokehold-fcgi` | FastCGI record codec, client, transport and CGI environment |
+| `crates/stokehold-server` | Backend abstraction, `php-cgi` pool, process lifecycle, dispatch |
 | `crates/stokehold-cli` | The `stokehold` binary |
 | `docs/plan.md` | The design and the phase plan |
 | `sdk/php` | The PHP worker SDK (later phase) |

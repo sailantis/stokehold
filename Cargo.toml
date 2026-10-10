@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/stokehold-core",
     "crates/stokehold-fcgi",
+    "crates/stokehold-server",
     "crates/stokehold-cli",
 ]
 
@@ -16,6 +17,7 @@ repository = "https://github.com/sailantis/stokehold"
 [workspace.dependencies]
 stokehold-core = { path = "crates/stokehold-core" }
 stokehold-fcgi = { path = "crates/stokehold-fcgi" }
+stokehold-server = { path = "crates/stokehold-server" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

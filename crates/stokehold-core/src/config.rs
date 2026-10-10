@@ -140,6 +140,11 @@ pub struct SpawnCgiConfig {
     /// First port to assign. Each worker gets the next free port from here.
     #[serde(default = "default_base_port")]
     pub base_port: u16,
+
+    /// Recycle a slot after this many requests, the equivalent of php-fpm's
+    /// `pm.max_requests`.
+    #[serde(default)]
+    pub max_requests: Option<u64>,
 }
 
 fn default_bind_host() -> String {

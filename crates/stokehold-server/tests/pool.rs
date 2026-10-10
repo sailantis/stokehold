@@ -1,0 +1,285 @@
+//! Integration tests for the `spawn_cgi` pool against real `php-cgi` processes.
+//!
+//! These are the tests that prove the supervisor actually supervises: it starts
+//! processes, serves requests through them, restarts a dead slot, recycles on
+//! `max_requests`, and leaves nothing running when it is dropped.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use stokehold_core::config::SpawnCgiConfig;
+use stokehold_fcgi::{build_params, Request, RequestInfo, Routing};
+use stokehold_server::CgiPool;
+
+mod common;
+use common::{find_php_cgi, free_port_run, serial, write_script};
+
+fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
+    SpawnCgiConfig {
+        binary: binary.to_path_buf(),
+        workers,
+        bind_host: "127.0.0.1".to_string(),
+        base_port,
+        max_requests: None,
+    }
+}
+
+/// A request for the script, built through the real CGI environment.
+fn request_for(root: &Path, script_name: &str, marker: &str) -> Request {
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some(script_name.to_string()),
+        ..Routing::default()
+    };
+    let body = marker.as_bytes().to_vec();
+    let info = RequestInfo {
+        method: "POST".to_string(),
+        uri: "/".to_string(),
+        body_len: body.len(),
+        ..RequestInfo::default()
+    };
+    Request {
+        params: build_params(&info, &routing).expect("params build"),
+        body,
+        keep_conn: true,
+    }
+}
+
+/// A document root plus a script that echoes whatever arrived on php://input.
+fn fixture(name: &str) -> (PathBuf, String) {
+    let root = std::env::temp_dir().join(format!(
+        "stokehold-pool-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    write_script(
+        &root,
+        "index.php",
+        r#"<?php echo "MARK="; echo file_get_contents("php://input");"#,
+    );
+    (root, "index.php".to_string())
+}
+
+#[test]
+fn starts_a_pool_and_serves_requests_through_every_slot() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(3) else {
+        eprintln!("skipping: no run of three free ports");
+        return;
+    };
+
+    let (root, script_name) = fixture("serve");
+    let mut pool = CgiPool::start("test", &config_for(&binary, 3, base)).expect("pool starts");
+
+    assert_eq!(pool.len(), 3);
+    // Consecutive ports from base_port, so every slot is reachable.
+    assert_eq!(pool.ports(), vec![base, base + 1, base + 2]);
+    assert!(pool.pids().iter().all(|pid| *pid != 0));
+
+    for index in 0..3 {
+        let response = pool
+            .request(&request_for(&root, &script_name, &format!("slot{index}")))
+            .expect("a slot answered");
+        response.check_protocol().expect("completed");
+        let stdout = String::from_utf8_lossy(&response.stdout);
+        assert!(
+            stdout.contains(&format!("MARK=slot{index}")),
+            "request {index} returned {stdout:?}"
+        );
+    }
+
+    pool.shutdown();
+    assert!(pool.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_killed_slot_is_replaced_and_the_pool_keeps_serving() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let (root, script_name) = fixture("restart");
+    let mut pool = CgiPool::start("test", &config_for(&binary, 1, base)).expect("pool starts");
+    let before = pool.pids();
+    assert_eq!(before.len(), 1);
+
+    // Kill the slot behind the pool's back, the way a crash or an OOM kill would.
+    kill(before[0]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The next request must still succeed: the pool restarts the slot in place.
+    let response = pool
+        .request(&request_for(&root, &script_name, "recovered"))
+        .expect("the pool recovered");
+    let stdout = String::from_utf8_lossy(&response.stdout);
+    assert!(stdout.contains("MARK=recovered"), "{stdout:?}");
+
+    let after = pool.pids();
+    assert_eq!(after.len(), 1, "the pool kept its size");
+    assert_ne!(after[0], before[0], "the dead slot was replaced");
+    assert_eq!(pool.ports(), vec![base], "the replacement kept the port");
+
+    pool.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recycling_replaces_the_process_after_max_requests() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let (root, script_name) = fixture("recycle");
+    let mut config = config_for(&binary, 1, base);
+    config.max_requests = Some(2);
+    let mut pool = CgiPool::start("test", &config).expect("pool starts");
+    let original = pool.pids()[0];
+
+    for _ in 0..2 {
+        let response = pool
+            .request(&request_for(&root, &script_name, "x"))
+            .expect("a slot answered");
+        assert!(String::from_utf8_lossy(&response.stdout).contains("MARK=x"));
+    }
+
+    // Two requests is the limit, so the slot must have been replaced.
+    assert_ne!(
+        pool.pids()[0],
+        original,
+        "the slot should have been recycled after max_requests"
+    );
+    assert_eq!(pool.ports(), vec![base], "the recycled slot kept the port");
+
+    pool.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dropping_the_pool_leaves_no_processes_behind() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base) = free_port_run(2) else {
+        eprintln!("skipping: no run of two free ports");
+        return;
+    };
+
+    let pids = {
+        let pool = CgiPool::start("test", &config_for(&binary, 2, base)).expect("pool starts");
+        let pids = pool.pids();
+        assert_eq!(pids.len(), 2);
+        pids
+        // `pool` is dropped here.
+    };
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    for pid in pids {
+        assert!(
+            !is_running(pid),
+            "pid {pid} survived the pool being dropped"
+        );
+    }
+
+    // The ports being free again is the symptom an orphan would cause.
+    for offset in 0..2u16 {
+        let port = base + offset;
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "port {port} is still held after the pool was dropped"
+        );
+    }
+}
+
+#[test]
+fn a_pool_skips_ports_that_are_already_in_use() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+
+    // Hold the base port itself, so the pool has to move past it.
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = blocker.local_addr().expect("address").port();
+    let next_free = (base + 1..base + 100)
+        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok());
+    let Some(next_free) = next_free else {
+        eprintln!("skipping: no free port after {base}");
+        return;
+    };
+
+    let mut pool = CgiPool::start("test", &config_for(&binary, 1, base)).expect("pool starts");
+    assert_eq!(pool.len(), 1);
+    assert_eq!(
+        pool.ports(),
+        vec![next_free],
+        "the occupied port should have been skipped"
+    );
+
+    pool.shutdown();
+    drop(blocker);
+}
+
+/// Kill a process by id, without pulling in a signal crate.
+fn kill(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+}
+
+/// Whether a process is still running.
+fn is_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        match std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+        {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()),
+            // If we cannot ask, assume it is running rather than assert wrongly.
+            Err(_) => true,
+        }
+    }
+    #[cfg(unix)]
+    {
+        PathBuf::from(format!("/proc/{pid}")).exists()
+            || std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(true)
+    }
+}

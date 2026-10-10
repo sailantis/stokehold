@@ -382,16 +382,17 @@ struct Slot {
     /// threshold wants: a transient spike during one request is the interesting
     /// event, and it is exactly what a spot check between requests would miss.
     ///
-    /// PHP's `memory_get_peak_usage(true)` is monotonic from process start, so
-    /// the figure only ever rises — which means a worker that once legitimately
-    /// peaked above the limit is recycled after *every* subsequent request. That
-    /// is correct but wasteful (one application boot per request). The SDK can
-    /// call `memory_reset_peak_usage()` (present from PHP 8.2 — verified absent
-    /// on 8.0.8 and present on 8.2.23 and later) to re-baseline the peak to
-    /// `memory_get_usage()`, turning the threshold into "a single request pushed
-    /// this worker over the limit". Verified in the PHP source too:
-    /// `zend_memory_reset_peak_usage` sets `real_peak = real_size`. Worth doing in
-    /// the SDK if a deployment finds the recycling too eager.
+    /// `memory_get_peak_usage(true)` is itself monotonic from process start, so on
+    /// its own it would make this a "has this worker *ever* peaked" flag — a worker
+    /// that legitimately peaked once would be recycled after every subsequent
+    /// request, one application boot per request. The SDK avoids that by calling
+    /// `memory_reset_peak_usage()` after reading the figure (present from PHP 8.2;
+    /// absent on 8.1, where the report stays monotonic rather than failing), so the
+    /// number in `END` measures the request that just finished. Verified in the PHP
+    /// source: `zend_memory_reset_peak_usage` sets `real_peak = real_size`.
+    ///
+    /// A worker that does not use the SDK, or speaks an older protocol revision,
+    /// may still report a cumulative figure. The pool acts on what it is told.
     peak_memory_bytes: u64,
 }
 

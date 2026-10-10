@@ -238,6 +238,9 @@ final class Worker
      * server treats it as authoritative *and* requires the final body frame to
      * carry LAST. Declaring a length the body does not match is exactly the bug
      * those two checks exist to catch.
+     *
+     * The reported figure is cleared afterwards, so that each `END` describes one
+     * request. See [`peakMemoryBytes`] for why that matters.
      */
     private function respond(Response $response, int $appStatus, int $durationUs): void
     {
@@ -264,7 +267,7 @@ final class Worker
 
         $this->sendJson(MessageType::END, $this->requestId, [
             'app_status' => $appStatus,
-            'peak_memory_bytes' => memory_get_peak_usage(true),
+            'peak_memory_bytes' => $this->peakMemoryBytes(),
             'duration_us' => $durationUs ?? 0,
             'keep_alive' => $this->keepAlive,
         ]);
@@ -272,6 +275,37 @@ final class Worker
         if (!$this->keepAlive) {
             $this->stopping = true;
         }
+    }
+
+    /**
+     * The peak resident set reached since the last request, in bytes.
+     *
+     * `memory_get_peak_usage(true)` is a high-water mark that begins at process
+     * start and never falls, so a worker that peaked once — during bootstrap, or
+     * during any single large request — would report a figure above a configured
+     * `memory_limit_mb` on *every* request thereafter, and the server's threshold
+     * would recycle it after each one. Correct in the sense that the peak was
+     * real, but useless in practice: it turns a leak detector into a per-request
+     * application boot.
+     *
+     * `memory_reset_peak_usage()` re-baselines the high-water mark to the current
+     * usage, so the number in the `END` frame measures the request that just
+     * finished. The reset happens *after* the figure is read, and only when the
+     * function exists: it arrived in PHP 8.2, and the SDK's stated minimum is 8.1,
+     * where the reported figure stays monotonic — the old, over-eager behaviour
+     * rather than a fatal error.
+     *
+     * @see https://www.php.net/manual/en/function.memory-reset-peak-usage.php
+     */
+    private function peakMemoryBytes(): int
+    {
+        $peak = memory_get_peak_usage(true);
+
+        if (\function_exists('memory_reset_peak_usage')) {
+            memory_reset_peak_usage();
+        }
+
+        return $peak;
     }
 
     /**
@@ -408,7 +442,7 @@ final class Worker
                 break;
 
             case 'report':
-                $this->emitMetric('worker.peak_memory_bytes', (float) memory_get_peak_usage(true), 'bytes');
+                $this->emitMetric('worker.peak_memory_bytes', (float) $this->peakMemoryBytes(), 'bytes');
                 break;
 
             case 'reload':

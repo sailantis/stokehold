@@ -574,4 +574,68 @@ $decodedLog = json_decode($logFrames[0]['payload'], true, 512, JSON_THROW_ON_ERR
 Assert::same('hello from the handler', $decodedLog['message'], 'the log message survives');
 Assert::same(1, $decodedLog['request_id'], 'the log record records which request it belongs to');
 
+// ------------------------------------------------------- peak memory reporting
+
+// `memory_get_peak_usage(true)` is a high-water mark that begins at process
+// start, so a worker that peaked once would report a figure above a configured
+// `memory_limit_mb` on every later request, and the server would recycle it every
+// time. The END figure is therefore read and then re-baselined, which makes it a
+// per-request measurement.
+$twoRequests = run_worker(
+    array_merge([A_HELLO], a_get('/first', 1), a_get('/second', 2)),
+    static function (Request $request): Response {
+        if ($request->uri === '/first') {
+            // Big enough to move `memory_get_peak_usage(true)` on any version,
+            // and freed before the request ends, so "usage now" is unchanged.
+            $spike = str_repeat('x', 16 * 1024 * 1024);
+            unset($spike);
+        }
+
+        return Response::text('ok');
+    },
+);
+
+$peakEnds = json_of($twoRequests['frames'], MessageType::END);
+Assert::same(2, count($peakEnds), 'two requests produce two END frames');
+Assert::true(
+    $peakEnds[0]['peak_memory_bytes'] > 0,
+    'a worker reports a positive peak resident set',
+);
+
+if (\function_exists('memory_reset_peak_usage')) {
+    Assert::true(
+        $peakEnds[1]['peak_memory_bytes'] < $peakEnds[0]['peak_memory_bytes'],
+        'the peak is re-baselined after each request, so one spike does not follow the worker for ever',
+    );
+} else {
+    Assert::same(
+        $peakEnds[0]['peak_memory_bytes'],
+        $peakEnds[1]['peak_memory_bytes'],
+        'without memory_reset_peak_usage (PHP < 8.2) the reported figure stays monotonic',
+    );
+}
+
+// The `report` control reads the same figure and resets it too, so an operator
+// sampling between requests cannot resurrect a spike the last request cleared.
+$afterReport = run_worker(
+    array_merge([A_HELLO], a_get('/spike', 3), [[MessageType::CONTROL, 0, ['kind' => 'report']]]),
+    static function (Request $request): Response {
+        $spike = str_repeat('y', 16 * 1024 * 1024);
+        unset($spike);
+
+        return Response::text('ok');
+    },
+);
+$spikeEnd = json_of($afterReport['frames'], MessageType::END)[0]['peak_memory_bytes'];
+$reported = json_of($afterReport['frames'], MessageType::METRIC);
+Assert::same(1, count($reported), 'a report answers with one metric');
+if (\function_exists('memory_reset_peak_usage')) {
+    Assert::true(
+        $reported[0]['value'] < $spikeEnd,
+        'a report after a large request measures the baseline, not the cleared spike',
+    );
+} else {
+    Assert::same((float) $spikeEnd, $reported[0]['value'], 'without a reset the report repeats the peak');
+}
+
 exit(Assert::report('worker behaviour'));

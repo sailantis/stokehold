@@ -188,6 +188,16 @@ that produced a valid error page.
 threshold — the same idea as RoadRunner's `max_worker_memory` — and `keep_alive`. A worker that
 handled a fatal error reports `keep_alive = false` and is replaced instead of reused.
 
+`peak_memory_bytes` is **per request, not per process**, and the protocol says so because the two
+behave differently. PHP's `memory_get_peak_usage(true)` is a high-water mark that begins at
+process start and never falls, so reporting it raw would mean a worker that peaked once — during
+bootstrap, or during one large request — reports a figure above the configured limit on *every*
+request thereafter, and is recycled after each one. The SDK reads the figure and then calls
+`memory_reset_peak_usage()` (PHP 8.2+; on 8.1 the function is absent and the figure stays
+monotonic, which is the old behaviour rather than a failure), so the number describes the request
+that just finished. A worker implementation that does not reset is free to report a cumulative
+figure — the server acts on whatever it is told — but it will be recycled more eagerly.
+
 ### Control
 
 ```
@@ -262,7 +272,7 @@ configuration:
 | --- | --- |
 | `keep_alive = false` in `END` | The application asked to be recycled (`Worker::recycle()`) |
 | `max_requests` reached | The configured request count for one worker |
-| `peak_memory_bytes` above `memory_limit_mb` | The worker's own report of its peak RSS |
+| `peak_memory_bytes` above `memory_limit_mb` | The worker's own report of its peak RSS for the request just finished |
 
 The replacement is invisible to the request that triggered it: the response is returned, and the
 next request lands on a freshly booted worker. The pool's size does not change — `pick_slot`

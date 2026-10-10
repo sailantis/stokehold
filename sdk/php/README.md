@@ -138,6 +138,12 @@ a leaked global, a stuck connection, a fat static cache. The server sees `keep_a
 `END` and boots a replacement; the request that asked is still answered normally, so a handler
 never has to choose between responding and being cleaned up.
 
+Each `END` frame reports `peak_memory_bytes` for **that request**, not for the process. The worker
+reads `memory_get_peak_usage(true)` and then calls `memory_reset_peak_usage()`, so a spike in one
+request does not make the server recycle the worker after every later one. On PHP 8.2+ that reset
+exists; on 8.1 the reported figure is cumulative, so a `memory_limit_mb` threshold recycles more
+eagerly there. The same figure is available between requests via the `report` control.
+
 ## Example
 
 [`example/worker.php`](example/worker.php) is a runnable worker with `/`, `/health`, `/echo`,

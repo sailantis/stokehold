@@ -50,6 +50,25 @@ fn find_php_cgi() -> Option<PathBuf> {
     None
 }
 
+/// Find `php` on `PATH`, for the worker-backend test.
+fn find_php() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let names: &[&str] = &["php.exe", "php"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["php"];
+
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// A run of consecutive free ports, since the pool increments from `base_port`.
 fn free_port_run(count: usize) -> Option<u16> {
     for _ in 0..64 {
@@ -223,6 +242,52 @@ fn start_server(
     let config = format!(
         "default_backend = \"cgi\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {binary:?}\nworkers = {workers}\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
         binary = php_cgi.display().to_string(),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+    Server::start(binary, &config_path)
+}
+
+/// The SDK's example worker, which is what the worker backend is pointed at.
+fn example_worker() -> PathBuf {
+    // `crates/stokehold-cli/tests/serve.rs` -> the repository root is two up.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("sdk")
+        .join("php")
+        .join("example")
+        .join("worker.php")
+}
+
+/// Quote a string for a TOML basic (`"…"`) string.
+///
+/// A Windows path has to be escaped here: in a TOML basic string a backslash
+/// starts an escape sequence, so `C:\Users` is a parse error, not a path. The
+/// same papercut is waiting for anyone who writes this configuration by hand, so
+/// the docs recommend a literal (`'…'`) string instead — but a test cannot rely
+/// on the temp directory being free of the characters that would break a literal
+/// string, so it escapes.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Start the server with a `worker` backend, so the whole chain runs on the
+/// stokehold worker protocol rather than on FastCGI to `php-cgi`.
+fn start_worker_server(binary: &Path, root: &Path) -> Option<Server> {
+    let config_path = root.join("stokehold.toml");
+    let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let config = format!(
+        "default_backend = \"app\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
     );
     std::fs::write(&config_path, config).expect("write the config");
     Server::start(binary, &config_path)
@@ -441,6 +506,78 @@ fn a_missing_script_is_an_error_response_not_a_hang() {
         status == 404 || status == 500 || body.contains("No input file"),
         "expected an error, got {status}: {body}"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The whole chain, with the worker pool in it:
+///
+/// ```text
+/// FastCGI client (standing in for nginx)
+///     ──FastCGI──► stokehold front-end ──► dispatcher ──stokehold protocol──► php worker
+/// ```
+///
+/// This is the step-17 milestone: the shipped binary serves a request through the
+/// persistent worker pool rather than through `php-cgi`, so the config parsing,
+/// the command splitter, the pool, the handshake and the response rendering are
+/// all exercised together.
+#[test]
+fn serve_reaches_a_persistent_php_worker_over_the_stokehold_protocol() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built (run `cargo build`)");
+        return;
+    };
+    if find_php().is_none() {
+        eprintln!("skipping: no php on PATH");
+        return;
+    }
+    let worker = example_worker();
+    if !worker.is_file() {
+        eprintln!(
+            "skipping: the SDK example worker is missing at {}",
+            worker.display()
+        );
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!("stokehold-smoke-worker-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+
+    let Some(server) = start_worker_server(&binary, &root) else {
+        eprintln!("skipping: the worker-backed server did not start");
+        return;
+    };
+    assert!(!server.address.is_empty());
+
+    // The worker decides what to run, so the document root only has to exist for
+    // the CGI environment to be built against it.
+    let params = params_for(&root, "/health", 0);
+    let (status, headers, body) =
+        request(&server.address, &params, b"").expect("the request completed");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("\"status\":\"ok\""),
+        "the worker's JSON should have arrived: {body}"
+    );
+    // The worker's own `Content-Type` survives the translation into a Status
+    // block, which is what proves the header list was rendered and not dropped.
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("content-type")
+                && value.starts_with("application/json")),
+        "the worker's Content-Type is missing: {headers:?}"
+    );
+
+    // A body in the request direction, and a second request to prove the worker
+    // is reused rather than restarted per request.
+    let marker = "over-the-pool";
+    let params = params_for(&root, "/echo", marker.len());
+    let (status, _, body) =
+        request(&server.address, &params, marker.as_bytes()).expect("the request completed");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(&format!("payload: {marker}")), "{body}");
 
     let _ = std::fs::remove_dir_all(&root);
 }

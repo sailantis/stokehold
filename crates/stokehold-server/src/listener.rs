@@ -317,22 +317,20 @@ mod tests {
                 http: None,
                 fastcgi: Some(address.clone()),
             },
+            // Nothing here has to start: the dispatcher is built but never used,
+            // because binding fails first. An `external` backend pointing at a
+            // port nothing listens on costs nothing and starts no process.
             backends: [(
-                "app".to_string(),
-                stokehold_core::config::BackendConfig::Worker(
-                    stokehold_core::config::WorkerConfig {
-                        command: "php worker.php".to_string(),
-                        workers: 1,
-                        memory_limit_mb: None,
-                        max_requests: None,
-                        working_dir: None,
-                        env: Default::default(),
+                "fpm".to_string(),
+                stokehold_core::config::BackendConfig::External(
+                    stokehold_core::config::ExternalConfig {
+                        socket: "127.0.0.1:1".to_string(),
                     },
                 ),
             )]
             .into_iter()
             .collect(),
-            default_backend: Some("app".to_string()),
+            default_backend: Some("fpm".to_string()),
         };
         let dispatcher = Dispatcher::from_config(&config, stokehold_fcgi::Routing::default())
             .expect("dispatcher");

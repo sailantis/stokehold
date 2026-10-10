@@ -104,17 +104,18 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stokehold_core::config::{BackendConfig, Config, ServerConfig, WorkerConfig};
+    use stokehold_core::config::{BackendConfig, Config, ExternalConfig, ServerConfig};
 
-    fn worker_config(command: &str) -> BackendConfig {
-        BackendConfig::Worker(WorkerConfig {
-            command: command.to_string(),
-            workers: 1,
-            memory_limit_mb: None,
-            max_requests: None,
-            working_dir: None,
-            env: Default::default(),
-        })
+    /// A backend that can be *built* without starting anything, but cannot serve:
+    /// an `external` backend pointing at a loopback port nothing listens on.
+    ///
+    /// Deliberately not a `worker` backend: the worker pool starts real processes
+    /// in `from_config`, and these tests are about routing, not supervision.
+    fn unreachable_backend() -> BackendConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
+        let socket = listener.local_addr().expect("address").to_string();
+        drop(listener);
+        BackendConfig::External(ExternalConfig { socket })
     }
 
     fn config_with(backends: &[(&str, BackendConfig)], default: &str) -> Config {
@@ -135,8 +136,8 @@ mod tests {
     fn builds_every_backend_and_dispatch_reaches_the_default() {
         let config = config_with(
             &[
-                ("app", worker_config("php worker.php")),
-                ("other", worker_config("php o.php")),
+                ("app", unreachable_backend()),
+                ("other", unreachable_backend()),
             ],
             "app",
         );
@@ -147,15 +148,15 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["app", "other"]);
 
-        // The worker protocol is unimplemented, but the routing itself works:
-        // the failure names the backend we reached.
+        // The backend cannot connect, but the routing is what is under test: the
+        // failure names the backend we reached, which is the default one.
         let err = dispatcher.dispatch(&Request::default()).unwrap_err();
         assert!(err.to_string().contains("app"), "{err}");
     }
 
     #[test]
     fn dispatch_to_an_unknown_backend_reports_it_by_name() {
-        let config = config_with(&[("app", worker_config("php worker.php"))], "app");
+        let config = config_with(&[("app", unreachable_backend())], "app");
         let mut dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
 
         let err = dispatcher
@@ -167,7 +168,7 @@ mod tests {
 
     #[test]
     fn rejects_a_default_backend_that_does_not_exist() {
-        let config = config_with(&[("app", worker_config("php worker.php"))], "missing");
+        let config = config_with(&[("app", unreachable_backend())], "missing");
         let err = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap_err();
         assert!(err.to_string().contains("default_backend"), "{err}");
     }

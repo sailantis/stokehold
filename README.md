@@ -18,9 +18,10 @@ supervises it for you.
 > implemented, with integration tests driving real `php-cgi` processes end to end. The worker
 > protocol is specified in [docs/worker-protocol.md](docs/worker-protocol.md), implemented in
 > `crates/stokehold-worker`, and the PHP worker SDK in [sdk/php](sdk/php) implements the other
-> end — proven by tests that drive a live `php worker.php` over pipes. The HTTP listener and the
-> worker pool that supervises those workers are next — see [docs/plan.md](docs/plan.md) for the
-> phase order.
+> end — proven by tests that drive a live `php worker.php` over pipes. The worker pool that
+> supervises those workers is implemented in `crates/stokehold-server`, so `kind = "worker"` now
+> serves for real: `stokehold serve` boots the pool, handshakes each worker, and serves through it.
+> The HTTP listener is next — see [docs/plan.md](docs/plan.md) for the phase order.
 
 ## Why
 
@@ -63,6 +64,16 @@ slot, restarts one that died, and recycles on `max_requests` — the equivalent 
 own process group; on Windows they are adopted into a job object with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so nothing is left running if `stokehold` dies.
 
+`worker` is implemented too, and it is the interesting case. Its `command` is a command line
+(`php worker.php`), split without a shell — double quotes group, and a backslash is kept unless it
+escapes a quote or another backslash, so a Windows path needs no doubling. Each worker is started,
+handshaken, and kept resident; `stderr` is drained on its own thread so a chatty application
+cannot fill a pipe and block; and a worker is replaced when it asks to be (`keep_alive = false`),
+when it reaches `max_requests`, or when the peak RSS it reports exceeds `memory_limit_mb`. Every
+wait has a deadline, enforced by killing the worker — the process *is* the cancellation token,
+because a pipe read has no portable timeout. A failed request is deliberately **not** retried,
+unlike the FastCGI backends: a worker failure can happen after the application ran.
+
 ```toml
 default_backend = "app"
 
@@ -84,6 +95,10 @@ kind = "spawn_cgi"
 binary = "C:/php-8.3.31/php-cgi.exe"
 workers = 8
 ```
+
+Paths with backslashes are easiest as TOML **literal strings** (`'C:\php-8.3.31\php-cgi.exe'`):
+in a `"…"` basic string a backslash starts an escape sequence, so `C:\Users` is a parse error
+rather than a path.
 
 See [stokehold.example.toml](stokehold.example.toml) for a commented version of the whole
 configuration surface.
@@ -137,7 +152,7 @@ marked down.
 | `crates/stokehold-core` | Configuration model, backend types, PHP discovery |
 | `crates/stokehold-fcgi` | FastCGI record codec, client, transport and CGI environment |
 | `crates/stokehold-worker` | The worker protocol: framed codec and message set over a worker's pipes |
-| `crates/stokehold-server` | Backend abstraction, `php-cgi` pool, process lifecycle, dispatch |
+| `crates/stokehold-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |
 | `crates/stokehold-cli` | The `stokehold` binary |
 | `sdk/php` | The PHP worker SDK — the other end of the worker protocol |
 | `docs/plan.md` | The design and the phase plan |
@@ -163,6 +178,12 @@ on a PHP install.
 `crates/stokehold-worker/tests/php_worker.rs` does the opposite: it starts a real
 `sdk/php/example/worker.php` process and speaks the protocol to it over pipes, so the Rust codec
 and the PHP SDK are checked against each other rather than only against their own fixtures.
+
+`crates/stokehold-server/tests/worker_pool.rs` tests the pool around that protocol against real
+worker processes: it boots a pool, serves through every worker in rotation, replaces a worker that
+was killed or asked to be recycled, recycles on `max_requests` and on `memory_limit_mb`, and
+checks that dropping the pool leaves no processes behind. It skips itself when no `php` is on
+`PATH`.
 
 The PHP SDK's own suite needs no Rust and no PHPUnit:
 

@@ -319,7 +319,10 @@ impl Drop for CgiPool {
 ///
 /// `0` is documented as "one per logical CPU", matching the example
 /// configuration and php-fpm's own `pm.start_servers` convention.
-fn worker_count(configured: u32) -> u32 {
+///
+/// Shared with the worker pool, so both pool kinds interpret `workers = 0` the
+/// same way.
+pub(crate) fn worker_count(configured: u32) -> u32 {
     if configured > 0 {
         return configured;
     }

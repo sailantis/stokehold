@@ -42,12 +42,28 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
 
     // Echo case: print something and return null. The captured output becomes
     // the response body, so a plain PHP script needs no changes at all.
+    //
+    // The raw body is echoed back too — not something a real application should
+    // do with untrusted input, but this route exists to be probed, and seeing the
+    // bytes is the only way to confirm a body arrived intact rather than merely
+    // arriving.
     if ($path === '/echo') {
         echo 'you asked for ', htmlspecialchars($request->uri, ENT_QUOTES), "\n";
         echo 'method: ', $request->method, "\n";
         echo 'body: ', strlen($request->body), " bytes\n";
+        echo 'payload: ', $request->body, "\n";
 
         return null;
+    }
+
+    // Ask the server to replace this worker once the request is done. The SDK
+    // reports `keep_alive = false` in END and the pool boots a fresh process,
+    // which is what an application does when it has put itself into a state it
+    // cannot clean up: a leaked global, a stuck connection, a fat static cache.
+    if ($path === '/recycle') {
+        $worker->recycle();
+
+        return Response::json(['recycled' => true, 'pid' => getmypid()]);
     }
 
     // A deliberately broken route, to show that one failing request does not

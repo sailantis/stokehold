@@ -248,6 +248,53 @@ Everything else means the reader can no longer trust its position in the stream.
 Both rules are implemented in `sdk/php/` and tested against a real PHP process by
 `crates/stokehold-worker/tests/php_worker.rs`, which drives a live `php worker.php` over pipes.
 
+## The server's side of the contract
+
+Everything above is the wire format. This section is the policy the server applies on top of it,
+because a worker cannot enforce any of it and an application author needs to know what to expect —
+`crates/stokehold-server/src/worker_pool.rs` is the implementation.
+
+**When a worker is replaced.** A worker is not replaced because it failed a request; it is
+replaced on exactly three signals, all of which come from the worker itself or from
+configuration:
+
+| Signal | Meaning |
+| --- | --- |
+| `keep_alive = false` in `END` | The application asked to be recycled (`Worker::recycle()`) |
+| `max_requests` reached | The configured request count for one worker |
+| `peak_memory_bytes` above `memory_limit_mb` | The worker's own report of its peak RSS |
+
+The replacement is invisible to the request that triggered it: the response is returned, and the
+next request lands on a freshly booted worker. The pool's size does not change — `pick_slot`
+replaces a worker that died in place rather than shrinking.
+
+**When a worker is discarded.** A fatal protocol failure (see the table above) means the stream
+can no longer be trusted, so the worker is killed and replaced rather than reused. A wrong
+request id or a remote error does not: those leave the stream aligned.
+
+**A failed request is not retried.** This is the one place the worker backend deliberately differs
+from the FastCGI backends, and it is a correctness point rather than a simplification. There, a
+transport error proves the request never reached the application, so replaying it is safe. Here a
+failure can happen *after* the application ran and produced side effects, and a frame the server
+did not finish reading is not evidence that nothing happened. Replaying a `POST` because its
+response was malformed would make the application run twice, so the error is reported instead.
+
+**Every wait has a deadline, and the deadline is a kill.** A pipe read has no portable timeout, so
+each exchange runs on a thread the pool is free to stop waiting on; the worker is killed to make
+the pending read return. That is also why a recycled worker's pipes are not reused after a
+timeout — the reader may still be inside a read.
+
+**Recycling and telemetry.** `LOG` and `METRIC` records that arrive while a request is in flight
+are attached to that request's response *and* kept on the channel, so a caller can see either the
+per-request view or everything the worker has ever said. The server renders a request's records
+into the response's `stderr`, which a front-end already forwards to its own error log.
+
+**Shutdown.** The server sends `CONTROL drain`, then closes the worker's stdin. The `CONTROL_ACK`
+is not awaited: the frame is already in the pipe buffer when the pipe closes, so the worker sees
+both signals in order. If the worker has not exited after a grace period it is killed, and a
+lifecycle guard (a job object on Windows, a process group on Unix) reaps anything left if the
+server itself dies.
+
 ## Versioning
 
 `protocol_version` is `1`. The reader rejects any other value rather than guessing, so a future

@@ -231,6 +231,19 @@ against the specification and secondary implementations, and are confirmed by fi
    single-request test passes either way — all the bytes are already buffered, so the
    non-blocking read succeeds. It only surfaced on an *interactive* exchange (a `GET_VALUES`
    probe followed by a request), which is why the probe test exists.
+7. **A pipe read has no portable timeout, so the worker is the cancellation token.** To give a
+   request or a handshake a deadline the exchange runs on its own thread and the pool stops
+   waiting on it; the worker is then *killed*, which is what makes the pending read return so the
+   thread can exit and drop the pipes. The consequence to remember is that a timed-out worker's
+   pipes must not be reused — the reader may still be inside a read.
+   `crates/stokehold-server/src/worker_pool.rs`.
+8. **Draining `STDERR` on the caller's thread is the same hang as not draining it.** A worker
+   whose stderr pipe fills blocks for ever on its next write, which is why one reader thread per
+   backend is mandatory. But reading that pipe to end-of-file *blocks until the worker exits*, so
+   doing it inline deadlocks the boot: the worker waits for `HELLO` while the server waits for a
+   line that will never come. It must be `std::thread::spawn`ed, and the failure looks like a
+   startup hang with no error at all — found here by tracing the pool's boot path, not by reading
+   the code.
 
 ## 6. Phases
 

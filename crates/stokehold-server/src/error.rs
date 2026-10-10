@@ -39,6 +39,13 @@ pub enum ServerError {
         source: stokehold_fcgi::FcgiError,
     },
 
+    #[error("backend {backend:?} could not speak the worker protocol: {source}")]
+    WorkerProtocol {
+        backend: String,
+        #[source]
+        source: stokehold_worker::WorkerError,
+    },
+
     #[error("bad FastCGI protocol: {reason}")]
     BadProtocol { reason: String },
 

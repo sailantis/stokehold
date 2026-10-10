@@ -425,6 +425,7 @@ version = "0.1.0"
 dependencies = [
  "stokehold-core",
  "stokehold-fcgi",
+ "stokehold-worker",
  "thiserror",
  "tracing",
  "windows-sys",

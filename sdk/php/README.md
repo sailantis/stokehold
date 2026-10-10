@@ -133,17 +133,31 @@ $response->withStatus(201)->withHeader('X-Trace', 'abc')->withBody('…');
 | `recycle()` | ask the server to replace this worker after the request |
 | `currentRequestId()` | the in-flight request id, for telemetry correlation |
 
+`recycle()` is what an application calls when it has put itself into a state it cannot clean up —
+a leaked global, a stuck connection, a fat static cache. The server sees `keep_alive = false` in
+`END` and boots a replacement; the request that asked is still answered normally, so a handler
+never has to choose between responding and being cleaned up.
+
 ## Example
 
 [`example/worker.php`](example/worker.php) is a runnable worker with `/`, `/health`, `/echo`,
-`/big` and `/boom` routes — including a route that throws, to show that a failing request does
-not kill the process.
+`/big`, `/boom` and `/recycle` routes — including a route that throws (to show that a failing
+request does not kill the process) and one that asks to be recycled. `/echo` also echoes the raw
+request body back, which is how the pool tests confirm a body arrived as bytes rather than merely
+arrived.
 
 To drive it by hand you need something that speaks the protocol; the test below does exactly
 that, over a real pipe:
 
 ```bash
 cargo test -p stokehold-worker --test php_worker
+```
+
+And the server side of the contract — spawning, handshaking, recycling, shutdown — is covered
+against real worker processes by:
+
+```bash
+cargo test -p stokehold-server --test worker_pool
 ```
 
 Those tests are also the honest answer to "how do you know it works": a Rust client writes

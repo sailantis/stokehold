@@ -8,6 +8,7 @@ use stokehold_fcgi::{Endpoint, Request, Response};
 
 use crate::error::{Result, ServerError};
 use crate::pool::CgiPool;
+use crate::worker_pool::WorkerPool;
 
 /// A backend, ready to serve requests.
 #[derive(Debug)]
@@ -23,11 +24,11 @@ pub enum Backend {
     },
     /// A pool of `php-cgi` processes that stokehold starts and supervises.
     SpawnCgi { name: String, pool: CgiPool },
-    /// A persistent PHP worker speaking stokehold's own protocol.
+    /// A pool of persistent PHP workers speaking stokehold's own protocol.
     ///
-    /// Not implemented yet: it needs the protocol from Phase 5. Recognised here
-    /// so configuration can be validated and reported before it works.
-    Worker { name: String },
+    /// The application boots once and stays resident, so PHP does *not* reset
+    /// state between requests — the application clears its own request scope.
+    Worker { name: String, pool: WorkerPool },
 }
 
 impl Backend {
@@ -51,8 +52,9 @@ impl Backend {
                 name: name.to_string(),
                 pool: CgiPool::start(name, cgi)?,
             }),
-            BackendConfig::Worker(_) => Ok(Backend::Worker {
+            BackendConfig::Worker(worker) => Ok(Backend::Worker {
                 name: name.to_string(),
+                pool: WorkerPool::start(name, worker)?,
             }),
             BackendConfig::SpawnFpm(fpm) => Err(ServerError::Misconfigured {
                 backend: name.to_string(),
@@ -69,7 +71,7 @@ impl Backend {
         match self {
             Backend::External { name, .. }
             | Backend::SpawnCgi { name, .. }
-            | Backend::Worker { name } => name,
+            | Backend::Worker { name, .. } => name,
         }
     }
 
@@ -91,11 +93,7 @@ impl Backend {
         match self {
             Backend::External { .. } => self.request_external(request),
             Backend::SpawnCgi { pool, .. } => pool.request(request),
-            Backend::Worker { name } => Err(ServerError::Misconfigured {
-                backend: name.clone(),
-                reason: "the worker backend needs the Phase 5 protocol, which is not implemented"
-                    .to_string(),
-            }),
+            Backend::Worker { pool, .. } => pool.request(request),
         }
     }
 
@@ -161,8 +159,14 @@ impl Backend {
 
     /// Stop the backend and everything it started.
     pub fn shutdown(&mut self) {
-        if let Backend::SpawnCgi { pool, .. } = self {
-            pool.shutdown();
+        match self {
+            Backend::SpawnCgi { pool, .. } => pool.shutdown(),
+            Backend::Worker { pool, .. } => pool.shutdown(),
+            Backend::External { client, .. } => {
+                // Nothing was started, so there is nothing to stop; dropping the
+                // connection is the whole cleanup.
+                *client = None;
+            }
         }
     }
 }
@@ -225,11 +229,13 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_backend_is_recognised_but_not_serving_yet() {
-        let mut backend = Backend::from_config(
+    fn a_worker_backend_without_a_real_command_is_reported_at_startup() {
+        // The pool boots its workers in `from_config`, so a command that cannot
+        // start is a startup error rather than a surprise on the first request.
+        let err = Backend::from_config(
             "app",
             &BackendConfig::Worker(WorkerConfig {
-                command: "php worker.php".to_string(),
+                command: "definitely-not-a-php-binary worker.php".to_string(),
                 workers: 1,
                 memory_limit_mb: None,
                 max_requests: None,
@@ -237,13 +243,9 @@ mod tests {
                 env: Default::default(),
             }),
         )
-        .unwrap();
-
-        assert_eq!(backend.kind(), "worker");
-        // Worker mode is exactly the case where PHP does not reset for us.
-        assert!(!backend.resets_per_request());
-        let err = backend.request(&Request::default()).unwrap_err();
-        assert!(err.to_string().contains("Phase 5"), "{err}");
+        .unwrap_err();
+        assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]

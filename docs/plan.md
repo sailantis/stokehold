@@ -212,6 +212,12 @@ against the specification and secondary implementations, and are confirmed by fi
 4. **`security.limit_extensions`** (php-fpm) rejects `.php`-less script paths; the CGI
    environment builder must produce a `SCRIPT_FILENAME` the backend accepts, or surface the
    backend's error instead of a generic 502.
+5. **`CONTENT_LENGTH` is mandatory, not decoration.** Verified against php-cgi 8.3.31: without
+   it PHP leaves `php://input` empty and never runs the request-body parser, so the raw bytes we
+   send as `STDIN` are silently dropped while the response still looks successful. The
+   environment builder must always send it, derived from the body it is about to frame. This was
+   found by the `php-cgi` integration test in
+   `crates/stokehold-fcgi/tests/php_cgi.rs`, which is why that test exists.
 
 ## 6. Phases
 

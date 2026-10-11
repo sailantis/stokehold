@@ -275,6 +275,33 @@ Both rules are implemented in the PHP SDK (`sailantis/stokehold-php-sdk`) and te
 real PHP process by `crates/stokehold-worker/tests/php_worker.rs`, which drives a live
 `php worker.php` over pipes.
 
+## The SAPI services a worker has to supply itself
+
+A worker is not a SAPI, so the things PHP normally does before the script runs are missing. Two are
+obvious and the SDK handles them — the request body must not be read from `php://input`, and
+`$_POST`/`$_COOKIE` are not populated. The third is easy to miss and is recorded here because the
+server side cannot detect it:
+
+**Sessions are half a CGI service.** PHP starts a session from the request's `Cookie` header and
+writes the cookie naming it into the response headers. Over a pipe neither happens, so a worker that
+wants sessions must read the id in and write the `Set-Cookie` out itself.
+
+There is a further trap in the CLI SAPI. `ext/session/session.c` refuses to start a session when
+`session.use_cookies` is on and `SG(headers_sent)` is already set, and the CLI SAPI sets
+`headers_sent` at process startup — so **a session cannot be started in a CLI worker at all** until
+`session.use_cookies` is turned off. It cannot be turned off from inside PHP either: `ini_set()` is
+refused for session settings once headers have been sent, as is `session_name()`. The only place
+PHP still accepts those settings is the command line, which is why a worker that wants sessions is
+started as:
+
+```toml
+command = "php -d session.use_cookies=0 -d session.cache_limiter= -d session.name=_s worker.php"
+```
+
+The failure mode without the flags is silent, not loud: the worker boots, serves every request, and
+only loses session state. `azera-stokehold` prints a one-line warning to stderr the first time it
+would have used a session, since stderr is not the protocol channel.
+
 ## The server's side of the contract
 
 Everything above is the wire format. This section is the policy the server applies on top of it,

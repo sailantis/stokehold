@@ -20,6 +20,7 @@ fn config_for(binary: &Path, workers: u32, base_port: u16) -> SpawnCgiConfig {
         workers,
         bind_host: "127.0.0.1".to_string(),
         base_port,
+        socket: None,
         max_requests: None,
     }
 }
@@ -62,9 +63,117 @@ fn fixture(name: &str) -> (PathBuf, String) {
     (root, "index.php".to_string())
 }
 
+/// A pool bound to unix sockets must serve exactly what the TCP pool serves.
+///
+/// This is the test that makes `socket = "unix:..."` a supported configuration
+/// rather than a documented possibility: the same request, the same script, and
+/// the same bytes back — with the difference that the transport is a file on disk
+/// and `php-cgi`'s own `-b` is given a bare path rather than `host:port`.
+#[cfg(unix)]
 #[test]
-fn starts_a_pool_and_serves_requests_through_every_slot() {
+fn a_pool_bound_to_unix_sockets_serves_the_same_bytes() {
     let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+
+    let (root, script_name) = fixture("unix");
+    let prefix = format!("/tmp/stokehold-pool-unix-{}", std::process::id());
+    let config = SpawnCgiConfig {
+        binary: binary.clone(),
+        workers: 2,
+        bind_host: "127.0.0.1".to_string(),
+        base_port: 19_900,
+        socket: Some(format!("unix:{prefix}")),
+        max_requests: None,
+    };
+
+    let mut pool = CgiPool::start("unix-test", &config).expect("a unix-socket pool starts");
+    assert_eq!(pool.len(), 2);
+    assert!(
+        pool.ports().is_empty(),
+        "a unix-socket pool binds no ports, got {:?}",
+        pool.ports()
+    );
+    let expected_paths = vec![
+        PathBuf::from(format!("{prefix}.0.sock")),
+        PathBuf::from(format!("{prefix}.1.sock")),
+    ];
+    assert_eq!(pool.socket_paths(), expected_paths.as_slice());
+    assert!(
+        expected_paths.iter().all(|path| path.exists()),
+        "php-cgi should have bound both paths"
+    );
+
+    for index in 0..4 {
+        let response = pool
+            .request(&request_for(&root, &script_name, &format!("unix{index}")))
+            .expect("a unix-socket slot answered");
+        response.check_protocol().expect("completed");
+        let stdout = String::from_utf8_lossy(&response.stdout);
+        assert!(
+            stdout.contains(&format!("MARK=unix{index}")),
+            "request {index} returned {stdout:?}"
+        );
+    }
+
+    pool.shutdown();
+    assert!(pool.is_empty());
+    // A stopped pool must not leave its sockets behind: the next run would bind
+    // them only because php-cgi unlinks first, and an operator would see litter
+    // that looks like a live server.
+    assert!(
+        expected_paths.iter().all(|path| !path.exists()),
+        "shutdown should have removed every socket"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A dead unix-socket slot is replaced on the same path, not on a new one.
+#[cfg(unix)]
+#[test]
+fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+
+    let (root, script_name) = fixture("unix-restart");
+    let prefix = format!("/tmp/stokehold-pool-unix-restart-{}", std::process::id());
+    let config = SpawnCgiConfig {
+        binary: binary.clone(),
+        workers: 1,
+        bind_host: "127.0.0.1".to_string(),
+        base_port: 19_950,
+        socket: Some(format!("unix:{prefix}")),
+        max_requests: None,
+    };
+
+    let mut pool = CgiPool::start("unix-restart", &config).expect("pool starts");
+    let before = pool.pids();
+    kill(before[0]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let response = pool
+        .request(&request_for(&root, &script_name, "unix-recovered"))
+        .expect("the pool recovered");
+    let stdout = String::from_utf8_lossy(&response.stdout);
+    assert!(stdout.contains("MARK=unix-recovered"), "{stdout:?}");
+    assert_ne!(pool.pids()[0], before[0], "the dead slot was replaced");
+    assert_eq!(
+        pool.endpoints(),
+        vec![format!("unix:{prefix}.0.sock")],
+        "the replacement kept the path"
+    );
+
+    pool.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn starts_a_pool_and_serves_requests_through_every_slot() {    let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
         return;

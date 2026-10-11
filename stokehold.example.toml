@@ -99,3 +99,10 @@ binary = "C:/php-8.3.31/php-cgi.exe"
 workers = 8
 bind_host = "127.0.0.1"   # loopback only; never expose php-cgi
 base_port = 19001
+
+# Unix sockets instead of TCP, where the platform has them (Linux, macOS).
+# This is a path PREFIX: slot 0 binds /run/stokehold/cgi.0.sock, slot 1 the next.
+# `php-cgi -b` accepts an AF_UNIX path on any non-Windows platform, which removes
+# the loopback hop. Rejected at startup on Windows, where the same argument means
+# a named pipe this backend does not drive. `bind_host`/`base_port` are then unused.
+# socket = "unix:/run/stokehold/cgi"

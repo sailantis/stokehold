@@ -33,11 +33,12 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for a single request to a slot.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One `php-cgi` process and the port it serves.
+/// One `php-cgi` process and the address it serves.
 #[derive(Debug)]
 struct Slot {
     child: Child,
-    port: u16,
+    /// Loopback TCP or a unix socket, depending on the configuration.
+    endpoint: Endpoint,
     /// Requests this slot has served, for `max_requests` recycling.
     served: u64,
     /// A live connection, reused while the backend allows it.
@@ -45,12 +46,17 @@ struct Slot {
 }
 
 impl Slot {
-    fn endpoint(&self) -> Endpoint {
-        Endpoint::Tcp(format!("127.0.0.1:{}", self.port))
-    }
-
     fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// The address this slot is bound to, reconstructed so a replacement can bind
+    /// the same one.
+    ///
+    /// Derived from `endpoint` rather than stored separately, so a slot cannot
+    /// hold two disagreeing notions of where it listens.
+    fn address(&self) -> SlotAddress {
+        slot_address_of(&self.endpoint)
     }
 
     /// Send one request over this slot, reconnecting if the backend closed.
@@ -58,7 +64,7 @@ impl Slot {
         // Reuse the connection only when the previous request said it may be
         // reused; `php-cgi` may close after every request, and assuming
         // otherwise is how a pool ends up writing into a dead socket.
-        let endpoint = self.endpoint();
+        let endpoint = self.endpoint.clone();
         if self.client.as_ref().is_some_and(|c| !c.is_reusable()) {
             self.client = None;
         }
@@ -112,6 +118,62 @@ fn retryable(err: &stokehold_fcgi::FcgiError) -> bool {
     is_connection_error(err)
 }
 
+/// Where a slot binds: a loopback port, or a unix socket path.
+#[derive(Debug, Clone)]
+enum SlotAddress {
+    Port(u16),
+    Socket(PathBuf),
+}
+
+impl SlotAddress {
+    /// The string `php-cgi -b` is given.
+    fn bind_argument(&self, bind_host: &str) -> String {
+        match self {
+            SlotAddress::Port(port) => format!("{bind_host}:{port}"),
+            SlotAddress::Socket(path) => path.display().to_string(),
+        }
+    }
+
+    /// The address the client connects to.
+    ///
+    /// Fallible rather than infallible because the `Socket` variant is
+    /// unrepresentable as an [`Endpoint`] on Windows; config validation rejects
+    /// such a configuration before a pool is built, so reaching the error here
+    /// means the pool was constructed by hand.
+    fn endpoint(&self, bind_host: &str) -> Result<Endpoint> {
+        match self {
+            SlotAddress::Port(port) => Ok(Endpoint::Tcp(format!("{bind_host}:{port}"))),
+            SlotAddress::Socket(path) => {
+                Endpoint::parse(&format!("unix:{}", path.display())).map_err(|source| {
+                    ServerError::Misconfigured {
+                        backend: "spawn_cgi".to_string(),
+                        reason: format!("{} cannot be a unix socket here: {source}", path.display()),
+                    }
+                })
+            }
+        }
+    }
+}
+
+/// Recover the bind address from a live endpoint.
+///
+/// This is the inverse of [`SlotAddress::endpoint`], and it is what lets recycling
+/// and restart bind the *same* place again. A slot stores only its endpoint, so
+/// there is no second field that could drift out of agreement with it.
+fn slot_address_of(endpoint: &Endpoint) -> SlotAddress {
+    match endpoint {
+        Endpoint::Tcp(spec) => SlotAddress::Port(
+            spec.rsplit_once(':')
+                .and_then(|(_, port)| port.parse().ok())
+                .unwrap_or_else(|| {
+                    panic!("a TCP endpoint always carries a port, got {spec:?}")
+                }),
+        ),
+        #[cfg(unix)]
+        Endpoint::Unix(path) => SlotAddress::Socket(PathBuf::from(path)),
+    }
+}
+
 /// A pool of `php-cgi` processes.
 #[derive(Debug)]
 pub struct CgiPool {
@@ -124,6 +186,8 @@ pub struct CgiPool {
     cursor: AtomicUsize,
     binary: PathBuf,
     bind_host: String,
+    /// Socket paths this pool bound and therefore must unlink on the way out.
+    socket_paths: Vec<PathBuf>,
     max_requests: Option<u64>,
     /// Held for the life of the pool; dropping it reaps every slot.
     _guard: LifecycleGuard,
@@ -153,30 +217,43 @@ impl CgiPool {
             cursor: AtomicUsize::new(0),
             binary: config.binary.clone(),
             bind_host: config.bind_host.clone(),
+            socket_paths: Vec::new(),
             max_requests: config.max_requests,
             _guard: guard,
         };
 
         let mut port = config.base_port;
-        for _ in 0..count {
-            // Skip ports that are already taken rather than failing the whole
-            // pool: another service on 19001 should not stop startup.
-            while !port_is_free(&pool.bind_host, port) {
-                port = port
-                    .checked_add(1)
-                    .ok_or_else(|| ServerError::Misconfigured {
-                        backend: name.to_string(),
-                        reason: "ran out of ports while allocating slots".to_string(),
-                    })?;
+        for index in 0..count {
+            let slot_address = match &config.socket {
+                Some(prefix) => SlotAddress::Socket(stokehold_core::config::cgi_socket_path(
+                    prefix, index,
+                )),
+                None => {
+                    // Skip ports that are already taken rather than failing the whole
+                    // pool: another service on 19001 should not stop startup.
+                    while !port_is_free(&pool.bind_host, port) {
+                        port = port
+                            .checked_add(1)
+                            .ok_or_else(|| ServerError::Misconfigured {
+                                backend: name.to_string(),
+                                reason: "ran out of ports while allocating slots".to_string(),
+                            })?;
+                    }
+                    let address = SlotAddress::Port(port);
+                    port = port
+                        .checked_add(1)
+                        .ok_or_else(|| ServerError::Misconfigured {
+                            backend: name.to_string(),
+                            reason: "ran out of ports while allocating slots".to_string(),
+                        })?;
+                    address
+                }
+            };
+            let slot = pool.spawn_slot(&slot_address)?;
+            if let SlotAddress::Socket(path) = &slot_address {
+                pool.socket_paths.push(path.clone());
             }
-            let slot = pool.spawn_slot(port)?;
             pool.slots.push(Mutex::new(slot));
-            port = port
-                .checked_add(1)
-                .ok_or_else(|| ServerError::Misconfigured {
-                    backend: name.to_string(),
-                    reason: "ran out of ports while allocating slots".to_string(),
-                })?;
         }
 
         tracing::info!(
@@ -195,11 +272,11 @@ impl CgiPool {
         self
     }
 
-    fn spawn_slot(&self, port: u16) -> Result<Slot> {
+    fn spawn_slot(&self, address: &SlotAddress) -> Result<Slot> {
         let mut command = Command::new(&self.binary);
         command
             .arg("-b")
-            .arg(format!("{}:{port}", self.bind_host))
+            .arg(address.bind_argument(&self.bind_host))
             // php-cgi's own preforking, which does not compose with this pool.
             //
             // A `php-cgi` started with `-b` is not one process: it is a parent
@@ -252,7 +329,7 @@ impl CgiPool {
 
         let mut slot = Slot {
             child,
-            port,
+            endpoint: address.endpoint(&self.bind_host)?,
             served: 0,
             client: None,
         };
@@ -292,8 +369,8 @@ impl CgiPool {
         // never, as it does for php-fpm — see `WorkerConfig::max_requests`.
         if let Some(max) = self.max_requests.filter(|max| *max > 0) {
             if slot.served >= max {
-                let port = slot.port;
-                let mut replacement = self.spawn_slot(port)?;
+                let address = slot.address();
+                let mut replacement = self.spawn_slot(&address)?;
                 replacement.served = 0;
                 let old = std::mem::replace(&mut *slot, replacement);
                 let mut old = old;
@@ -323,7 +400,7 @@ impl CgiPool {
             // fails the slot is replaced lazily on the next tick.
             tracing::warn!(
                 backend = %self.name,
-                port = slot.port,
+                address = %slot.endpoint,
                 "a php-cgi slot died; restarting"
             );
             if let Err(err) = self.replace_locked(&mut slot) {
@@ -336,7 +413,7 @@ impl CgiPool {
         0
     }
 
-    /// Replace the process in a slot, keeping its port.
+    /// Replace the process in a slot, keeping its address.
     pub fn restart(&self, index: usize) -> Result<()> {
         let mut slot = self.slots[index]
             .lock()
@@ -344,12 +421,13 @@ impl CgiPool {
         self.replace_locked(&mut slot)
     }
 
-    /// Replace a locked slot's process with a fresh one on the same port.
+    /// Replace a locked slot's process with a fresh one on the same address.
     ///
     /// The replacement is booted before the old process is killed, so a slot that
     /// cannot be restarted keeps working rather than being left dead.
     fn replace_locked(&self, slot: &mut Slot) -> Result<()> {
-        let mut replacement = self.spawn_slot(slot.port)?;
+        let address = slot.address();
+        let mut replacement = self.spawn_slot(&address)?;
         replacement.served = 0;
         let mut old = std::mem::replace(slot, replacement);
         let _ = old.child.kill();
@@ -373,11 +451,48 @@ impl CgiPool {
             let _ = slot.child.wait();
         }
         self.slots.clear();
+        // `php-cgi` unlinks a stale path before binding, so a leftover socket is
+        // not fatal — but a stopped pool should not leave litter behind, and on
+        // Linux an unlinked file is what releases the name for the next run.
+        for path in self.socket_paths.drain(..) {
+            if let Err(err) = std::fs::remove_file(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        backend = %self.name,
+                        path = %path.display(),
+                        %err,
+                        "could not remove a unix socket"
+                    );
+                }
+            }
+        }
     }
 
-    /// The ports in use, for diagnostics.
+    /// The ports in use, for diagnostics. Unix-socket slots are not represented.
     pub fn ports(&self) -> Vec<u16> {
-        self.locked_slots().iter().map(|slot| slot.port).collect()
+        self.locked_slots()
+            .iter()
+            .filter_map(|slot| match &slot.endpoint {
+                Endpoint::Tcp(spec) => spec
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok()),
+                #[cfg(unix)]
+                Endpoint::Unix(_) => None,
+            })
+            .collect()
+    }
+
+    /// Every slot's address, in slot order, for diagnostics and tests.
+    pub fn endpoints(&self) -> Vec<String> {
+        self.locked_slots()
+            .iter()
+            .map(|slot| slot.endpoint.to_string())
+            .collect()
+    }
+
+    /// The unix socket paths this pool bound.
+    pub fn socket_paths(&self) -> &[PathBuf] {
+        &self.socket_paths
     }
 
     /// The process ids of the slots, for diagnostics and tests.
@@ -425,6 +540,11 @@ fn port_is_free(host: &str, port: u16) -> bool {
 }
 
 /// Wait for a slot to accept connections.
+///
+/// Connects through the slot's own endpoint, so this works the same whether the
+/// slot bound a port or a unix socket — and it is the only startup probe that
+/// proves the *client* can reach the address, rather than that something is
+/// listening somewhere.
 fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -438,14 +558,14 @@ fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Re
             Ok(None) => {}
             Err(source) => return Err(ServerError::Io(source)),
         }
-        if std::net::TcpStream::connect(("127.0.0.1", slot.port)).is_ok() {
+        if slot.endpoint.connect(Some(Duration::from_millis(250))).is_ok() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
     Err(ServerError::StartupTimeout {
         binary: binary.to_path_buf(),
-        address: format!("127.0.0.1:{}", slot.port),
+        address: slot.endpoint.to_string(),
         timeout,
     })
 }
@@ -459,6 +579,71 @@ mod tests {
         assert!(worker_count(0) >= 1);
         assert_eq!(worker_count(4), 4);
         assert_eq!(worker_count(1), 1);
+    }
+
+    #[test]
+    fn a_slot_address_knows_how_to_bind_and_how_to_connect() {
+        let port = SlotAddress::Port(19_001);
+        assert_eq!(port.bind_argument("127.0.0.1"), "127.0.0.1:19001");
+        assert_eq!(
+            port.endpoint("127.0.0.1").expect("a port is always an endpoint"),
+            Endpoint::Tcp("127.0.0.1:19001".to_string())
+        );
+
+        let socket = SlotAddress::Socket(PathBuf::from("/run/stokehold/cgi.0.sock"));
+        assert_eq!(
+            socket.bind_argument("127.0.0.1"),
+            "/run/stokehold/cgi.0.sock",
+            "php-cgi takes a bare path for a unix socket, not the `unix:` prefix"
+        );
+    }
+
+    /// Where unix sockets exist they resolve to a `Unix` endpoint; where they do
+    /// not, the same input is an error rather than a silent fallback to TCP.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_slot_address_resolves_to_a_unix_endpoint() {
+        let socket = SlotAddress::Socket(PathBuf::from("/run/stokehold/cgi.0.sock"));
+        assert_eq!(
+            socket.endpoint("127.0.0.1").expect("unix sockets exist here"),
+            Endpoint::Unix("/run/stokehold/cgi.0.sock".to_string())
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_unix_slot_address_is_refused_where_the_platform_has_none() {
+        let socket = SlotAddress::Socket(PathBuf::from("/run/stokehold/cgi.0.sock"));
+        let err = socket
+            .endpoint("127.0.0.1")
+            .expect_err("a unix socket cannot be reached here");
+        assert!(err.to_string().contains("cannot be a unix socket"), "{err}");
+    }
+
+    #[test]
+    fn a_slot_address_round_trips_through_an_endpoint() {
+        // `slot_address_of` recovers the bind address from a live endpoint, which
+        // is how recycling and restart bind the same place again. If that
+        // reconstruction drifts, a recycled slot silently moves.
+        let port = SlotAddress::Port(19_444);
+        let endpoint = port.endpoint("127.0.0.1").expect("a port is always reachable");
+        match slot_address_of(&endpoint) {
+            SlotAddress::Port(recovered) => assert_eq!(recovered, 19_444),
+            SlotAddress::Socket(path) => panic!("expected a port, got {path:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_slot_address_round_trips_through_an_endpoint() {
+        let socket = SlotAddress::Socket(PathBuf::from("/run/stokehold/cgi.3.sock"));
+        let endpoint = socket.endpoint("127.0.0.1").expect("unix sockets exist here");
+        match slot_address_of(&endpoint) {
+            SlotAddress::Socket(recovered) => {
+                assert_eq!(recovered, PathBuf::from("/run/stokehold/cgi.3.sock"));
+            }
+            SlotAddress::Port(port) => panic!("expected a socket, got port {port}"),
+        }
     }
 
     #[test]
@@ -477,6 +662,7 @@ mod tests {
             workers: 1,
             bind_host: "127.0.0.1".to_string(),
             base_port: 19_700,
+            socket: None,
             max_requests: None,
         };
         let err = CgiPool::start("test", &config).unwrap_err();

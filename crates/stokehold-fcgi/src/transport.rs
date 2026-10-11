@@ -29,6 +29,18 @@ pub enum Endpoint {
     Unix(String),
 }
 
+impl std::fmt::Display for Endpoint {
+    /// The reverse of [`Endpoint::parse`], so an endpoint can travel through a
+    /// log line, an error message or a config template and come back unchanged.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Endpoint::Tcp(spec) => write!(f, "{spec}"),
+            #[cfg(unix)]
+            Endpoint::Unix(path) => write!(f, "unix:{path}"),
+        }
+    }
+}
+
 impl Endpoint {
     /// Parse `host:port` or `unix:/path`.
     ///
@@ -162,6 +174,24 @@ mod tests {
             Endpoint::parse(" 127.0.0.1:9000 ").unwrap(),
             Endpoint::Tcp("127.0.0.1:9000".to_string())
         );
+    }
+
+    #[test]
+    fn an_endpoint_round_trips_through_display() {
+        for spec in ["127.0.0.1:9000", " 192.0.2.1:1234 "] {
+            let endpoint = Endpoint::parse(spec).unwrap();
+            assert_eq!(
+                Endpoint::parse(&endpoint.to_string()).unwrap(),
+                endpoint,
+                "Display must be the inverse of parse"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let endpoint = Endpoint::parse("unix:/run/php.sock").unwrap();
+            assert_eq!(endpoint.to_string(), "unix:/run/php.sock");
+            assert_eq!(Endpoint::parse(&endpoint.to_string()).unwrap(), endpoint);
+        }
     }
 
     #[test]

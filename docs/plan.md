@@ -492,6 +492,20 @@ against the specification and secondary implementations, and are confirmed by fi
     there. Relevant because the TCP arm's advantage over the piped arm at high concurrency is a
     per-request cost, and a unix socket is the cheaper version of the same shape.
 
+    **Implemented** as `socket = "unix:/run/stokehold/cgi"` in a `spawn_cgi` backend
+    (`SpawnCgiConfig::socket`). Three things about it are deliberate rather than incidental. The
+    configured value is a **path prefix**, not a finished path: slot `i` binds `<prefix>.<i>.sock`,
+    because one socket per process is what lets a slot be recycled, counted and reasoned about on
+    its own — the same reason each TCP slot needs its own port. A `Slot` therefore stores an
+    `Endpoint` rather than a port, and recovers the bind address from it for recycling and restart,
+    so there is no second field that could drift out of agreement with where the slot actually
+    listens. And the `unix:` form is **rejected at validation time** on Windows rather than accepted
+    and silently ignored, because the same `-b` argument there means a named pipe that this backend
+    does not drive. The path-length check accounts for the per-slot suffix, so a prefix that fits
+    for slot 0 but not slot 11 is a startup error rather than a late surprise. The startup probe
+    connects through the slot's endpoint, which is the only probe that proves the *client* can
+    reach the address rather than that something is listening somewhere.
+
 27. **With a real database in the request, the four arms converge — and the piped worker stops
     being behind.** One `SELECT` of one row from a local MariaDB, `p:`-prefixed persistent
     connections, 12 workers, concurrency 1→32: piped worker **2,073 / 4,085 / 7,844 / 12,987 /

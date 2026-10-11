@@ -356,6 +356,23 @@ pub struct SpawnCgiConfig {
     #[serde(default = "default_base_port")]
     pub base_port: u16,
 
+    /// Bind unix sockets instead of TCP, where the platform has them.
+    ///
+    /// This is a path **prefix**, not a finished path: slot `i` binds
+    /// `<prefix>.<i>.sock`, for the same reason each TCP slot needs its own port
+    /// — `php-cgi` processes one request at a time, and one socket per process is
+    /// what lets a slot be recycled, counted and reasoned about on its own.
+    ///
+    /// `php-cgi -b` accepts an `AF_UNIX` path on any non-Windows platform because
+    /// `fcgi_listen` (`main/fastcgi.c`) only falls back to TCP when the argument
+    /// contains a `:` or is all digits. On Windows the same code path is a named
+    /// pipe, which is a different feature, so this option is rejected there at
+    /// validation time rather than accepted and ignored.
+    ///
+    /// `bind_host` and `base_port` are unused when this is set.
+    #[serde(default)]
+    pub socket: Option<String>,
+
     /// Recycle a slot after this many requests, the equivalent of php-fpm's
     /// `pm.max_requests`. **`0` means never recycle**, as it does there.
     #[serde(default)]
@@ -531,6 +548,10 @@ impl Config {
                 }
             }
             BackendConfig::SpawnCgi(c) => {
+                if let Some(socket) = &c.socket {
+                    validate_cgi_socket(socket)
+                        .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
+                }
                 if c.bind_host != "127.0.0.1" && c.bind_host != "::1" {
                     return bad(format!(
                         "bind_host {:?} is not loopback; php-cgi should never be exposed",
@@ -550,6 +571,59 @@ pub enum Listener {
     Tcp(SocketAddr),
     /// `unix:/path/to.sock`
     Unix(PathBuf),
+}
+
+/// The longest `sun_path` a unix socket may bind, in bytes.
+///
+/// `sockaddr_un` is 110 bytes on Linux with a 2-byte `sun_family`, so 108 usable
+/// for the path including its NUL terminator; 107 is the portable maximum. The
+/// kernel truncates anything longer rather than failing, which would bind a path
+/// nobody asked for, so the check is explicit.
+pub const UNIX_SOCKET_PATH_MAX: usize = 107;
+
+/// Validate a `spawn_cgi` `socket` prefix.
+///
+/// The value is a prefix rather than a finished path because the pool appends
+/// `.<slot>.sock` — see [`SpawnCgiConfig::socket`]. The per-slot suffix is
+/// accounted for here so a prefix that only fits because of a low slot number is
+/// rejected at startup rather than at the twelfth worker.
+pub fn validate_cgi_socket(spec: &str) -> std::result::Result<(), String> {
+    let path = spec.strip_prefix("unix:").ok_or_else(|| {
+        format!("{spec:?} must start with `unix:`, e.g. `unix:/run/stokehold/cgi`")
+    })?;
+    if path.is_empty() {
+        return Err("unix socket path is empty".to_string());
+    }
+    if !path.starts_with('/') {
+        return Err(format!(
+            "unix socket path {path:?} must be absolute; php-cgi's working directory is not ours"
+        ));
+    }
+    if path.contains('\0') {
+        return Err("unix socket path contains a NUL byte".to_string());
+    }
+    if cfg!(not(unix)) {
+        return Err(format!(
+            "unix sockets are not available on this platform, so {spec:?} cannot be used; \
+             php-cgi's `-b` binds a named pipe here, which this backend does not drive — \
+             drop `socket` to use loopback TCP"
+        ));
+    }
+    // `.<slot>.sock`: a dot, up to 10 digits of `u32`, then ".sock".
+    let worst_case = path.len() + 1 + 10 + 5;
+    if worst_case > UNIX_SOCKET_PATH_MAX {
+        return Err(format!(
+            "unix socket path {path:?} is too long: with the per-slot suffix a worker would need \
+             up to {worst_case} bytes and the platform allows {UNIX_SOCKET_PATH_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+/// The socket path slot `index` binds, given a `unix:` prefix.
+pub fn cgi_socket_path(prefix: &str, index: u32) -> PathBuf {
+    let base = prefix.strip_prefix("unix:").unwrap_or(prefix);
+    PathBuf::from(format!("{base}.{index}.sock"))
 }
 
 /// Parse a listener endpoint from either `host:port` or `unix:/path`.
@@ -668,6 +742,76 @@ bind_host = "0.0.0.0"
         assert!(parse_listener("unix:").is_err());
         assert!(parse_listener("").is_err());
         assert!(parse_listener("nonsense").is_err());
+    }
+
+    #[test]
+    fn parses_a_spawn_cgi_unix_socket() {
+        let text = r#"
+default_backend = "cgi"
+[server]
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "php-cgi"
+socket = "unix:/run/stokehold/cgi"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        match &config.backends["cgi"] {
+            BackendConfig::SpawnCgi(cgi) => {
+                assert_eq!(cgi.socket.as_deref(), Some("unix:/run/stokehold/cgi"));
+                // Defaults still present, so a TCP fallback stays expressible.
+                assert_eq!(cgi.base_port, 19_001);
+            }
+            other => panic!("expected spawn_cgi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cgi_socket_prefix_is_validated() {
+        // On Windows the platform check fires first; elsewhere these are the path
+        // checks, so assert only on what must hold everywhere.
+        let err = validate_cgi_socket("/run/stokehold/cgi").expect_err("no unix: prefix");
+        assert!(err.contains("unix:"), "{err}");
+
+        let err = validate_cgi_socket("unix:").expect_err("empty path");
+        assert!(err.contains("empty"), "{err}");
+
+        let err = validate_cgi_socket("unix:relative/cgi").expect_err("relative path");
+        assert!(err.contains("absolute"), "{err}");
+
+        if cfg!(unix) {
+            validate_cgi_socket("unix:/run/stokehold/cgi").expect("a plain absolute path is valid");
+            // A path that looks finished is still just a prefix, which is the
+            // documented contract — it binds `/run/php.sock.0.sock`.
+            validate_cgi_socket("unix:/run/php.sock").expect("a finished-looking path is a prefix");
+        }
+    }
+
+    #[test]
+    fn a_socket_path_that_only_fits_before_the_suffix_is_rejected() {
+        // 107 is the portable `sun_path` maximum; the check must account for the
+        // `.<slot>.sock` the pool appends, or slot 0 binds and slot 11 fails.
+        let fits = format!("unix:{}", "a".repeat(UNIX_SOCKET_PATH_MAX - "..sock".len() - 1));
+        let too_long = format!("unix:{}", "a".repeat(UNIX_SOCKET_PATH_MAX));
+        if cfg!(unix) {
+            validate_cgi_socket(&fits).expect("a path with room for the suffix is accepted");
+            assert!(
+                validate_cgi_socket(&too_long).is_err(),
+                "a path that leaves no room for the suffix must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cgi_socket_path_appends_the_slot() {
+        assert_eq!(
+            cgi_socket_path("unix:/run/stokehold/cgi", 0),
+            PathBuf::from("/run/stokehold/cgi.0.sock")
+        );
+        assert_eq!(
+            cgi_socket_path("unix:/run/stokehold/cgi", 11),
+            PathBuf::from("/run/stokehold/cgi.11.sock")
+        );
     }
 
     fn routed_config() -> Config {

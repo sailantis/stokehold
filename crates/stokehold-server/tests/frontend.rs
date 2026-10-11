@@ -114,6 +114,7 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
                 workers: 1,
                 bind_host: "127.0.0.1".to_string(),
                 base_port,
+                socket: None,
                 max_requests: None,
             }),
         )]

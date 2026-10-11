@@ -591,6 +591,41 @@ against the specification and secondary implementations, and are confirmed by fi
     That SIGTERM leak was the *other* bug found the same way, and it is the same shape: a correct-
     looking configuration (`Ctrl-C works`) with a silently wrong failure mode (`kill` does not).
 
+30. **On a real page the FastCGI arms lose most of their throughput to loopback TCP, and a unix socket
+    gets it back — so hazard 23's "the TCP path pulls away" was partly a TCP artifact.** Hazard 23
+    measured `spawn_cgi` over TCP beating the piped worker at high concurrency and concluded that
+    "what separates them is later: the CGI arm keeps scaling to 32 while the piped arm plateaus at
+    ~21k". That plateau was hazard 25's thread-per-request cost and is gone. What hazard 23 did *not*
+    isolate is the transport: it compared a piped worker against a TCP CGI arm, so the transport and
+    the SAPI moved together.
+
+    Measured on the framework page (`GET /items`, one ORM query plus a template render), 12 slots,
+    concurrency 1, same server, same model, same SAPI, only the transport differing:
+
+    | transport | rps | p50 | p75 | stdev |
+    |---|---|---|---|---|
+    | loopback TCP | 138 | 3.43 ms | 21.77 ms | 13.5 ms |
+    | unix socket | **283** | 3.17 ms | 3.30 ms | 6.8 ms |
+
+    A 2.05x difference at concurrency 1, and the shape is diagnostic rather than incidental: the p50 is
+    the same while the TCP arm's p75 is **6.6x** the unix arm's, on identical work. An unchanged median
+    plus a ~40 ms tail is a timer-based stall, and 40 ms is the Linux **delayed-ACK** timer rather than
+    the RTO, which starts in the hundreds of milliseconds — a response needing more than one write
+    waits for the peer's delayed acknowledgement. It scales with how many chunks the response is written
+    in, which is why `/` (5 KB) shows **1.0x** T/U and `/items` (10 KB) collapses; a unix socket has no
+    Nagle and no delayed ACK. Note that the mechanism is the evidence rather than the two data points —
+    what the run shows directly is the shape (identical p50, a 40 ms tail, 1.0x on the small endpoint
+    and 3.5x at c=1 / 29x at c=32 on the large one), with server, model, SAPI and entry script held
+    equal.
+
+    Two consequences. First, **`spawn_cgi` over loopback TCP should not be the recommended
+    configuration on Linux** where a unix socket is available; this is the concrete reason
+    `socket = "unix:..."` exists (hazard 26), and it is worth far more than the loopback hop it was
+    justified by. Second, **any earlier FastCGI measurement taken over TCP understates its arm**, so
+    the piped worker's standing against the FastCGI arms (hazards 22, 23, 25, 27) is at least as good
+    as those figures say. The `/`-endpoint figures in this repository are unaffected: same arms, same
+    host, and the response is small enough that the write fits the first segment.
+
 ## 6. Phases
 
 Phase 0 — skeleton and baseline

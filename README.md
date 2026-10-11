@@ -195,6 +195,9 @@ reach the front controller still does, so upgrading does not change an existing 
 enabled = true
 ```
 
+The document root is the same `--document-root` that routing already resolves scripts against, so
+one flag describes the whole site.
+
 A request is then answered from disk when the path names a real file under the document root, and
 goes to PHP when it does not. `/assets/app.css` is a file; `/about` is not, so the front controller
 still sees it. That one sentence is the whole rule.

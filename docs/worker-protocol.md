@@ -172,11 +172,14 @@ server  ──HELLO (version)─────────────────
 The worker's `protocol_version` is checked **here**, at boot, not on the first request: a
 mismatched SDK is a configuration problem and should look like one.
 
-`runtime` identifies the implementation and its **package** version, as
-`stokehold-worker-php/0.1.0`. The package version is not the protocol version: the protocol is
-`1` and moves only when the wire format does, while the package version moves on every release.
-A server that does not care about the field ignores it, since it is a free-form string; a server
-that does can report which SDK build a worker is running without shelling into the host.
+`runtime` identifies the implementation and the **build** it is running, as
+`stokehold-worker-php/7c6945f`. The build is not the protocol version: the protocol is `1` and moves only
+when the wire format does, while the build names one particular checkout or release of the SDK. A server
+that does not care about the field ignores it, since it is a free-form string; a server that does can
+report which SDK build a worker is running without shelling into the host.
+
+A worker reports `unknown` when nothing can tell it what it is — a bare `php worker.php` with no Composer
+around it. That is a diagnostic gap, not an error, and a server must not treat it as one.
 
 The field is deliberately reused rather than added. A new field would be a change to the wire
 format and would require a protocol version bump — a breaking change to discover a string that

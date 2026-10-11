@@ -192,6 +192,35 @@ impl CgiPool {
         command
             .arg("-b")
             .arg(format!("{}:{port}", self.bind_host))
+            // php-cgi's own preforking, which does not compose with this pool.
+            //
+            // A `php-cgi` started with `-b` is not one process: it is a parent
+            // that spawns `PHP_FCGI_CHILDREN` children, all sharing the one bound
+            // socket, and the parent's accept loop distributes connections
+            // between them. Left at its default that is 20 on a 12-core machine
+            // — measured here, and inherited, because php-cgi reads the variable
+            // from *its* environment (sapi/cgi/cgi_main.c) and a deployment that
+            // sets it for php-fpm hands it to us too.
+            //
+            // The pool already decides how many PHP processes exist, and each
+            // slot is meant to be one process with one port so it can be
+            // recycled, counted and reasoned about. 20 hidden children under it
+            // make `workers` a lie: the slot looks idle while 20 requests run,
+            // `max_requests` never matches what php-fpm would call a request
+            // count, killing a slot does not stop the work its children are
+            // doing, and every test silently starts 21 processes instead of 1.
+            //
+            // `0`, not `1`: php-cgi spawns "CHILDREN" *children in addition to
+            // itself*, so `1` means two processes per slot. Measured against
+            // php-cgi 8.3.31 — `0` gives exactly one process, `1` gives two.
+            //
+            // `max_requests = 0` is the matching statement on the child side:
+            // php-cgi exits a child after 500 requests by default, and its own
+            // check is `if (max_requests && requests == max_requests)`, so 0
+            // means never. Recycling is the pool's decision here, so that
+            // `max_requests` means the same thing for every backend.
+            .env("PHP_FCGI_CHILDREN", "0")
+            .env("PHP_FCGI_MAX_REQUESTS", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

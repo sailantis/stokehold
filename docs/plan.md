@@ -104,6 +104,8 @@ opt-in and only when configured.
 | HTTP front-end runtime | **`hyper` on `tokio`, confined to `crates/stokehold-http`** — the target is the public-facing case (static files, HTTP/2 now, HTTP/3 later), and HTTP/3 needs `quinn`, which is itself a `tokio` program. So the runtime was arriving anyway; this is that bet made earlier rather than a second one. Every backend stays blocking and is reached only through `spawn_blocking` |
 | PHP floor | **8.2** — the floor is `memory_reset_peak_usage()`, which the SDK calls to make each `END` report that request's peak rather than a high-water mark that never falls. 8.1 was never verified, and azera and clarity already require 8.2+, so one floor across the stack beats three |
 | Static files | **In the HTTP front-end, above the backends, off by default** — a path naming a file is answered from disk, a path naming nothing is dispatched. Streaming through `tokio::fs` rather than zero-copy: `sendfile` is Unix-only, so it would be a second code path rather than a faster one |
+| Where the document root lives | **`server.document_root`, with the `--document-root` flag overriding it** — a deployment fact belongs in the file a systemd unit already reads, and the more specific statement (the flag) is the one that takes effect. Same rule for `front_controller`. An empty file value is **rejected** rather than given a meaning, because TOML cannot distinguish it from an absent key |
+| Configuration reload | **Not built** — see open decision 5. Restarting the process is the honest answer until the dispatcher can be reloaded whole rather than in part |
 
 ## 4. Worker protocol (own protocol)
 
@@ -269,6 +271,70 @@ against the specification and secondary implementations, and are confirmed by fi
     with `SizeHint::with_exact` rather than more bytes than were promised — a mismatch desynchronises
     the connection rather than merely being wrong. The streaming body in `static_files.rs` keeps its
     own remaining-byte count for exactly this reason.
+13. **TOML cannot express "set, but empty".** `front_controller = ""` and an absent
+    `front_controller` deserialize to the same thing, so an empty value cannot be given a meaning
+    distinct from the default. Rather than guessing which the operator meant, the value is
+    *rejected* with a message pointing at the command-line flag that does mean "no front
+    controller" — and `stokehold check` reports the resolved controller so the effective value is
+    always visible. The general rule: when a config format cannot distinguish two states, refuse
+    the ambiguous input instead of picking a winner.
+14. **A preflight hint is a claim about the rest of the system, so test it against the rest of the
+    system.** The first version of the missing-front-controller hint told the operator to write
+    `server.front_controller = ""`, which `Config::validate` rejects — a warning whose advice fails
+    when followed. `crates/stokehold-core/src/preflight.rs` has a test asserting no hint
+    recommends a value validation refuses, because the two were written separately and nothing else
+    connects them.
+15. **A static file server must refuse to serve a script, or it discloses source code.** The static
+    layer answers a path that names any existing file, and `.php` source is a perfectly valid
+    response body — so `GET /index.php` returned the program rather than running it, with a 200 and
+    a plausible `Content-Type`, and nothing downstream could tell. Worse, this was **missed by the
+    test suite for a structural reason**: the shared fixture never wrote an `index.php`, so the
+    assertion `"/index.php" → not a file` passed because the file was absent, not because the rule
+    existed. A test that asserts a refusal must create the thing being refused. The rule now shares
+    `stokehold_fcgi::cgi::has_php_extension` with the routing layer, because two lists of "what is a
+    script" would drift and the one that drifted would be the one serving source. It also makes
+    `/index.php/foo` work, which is the `PATH_INFO` case a deployment needs.
+16. **A relative document root silently breaks a *persistent* PHP pool after the first request.**
+    `php-cgi` `chdir()`s into the directory of the script it executed, and the pool keeps the
+    process, so from the second request on a relative `SCRIPT_FILENAME` resolves against the
+    previous request's directory and PHP answers `No input file specified`. Verified against
+    php-cgi 8.3.31: the identical path succeeds once and fails every time afterwards — which also
+    means a single-request test cannot see it. The CLI therefore absolutises the document root
+    before it builds the CGI environment. This is *not* something nginx has to do, because nginx
+    does not cache a `chdir` across requests.
+17. **`php-cgi -b` is not one process, and `PHP_FCGI_CHILDREN` is inherited from the environment.**
+    The plan's Windows note ("`PHP_FCGI_CHILDREN` relies on `fork()` and cannot work there") is
+    **wrong about the mechanism**: on Windows php-cgi re-spawns itself with `CreateProcess`, up to
+    `WIN32_MAX_SPAWN_CHILDREN` (64) of them, and all of them share the single bound socket. So
+    `php-cgi -b host:port` gives *one slot's worth of concurrency* rather than one process, and the
+    count is read from php-cgi's own environment (`sapi/cgi/cgi_main.c`) — a host that exports
+    `PHP_FCGI_CHILDREN` for php-fpm silently hands it to stokehold too. Measured on this machine:
+    `workers = 2` produced **21 processes** (one parent plus 20 children per slot, 20 being the
+    inherited value). The pool now sets `PHP_FCGI_CHILDREN=0` (`0`, not `1`: php-cgi spawns
+    CHILDREN *children in addition to itself*) and `PHP_FCGI_MAX_REQUESTS=0`, because PHP's own
+    check is `if (max_requests && requests == max_requests)` and its default is 500 — so without
+    the second variable a child exits and is silently replaced while stokehold's `max_requests`
+    accounting keeps counting. That made every pool test start 21 processes instead of 1, which is
+    also an excellent way to make an integration suite flaky.
+18. **A test helper that waits for a specific banner field hangs on a config that does not set it.**
+    The CLI tests parsed the startup banner and returned only once the *FastCGI* address had been
+    seen. A test configuring only `http` therefore never satisfied the condition, and because it
+    used `read_line` — which has no timeout — on a pipe the server never closes, the loop's own
+    deadline was never re-checked. The symptom was a test that hung for ever instead of failing,
+    which is strictly worse than a failure: it hides the assertion it was about to make. The
+    requirement is now "any listener was reported".
+19. **Routing must only treat a script as a script, and must not hand PHP a dotfile.** `php-cgi`
+    does not check that the file it is given is PHP: handed a file it cannot parse it emits it
+    **verbatim with a 200**. Two rules keep that from turning the document root into a file server:
+    the script-boundary split requires a PHP extension (so `/config.json` is application input
+    rather than a script), and a path with a dotfile component is 404 before the front-controller
+    fallback (so `/.env` is not answered with its own contents as `PATH_INFO`). Found by hand,
+    not by a test: `GET /.env` returned the secrets in it *with static serving switched off*, so
+    the static layer's dotfile rule never applied, and `POST /assets/app.css` returned the file
+    because the static layer deliberately only handles `GET`/`HEAD`/`OPTIONS` and routing then
+    dispatched the stylesheet as a script. The tests that existed could not catch it: their fixture
+    never wrote a non-PHP file, and the FastCGI tests drive routing through a client-built CGI
+    environment.
 
 ## 6. Phases
 
@@ -333,7 +399,17 @@ Phase 6 — front-ends
     step 19 because it is a feature rather than a translation layer, and because it is what turns
     "serves PHP" into "can front a site". See `crates/stokehold-http/src/static_files.rs`, and
     hazards 11 and 12.
-21. `config-cli` — `stokehold serve|check|version`, TOML loading, validation and diagnostics.
+21. `config-cli` — **done**. `stokehold serve|check|version`. The gap this closed was that the two
+    settings that describe a deployment most concretely — the document root and the front
+    controller — existed only as `serve` flags, so a systemd unit or a container image had to carry
+    a command line to say where the application lived. Both are now `server.document_root` and
+    `server.front_controller`, with **a flag winning over the file**. `version` prints the worker
+    protocol version and the PHP floor from constants next to the code they describe, so a build
+    cannot claim a floor it does not have. `check` gained preflight warnings that need the
+    filesystem rather than the file — is the document root there, is the front controller actually
+    present, is a discovered PHP below the worker floor — reported as warnings rather than errors,
+    because a document root that does not exist yet is a normal thing to check. Reload was
+    deliberately **not** built: see open decision 5.
 
 Phase 7 — packaging
 22. `packaging-ci` — release artifacts per target, systemd unit, Windows service notes, CI
@@ -378,6 +454,15 @@ Later milestone
 4. **Static file serving** in the HTTP front-end: minimal `static` middleware, or out of scope
    for v1? — **Answered: in scope, as its own routing layer above the backends, off by default.**
    See step 20 and the Static files section of the README.
+5. **Configuration reload.** Re-reading `stokehold.toml` on `SIGHUP` without dropping a connection
+   is the obvious next thing an operator asks for, and it is **not** built. The reason is that
+   only part of the file can be reloaded in place: listeners are bound, backends are running
+   processes with live pipes, and both front-ends hold the dispatcher behind a handle. Reloading
+   routes or static settings into a *running* dispatcher needs the dispatcher to be re-readable
+   rather than owned, which is a real change to how `serve` holds it — so the honest options are
+   (a) leave it out and restart the process, (b) reload only what is cheap, or (c) make the
+   dispatcher a reloadable handle. Pick deliberately rather than growing a half-reload that
+   changes some settings and silently ignores others.
 
 ## 9. Notes
 
@@ -387,5 +472,10 @@ Later milestone
 - **Windows needs N processes on N ports.** `PHP_FCGI_CHILDREN` relies on `fork()` and cannot
   work there; `SO_REUSEADDR` on one port does not load-balance on Windows. One slot per
   process, one port per slot. Worker mode avoids this entirely by using pipes.
+  — **Corrected in hazard 17:** `fork()` is not the mechanism (Windows php-cgi re-spawns itself
+  with `CreateProcess`, and does honour `PHP_FCGI_CHILDREN`), but the *conclusion* holds and one
+  process per port is still right: the children share one socket, so the slot cannot be recycled,
+  counted or killed as a unit. The pool now forces `PHP_FCGI_CHILDREN=0` to say so explicitly
+  rather than relying on the host not having exported it.
 - **The plan lives in `docs/` in the repo** so it can be opened and commented on in VS Code,
   which was the friction that blocked review of the previous plan.

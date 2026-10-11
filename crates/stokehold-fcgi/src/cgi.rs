@@ -102,6 +102,14 @@ pub fn route(path: &str, routing: &Routing) -> Route {
 
     match &routing.front_controller {
         Some(front) => {
+            // A dotfile must not be handled by the application either. PHP is
+            // the one interpreter that will happily emit a file it cannot parse,
+            // so a front controller handed `/.env` as its PATH_INFO answers with
+            // whatever is in it. Hiding one is the same decision the static layer
+            // makes, for the same reason.
+            if relative.split('/').any(|part| part.starts_with('.')) {
+                return Route::NotFound;
+            }
             let script_filename = routing.document_root.join(front);
             Route::Script {
                 script_filename,
@@ -113,7 +121,15 @@ pub fn route(path: &str, routing: &Routing) -> Route {
     }
 }
 
-/// Find the longest leading path segment sequence that names an existing file.
+/// Find the longest leading path segment sequence that names an existing script.
+///
+/// The `has_php_extension` check is the whole point. Without it this matches any
+/// file, and php-cgi does not verify that a script is PHP: given a file it cannot
+/// parse it emits the file verbatim with a 200. So a front-controller deployment
+/// would hand `/config.json` and `/.env` to PHP and return their contents.
+/// Requiring the extension means PHP is only ever asked to run something it is
+/// meant to run, and every other path falls through to the front controller as
+/// application input.
 fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, &'a str)> {
     let mut boundaries: Vec<usize> = relative
         .match_indices('/')
@@ -126,6 +142,9 @@ fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, 
         if head.is_empty() {
             continue;
         }
+        if !has_php_extension(head) {
+            continue;
+        }
         let candidate = routing.document_root.join(head);
         if candidate.is_file() {
             let rest = relative[boundary..].trim_start_matches('/');
@@ -135,7 +154,11 @@ fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, 
     None
 }
 
-fn has_php_extension(path: &str) -> bool {
+/// Whether a path names something PHP is expected to execute.
+///
+/// Shared with the static layer, which must not serve one of these as a file:
+/// serving `index.php` from disk sends its *source* to the client.
+pub fn has_php_extension(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.ends_with(".php") || lower.ends_with(".php3") || lower.ends_with(".phtml")
 }
@@ -410,6 +433,85 @@ mod tests {
             }
             other => panic!("expected a split, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dotfile does not reach the application either, only the static layer.
+    ///
+    /// `/.env` travels as PATH_INFO otherwise, and the front controller answers
+    /// with the file's contents.
+    #[test]
+    fn a_dotfile_does_not_reach_the_application() {
+        let root = fixture("dotapp", &[("index.php", "<?php")]);
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+
+        for path in ["/.env", "/.git/config", "/sub/.hidden", "/.well-known"] {
+            assert_eq!(route(path, &routing), Route::NotFound, "{path}");
+        }
+        // An ordinary path still reaches the front controller.
+        match route("/about", &routing) {
+            Route::Script { script_name, .. } => assert_eq!(script_name, "/index.php"),
+            other => panic!("expected the front controller, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only a script may be handed to PHP as the script.
+    ///
+    /// php-cgi does not check that a script is PHP: given a file it cannot parse
+    /// it emits it verbatim with a 200. So a route that matches any existing file
+    /// turns the document root into a file server by accident — verified by
+    /// hand, `GET /.env` returned the secrets in it even with static file serving
+    /// switched off.
+    #[test]
+    fn a_non_php_file_is_never_routed_to_php_as_a_script() {
+        let root = fixture(
+            "nonphp",
+            &[
+                ("index.php", "<?php"),
+                ("assets/app.css", "body{margin:0}"),
+                ("config.json", "{\"secret\":1}"),
+                (".env", "SECRET=1"),
+            ],
+        );
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+
+        // A stylesheet and a JSON file must go to the front controller as
+        // *input*, never be used as the script themselves.
+        for path in ["/assets/app.css", "/config.json"] {
+            match route(path, &routing) {
+                Route::Script { script_name, .. } => {
+                    assert_eq!(script_name, "/index.php", "{path} must not be the script");
+                }
+                other => panic!("{path}: expected the front controller, got {other:?}"),
+            }
+        }
+
+        // A dotfile never reaches PHP at all.
+        assert_eq!(route("/.env", &routing), Route::NotFound);
+
+        // PATH_INFO still works after a real script.
+        match route("/index.php/foo", &routing) {
+            Route::Script {
+                script_name,
+                path_info,
+                ..
+            } => {
+                assert_eq!(script_name, "/index.php");
+                assert_eq!(path_info, "/foo");
+            }
+            other => panic!("expected a split, got {other:?}"),
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

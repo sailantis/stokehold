@@ -4,6 +4,7 @@
 //! so both front-ends have a single call to make. See `docs/plan.md` §3.
 
 pub mod backend;
+pub mod build;
 pub mod dispatch;
 pub mod error;
 pub mod frontend;
@@ -13,6 +14,7 @@ pub mod pool;
 pub mod worker_pool;
 
 pub use backend::Backend;
+pub use build::{MINIMUM_PHP_VERSION, WORKER_PROTOCOL_VERSION};
 pub use dispatch::Dispatcher;
 pub use error::{Result, ServerError};
 pub use frontend::fastcgi::{self, IncomingRequest};

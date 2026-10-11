@@ -109,15 +109,31 @@ impl Server {
     /// `--document-root` is one of those: it is what routing *and* static serving
     /// resolve against, so a test that writes a file elsewhere has to say so.
     fn start_with(binary: &Path, config: &Path, extra: &[&str]) -> Option<Self> {
-        let child = Command::new(binary)
+        Server::spawn(binary, config, extra, None)
+    }
+
+    /// Start the server with a working directory of its own.
+    ///
+    /// Needed to test a *relative* document root: the path is relative to the
+    /// process's working directory, so the child has to be started where the
+    /// fixture lives.
+    fn start_in(binary: &Path, config: &Path, cwd: &Path) -> Option<Self> {
+        Server::spawn(binary, config, &[], Some(cwd))
+    }
+
+    fn spawn(binary: &Path, config: &Path, extra: &[&str], cwd: Option<&Path>) -> Option<Self> {
+        let mut command = Command::new(binary);
+        command
             .arg("serve")
             .arg("--config")
             .arg(config)
             .args(extra)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(Stdio::null());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let child = command.spawn().ok()?;
 
         let mut server = Server {
             child,
@@ -149,7 +165,17 @@ impl Server {
                 if !address.is_empty() && address != "(disabled)" {
                     server.http_address = Some(address.to_string());
                 }
-            } else if trimmed.starts_with("press Ctrl-C") && !server.address.is_empty() {
+            } else if trimmed.starts_with("press Ctrl-C") {
+                // The banner ends here, and this is the last line printed before
+                // the listeners serve. Which addresses appear depends on the
+                // configuration, so the requirement is that *something* was
+                // reported — not that a particular listener was. Waiting for the
+                // FastCGI address specifically hangs a config that has only
+                // `http`, and it hangs *silently*: `read_line` has no timeout, so
+                // the deadline above is never re-checked while it blocks.
+                if server.address.is_empty() && server.http_address.is_none() {
+                    break;
+                }
                 return Some(server);
             }
         }
@@ -254,6 +280,9 @@ fn params_for(root: &Path, uri: &str, body_len: usize) -> Vec<(Vec<u8>, Vec<u8>)
 }
 
 /// Write the config the server will read, then start it.
+///
+/// The document root is written into the config rather than passed as a flag:
+/// this is the path a deployment takes, and the flag is only the override.
 fn start_server(
     binary: &Path,
     php_cgi: &Path,
@@ -262,8 +291,9 @@ fn start_server(
     base_port: u16,
 ) -> Option<Server> {
     let config_path = root.join("stokehold.toml");
+    let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"cgi\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {binary:?}\nworkers = {workers}\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
+        "default_backend = \"cgi\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {binary:?}\nworkers = {workers}\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
         binary = php_cgi.display().to_string(),
     );
     std::fs::write(&config_path, config).expect("write the config");
@@ -309,8 +339,9 @@ fn toml_string(value: &str) -> String {
 fn start_worker_server(binary: &Path, root: &Path) -> Option<Server> {
     let config_path = root.join("stokehold.toml");
     let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"app\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+        "default_backend = \"app\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
     );
     std::fs::write(&config_path, config).expect("write the config");
     Server::start(binary, &config_path)
@@ -320,8 +351,9 @@ fn start_worker_server(binary: &Path, root: &Path) -> Option<Server> {
 fn start_dual_listener_server(binary: &Path, root: &Path) -> Option<Server> {
     let config_path = root.join("stokehold.toml");
     let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
     );
     std::fs::write(&config_path, config).expect("write the config");
     Server::start(binary, &config_path)
@@ -731,21 +763,18 @@ fn serve_reaches_a_persistent_php_worker_over_the_stokehold_protocol() {
 
 /// Start the server with both listeners, a worker backend and static files.
 ///
-/// The document root is the temp directory the test writes its own file into, so
-/// the file is served by the *shipped binary* reading the *shipped config* —
-/// nothing about this path is exercised only in a library test.
+/// The document root is written into the config, so the file served by the
+/// *shipped binary* is resolved from the *shipped config* — nothing about the
+/// path is passed on a command line.
 fn start_static_server(binary: &Path, root: &Path) -> Option<Server> {
     let config_path = root.join("stokehold.toml");
     let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let document_root = toml_string(&root.display().to_string());
     let config = format!(
-        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\n\n[server.static_files]\nenabled = true\ncache_control = \"public, max-age=60\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[server.static_files]\nenabled = true\ncache_control = \"public, max-age=60\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
     );
     std::fs::write(&config_path, config).expect("write the config");
-    Server::start_with(
-        binary,
-        &config_path,
-        &["--document-root", &root.display().to_string()],
-    )
+    Server::start_with(binary, &config_path, &[])
 }
 
 /// The static layer, end to end through the shipped binary.
@@ -806,4 +835,160 @@ fn serve_serves_a_static_file_and_still_reaches_php_for_a_route() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A config that describes the whole deployment, and a flag that overrides part
+/// of it — which is the rule the CLI documents.
+///
+/// Two document roots exist, and each holds a front controller that says which
+/// one ran. That matters because the file and the flag are both plausible places
+/// to set the root, and "which wins" has to be observable rather than assumed.
+#[test]
+fn the_command_line_document_root_overrides_the_one_in_the_file() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built (run `cargo build`)");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("stokehold-override-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let from_file = root.join("from-file");
+    let from_flag = root.join("from-flag");
+    std::fs::create_dir_all(&from_file).expect("create the configured root");
+    std::fs::create_dir_all(&from_flag).expect("create the override root");
+    std::fs::write(from_file.join("index.php"), "<?php echo \"FILE\";")
+        .expect("write the configured front controller");
+    std::fs::write(from_flag.join("index.php"), "<?php echo \"FLAG\";")
+        .expect("write the overriding front controller");
+
+    let config_path = root.join("stokehold.toml");
+    let document_root = toml_string(&from_file.display().to_string());
+    let config = format!(
+        "default_backend = \"cgi\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {cgi:?}\nworkers = 1\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
+        cgi = php_cgi.display().to_string(),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start_with(
+        &binary,
+        &config_path,
+        &["--document-root", &from_flag.display().to_string()],
+    ) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+
+    let params = params_for(&from_flag, "/", 0);
+    let (status, _, body) = request(&server.address, &params, b"").expect("the request completed");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("FLAG"),
+        "the flag's document root must answer, not the file's: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A relative document root must survive a *second* request.
+///
+/// This drives the **HTTP** listener on purpose. The FastCGI tests build their
+/// own `SCRIPT_FILENAME` and hand it to stokehold, so they cannot see a bug in
+/// how stokehold derives one — the value under test never comes from stokehold
+/// at all. The HTTP front-end computes it from the document root, which is where
+/// the bug lived.
+///
+/// It also asks twice on purpose: `php-cgi` `chdir()`s into the script's
+/// directory and the pool keeps the process, so a relative root only breaks once
+/// a PHP request has already run. A single-request test passes either way.
+#[test]
+fn a_relative_document_root_keeps_working_after_the_first_request() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built (run `cargo build`)");
+        return;
+    };
+    let Some(php_cgi) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+    let Some(base_port) = free_port_run(1) else {
+        eprintln!("skipping: no free port");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("stokehold-relative-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("public")).expect("create the document root");
+    std::fs::write(
+        root.join("public/index.php"),
+        "<?php echo \"PATH_INFO=\", $_SERVER['PATH_INFO'] ?? '-';",
+    )
+    .expect("write the front controller");
+
+    // Deliberately relative, and the server is started from the directory it is
+    // relative to — exactly how an operator would write it. `Server::start_in`
+    // sets the child's working directory, so `"public"` resolves against the
+    // fixture rather than against wherever the test runner happens to be.
+    let config_path = root.join("stokehold.toml");
+    let config = format!(
+        "default_backend = \"cgi\"\n\n[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = \"public\"\n\n[backends.cgi]\nkind = \"spawn_cgi\"\nbinary = {cgi:?}\nworkers = 1\nbind_host = \"127.0.0.1\"\nbase_port = {base_port}\n",
+        cgi = php_cgi.display().to_string(),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start_in(&binary, &config_path, &root) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let Some(http_address) = server.http_address.clone() else {
+        panic!("the HTTP listener did not report an address; the banner was not parsed");
+    };
+
+    // The same URL, three times: the first request is the one that makes the
+    // difference, and the second is where a relative root would fail.
+    for attempt in 1..=3 {
+        let response = http_get(&http_address, "/some/route");
+        assert_eq!(
+            response.status, 200,
+            "request {attempt} failed: {response:?}"
+        );
+        assert!(
+            response.text().contains("PATH_INFO=/some/route"),
+            "request {attempt} did not reach the front controller: {}",
+            response.text()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `version` reports the build's own facts, so an operator can check the PHP
+/// floor from a shell without opening the documentation.
+#[test]
+fn version_prints_the_protocol_and_the_php_floor() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let output = Command::new(&binary)
+        .arg("version")
+        .output()
+        .expect("the version command runs");
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    assert!(text.contains("worker protocol"), "{text}");
+    assert!(
+        text.contains("php floor:        8.2"),
+        "the floor a build claims must be the floor it has: {text}"
+    );
+    assert!(text.contains("FastCGI"), "{text}");
 }

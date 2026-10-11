@@ -11,6 +11,21 @@ http = "127.0.0.1:8080"
 # nginx-facing listener; use a unix socket on Linux/macOS.
 fastcgi = "127.0.0.1:9080"
 
+# Where the application lives. Both of the next two keys are also `serve`
+# command-line flags, and a flag wins over the file -- so a systemd unit or a
+# container image can describe its whole deployment here instead of carrying
+# arguments. `stokehold check` prints the path and controller it actually
+# resolved, which is the fastest way to see what a running deployment uses.
+#
+# document_root = "./public"
+#
+# The front controller, relative to the document root. This is what keeps a
+# framework working: a path that names no file is given to this script, with
+# PATH_INFO set, instead of answering 404. Use `--front-controller ''` on the
+# command line for "only real .php files" -- an empty value is not written here,
+# because TOML cannot tell an empty string from an absent key.
+# front_controller = "index.php"
+
 # ---------------------------------------------------------------------------
 # Static files, served from the document root without waking PHP at all. This is
 # a routing layer above the backends: a path that names a real file under the

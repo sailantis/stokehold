@@ -105,7 +105,9 @@ impl Config {
     }
 }
 
-/// Listeners. Both are optional, but at least one must be configured.
+/// Server-wide settings: the listeners, plus how a request path becomes a script.
+///
+/// Both listeners are optional, but at least one must be configured.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -117,9 +119,54 @@ pub struct ServerConfig {
     #[serde(default)]
     pub fastcgi: Option<String>,
 
+    /// Directory that PHP scripts and static files are resolved against.
+    ///
+    /// A relative path is relative to the process's working directory, not to
+    /// this file — the same rule [`WorkerConfig::working_dir`] follows. Prefer
+    /// an absolute path: a deployment that sets its working directory elsewhere
+    /// would otherwise resolve somewhere else silently. `stokehold check` prints
+    /// the path it actually resolved.
+    ///
+    /// Unset means the `serve` command line decides, and failing that `.`.
+    #[serde(default)]
+    pub document_root: Option<PathBuf>,
+
+    /// Front controller, relative to the document root, e.g. `index.php`.
+    ///
+    /// This is what makes a front controller work: a path naming no file under
+    /// the document root is given to this script with `PATH_INFO` set, instead
+    /// of answering 404.
+    ///
+    /// Set it to the empty string to serve only real `.php` files, matching
+    /// nginx's `location ~ \.php$`. Unset means the `serve` command line
+    /// decides, and failing that `index.php`.
+    #[serde(default)]
+    pub front_controller: Option<String>,
+
     /// Serving files from the document root, without a backend.
     #[serde(default)]
     pub static_files: StaticConfig,
+}
+
+/// The front controller used when neither the config nor the command line says.
+pub const DEFAULT_FRONT_CONTROLLER: &str = "index.php";
+
+impl ServerConfig {
+    /// The effective front controller, or `None` for "serve only real files".
+    ///
+    /// The command line wins over this file, because a flag is the more specific
+    /// statement, and an empty value on either side means "no front controller".
+    pub fn resolve_front_controller(&self, from_command_line: Option<&str>) -> Option<String> {
+        let value = from_command_line
+            .or(self.front_controller.as_deref())
+            .unwrap_or(DEFAULT_FRONT_CONTROLLER);
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    }
 }
 
 /// How files under the document root are served.
@@ -353,6 +400,45 @@ impl Config {
             return Err(Error::Config(
                 "server.static_files is enabled but no server.http listener is configured; \
                  static content is served over HTTP, and a FastCGI client does its own"
+                    .to_string(),
+            ));
+        }
+        if self
+            .server
+            .document_root
+            .as_ref()
+            .is_some_and(|root| root.as_os_str().is_empty())
+        {
+            return Err(Error::Config(
+                "server.document_root is empty; set a directory or remove the key".to_string(),
+            ));
+        }
+        if self
+            .server
+            .front_controller
+            .as_ref()
+            .is_some_and(|front| front.trim().is_empty())
+        {
+            return Err(Error::Config(
+                "server.front_controller is empty, which is not how \"serve only real files\" is \
+                 written here — TOML has no way to tell an empty string from an absent key, so \
+                 the meaning is reserved. Remove the key to get the default, or use \
+                 `stokehold serve --front-controller ''` to mean \"only real files\"."
+                    .to_string(),
+            ));
+        }
+        if self.server.front_controller.as_ref().is_some_and(|front| {
+            let front = front.trim_start();
+            front.starts_with('/')
+                || front.contains('\\')
+                || Path::new(front)
+                    .components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir))
+        }) {
+            return Err(Error::Config(
+                "server.front_controller must be a relative path below the document root, e.g. \
+                 \"index.php\" or \"public/index.php\" — an absolute path, a `..` component or a \
+                 backslash would escape it"
                     .to_string(),
             ));
         }
@@ -810,5 +896,98 @@ enable = true
         // bug to diagnose from the outside, which is why the section denies
         // unknown fields like the rest of the model.
         assert!(Config::from_toml(text).is_err());
+    }
+
+    #[test]
+    fn a_deployment_can_be_described_entirely_in_the_file() {
+        // The point of these keys: a systemd unit or a container image should not
+        // have to carry a command line to say where the application lives.
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+document_root = "./public"
+front_controller = "public/index.php"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("config validates");
+        assert_eq!(
+            config.server.document_root.as_deref(),
+            Some(Path::new("./public"))
+        );
+        assert_eq!(
+            config.server.resolve_front_controller(None).as_deref(),
+            Some("public/index.php")
+        );
+    }
+
+    #[test]
+    fn the_command_line_front_controller_wins_over_the_file() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+front_controller = "index.php"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+
+        assert_eq!(
+            config
+                .server
+                .resolve_front_controller(Some("app.php"))
+                .as_deref(),
+            Some("app.php")
+        );
+        // An empty flag is not "unset": it is the operator asking for files only.
+        assert_eq!(config.server.resolve_front_controller(Some("   ")), None);
+    }
+
+    #[test]
+    fn the_front_controller_defaults_to_index_php() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        assert_eq!(
+            config.server.resolve_front_controller(None).as_deref(),
+            Some("index.php")
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_config_file_paths_and_a_front_controller_above_the_root() {
+        // An empty string in TOML is indistinguishable from an absent key, so
+        // "only real .php files" must be said on the command line, not here.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+front_controller = ""
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("front_controller"), "{err}");
+
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = ""
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("document_root"), "{err}");
+
+        for front in ["/etc/passwd", "../index.php", "a\\b.php"] {
+            let text =
+                format!("[server]\nhttp = \"127.0.0.1:8080\"\nfront_controller = {front:?}\n");
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(
+                err.to_string().contains("below the document root"),
+                "{front}: {err}"
+            );
+        }
     }
 }

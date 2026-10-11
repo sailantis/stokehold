@@ -38,13 +38,18 @@ enum Command {
         config: PathBuf,
 
         /// Document root that PHP scripts are resolved against.
-        #[arg(long, default_value = ".")]
-        document_root: PathBuf,
+        ///
+        /// Overrides `server.document_root`; without either, `.`.
+        #[arg(long)]
+        document_root: Option<PathBuf>,
 
-        /// Front controller, relative to the document root. Set it empty to
-        /// serve only actual files, matching nginx's `location ~ \.php$`.
-        #[arg(long, default_value = "index.php")]
-        front_controller: String,
+        /// Front controller, relative to the document root.
+        ///
+        /// Overrides `server.front_controller`; without either, `index.php`.
+        /// Set it empty to serve only actual files, matching nginx's
+        /// `location ~ \.php$`.
+        #[arg(long)]
+        front_controller: Option<String>,
 
         /// Maximum concurrent client connections.
         #[arg(long, default_value_t = 512)]
@@ -57,10 +62,17 @@ enum Command {
         #[arg(short, long, default_value = "stokehold.toml")]
         config: PathBuf,
 
+        /// Document root to check, overriding `server.document_root`.
+        #[arg(long)]
+        document_root: Option<PathBuf>,
+
         /// Extra directories to search for PHP binaries.
         #[arg(long = "php-dir")]
         php_dirs: Vec<PathBuf>,
     },
+
+    /// Print the version, the PHP floor, and the protocols this build speaks.
+    Version,
 }
 
 fn main() -> ExitCode {
@@ -73,8 +85,21 @@ fn main() -> ExitCode {
             document_root,
             front_controller,
             max_connections,
-        } => serve(&config, &document_root, &front_controller, max_connections),
-        Command::Check { config, php_dirs } => check(&config, &php_dirs).map_err(ServerError::from),
+        } => serve(
+            &config,
+            document_root.as_deref(),
+            front_controller.as_deref(),
+            max_connections,
+        ),
+        Command::Check {
+            config,
+            document_root,
+            php_dirs,
+        } => check(&config, document_root.as_deref(), &php_dirs).map_err(ServerError::from),
+        Command::Version => {
+            version();
+            Ok(())
+        }
     };
 
     match result {
@@ -89,6 +114,25 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `version` prints what is running, and what that build can do.
+///
+/// The PHP floor is here because it is a build fact an operator has to be able
+/// to check from a shell: a worker below it starts and then cannot be asked for
+/// a per-request peak. See `sdk/php/README.md`.
+fn version() {
+    println!("stokehold {}", env!("CARGO_PKG_VERSION"));
+    println!("  front-ends:       HTTP/1.1, HTTP/2 (cleartext), FastCGI");
+    println!(
+        "  worker protocol:  {}",
+        stokehold_server::WORKER_PROTOCOL_VERSION
+    );
+    println!(
+        "  php floor:        {}",
+        stokehold_server::MINIMUM_PHP_VERSION
+    );
+    println!("  backends:         worker, external fpm, spawn_fpm, spawn_cgi");
 }
 
 fn init_tracing(verbosity: u8) {
@@ -113,17 +157,45 @@ fn load_and_validate(path: &Path) -> Result<Config, ServerError> {
     Ok(config)
 }
 
-fn routing_for(document_root: &Path, front_controller: &str) -> Routing {
-    let front_controller = front_controller.trim();
+fn routing_for(document_root: &Path, front_controller: Option<&str>) -> Routing {
     Routing {
         document_root: document_root.to_path_buf(),
-        front_controller: if front_controller.is_empty() {
-            None
-        } else {
-            Some(front_controller.to_string())
-        },
+        front_controller: front_controller.map(str::to_string),
         ..Routing::default()
     }
+}
+
+/// The document root in effect: the flag, else the file, else the working
+/// directory.
+///
+/// The order matters and is stated once, here, so `serve` and `check` cannot
+/// disagree about which root will be used — `check` reports on the deployment
+/// `serve` would actually start.
+fn resolve_document_root(flag: Option<&Path>, config: &Config) -> PathBuf {
+    flag.map(Path::to_path_buf)
+        .or_else(|| config.server.document_root.clone())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Absolutise the document root, because a relative one silently breaks PHP.
+///
+/// `SCRIPT_FILENAME` is built by joining this root, and `php-cgi` runs in a
+/// persistent pool: it `chdir()`s into the directory of the script it executed.
+/// A relative root therefore resolves against the *previous* request's
+/// directory from the second request onwards, and the answer is `No input file
+/// specified` — verified against php-cgi 8.3.31, where the same path succeeds
+/// once and fails every time after. An absolute root has no such dependency.
+///
+/// Best-effort: if the working directory cannot be read there is nothing better
+/// to offer than the path as written, and the preflight warning for a root that
+/// does not exist already covers the case where something is wrong.
+fn absolute_document_root(root: &Path) -> PathBuf {
+    if root.is_absolute() {
+        return root.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(root))
+        .unwrap_or_else(|_| root.to_path_buf())
 }
 
 /// Run the configured listeners until interrupted.
@@ -135,12 +207,16 @@ fn routing_for(document_root: &Path, front_controller: &str) -> Routing {
 /// and nothing else in the program depends on it.
 fn serve(
     path: &Path,
-    document_root: &Path,
-    front_controller: &str,
+    document_root_flag: Option<&Path>,
+    front_controller_flag: Option<&str>,
     max_connections: usize,
 ) -> Result<(), ServerError> {
     let config = load_and_validate(path)?;
-    let routing = routing_for(document_root, front_controller);
+    let document_root = absolute_document_root(&resolve_document_root(document_root_flag, &config));
+    let front_controller = config
+        .server
+        .resolve_front_controller(front_controller_flag);
+    let routing = routing_for(&document_root, front_controller.as_deref());
     let static_state = config.server.static_files.clone();
     let http_address = config.server.http.clone();
     let fastcgi_address = config.server.fastcgi.clone();
@@ -162,11 +238,9 @@ fn serve(
     println!("  document root:    {}", document_root.display());
     println!(
         "  front controller: {}",
-        if front_controller.trim().is_empty() {
-            "(none: only real .php files are served)"
-        } else {
-            front_controller
-        }
+        front_controller
+            .as_deref()
+            .unwrap_or("(none: only real .php files are served)")
     );
     println!("  backends:         {}", config.backends.len());
     if !config.routes.is_empty() {
@@ -174,6 +248,18 @@ fn serve(
     }
     if static_state.enabled {
         println!("  static files:     serving from the document root");
+    }
+
+    // Reported before the listeners start, not after: a document root that is
+    // not there is the mistake that produces a 404 for every static file and a
+    // front controller PHP will not run, and noticing it in the log is worth
+    // more than the process refusing to start. Only in the log, so a deployment
+    // that creates the root during startup still works.
+    for warning in stokehold_core::preflight::inspect(&config, &document_root) {
+        tracing::warn!("{}", warning.message);
+        if let Some(hint) = &warning.hint {
+            tracing::warn!("  {hint}");
+        }
     }
 
     // The FastCGI listener binds first, because binding is synchronous here while
@@ -294,9 +380,18 @@ fn install_shutdown_handler(shutdown: Option<stokehold_server::ShutdownHandle>) 
 }
 
 /// `check` validates configuration and reports the PHP binaries found here.
-fn check(path: &Path, extra_php_dirs: &[PathBuf]) -> Result<(), stokehold_core::Error> {
+fn check(
+    path: &Path,
+    document_root_flag: Option<&Path>,
+    extra_php_dirs: &[PathBuf],
+) -> Result<(), stokehold_core::Error> {
     let config = Config::load(path)?;
     config.validate()?;
+
+    // The same resolution `serve` performs, so this reports the deployment that
+    // would actually start rather than the one written in the file.
+    let document_root = absolute_document_root(&resolve_document_root(document_root_flag, &config));
+    let front_controller = config.server.resolve_front_controller(None);
 
     println!("configuration: {}", path.display());
     println!("  listeners:");
@@ -307,6 +402,27 @@ fn check(path: &Path, extra_php_dirs: &[PathBuf]) -> Result<(), stokehold_core::
     match &config.server.fastcgi {
         Some(fcgi) => println!("    fastcgi: {fcgi}"),
         None => println!("    fastcgi: (disabled)"),
+    }
+
+    println!("  document root: {}", document_root.display());
+    println!(
+        "    exists:           {}",
+        match (document_root.exists(), document_root.is_dir()) {
+            (false, _) => "no",
+            (true, true) => "yes",
+            (true, false) => "no (it is a file, not a directory)",
+        }
+    );
+    match &front_controller {
+        Some(front) => {
+            println!("    front controller: {front}");
+            let script = document_root.join(front);
+            println!(
+                "      present:        {}",
+                if script.is_file() { "yes" } else { "NO" }
+            );
+        }
+        None => println!("    front controller: (none: only real .php files)"),
     }
 
     println!("  backends:");
@@ -381,13 +497,33 @@ fn check(path: &Path, extra_php_dirs: &[PathBuf]) -> Result<(), stokehold_core::
     }
     for entry in &found {
         let binary = &entry.binary;
+        let below_floor = binary.version.as_str() < stokehold_server::MINIMUM_PHP_VERSION;
         println!(
-            "    {:<4} PHP {} {:<8} {}",
+            "    {:<4} PHP {} {:<8} {}{}",
             entry.role,
             binary.version,
             binary.flavour(),
-            binary.path.display()
+            binary.path.display(),
+            if below_floor {
+                "  (below the worker floor; worker mode needs 8.2+)"
+            } else {
+                ""
+            }
         );
+    }
+
+    // Warnings, not errors: every one of these is a normal intermediate state on
+    // the way to a working deployment, and refusing to report anything else
+    // because the root is not there yet would be the wrong trade.
+    let warnings = stokehold_core::preflight::inspect(&config, &document_root);
+    if !warnings.is_empty() {
+        println!("  warnings:");
+        for warning in &warnings {
+            println!("    - {}", warning.message);
+            if let Some(hint) = &warning.hint {
+                println!("      {hint}");
+            }
+        }
     }
 
     println!("configuration OK");
@@ -400,14 +536,36 @@ mod tests {
 
     #[test]
     fn routing_uses_a_front_controller_by_default() {
-        let routing = routing_for(Path::new("/srv/app"), "index.php");
+        let routing = routing_for(Path::new("/srv/app"), Some("index.php"));
         assert_eq!(routing.front_controller.as_deref(), Some("index.php"));
         assert_eq!(routing.document_root, PathBuf::from("/srv/app"));
     }
 
     #[test]
+    fn resolve_document_root_prefers_the_flags_that_are_set() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+document_root = "/from/file"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+
+        assert_eq!(
+            resolve_document_root(Some(Path::new("/from/flag")), &config),
+            PathBuf::from("/from/flag")
+        );
+        assert_eq!(
+            resolve_document_root(None, &config),
+            PathBuf::from("/from/file")
+        );
+
+        let bare = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("parses");
+        assert_eq!(resolve_document_root(None, &bare), PathBuf::from("."));
+    }
+
+    #[test]
     fn an_empty_front_controller_means_files_only() {
-        let routing = routing_for(Path::new("."), "   ");
+        let routing = routing_for(Path::new("."), None);
         assert_eq!(routing.front_controller, None);
     }
 }

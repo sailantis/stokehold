@@ -223,7 +223,10 @@ fn a_pool_skips_ports_that_are_already_in_use() {
     // Hold the base port itself, so the pool has to move past it.
     let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let base = blocker.local_addr().expect("address").port();
-    let next_free = (base + 1..base + 100)
+    // `base` comes from the ephemeral range, so `base + 100` can pass 65535 and
+    // panic on overflow — which made this test fail or pass depending on which
+    // port the OS handed out. Saturating arithmetic keeps the search in range.
+    let next_free = (base.saturating_add(1)..base.saturating_add(100))
         .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok());
     let Some(next_free) = next_free else {
         eprintln!("skipping: no free port after {base}");

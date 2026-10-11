@@ -24,8 +24,9 @@ supervises it for you.
 > The HTTP front-end is implemented in `crates/stokehold-http` — a `hyper` listener speaking
 > HTTP/1.1 and HTTP/2 over the same dispatcher as the FastCGI one — and it serves static files
 > from the document root, so a single `stokehold` process can front a site the way nginx plus
-> `php-fpm` would. TLS and HTTP/3 are not there yet; see [docs/plan.md](docs/plan.md) for the
-> phase order.
+> `php-fpm` would. The CLI is complete: `serve`, `check` and `version`, with the document root and
+> front controller configurable in the file rather than only on a command line. TLS and HTTP/3 are
+> not there yet; see [docs/plan.md](docs/plan.md) for the phase order.
 >
 > **The async boundary.** `stokehold-http` is the only place with a `tokio` runtime, because
 > `hyper` needs one. Every backend stays blocking, and the dispatcher is reached only through
@@ -72,6 +73,14 @@ slot, restarts one that died, and recycles on `max_requests` — the equivalent 
 `pm.max_requests`, which does not exist on Windows. On Unix the processes are placed in their
 own process group; on Windows they are adopted into a job object with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so nothing is left running if `stokehold` dies.
+
+One `spawn_cgi` slot is **one process on one port**, and stokehold enforces that by setting
+`PHP_FCGI_CHILDREN=0` for each child. `php-cgi -b` is otherwise not one process: it spawns
+`PHP_FCGI_CHILDREN` children that all share the single bound socket, and the count is read from its
+inherited environment — so a host that exports it for `php-fpm` would silently give every slot 20
+hidden workers, making `workers` a lie and `max_requests` unaccountable. `PHP_FCGI_MAX_REQUESTS=0`
+goes with it, because php-cgi's own default is to retire a child after 500 requests; recycling here
+is the pool's decision, so `max_requests` means the same thing for every backend.
 
 `worker` is implemented too, and it is the interesting case. Its `command` is a command line
 (`php worker.php`), split without a shell — double quotes group, and a backslash is kept unless it
@@ -126,15 +135,22 @@ Validate a configuration and see what `stokehold` found on this host:
 cargo run -- check --config stokehold.example.toml
 ```
 
-That prints the configured listeners, each backend and whether it resets per request, and every
-PHP binary discovered (role, version, ZTS/NTS flavour and path). Extra search directories can be
-added with `--php-dir <dir>`.
+That prints the configured listeners, the document root and front controller it resolved (and
+whether they are actually there), each backend and whether it resets per request, the static-file
+settings, and every PHP binary discovered (role, version, ZTS/NTS flavour and path) — flagging any
+that are below the worker floor. Extra search directories can be added with `--php-dir <dir>`.
+
+Problems it can see are reported as **warnings**, and the exit status stays 0: a document root that
+does not exist yet is a normal thing to check before a deploy creates it. What the warnings buy is
+that a mistake is reported once, here, instead of as a puzzling 404 at the first request.
+
+`stokehold version` prints what the build is, including the worker protocol version and the PHP
+floor it supports.
 
 Then serve it:
 
 ```bash
-cargo run -- serve --config stokehold.example.toml \
-  --document-root /srv/app --front-controller index.php
+cargo run -- serve --config stokehold.example.toml
 ```
 
 `stokehold` prints both addresses it bound, then serves HTTP and FastCGI side by side until
@@ -151,9 +167,29 @@ location ~ \.php$ {
 Set `server.http` or `server.fastcgi` to run only one of them. Both feed the same dispatcher, so
 a request gets the same backend whichever protocol carried it.
 
-Pass an empty `--front-controller` to serve only real `.php` files, which matches nginx's
-`location ~ \.php$` behaviour; the default resolves everything else through `index.php` with
-`PATH_INFO`, which is what most frameworks want.
+## Where the application lives
+
+Which directory PHP scripts resolve against is a deployment fact, so it belongs in the file rather
+than on a command line that a systemd unit or a container image has to carry:
+
+```toml
+[server]
+document_root = "/srv/app/public"
+front_controller = "index.php"
+```
+
+Both keys are also `serve` flags, and **a flag wins over the file** — the more specific statement
+should be the one that takes effect.
+
+`front_controller` is what keeps a framework working: a path that names no file under the document
+root is given to this script with `PATH_INFO` set, instead of answering 404. Pass an empty
+`--front-controller ''` to serve only real `.php` files, which matches nginx's `location ~ \.php$`
+behaviour. That form is a *flag* and not a config value, deliberately: TOML cannot tell an empty
+string from an absent key, so writing `front_controller = ""` in the file is rejected with a
+message saying so rather than being given a meaning of its own.
+
+`stokehold check` prints the document root and front controller it resolved and whether each is
+actually present, which is the fastest way to see what a running deployment uses.
 
 `stokehold` answers nginx's `GET_VALUES` health probe, so it stays in rotation rather than being
 marked down.
@@ -195,12 +231,29 @@ reach the front controller still does, so upgrading does not change an existing 
 enabled = true
 ```
 
-The document root is the same `--document-root` that routing already resolves scripts against, so
-one flag describes the whole site.
+The document root is the same `server.document_root` that routing already resolves scripts against,
+so one setting describes the whole site.
 
 A request is then answered from disk when the path names a real file under the document root, and
 goes to PHP when it does not. `/assets/app.css` is a file; `/about` is not, so the front controller
 still sees it. That one sentence is the whole rule.
+
+A file PHP is meant to execute is never served from disk — `GET /index.php` runs the script, it does
+not return its source. That also gives `/index.php/more/path` the `PATH_INFO` behaviour a deployment
+expects.
+
+Two rules hold whether or not static serving is enabled, because both are about what PHP is asked to
+run rather than about this layer:
+
+- **A file that is not a script is never run as one.** Only `.php`/`.php3`/`.phtml` can be the script;
+  anything else falls through to the front controller as application input. Without this, `php-cgi`
+  would emit a file it cannot parse verbatim — `GET /config.json` and, worse, `GET /.env`.
+- **A dotfile is never given to the application**, not even as `PATH_INFO`, for the same reason. It
+  answers 404 on every method.
+
+Note that the static layer handles only `GET`, `HEAD` and `OPTIONS`: a `POST` to a path that names a
+file goes to the front controller, so a framework can route it. Those two rules are what keep that
+from becoming a way to read a file.
 
 With it enabled, `stokehold` serves:
 
@@ -213,6 +266,7 @@ With it enabled, `stokehold` serves:
 | Directory indexes | `index.html`, with a 301 from `/docs` to `/docs/` |
 | Caching | One `Cache-Control` for everything, because a per-extension guess goes stale silently |
 | Refusals | Dotfiles answer 404, and a `..` segment answers 403 rather than being clamped |
+| Scripts | A `.php`/`.php3`/`.phtml` path is never served from disk, so its source cannot be disclosed |
 
 Serving a file costs no PHP worker and no `spawn_blocking`: path resolution is one blocking
 `stat`, and the bytes stream through `tokio::fs` in 64 KiB blocks with a *content-length* frame, so
@@ -224,7 +278,7 @@ would be a Unix-only second code path — so a large file is copied per block. S
 
 | Path | Contents |
 | --- | --- |
-| `crates/stokehold-core` | Configuration model, backend types, PHP discovery |
+| `crates/stokehold-core` | Configuration model, backend types, PHP discovery, deployment preflight checks |
 | `crates/stokehold-fcgi` | FastCGI record codec, client, transport and CGI environment |
 | `crates/stokehold-worker` | The worker protocol: framed codec and message set over a worker's pipes |
 | `crates/stokehold-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |

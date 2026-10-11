@@ -229,6 +229,17 @@ fn plan(owned: &Owned, files: &StaticFiles) -> Plan {
         return Plan::NotAFile;
     }
 
+    // A file PHP is meant to execute is never served from disk: sending
+    // `index.php` as a file discloses its source, and `<?php …` is a valid
+    // response body, so nothing downstream would notice. It goes to the
+    // backend, which is also what makes `/index.php/foo` work. This is why
+    // `has_php_extension` is shared with the routing layer rather than
+    // duplicated: two lists of "what is a script" would drift, and the one that
+    // drifted would be the one that serves source code.
+    if stokehold_fcgi::cgi::has_php_extension(path) {
+        return Plan::NotAFile;
+    }
+
     describe(resolved, owned, files)
 }
 
@@ -1428,7 +1439,7 @@ mod tests {
         let headers = no_headers();
 
         // Not a file: PHP's business, which is how a front controller survives.
-        for path in ["/about", "/api/users", "/index.php"] {
+        for path in ["/about", "/api/users"] {
             let outcome = plan(&owned(path, &headers), &files);
             assert_eq!(name_of(&outcome), "not a file", "{path}");
         }
@@ -1454,6 +1465,49 @@ mod tests {
         assert_eq!(name_of(&outcome), "forbidden");
         let outcome = plan(&owned("/.env", &headers), &files);
         assert_eq!(name_of(&outcome), "not found");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A file PHP is meant to execute must never come from this layer.
+    ///
+    /// This is a source-disclosure hole when it is wrong, and a silent one: PHP
+    /// source is a perfectly valid response body, so the only symptom is that
+    /// the client received the program instead of the program's output. The file
+    /// is written here on purpose — the earlier version of the test above only
+    /// asserted `not a file` for `/index.php` in a fixture that never *had* an
+    /// `index.php`, so it passed for the wrong reason and hid exactly this.
+    #[test]
+    fn a_php_script_is_never_served_as_a_file() {
+        let root = fixture(
+            "phpguard",
+            &[
+                ("index.php", "<?php echo 'secret';"),
+                ("app.php", "<?php echo 'secret';"),
+                ("legacy.phtml", "<?php echo 'secret';"),
+                ("old.php3", "<?php echo 'secret';"),
+                ("public/style.css", "body{}"),
+            ],
+        );
+        let files = layer(&root, true);
+        let headers = no_headers();
+
+        for path in ["/index.php", "/app.php", "/legacy.phtml", "/old.php3"] {
+            let outcome = plan(&owned(path, &headers), &files);
+            assert_eq!(name_of(&outcome), "not a file", "{path} must go to PHP");
+        }
+
+        // Extension matching is case-insensitive, like the routing layer's.
+        assert_eq!(
+            name_of(&plan(&owned("/INDEX.PHP", &headers), &files)),
+            "not a file"
+        );
+
+        // A plain file with a misleading name is still a file.
+        assert_eq!(
+            name_of(&plan(&owned("/public/style.css", &headers), &files)),
+            "a file"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

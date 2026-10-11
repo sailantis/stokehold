@@ -69,8 +69,7 @@ fn worker_config(workers: u32) -> Config {
     Config {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
-            fastcgi: None,
-            static_files: Default::default(),
+            ..Default::default()
         },
         backends: [(
             "app".to_string(),
@@ -412,8 +411,7 @@ fn unreachable_config() -> Config {
     Config {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
-            fastcgi: None,
-            static_files: Default::default(),
+            ..Default::default()
         },
         backends: [(
             "fpm".to_string(),
@@ -596,6 +594,10 @@ fn static_root(name: &str) -> PathBuf {
     std::fs::write(root.join("assets/app.js.br"), "brotli-bytes").expect("write app.js.br");
     std::fs::write(root.join("assets/logo.svg"), "<svg/>").expect("write logo.svg");
     std::fs::write(root.join(".env"), "SECRET=1").expect("write a dotfile");
+    // A script, so a test can prove this layer refuses to hand one over. Its
+    // contents are what a client would receive if that ever regressed.
+    std::fs::write(root.join("index.php"), "<?php echo 'SECRET-SOURCE';")
+        .expect("write a front controller");
     std::fs::write(root.join("big.bin"), vec![b'x'; 256 * 1024]).expect("write a binary file");
     root
 }
@@ -811,6 +813,48 @@ fn a_dotfile_is_not_served_and_is_not_reported_as_missing() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// With static serving **off**, a non-script file must not reach PHP either.
+///
+/// The backend here is unreachable, so a 502 is the proof that routing declined
+/// to use the file as a script. Before this was fixed, routing matched *any*
+/// existing file and handed it to php-cgi, which does not check that a script is
+/// PHP: given `/.env` or `/config.json` it emitted the contents verbatim with a
+/// 200. The static layer's own refusals do not cover this, because the request
+/// never reached it — `POST` never does, and nor does anything at all when the
+/// layer is disabled.
+#[test]
+fn a_non_script_file_is_not_dispatched_to_php() {
+    let root = static_root("nonscript");
+    // The fixture has `.env`; add a plain non-PHP data file next to it.
+    std::fs::write(root.join("config.json"), "{\"secret\":1}").expect("write config.json");
+
+    let Some(server) = static_server(&root, Default::default()) else {
+        return;
+    };
+
+    for path in ["/config.json", "/assets/app.css"] {
+        let response = get(&server.address, path);
+        assert_eq!(
+            response.status, 502,
+            "{path} must reach the backend as application input, not be read as a script: {response:?}"
+        );
+        assert!(
+            !response.text().contains("secret") && !response.text().contains("SECRET"),
+            "{path} leaked file contents: {response:?}"
+        );
+    }
+
+    // A dotfile is hidden outright, not passed on as input.
+    let response = get(&server.address, "/.env");
+    assert_eq!(response.status, 404, "{response:?}");
+    assert!(
+        !response.text().contains("SECRET"),
+        "the dotfile's contents leaked: {response:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_traversal_is_refused() {
     let root = static_root("traversal");
@@ -900,6 +944,59 @@ fn a_large_file_arrives_whole() {
     assert_eq!(response.status, 200, "{response:?}");
     assert_eq!(response.body.len(), 256 * 1024);
     assert!(response.body.iter().all(|byte| *byte == b'x'));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A script must never be handed over as a file.
+///
+/// This is the one failure in this layer that is a *disclosure* rather than a
+/// wrong answer, and it is silent by nature: PHP source is a valid body, so the
+/// only symptom is that the client received the program instead of its output.
+/// The backend here is unreachable, so a 502 is the proof that the layer
+/// declined and left the decision to the layer that executes scripts.
+#[test]
+fn a_php_script_is_never_served_as_a_file() {
+    let root = static_root("phpguard");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = get(&server.address, "/index.php");
+
+    assert_eq!(
+        response.status, 502,
+        "a .php path must reach the backend, never the file server: {response:?}"
+    );
+    assert!(
+        !response.text().contains("SECRET-SOURCE"),
+        "the script's source was disclosed: {response:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The extension rule is the routing layer's, not a second list.
+///
+/// A path that names a script *and* then more path is the `PATH_INFO` case, and
+/// it is the one nginx users rely on every day; it has to reach PHP too.
+#[test]
+fn a_php_script_with_path_info_still_reaches_the_backend() {
+    let root = static_root("phpinfo");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = get(&server.address, "/index.php/deep/route");
+
+    assert_eq!(
+        response.status, 502,
+        "PATH_INFO must reach the backend: {response:?}"
+    );
+    assert!(
+        !response.text().contains("SECRET-SOURCE"),
+        "the script's source was disclosed: {response:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

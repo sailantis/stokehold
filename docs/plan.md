@@ -430,17 +430,26 @@ against the specification and secondary implementations, and are confirmed by fi
     arm's p99 goes 458 µs → 5.27 ms between concurrency 16 and 32 while its rps is flat, which is
     the signature of a queue forming behind a saturated pool rather than a throughput problem.
 
-25. **The worker arm still spends a thread per request, and that is what caps it.** The piped
-    worker reaches 20,864 rps at concurrency 32 while `spawn_cgi` with the *same* 12 slots reaches
-    30,278. The difference on the worker path is `request_with_deadline`
+25. **The worker arm still spends a thread per request, and that is what caps it.** On the trivial
+    handler the piped worker reaches 20,422 rps at concurrency 32 while `spawn_cgi` with the *same*
+    12 slots reaches 29,950 — and RoadRunner's piped worker, speaking the same protocol shape,
+    reaches **31,525**. So stokehold currently *loses* the direct worker-versus-worker comparison
+    by about 54% at concurrency 32, having been level up to concurrency 8 (17,471 vs 16,610). The
+    difference on the worker path is `request_with_deadline`
     (`crates/stokehold-server/src/worker_pool.rs`): a pipe read has no portable timeout, so each
     request spawns a `std::thread` to run the exchange and takes the result through an
     `mpsc::recv_timeout`, while `CgiPool::request` calls straight into the slot. So every request
     costs a thread create and a channel handoff, and the pool reaches its ceiling *below* the
-    point where PHP is saturated — the signature is the piped arm's `p99` climbing to 5.27 ms
+    point where PHP is saturated — the signature is the piped arm's `p99` climbing to 5.48 ms
     while its rps stays flat. The fix has to keep the deadline: a persistent per-slot reader
     thread with a channel handoff preserves it, and the timeout then becomes a `recv_timeout` on
     a channel that already exists rather than one created per request. Not yet done.
+
+    The consolation is that this is the *only* arm where stokehold is behind: the `external`
+    backend, once hazard 22 was fixed, beats RoadRunner 36,341 to 31,525 at concurrency 32 — and
+    with a real database query in the request the piped worker is ahead of every FastCGI arm at
+    low concurrency (hazard 27), which suggests the deficit is amortised away by any request that
+    does actual work. It is still a real cost on the path of every request and worth removing.
 
 26. **`php-cgi -b` accepts a unix socket where the platform has one.** `-b <address:port>|<port>`
     is not TCP-only: `fcgi_listen` (`main/fastcgi.c`) treats a bind path that contains no `:` as

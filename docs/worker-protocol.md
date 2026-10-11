@@ -81,7 +81,7 @@ The numbering is part of the protocol. These values must never be reordered or r
 | # | Name | Direction | Correlated | Carries |
 | --- | --- | --- | --- | --- |
 | 1 | `HELLO` | server → worker | no | Protocol version, for the handshake |
-| 2 | `HELLO_ACK` | worker → server | no | `protocol_version`, `php_version`, `sapi`, `pid`, `runtime` |
+| 2 | `HELLO_ACK` | worker → server | no | `protocol_version`, `php_version`, `sapi`, `pid`, `runtime` (see below) |
 | 3 | `REQUEST` | server → worker | yes | Request metadata (JSON). The body follows in `BODY` frames |
 | 4 | `RESPONSE` | worker → server | yes | Response head: `status`, `headers`, `body_len` |
 | 5 | `BODY` | either direction | yes | Raw bytes of the request or response body |
@@ -171,6 +171,16 @@ server  ──HELLO (version)─────────────────
 
 The worker's `protocol_version` is checked **here**, at boot, not on the first request: a
 mismatched SDK is a configuration problem and should look like one.
+
+`runtime` identifies the implementation and its **package** version, as
+`stokehold-worker-php/0.1.0`. The package version is not the protocol version: the protocol is
+`1` and moves only when the wire format does, while the package version moves on every release.
+A server that does not care about the field ignores it, since it is a free-form string; a server
+that does can report which SDK build a worker is running without shelling into the host.
+
+The field is deliberately reused rather than added. A new field would be a change to the wire
+format and would require a protocol version bump — a breaking change to discover a string that
+the message already had room for.
 
 ### Serving a request
 

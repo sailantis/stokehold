@@ -19,7 +19,7 @@
 //! The wire format is specified in `docs/worker-protocol.md` and pinned by the
 //! tests here. The two rules that prevent the classic bugs living in a worker
 //! protocol — output rebinding and shutdown-by-closing-stdin — are described
-//! there too, and the PHP SDK in `sdk/php/` implements them.
+//! there too, and the PHP SDK (`sailantis/stokehold-php-sdk`) implements them.
 //!
 //! ```text
 //!   stokehold ──REQUEST──►  php worker (stdin)

@@ -2,7 +2,10 @@
 
 **Version 1.** This document is the specification; `crates/stokehold-worker` is its reference
 implementation, and the tests in that crate (plus `tests/wire_format.rs`) pin it byte for byte.
-The PHP SDK in `sdk/php/` implements the other end.
+The PHP SDK implements the other end; it lives in
+[`sailantis/stokehold-php-sdk`](https://github.com/sailantis/stokehold-php-sdk), because a
+Composer package needs `composer.json` at the root of a repository. A release of that package
+links back to this document at a pinned commit, so the two versions can be compared.
 
 ## Why this exists at all
 
@@ -249,14 +252,15 @@ Everything else means the reader can no longer trust its position in the stream.
    **captures** rather than bans it: `ob_start()` per request collects `echo` and template
    output (and turns it into the response body when the handler returns null), `ini_set('display_errors', 'stderr')`
    sends warnings to stderr, and `emitLog`/`emitMetric` are the supported way to speak outside a
-   request. See `sdk/php/src/Worker.php`.
+   request. See `src/Worker.php` in `sailantis/stokehold-php-sdk`.
 2. **Graceful shutdown by construction.** Closing the child's stdin makes the worker's read
    return EOF and `waitRequest()` return `false`; the worker exits on its own. Only after a grace
    period does the supervisor kill it. There is no signal to catch and no flag to poll, which is
    why the server never has to ask twice.
 
-Both rules are implemented in `sdk/php/` and tested against a real PHP process by
-`crates/stokehold-worker/tests/php_worker.rs`, which drives a live `php worker.php` over pipes.
+Both rules are implemented in the PHP SDK (`sailantis/stokehold-php-sdk`) and tested against a
+real PHP process by `crates/stokehold-worker/tests/php_worker.rs`, which drives a live
+`php worker.php` over pipes.
 
 ## The server's side of the contract
 

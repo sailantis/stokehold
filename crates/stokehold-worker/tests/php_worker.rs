@@ -8,11 +8,15 @@
 //!
 //! Both sides are independently pinned by golden fixtures
 //! (`crates/stokehold-worker/tests/wire_format.rs` and
-//! `sdk/php/tests/WireFormatTest.php`), so a disagreement fails here with a real
+//! `tests/WireFormatTest.php` in the `sailantis/stokehold-php-sdk` repository),
+//! so a disagreement fails here with a real
 //! process rather than only in theory.
 //!
 //! The tests are skipped, with a printed reason, when no `php` binary is on
-//! `PATH`, so the suite stays green on a machine without PHP.
+//! `PATH` or when the SDK checkout cannot be found, so the suite stays green on
+//! a machine without either — but never silent about which of the two it was.
+//! Note that libtest hides a passing test's stderr, so a skip only *shows* with
+//! `--nocapture`; set `STOKEHOLD_E2E=1` where a skip should be a failure.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -41,19 +45,75 @@ fn find_php() -> Option<PathBuf> {
     None
 }
 
-/// The SDK's example worker, relative to this crate.
+/// The SDK the example worker lives in, which is now a repository of its own.
 ///
-/// `CARGO_MANIFEST_DIR` is `crates/stokehold-worker`, so the repository root is
-/// two levels up. That keeps the test pointing at the shipped example rather than
-/// a fixture that could drift away from it.
+/// `STOKEHOLD_SDK_DIR` overrides it, which is how a CI checkout at any path —
+/// or a sibling clone under a different name — is pointed at. Otherwise the
+/// layout this project is developed in is assumed: `sailantis/stokehold` and
+/// `sailantis/stokehold-php-sdk` next to each other.
+fn sdk_dir() -> PathBuf {
+    match std::env::var_os("STOKEHOLD_SDK_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("stokehold-php-sdk"),
+    }
+}
+
+/// The SDK's example worker.
+///
+/// This keeps the test pointing at the shipped example rather than a fixture
+/// that could drift away from it.
 fn example_worker() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("sdk")
-        .join("php")
-        .join("example")
-        .join("worker.php")
+    sdk_dir().join("example").join("worker.php")
+}
+
+/// Why this test cannot run here, if it cannot.
+///
+/// The SDK is no longer inside this repository, so "the test ran" and "the test
+/// was skipped" are easy to confuse. A missing SDK must therefore be reported as
+/// a skip with a reason — silently returning would report success for a codec
+/// that was never exercised.
+fn skip_reason() -> Option<String> {
+    if find_php().is_none() {
+        return Some("no php on PATH".to_string());
+    }
+
+    let script = example_worker();
+    if !script.is_file() {
+        return Some(format!(
+            "the SDK example worker is not at {} — set STOKEHOLD_SDK_DIR to a \
+             stokehold-php-sdk checkout",
+            script.display()
+        ));
+    }
+
+    None
+}
+
+/// Report that this test cannot run here.
+///
+/// libtest hides the stderr of a passing test, so a skip is invisible in an
+/// ordinary run: `cargo test` reports the same "11 passed" whether this codec
+/// was exercised against PHP or not. That is right on a laptop with no PHP, and
+/// wrong in CI, where a silently skipped end-to-end test is a claim the suite
+/// cannot support. Set `STOKEHOLD_E2E=1` on a machine that is *supposed* to have
+/// PHP and the SDK, and a skip becomes a failure instead.
+fn report_skip(reason: String) {
+    if skip_is_a_failure() {
+        panic!("STOKEHOLD_E2E is set, so a skipped test is a failure: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
+/// Whether `STOKEHOLD_E2E` asks for skips to be failures. `0` or empty means no.
+fn skip_is_a_failure() -> bool {
+    match std::env::var("STOKEHOLD_E2E") {
+        Ok(value) => !value.is_empty() && value != "0",
+        Err(_) => false,
+    }
 }
 
 /// A `php worker.php` process, killed when the test ends however it ends.
@@ -64,15 +124,20 @@ struct PhpWorker {
 }
 
 impl PhpWorker {
+    /// Start a worker, or report why this machine cannot.
+    ///
+    /// `None` means the test cannot run here, and the reason has already been
+    /// printed. It is deliberately not a panic: a machine without PHP is
+    /// expected, whereas a machine with PHP and no SDK checkout is a setup
+    /// mistake that should say so rather than pass quietly.
     fn start() -> Option<Self> {
-        let php = find_php()?;
-        let script = example_worker();
-        assert!(
-            script.is_file(),
-            "the SDK example worker is missing at {}",
-            script.display()
-        );
+        if let Some(reason) = skip_reason() {
+            report_skip(reason);
+            return None;
+        }
 
+        let php = find_php().expect("skip_reason established that php is on PATH");
+        let script = example_worker();
         let mut child = Command::new(&php)
             .arg(&script)
             .stdin(Stdio::piped())
@@ -156,15 +221,14 @@ fn body_text(response: &stokehold_worker::codec::WorkerResponse) -> String {
     String::from_utf8_lossy(&response.body).into_owned()
 }
 
-/// Skip the test, loudly, when PHP is not installed.
+/// Skip the test, loudly, when PHP or the SDK checkout is missing.
+///
+/// The reason comes from `PhpWorker::start`, which has already printed it.
 macro_rules! require_php {
     () => {
         match PhpWorker::start() {
             Some(worker) => worker,
-            None => {
-                eprintln!("skipping: no php on PATH");
-                return;
-            }
+            None => return,
         }
     };
 }

@@ -120,7 +120,7 @@ fn main() -> ExitCode {
 ///
 /// The PHP floor is here because it is a build fact an operator has to be able
 /// to check from a shell: a worker below it starts and then cannot be asked for
-/// a per-request peak. See `sdk/php/README.md`.
+/// a per-request peak. See the README in `sailantis/stokehold-php-sdk`.
 fn version() {
     println!("stokehold {}", env!("CARGO_PKG_VERSION"));
     println!("  front-ends:       HTTP/1.1, HTTP/2 (cleartext), FastCGI");

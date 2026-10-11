@@ -5,12 +5,17 @@
 //! rotation, replaces a worker that died or asked to be recycled, and leaves
 //! nothing running when it is dropped.
 //!
-//! They drive `sdk/php/example/worker.php` rather than a fixture, so the PHP end
-//! is the shipped SDK and a change to either side fails here. The Rust codec is
+//! They drive the SDK's `example/worker.php` rather than a fixture, so the PHP
+//! end is the shipped SDK and a change to either side fails here. The SDK lives
+//! in the `sailantis/stokehold-php-sdk` repository; `STOKEHOLD_SDK_DIR` points
+//! at a checkout that is not beside this one. The Rust codec is
 //! covered on its own in `crates/stokehold-worker`; what is under test *here* is
 //! the supervision around it.
 //!
-//! Skipped, with a printed reason, when no `php` binary is on `PATH`.
+//! Skipped, with a printed reason, when no `php` binary is on `PATH` or when the
+//! SDK checkout cannot be found. libtest hides a passing test's stderr, so a
+//! skip only *shows* with `--nocapture`; set `STOKEHOLD_E2E=1` where a skip
+//! should be a failure.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -41,15 +46,74 @@ fn find_php() -> Option<PathBuf> {
     None
 }
 
+/// The SDK the example worker lives in, which is now a repository of its own.
+///
+/// `STOKEHOLD_SDK_DIR` overrides it, which is how a CI checkout at any path —
+/// or a sibling clone under a different name — is pointed at. Otherwise the
+/// layout this project is developed in is assumed: `sailantis/stokehold` and
+/// `sailantis/stokehold-php-sdk` next to each other.
+fn sdk_dir() -> PathBuf {
+    match std::env::var_os("STOKEHOLD_SDK_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("stokehold-php-sdk"),
+    }
+}
+
 /// The SDK's example worker, which is what the pool is pointed at.
 fn example_worker() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("sdk")
-        .join("php")
-        .join("example")
-        .join("worker.php")
+    sdk_dir().join("example").join("worker.php")
+}
+
+/// Why this test cannot run here, if it cannot.
+fn skip_reason() -> Option<String> {
+    if find_php().is_none() {
+        return Some("no php on PATH".to_string());
+    }
+
+    let script = example_worker();
+    if !script.is_file() {
+        return Some(format!(
+            "the SDK example worker is not at {} — set STOKEHOLD_SDK_DIR to a \
+             stokehold-php-sdk checkout",
+            script.display()
+        ));
+    }
+
+    None
+}
+
+/// Report that this test cannot run here.
+///
+/// libtest hides the stderr of a passing test, so a skip is invisible in an
+/// ordinary run. Set `STOKEHOLD_E2E=1` on a machine that is *supposed* to have
+/// PHP and the SDK, and a skip becomes a failure instead.
+fn report_skip(reason: String) {
+    if skip_is_a_failure() {
+        panic!("STOKEHOLD_E2E is set, so a skipped test is a failure: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
+/// Whether `STOKEHOLD_E2E` asks for skips to be failures. `0` or empty means no.
+fn skip_is_a_failure() -> bool {
+    match std::env::var("STOKEHOLD_E2E") {
+        Ok(value) => !value.is_empty() && value != "0",
+        Err(_) => false,
+    }
+}
+
+/// Skip the test, loudly, when PHP or the SDK checkout is missing.
+macro_rules! require_sdk {
+    () => {
+        if let Some(reason) = skip_reason() {
+            report_skip(reason);
+            return;
+        }
+    };
 }
 
 /// A pool configuration for the example worker.
@@ -70,16 +134,10 @@ fn config(workers: u32) -> WorkerConfig {
 
 /// Start a pool, or report why the test cannot run.
 fn start(workers: u32) -> Option<WorkerPool> {
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
+    if let Some(reason) = skip_reason() {
+        report_skip(reason);
         return None;
     }
-    let script = example_worker();
-    assert!(
-        script.is_file(),
-        "the SDK example worker is missing at {}",
-        script.display()
-    );
     match WorkerPool::start("test", &config(workers)) {
         Ok(pool) => Some(pool),
         Err(err) => {
@@ -318,10 +376,7 @@ fn a_killed_worker_is_replaced_in_place() {
 #[test]
 fn recycling_replaces_the_worker_after_max_requests() {
     let _serial = serial();
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_sdk!();
 
     let mut config = config(1);
     config.max_requests = Some(2);
@@ -405,10 +460,7 @@ fn the_pool_reports_the_peak_memory_its_workers_measured() {
 #[test]
 fn a_memory_limit_recycles_a_worker_that_exceeds_it() {
     let _serial = serial();
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_sdk!();
 
     // One megabyte is below what any PHP process uses, so every request
     // recycles. That makes the threshold's effect observable without needing to
@@ -451,10 +503,7 @@ fn dropping_the_pool_leaves_no_workers_behind() {
 #[test]
 fn a_pool_dropped_without_shutdown_still_stops_its_workers() {
     let _serial = serial();
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_sdk!();
 
     let pids = {
         let pool = WorkerPool::start("test", &config(2)).expect("pool starts");
@@ -476,10 +525,7 @@ fn a_pool_dropped_without_shutdown_still_stops_its_workers() {
 #[test]
 fn a_worker_that_cannot_boot_is_refused_at_startup() {
     let _serial = serial();
-    if find_php().is_none() {
-        eprintln!("skipping: no php on PATH");
-        return;
-    }
+    require_sdk!();
 
     // A file that exists but is not a worker: PHP parses it, does nothing, and
     // exits, so the handshake can never complete. This is the case that would

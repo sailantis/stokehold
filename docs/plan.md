@@ -106,6 +106,8 @@ opt-in and only when configured.
 | Static files | **In the HTTP front-end, above the backends, off by default** — a path naming a file is answered from disk, a path naming nothing is dispatched. Streaming through `tokio::fs` rather than zero-copy: `sendfile` is Unix-only, so it would be a second code path rather than a faster one |
 | Where the document root lives | **`server.document_root`, with the `--document-root` flag overriding it** — a deployment fact belongs in the file a systemd unit already reads, and the more specific statement (the flag) is the one that takes effect. Same rule for `front_controller`. An empty file value is **rejected** rather than given a meaning, because TOML cannot distinguish it from an absent key |
 | Configuration reload | **Not built** — see open decision 5. Restarting the process is the honest answer until the dispatcher can be reloaded whole rather than in part |
+| Where the PHP SDK lives | **Its own repository, `sailantis/stokehold-php-sdk`** — Packagist requires `composer.json` at the root of a repository, so a tagged `sailantis/stokehold-worker` cannot exist while the SDK sits in `sdk/php/`. The spec (`docs/worker-protocol.md`) stays here: it is the shared document both ends are tested against, and two copies of a specification are two specifications. A release of the package links back to it at a **pinned commit**, because a branch link would silently start describing a later protocol than the release implements |
+| Skipped end-to-end tests | **A skip is visible, and a failure when `STOKEHOLD_E2E=1`** — `libtest` hides a passing test's stderr, so "skipped with a printed reason" was in practice identical to "passed". The suites that need PHP or the SDK are the ones that actually prove the wire format, so CI sets `STOKEHOLD_E2E=1` and a skip fails there |
 
 ## 4. Worker protocol (own protocol)
 
@@ -162,7 +164,9 @@ Deliberately stdlib-only — no extensions, no FFI, no build step:
   figure where available) so the supervisor can recycle on a threshold — the same idea as
   RoadRunner's `max_worker_memory`.
 
-Shape of the SDK (`sailantis/stokehold-worker`, MIT, shipped in this repo under `sdk/php/`):
+Shape of the SDK (`sailantis/stokehold-worker`, MIT, its own repository —
+[`sailantis/stokehold-php-sdk`](https://github.com/sailantis/stokehold-php-sdk) — because a
+Composer package needs `composer.json` at the root of a repository):
 
 ```php
 $worker = Stokehold\Worker::create();          // HELLO handshake
@@ -335,6 +339,16 @@ against the specification and secondary implementations, and are confirmed by fi
     dispatched the stylesheet as a script. The tests that existed could not catch it: their fixture
     never wrote a non-PHP file, and the FastCGI tests drive routing through a client-built CGI
     environment.
+
+20. **A skipped test and a passing test are the same green.** `libtest` hides the captured stderr
+    of a *passing* test, so `println!`/`eprintln!` reason strings never reach an ordinary
+    `cargo test` run. The worker suites ("skipped, with a printed reason, when no `php` is on
+    `PATH`") therefore report the same result whether the protocol was exercised against PHP or
+    not — and a green suite is exactly the shape a silently broken end-to-end test takes. Worse,
+    the SDK moved to its own repository, so the two suites that drive it now depend on a checkout
+    being *found*: a wrong `STOKEHOLD_SDK_DIR` would have been indistinguishable from a pass.
+    `STOKEHOLD_E2E=1` makes a skip a failure, which is what CI should set; it is deliberately off
+    by default so a laptop with no PHP stays green.
 
 ## 6. Phases
 

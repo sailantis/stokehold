@@ -300,16 +300,57 @@ fn start_server(
     Server::start(binary, &config_path)
 }
 
+/// The SDK the example worker lives in, which is now a repository of its own.
+///
+/// `STOKEHOLD_SDK_DIR` overrides it; otherwise the sibling layout is assumed:
+/// `sailantis/stokehold` and `sailantis/stokehold-php-sdk` next to each other.
+fn sdk_dir() -> PathBuf {
+    match std::env::var_os("STOKEHOLD_SDK_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("stokehold-php-sdk"),
+    }
+}
+
 /// The SDK's example worker, which is what the worker backend is pointed at.
 fn example_worker() -> PathBuf {
-    // `crates/stokehold-cli/tests/serve.rs` -> the repository root is two up.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("sdk")
-        .join("php")
-        .join("example")
-        .join("worker.php")
+    sdk_dir().join("example").join("worker.php")
+}
+
+/// Why a worker-backed test cannot run here, if it cannot.
+///
+/// The SDK is a separate checkout, so "the test ran" and "the test was skipped"
+/// are easy to confuse. `STOKEHOLD_E2E=1` turns the skip into a failure, because
+/// libtest hides the stderr of a passing test and a skip is otherwise invisible.
+fn sdk_skip_reason() -> Option<String> {
+    let script = example_worker();
+    if !script.is_file() {
+        return Some(format!(
+            "the SDK example worker is not at {} — set STOKEHOLD_SDK_DIR to a \
+             stokehold-php-sdk checkout",
+            script.display()
+        ));
+    }
+    None
+}
+
+/// Skip a worker-backed test, loudly, when the SDK checkout is missing.
+macro_rules! require_sdk {
+    () => {
+        if let Some(reason) = sdk_skip_reason() {
+            if std::env::var("STOKEHOLD_E2E")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false)
+            {
+                panic!("STOKEHOLD_E2E is set, so a skipped test is a failure: {reason}");
+            }
+            eprintln!("skipping: {reason}");
+            return;
+        }
+    };
 }
 
 /// Quote a string for a TOML basic (`"…"`) string.
@@ -338,7 +379,13 @@ fn toml_string(value: &str) -> String {
 /// stokehold worker protocol rather than on FastCGI to `php-cgi`.
 fn start_worker_server(binary: &Path, root: &Path) -> Option<Server> {
     let config_path = root.join("stokehold.toml");
-    let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let script = example_worker();
+    assert!(
+        script.is_file(),
+        "the SDK example worker is missing at {}",
+        script.display()
+    );
+    let command = toml_string(&format!("php \"{}\"", script.display()));
     let document_root = toml_string(&root.display().to_string());
     let config = format!(
         "default_backend = \"app\"\n\n[server]\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
@@ -350,7 +397,13 @@ fn start_worker_server(binary: &Path, root: &Path) -> Option<Server> {
 /// Start the server with both listeners and a worker backend.
 fn start_dual_listener_server(binary: &Path, root: &Path) -> Option<Server> {
     let config_path = root.join("stokehold.toml");
-    let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let script = example_worker();
+    assert!(
+        script.is_file(),
+        "the SDK example worker is missing at {}",
+        script.display()
+    );
+    let command = toml_string(&format!("php \"{}\"", script.display()));
     let document_root = toml_string(&root.display().to_string());
     let config = format!(
         "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
@@ -373,6 +426,8 @@ fn serve_answers_an_http_request_and_a_fastcgi_request_at_once() {
     let root = std::env::temp_dir().join(format!("stokehold-http-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the temp root");
+
+    require_sdk!();
 
     let Some(server) = start_dual_listener_server(&binary, &root) else {
         eprintln!("skipping: the server did not start");
@@ -722,6 +777,8 @@ fn serve_reaches_a_persistent_php_worker_over_the_stokehold_protocol() {
     let root = std::env::temp_dir().join(format!("stokehold-smoke-worker-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the document root");
+
+    require_sdk!();
 
     let Some(server) = start_worker_server(&binary, &root) else {
         eprintln!("skipping: the worker-backed server did not start");

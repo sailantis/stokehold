@@ -17,8 +17,10 @@ supervises it for you.
 > client, CGI environment, `php-cgi` pool, backend dispatch and both front-ends are all
 > implemented, with integration tests driving real `php-cgi` processes end to end. The worker
 > protocol is specified in [docs/worker-protocol.md](docs/worker-protocol.md), implemented in
-> `crates/stokehold-worker`, and the PHP worker SDK in [sdk/php](sdk/php) implements the other
-> end — proven by tests that drive a live `php worker.php` over pipes. The worker pool that
+> `crates/stokehold-worker`, and the PHP worker SDK implements the other end — it lives in its own
+> repository, [`sailantis/stokehold-php-sdk`](https://github.com/sailantis/stokehold-php-sdk),
+> because a Composer package needs `composer.json` at the root of a repository. It is proven by
+> tests that drive a live `php worker.php` over pipes. The worker pool that
 > supervises those workers is implemented in `crates/stokehold-server`, so `kind = "worker"` now
 > serves for real: `stokehold serve` boots the pool, handshakes each worker, and serves through it.
 > The HTTP front-end is implemented in `crates/stokehold-http` — a `hyper` listener speaking
@@ -284,9 +286,13 @@ would be a Unix-only second code path — so a large file is copied per block. S
 | `crates/stokehold-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |
 | `crates/stokehold-http` | The HTTP front-end: a `hyper` listener and the static file layer — the only async code in the project |
 | `crates/stokehold-cli` | The `stokehold` binary |
-| `sdk/php` | The PHP worker SDK — the other end of the worker protocol |
 | `docs/plan.md` | The design and the phase plan |
 | `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements |
+
+The PHP worker SDK is not in this repository. It is
+[`sailantis/stokehold-php-sdk`](https://github.com/sailantis/stokehold-php-sdk), a Composer
+package that implements the other end of the worker protocol. The tests here drive its example
+worker, so a working checkout is expected beside this one — or at `STOKEHOLD_SDK_DIR`.
 
 ## Development
 
@@ -306,14 +312,20 @@ in-memory stream and assert the exact wire bytes, so the protocol stays frozen w
 on a PHP install.
 
 `crates/stokehold-worker/tests/php_worker.rs` does the opposite: it starts a real
-`sdk/php/example/worker.php` process and speaks the protocol to it over pipes, so the Rust codec
-and the PHP SDK are checked against each other rather than only against their own fixtures.
+`example/worker.php` from the SDK checkout and speaks the protocol to it over pipes, so the Rust
+codec and the PHP SDK are checked against each other rather than only against their own fixtures.
 
 `crates/stokehold-server/tests/worker_pool.rs` tests the pool around that protocol against real
 worker processes: it boots a pool, serves through every worker in rotation, replaces a worker that
 was killed or asked to be recycled, recycles on `max_requests` and on `memory_limit_mb`, and
 checks that dropping the pool leaves no processes behind. It skips itself when no `php` is on
-`PATH`.
+`PATH` or the SDK checkout is missing.
+
+The two suites above are the only tests that need the SDK. libtest hides the stderr of a passing
+test, so their skip message is invisible in an ordinary run — the suite reports the same result
+whether the SDK was exercised or not. Where it must have been (CI), set **`STOKEHOLD_E2E=1`**:
+a skip then fails instead of passing. `STOKEHOLD_SDK_DIR` points them at a checkout that is not
+beside this repository.
 
 `crates/stokehold-http/tests/frontend.rs` drives the HTTP listener over a real socket against a
 real worker pool: a GET, a POST body verified byte for byte, request headers landing in the CGI
@@ -334,10 +346,10 @@ the same process, which is what proves the two front-ends really do share one di
 test in that file serves a static file and reaches PHP for a route through the same config and the
 same binary.
 
-The PHP SDK's own suite needs no Rust and no PHPUnit:
+The PHP SDK's own suite needs no Rust and no PHPUnit. It runs in the SDK repository:
 
 ```bash
-php sdk/php/tests/run.php
+php tests/run.php
 ```
 
 ## License

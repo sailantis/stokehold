@@ -46,23 +46,73 @@ fn find_php() -> Option<PathBuf> {
     None
 }
 
+/// The SDK the example worker lives in, which is now a repository of its own.
+///
+/// `STOKEHOLD_SDK_DIR` overrides it; otherwise the sibling layout is assumed.
+fn sdk_dir() -> PathBuf {
+    match std::env::var_os("STOKEHOLD_SDK_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("stokehold-php-sdk"),
+    }
+}
+
 /// The SDK's example worker, which is what the pool is pointed at.
 fn example_worker() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("sdk")
-        .join("php")
-        .join("example")
-        .join("worker.php")
+    sdk_dir().join("example").join("worker.php")
+}
+
+/// Why this test cannot run here, if it cannot.
+fn skip_reason() -> Option<String> {
+    if find_php().is_none() {
+        return Some("no php on PATH".to_string());
+    }
+
+    let script = example_worker();
+    if !script.is_file() {
+        return Some(format!(
+            "the SDK example worker is not at {} — set STOKEHOLD_SDK_DIR to a \
+             stokehold-php-sdk checkout",
+            script.display()
+        ));
+    }
+
+    None
+}
+
+/// Report that this test cannot run here.
+///
+/// libtest hides the stderr of a passing test, so a skip is invisible in an
+/// ordinary run. Set `STOKEHOLD_E2E=1` where a skip should be a failure.
+fn report_skip(reason: String) {
+    if skip_is_a_failure() {
+        panic!("STOKEHOLD_E2E is set, so a skipped test is a failure: {reason}");
+    }
+    eprintln!("skipping: {reason}");
+}
+
+/// Whether `STOKEHOLD_E2E` asks for skips to be failures. `0` or empty means no.
+fn skip_is_a_failure() -> bool {
+    match std::env::var("STOKEHOLD_E2E") {
+        Ok(value) => !value.is_empty() && value != "0",
+        Err(_) => false,
+    }
 }
 
 /// A configuration pointing a worker backend at the example worker.
+///
+/// Callers check `skip_reason()` first, so reaching the assertion below means
+/// something asked for this config without one — which is a test bug, not an
+/// environment fact, and has to fail loudly rather than skip.
 fn worker_config(workers: u32) -> Config {
     let script = example_worker();
     assert!(
         script.is_file(),
-        "the SDK example worker is missing at {}",
+        "the SDK example worker is missing at {} — set STOKEHOLD_SDK_DIR to a \
+         stokehold-php-sdk checkout",
         script.display()
     );
 
@@ -114,8 +164,8 @@ impl Server {
     /// its own runtime keeps the async boundary visible in the test as well as in
     /// the production code.
     fn with_workers(workers: u32) -> Option<Server> {
-        if find_php().is_none() {
-            eprintln!("skipping: no php on PATH");
+        if let Some(reason) = skip_reason() {
+            report_skip(reason);
             return None;
         }
         let config = worker_config(workers);

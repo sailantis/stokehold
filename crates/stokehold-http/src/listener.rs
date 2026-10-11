@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
@@ -42,6 +43,22 @@ use stokehold_fcgi::{cgi, RequestInfo, Route, Routing};
 use stokehold_server::{Dispatcher, ServerError};
 
 use crate::error::{HttpError, Result};
+use crate::static_files::{self, StaticFiles};
+
+/// The body type every response uses.
+///
+/// A backend answer is a `Vec` that is already in memory, while a static file is
+/// a stream, so the two have to meet somewhere. Boxing is that meeting point: one
+/// allocation per response, against a static file that would otherwise have to be
+/// buffered whole to be expressible.
+pub type ResponseBody = BoxBody<Bytes, std::io::Error>;
+
+/// A body made of bytes that are already in memory.
+pub fn body_of(bytes: Bytes) -> ResponseBody {
+    Full::new(bytes)
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed()
+}
 
 /// How long an idle keep-alive connection may sit before it is closed.
 ///
@@ -130,6 +147,19 @@ struct FrontEnd {
     /// The port this listener is bound to, for `SERVER_PORT` when the client
     /// sends no `Host`.
     server_port: u16,
+    /// Serving files from the document root. Consulted before the body is read,
+    /// and inert until `enabled` is set.
+    statics: StaticFiles,
+}
+
+/// What the static layer needs, as the caller spells it.
+///
+/// Separate from [`StaticFiles`] because only the listener knows its own bound
+/// port, which the layer needs for a redirect.
+#[derive(Debug, Clone, Default)]
+pub struct StaticState {
+    pub config: stokehold_core::config::StaticConfig,
+    pub document_root: std::path::PathBuf,
 }
 
 /// A running HTTP listener.
@@ -166,14 +196,16 @@ impl RunningHttp {
         dispatcher: Arc<Mutex<Dispatcher>>,
         routing: Routing,
         limits: HttpLimits,
+        statics: StaticState,
     ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(HttpError::Runtime)?;
 
-        let listener =
-            runtime.block_on(HttpListener::bind(address, dispatcher, routing, limits))?;
+        let listener = runtime.block_on(HttpListener::bind(
+            address, dispatcher, routing, limits, statics,
+        ))?;
         let bound = listener.local_addr()?;
         let shutdown = listener.shutdown_handle();
         let stats = listener.stats();
@@ -239,6 +271,7 @@ impl HttpListener {
         dispatcher: Arc<Mutex<Dispatcher>>,
         routing: Routing,
         limits: HttpLimits,
+        statics: StaticState,
     ) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -260,6 +293,12 @@ impl HttpListener {
                 stats: Arc::new(HttpStats::default()),
                 shutdown: Arc::new(AtomicBool::new(false)),
                 server_port: bound.port(),
+                statics: StaticFiles {
+                    config: statics.config,
+                    document_root: statics.document_root,
+                    // The bound port, which matters when port 0 was requested.
+                    server_port: bound.port(),
+                },
             }),
         })
     }
@@ -387,7 +426,7 @@ async fn handle(
     request: Request<Incoming>,
     front_end: Arc<FrontEnd>,
     remote_addr: String,
-) -> Response<Full<Bytes>> {
+) -> Response<ResponseBody> {
     match prepare(request, &front_end, remote_addr).await {
         Ok(response) => {
             front_end.stats.requests.fetch_add(1, Ordering::Relaxed);
@@ -406,13 +445,32 @@ async fn prepare(
     request: Request<Incoming>,
     front_end: &Arc<FrontEnd>,
     remote_addr: String,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
+
+    // Static content is decided before the body is read: a `GET` for a file has
+    // no body worth buffering, and refusing to buffer one it will never use is
+    // the point of a limit.
+    {
+        let static_request = static_files::Request {
+            method: &parts.method,
+            path: parts.uri.path(),
+            headers: &parts.headers,
+            host: parts
+                .headers
+                .get(HOST)
+                .and_then(|value| value.to_str().ok()),
+        };
+        if let Some(answer) = static_files::respond(static_request, &front_end.statics).await {
+            return answer;
+        }
+    }
+
     let body = read_body(body, front_end.limits.max_body_bytes).await?;
 
-    // Everything from here on blocks: the routing layer stats the filesystem to
-    // resolve SCRIPT_FILENAME, and the backend reads and writes pipes. Both must
-    // happen off the runtime's threads.
+    // Everything from here on blocks: routing stats the filesystem to resolve
+    // SCRIPT_FILENAME, and the backend reads and writes pipes. Both must happen
+    // off the runtime's threads.
     let front_end = Arc::clone(front_end);
     let blocking = tokio::task::spawn_blocking(move || {
         let cgi_request = to_cgi(
@@ -549,7 +607,7 @@ fn to_cgi(
 /// connection, while declaring less is merely conservative. `HEAD` is handled by
 /// `hyper`, which suppresses the body and keeps the length — which is exactly
 /// what `HEAD` is for.
-fn from_cgi(response: stokehold_fcgi::Response) -> Result<Response<Full<Bytes>>> {
+fn from_cgi(response: stokehold_fcgi::Response) -> Result<Response<ResponseBody>> {
     let (status, headers) = response.parse_status_headers();
     let body = stokehold_fcgi::split_response_body(&response.stdout).to_vec();
 
@@ -563,19 +621,19 @@ fn from_cgi(response: stokehold_fcgi::Response) -> Result<Response<Full<Bytes>>>
     builder = builder.header(CONTENT_LENGTH, body.len());
 
     builder
-        .body(Full::new(Bytes::from(body)))
+        .body(body_of(Bytes::from(body)))
         .map_err(|err| HttpError::BadGateway(format!("the backend sent an unusable header: {err}")))
 }
 
 /// A plain-text error page for a failure that never reached the application.
-fn error_response(err: &HttpError) -> Response<Full<Bytes>> {
+fn error_response(err: &HttpError) -> Response<ResponseBody> {
     let body = format!("{}\n", err);
     Response::builder()
         .status(err.status())
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(CONTENT_LENGTH, body.len())
-        .body(Full::new(Bytes::from(body)))
-        .expect("a fixed status, fixed headers and a textual body always build")
+        .body(body_of(Bytes::from(body)))
+        .expect("a plain-text error page is a valid response")
 }
 
 /// Which HTTP status a dispatch failure deserves.

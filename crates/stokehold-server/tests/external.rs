@@ -65,6 +65,7 @@ fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
         server: ServerConfig {
             http: Some("127.0.0.1:8080".to_string()),
             fastcgi: None,
+            static_files: Default::default(),
         },
         backends: [(
             "fpm".to_string(),

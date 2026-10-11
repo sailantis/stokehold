@@ -22,8 +22,10 @@ supervises it for you.
 > supervises those workers is implemented in `crates/stokehold-server`, so `kind = "worker"` now
 > serves for real: `stokehold serve` boots the pool, handshakes each worker, and serves through it.
 > The HTTP front-end is implemented in `crates/stokehold-http` — a `hyper` listener speaking
-> HTTP/1.1 and HTTP/2 over the same dispatcher as the FastCGI one. Static file serving, TLS and
-> HTTP/3 are not there yet; see [docs/plan.md](docs/plan.md) for the phase order.
+> HTTP/1.1 and HTTP/2 over the same dispatcher as the FastCGI one — and it serves static files
+> from the document root, so a single `stokehold` process can front a site the way nginx plus
+> `php-fpm` would. TLS and HTTP/3 are not there yet; see [docs/plan.md](docs/plan.md) for the
+> phase order.
 >
 > **The async boundary.** `stokehold-http` is the only place with a `tokio` runtime, because
 > `hyper` needs one. Every backend stays blocking, and the dispatcher is reached only through
@@ -53,7 +55,8 @@ Both are served by one dispatcher, so a route can pick whichever semantics it ne
 ```
 
 One binary. No second application is needed to try it — `stokehold serve` can be hit directly
-by a browser and spoken to by nginx at the same time.
+by a browser and spoken to by nginx at the same time, and it serves the site's static files
+itself.
 
 ## Backends
 
@@ -182,6 +185,38 @@ The **most specific** matching route wins — a route stating both a host and a 
 stating only a path — and ties go to the earlier entry. That is deliberately the whole rule: a
 table whose winner depended on something cleverer could not be predicted by reading the file.
 
+## Static files
+
+Static serving is a routing layer of its own, and it is **off by default**: a request that used to
+reach the front controller still does, so upgrading does not change an existing deployment.
+
+```toml
+[server.static_files]
+enabled = true
+```
+
+A request is then answered from disk when the path names a real file under the document root, and
+goes to PHP when it does not. `/assets/app.css` is a file; `/about` is not, so the front controller
+still sees it. That one sentence is the whole rule.
+
+With it enabled, `stokehold` serves:
+
+| Feature | Detail |
+| --- | --- |
+| Content types | A table of what a web build contains; anything unknown is `application/octet-stream` |
+| Validators | `ETag` (length + mtime) and `Last-Modified`, with 304s for `If-None-Match` / `If-Modified-Since` |
+| Ranges | `bytes=0-99`, `bytes=100-`, `bytes=-500`, several at once, 416 for a range past the end, `If-Range` |
+| Precompressed | `file.br` then `file.gz` when the client asked — opt-in, and only when the file exists |
+| Directory indexes | `index.html`, with a 301 from `/docs` to `/docs/` |
+| Caching | One `Cache-Control` for everything, because a per-extension guess goes stale silently |
+| Refusals | Dotfiles answer 404, and a `..` segment answers 403 rather than being clamped |
+
+Serving a file costs no PHP worker and no `spawn_blocking`: path resolution is one blocking
+`stat`, and the bytes stream through `tokio::fs` in 64 KiB blocks with a *content-length* frame, so
+hyper frames the response without chunked encoding. Zero-copy (`sendfile`) is *not* used — that
+would be a Unix-only second code path — so a large file is copied per block. See
+[the module docs](crates/stokehold-http/src/static_files.rs) for what is deliberately absent.
+
 ## Layout
 
 | Path | Contents |
@@ -190,7 +225,7 @@ table whose winner depended on something cleverer could not be predicted by read
 | `crates/stokehold-fcgi` | FastCGI record codec, client, transport and CGI environment |
 | `crates/stokehold-worker` | The worker protocol: framed codec and message set over a worker's pipes |
 | `crates/stokehold-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |
-| `crates/stokehold-http` | The HTTP front-end: a `hyper` listener, the only async code in the project |
+| `crates/stokehold-http` | The HTTP front-end: a `hyper` listener and the static file layer — the only async code in the project |
 | `crates/stokehold-cli` | The `stokehold` binary |
 | `sdk/php` | The PHP worker SDK — the other end of the worker protocol |
 | `docs/plan.md` | The design and the phase plan |
@@ -229,9 +264,18 @@ environment, an application error becoming a 500 while the worker survives, `Con
 agreeing with the body that was sent, keep-alive serving two requests on one connection, four
 concurrent requests, and the error mappings that do not need a backend (404, 413, 502).
 
+The static tests in the same file need no PHP at all, which is most of the point: they start a
+listener over a backend nothing can reach, so a request answered correctly can only have been
+answered by the file server. Serving a file, a 304 for an unchanged one, a 206 range with exactly
+the requested bytes, a 416 past the end, the `/assets` → `/assets/` redirect, a dotfile, a
+traversal, a precompressed variant, a 256 KiB file arriving whole — and, crucially, **502 for
+`/about`**, which is how the tests prove a path that names no file still reaches the application.
+
 `crates/stokehold-cli/tests/serve.rs` is the end-to-end one: it runs the shipped `stokehold`
 binary with both listeners configured on port 0, then drives it over HTTP *and* over FastCGI in
-the same process, which is what proves the two front-ends really do share one dispatcher.
+the same process, which is what proves the two front-ends really do share one dispatcher. A second
+test in that file serves a static file and reaches PHP for a route through the same config and the
+same binary.
 
 The PHP SDK's own suite needs no Rust and no PHPUnit:
 

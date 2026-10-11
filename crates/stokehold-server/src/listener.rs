@@ -320,6 +320,7 @@ mod tests {
             server: stokehold_core::config::ServerConfig {
                 http: None,
                 fastcgi: Some(address.clone()),
+                static_files: Default::default(),
             },
             // Nothing here has to start: the dispatcher is built but never used,
             // because binding fails first. An `external` backend pointing at a

@@ -105,6 +105,7 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
             fastcgi: Some("127.0.0.1:0".to_string()),
+            static_files: Default::default(),
         },
         backends: [(
             "cgi".to_string(),
@@ -245,6 +246,7 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
         server: ServerConfig {
             http: None,
             fastcgi: Some("127.0.0.1:0".to_string()),
+            static_files: Default::default(),
         },
         backends: [(
             "dead".to_string(),

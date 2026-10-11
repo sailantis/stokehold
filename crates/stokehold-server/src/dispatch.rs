@@ -161,6 +161,7 @@ mod tests {
             server: ServerConfig {
                 http: Some("127.0.0.1:8080".to_string()),
                 fastcgi: None,
+                static_files: Default::default(),
             },
             backends: backends
                 .iter()

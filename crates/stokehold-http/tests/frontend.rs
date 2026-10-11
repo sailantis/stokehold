@@ -70,6 +70,7 @@ fn worker_config(workers: u32) -> Config {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
             fastcgi: None,
+            static_files: Default::default(),
         },
         backends: [(
             "app".to_string(),
@@ -128,11 +129,21 @@ impl Server {
             }
         };
 
-        Server::start(dispatcher, routing, HttpLimits::default())
+        Server::start(
+            dispatcher,
+            routing,
+            HttpLimits::default(),
+            Default::default(),
+        )
     }
 
     /// Start a listener around an already-built dispatcher.
-    fn start(dispatcher: Dispatcher, routing: Routing, limits: HttpLimits) -> Option<Server> {
+    fn start(
+        dispatcher: Dispatcher,
+        routing: Routing,
+        limits: HttpLimits,
+        statics: stokehold_http::StaticState,
+    ) -> Option<Server> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -144,6 +155,7 @@ impl Server {
             Arc::new(Mutex::new(dispatcher)),
             routing,
             limits,
+            statics,
         ));
         let listener = match listener {
             Ok(listener) => listener,
@@ -375,7 +387,12 @@ fn a_missing_script_is_a_404_without_troubling_the_backend() {
     let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
         .expect("a dispatcher that starts no process");
 
-    let Some(server) = Server::start(dispatcher, routing, HttpLimits::default()) else {
+    let Some(server) = Server::start(
+        dispatcher,
+        routing,
+        HttpLimits::default(),
+        Default::default(),
+    ) else {
         return;
     };
     let response = get(&server.address, "/nothing.php");
@@ -396,6 +413,7 @@ fn unreachable_config() -> Config {
         server: ServerConfig {
             http: Some("127.0.0.1:0".to_string()),
             fastcgi: None,
+            static_files: Default::default(),
         },
         backends: [(
             "fpm".to_string(),
@@ -414,7 +432,12 @@ fn an_unreachable_backend_is_a_502() {
     let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
         .expect("a dispatcher that starts no process");
 
-    let Some(server) = Server::start(dispatcher, routing, HttpLimits::default()) else {
+    let Some(server) = Server::start(
+        dispatcher,
+        routing,
+        HttpLimits::default(),
+        Default::default(),
+    ) else {
         return;
     };
 
@@ -437,7 +460,7 @@ fn an_oversized_body_is_refused_with_a_413() {
         max_body_bytes: 64,
         ..HttpLimits::default()
     };
-    let Some(server) = Server::start(dispatcher, routing, limits) else {
+    let Some(server) = Server::start(dispatcher, routing, limits, Default::default()) else {
         return;
     };
 
@@ -547,4 +570,336 @@ fn read_one_response(reader: &mut BufReader<TcpStream>) -> u16 {
     reader.read_exact(&mut body).expect("the body");
 
     status
+}
+
+// --------------------------------------------------------- static content
+//
+// The static layer needs no PHP at all, which is most of the point: these tests
+// start a listener over an *unreachable* backend, so a request answered correctly
+// can only have been answered by the file server. A request for a path that names
+// no file must still reach the backend, and that is what the 502s below prove.
+
+/// A document root with the files a static test needs.
+fn static_root(name: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "stokehold-http-static-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("assets")).expect("create the root");
+    std::fs::write(root.join("index.html"), "<h1>home</h1>").expect("write index.html");
+    std::fs::write(root.join("assets/app.css"), "body { margin: 0 }").expect("write app.css");
+    // A directory needs an index for the trailing-slash redirect to mean
+    // anything: without one there is nothing to serve at `/assets/`.
+    std::fs::write(root.join("assets/index.html"), "<h1>assets</h1>").expect("write assets index");
+    std::fs::write(root.join("assets/app.js"), "console.log(1)").expect("write app.js");
+    std::fs::write(root.join("assets/app.js.br"), "brotli-bytes").expect("write app.js.br");
+    std::fs::write(root.join("assets/logo.svg"), "<svg/>").expect("write logo.svg");
+    std::fs::write(root.join(".env"), "SECRET=1").expect("write a dotfile");
+    std::fs::write(root.join("big.bin"), vec![b'x'; 256 * 1024]).expect("write a binary file");
+    root
+}
+
+/// A server that serves files from `root`, with a backend nothing can reach.
+fn static_server(root: &Path, config: stokehold_core::config::StaticConfig) -> Option<Server> {
+    let routing = Routing {
+        document_root: root.to_path_buf(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+
+    Server::start(
+        dispatcher,
+        routing,
+        HttpLimits::default(),
+        stokehold_http::StaticState {
+            config,
+            document_root: root.to_path_buf(),
+        },
+    )
+}
+
+/// The static configuration a test wants, with serving switched on.
+fn static_config() -> stokehold_core::config::StaticConfig {
+    stokehold_core::config::StaticConfig {
+        enabled: true,
+        ..Default::default()
+    }
+}
+
+/// A request with arbitrary headers, ending at EOF.
+fn request_with(address: &str, request: &str) -> Exchange {
+    exchange(address, request.as_bytes())
+}
+
+#[test]
+fn a_file_is_served_without_a_backend() {
+    let root = static_root("serve");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = get(&server.address, "/assets/app.css");
+
+    assert_eq!(response.status, 200, "{response:?}");
+    assert_eq!(response.text(), "body { margin: 0 }");
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/css; charset=utf-8")
+    );
+    assert_eq!(
+        response.header("content-length"),
+        Some(response.body.len().to_string().as_str())
+    );
+    assert_eq!(response.header("accept-ranges"), Some("bytes"));
+    assert_eq!(
+        response.header("cache-control"),
+        Some("public, max-age=3600")
+    );
+    assert!(
+        response.header("etag").is_some(),
+        "a file needs a validator to be cacheable"
+    );
+    assert!(response.header("last-modified").is_some());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_path_that_names_no_file_still_reaches_the_backend() {
+    let root = static_root("fallthrough");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    // `/about` is not a file, so it goes to the front controller — and the
+    // backend here is unreachable, which is how this test proves the request
+    // really was dispatched rather than answered from the filesystem.
+    let response = get(&server.address, "/about");
+    assert_eq!(response.status, 502, "{response:?}");
+
+    // A real PHP file is not the static layer's business either: it is a script,
+    // and the backend decides what happens.
+    let response = get(&server.address, "/index.php");
+    assert_eq!(response.status, 502, "{response:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_head_request_describes_the_file_without_sending_it() {
+    let root = static_root("head");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = request_with(
+        &server.address,
+        "HEAD /assets/app.css HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(response.status, 200, "{response:?}");
+    assert!(response.body.is_empty(), "a HEAD has no body");
+    assert_eq!(
+        response.header("content-length"),
+        Some("18"),
+        "but it still declares the length it would have sent"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_unchanged_file_is_a_304_with_no_body() {
+    let root = static_root("conditional");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let first = get(&server.address, "/assets/app.css");
+    let tag = first.header("etag").expect("an etag").to_string();
+
+    let response = request_with(
+        &server.address,
+        &format!(
+            "GET /assets/app.css HTTP/1.1\r\nHost: example.test\r\nIf-None-Match: {tag}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+
+    assert_eq!(response.status, 304, "{response:?}");
+    assert!(response.body.is_empty(), "a 304 carries no body");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_range_request_returns_just_those_bytes() {
+    let root = static_root("range");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = request_with(
+        &server.address,
+        "GET /big.bin HTTP/1.1\r\nHost: example.test\r\nRange: bytes=0-9\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(response.status, 206, "{response:?}");
+    assert_eq!(response.header("content-range"), Some("bytes 0-9/262144"));
+    assert_eq!(response.header("content-length"), Some("10"));
+    assert_eq!(response.body, vec![b'x'; 10]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_range_past_the_end_is_a_416() {
+    let root = static_root("unsatisfiable");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = request_with(
+        &server.address,
+        "GET /assets/app.css HTTP/1.1\r\nHost: example.test\r\nRange: bytes=9999-\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(response.status, 416, "{response:?}");
+    assert_eq!(
+        response.header("content-range"),
+        Some("bytes */18"),
+        "the client is told what would have worked"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_directory_without_its_slash_redirects() {
+    let root = static_root("redirect");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = get(&server.address, "/assets");
+
+    assert_eq!(response.status, 301, "{response:?}");
+    assert_eq!(
+        response.header("location"),
+        Some("//example.test/assets/"),
+        "the client's own Host is used, so the redirect stays on it"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_dotfile_is_not_served_and_is_not_reported_as_missing() {
+    let root = static_root("dotfile");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = get(&server.address, "/.env");
+
+    // 404 rather than 403: whether a file exists is not a client's business, and
+    // a 403 would confirm it is there.
+    assert_eq!(response.status, 404, "{response:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_traversal_is_refused() {
+    let root = static_root("traversal");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    let response = get(&server.address, "/../Cargo.toml");
+    assert!(
+        response.status == 403 || response.status == 404,
+        "a traversal must not be served: {response:?}"
+    );
+    assert!(
+        !response.text().contains("stokehold"),
+        "and must not leak a file above the root"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_precompressed_variant_is_served_when_it_is_accepted() {
+    let root = static_root("precompressed");
+    let config = stokehold_core::config::StaticConfig {
+        enabled: true,
+        precompressed: true,
+        ..Default::default()
+    };
+    let Some(server) = static_server(&root, config) else {
+        return;
+    };
+
+    let response = request_with(
+        &server.address,
+        "GET /assets/app.js HTTP/1.1\r\nHost: example.test\r\nAccept-Encoding: gzip, br\r\nConnection: close\r\n\r\n",
+    );
+
+    assert_eq!(response.status, 200, "{response:?}");
+    assert_eq!(response.text(), "brotli-bytes");
+    assert_eq!(response.header("content-encoding"), Some("br"));
+    assert_eq!(
+        response.header("vary"),
+        Some("accept-encoding"),
+        "a cache has to key on the encoding"
+    );
+
+    // A client that does not accept it gets the original.
+    let response = request_with(
+        &server.address,
+        "GET /assets/app.js HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(response.text(), "console.log(1)");
+    assert_eq!(response.header("content-encoding"), None);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn static_serving_is_inert_until_it_is_enabled() {
+    let root = static_root("disabled");
+    // The same document root, but serving switched off: every request must reach
+    // the backend, exactly as it did before this layer existed.
+    let Some(server) = static_server(&root, Default::default()) else {
+        return;
+    };
+
+    let response = get(&server.address, "/assets/app.css");
+    assert_eq!(
+        response.status, 502,
+        "a disabled static layer must not answer at all: {response:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_large_file_arrives_whole() {
+    let root = static_root("large");
+    let Some(server) = static_server(&root, static_config()) else {
+        return;
+    };
+
+    // 256 KiB is four times the streaming block size, so this crosses the
+    // boundary where a hand-written body would drop or duplicate a block.
+    let response = get(&server.address, "/big.bin");
+
+    assert_eq!(response.status, 200, "{response:?}");
+    assert_eq!(response.body.len(), 256 * 1024);
+    assert!(response.body.iter().all(|byte| *byte == b'x'));
+
+    let _ = std::fs::remove_dir_all(&root);
 }

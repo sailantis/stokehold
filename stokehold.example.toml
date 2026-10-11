@@ -12,6 +12,20 @@ http = "127.0.0.1:8080"
 fastcgi = "127.0.0.1:9080"
 
 # ---------------------------------------------------------------------------
+# Static files, served from the document root without waking PHP at all. This is
+# a routing layer above the backends: a path that names a real file under the
+# document root is answered from disk, and a path that names nothing still goes
+# to the front controller. Off by default, so enabling it is an explicit choice.
+# ---------------------------------------------------------------------------
+# [server.static_files]
+# enabled = true
+# precompressed = false        # serve file.br / file.gz when the client accepts them
+# directory_index = true       # index.html, with a 301 from /docs to /docs/
+# dotfiles = "deny"            # or "allow"; a denied dotfile answers 404
+# cache_control = "public, max-age=3600"
+# max_multirange_bytes = 1048576   # a multi-range answer is buffered, so it is capped
+
+# ---------------------------------------------------------------------------
 # Persistent worker pool: the PHP process boots the application once and stays
 # resident. stokehold talks to it over the child's stdin/stdout pipes using its
 # own framed protocol. State is NOT reset by PHP per request, so the

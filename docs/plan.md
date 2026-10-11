@@ -102,6 +102,8 @@ opt-in and only when configured.
 | Front-end scope | HTTP listener **in v1**; TLS/ACME/HTTP-2 as a later milestone |
 | Prefork | **deferred**, Unix-only, forked from a PHP boot parent — never from the Tokio runtime |
 | HTTP front-end runtime | **`hyper` on `tokio`, confined to `crates/stokehold-http`** — the target is the public-facing case (static files, HTTP/2 now, HTTP/3 later), and HTTP/3 needs `quinn`, which is itself a `tokio` program. So the runtime was arriving anyway; this is that bet made earlier rather than a second one. Every backend stays blocking and is reached only through `spawn_blocking` |
+| PHP floor | **8.2** — the floor is `memory_reset_peak_usage()`, which the SDK calls to make each `END` report that request's peak rather than a high-water mark that never falls. 8.1 was never verified, and azera and clarity already require 8.2+, so one floor across the stack beats three |
+| Static files | **In the HTTP front-end, above the backends, off by default** — a path naming a file is answered from disk, a path naming nothing is dispatched. Streaming through `tokio::fs` rather than zero-copy: `sendfile` is Unix-only, so it would be a second code path rather than a faster one |
 
 ## 4. Worker protocol (own protocol)
 
@@ -256,6 +258,17 @@ against the specification and secondary implementations, and are confirmed by fi
     connection, and the symptom is latency, not an error. The dispatcher is therefore reached only
     through `spawn_blocking` — `crates/stokehold-http/src/listener.rs`, and the rule is stated in
     that crate's module docs so it is not rediscovered.
+11. **Static serving must not decode the URL path.** Percent-decoding a path before resolving it
+    to a file is how a file server is walked out of its document root: `%2e%2e%2f` resolves to
+    `../` in a layer that decodes and to a literal file name in a layer that does not. The static
+    layer therefore refuses `..` segments outright *and* leaves the path encoded, so the two rules
+    cannot disagree. PHP's router, which does decode, is reached through the front controller and
+    is a separate trust boundary — see `crates/stokehold-http/src/static_files.rs`.
+12. **A ranged or streamed response cannot carry a `Content-Length` hyper did not choose.** A body
+    whose `size_hint` is not exact is framed as chunked, so a stream over a file must be a `Body`
+    with `SizeHint::with_exact` rather than more bytes than were promised — a mismatch desynchronises
+    the connection rather than merely being wrong. The streaming body in `static_files.rs` keeps its
+    own remaining-byte count for exactly this reason.
 
 ## 6. Phases
 
@@ -311,10 +324,15 @@ Phase 6 — front-ends
     and HTTP/2 over the same dispatcher as the FastCGI front-end, with route → backend selection
     and the 404/403/413/502/503/504 mappings. This is the project's only async code, and the
     boundary is `spawn_blocking`; see the crate docs for why.
-20. `static-files` — serve files under the document root without a backend: MIME types,
-    `ETag`/`Last-Modified` and 304s, `Range` requests, precompressed variants, directory indexes,
-    dotfile denial. Split out of step 19 because it is a feature rather than a translation layer —
-    and because it is what turns "serves PHP" into "can front a site".
+20. `static-files` — **done**. Files under the document root are served without a backend: a MIME
+    type table, `ETag`/`Last-Modified` and 304s, single and multi-range requests with `If-Range`,
+    precompressed `.br`/`.gz` variants, directory indexes with a redirect, dotfile denial, and a
+    configurable `Cache-Control`. It is deliberately **off by default**, so upgrading changes
+    nothing, and it sits *above* the backends rather than beside them: a path that names no file
+    goes to PHP exactly as before, which is what keeps a front controller working. Split out of
+    step 19 because it is a feature rather than a translation layer, and because it is what turns
+    "serves PHP" into "can front a site". See `crates/stokehold-http/src/static_files.rs`, and
+    hazards 11 and 12.
 21. `config-cli` — `stokehold serve|check|version`, TOML loading, validation and diagnostics.
 
 Phase 7 — packaging
@@ -358,7 +376,8 @@ Later milestone
    and let systemd own php-fpm (the recommendation, since php-fpm does pool management,
    `pm.max_requests`, per-pool users and slow logs better than we would)?
 4. **Static file serving** in the HTTP front-end: minimal `static` middleware, or out of scope
-   for v1?
+   for v1? — **Answered: in scope, as its own routing layer above the backends, off by default.**
+   See step 20 and the Static files section of the README.
 
 ## 9. Notes
 

@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use stokehold_core::config::Config;
 use stokehold_core::php;
 use stokehold_fcgi::cgi::Routing;
-use stokehold_http::{HttpLimits, RunningHttp};
+use stokehold_http::{HttpLimits, RunningHttp, StaticState};
 use stokehold_server::{Dispatcher, FastCgiListener, Limits, ServerError};
 
 #[derive(Parser, Debug)]
@@ -141,7 +141,7 @@ fn serve(
 ) -> Result<(), ServerError> {
     let config = load_and_validate(path)?;
     let routing = routing_for(document_root, front_controller);
-
+    let static_state = config.server.static_files.clone();
     let http_address = config.server.http.clone();
     let fastcgi_address = config.server.fastcgi.clone();
     if http_address.is_none() && fastcgi_address.is_none() {
@@ -172,6 +172,9 @@ fn serve(
     if !config.routes.is_empty() {
         println!("  routes:           {}", config.routes.len());
     }
+    if static_state.enabled {
+        println!("  static files:     serving from the document root");
+    }
 
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
@@ -201,6 +204,10 @@ fn serve(
                 HttpLimits {
                     max_connections,
                     ..HttpLimits::default()
+                },
+                StaticState {
+                    config: static_state.clone(),
+                    document_root: document_root.to_path_buf(),
                 },
             )
             .map_err(|err| ServerError::Listener {
@@ -331,6 +338,37 @@ fn check(path: &Path, extra_php_dirs: &[PathBuf]) -> Result<(), stokehold_core::
         let host = route.host.as_deref().unwrap_or("*");
         let path = route.path_prefix.as_deref().unwrap_or("*");
         println!("    {host}{path} -> {}", route.backend);
+    }
+
+    println!("  static files:");
+    if config.server.static_files.enabled {
+        println!("    enabled for the HTTP listener");
+        println!(
+            "      precompressed:   {}",
+            if config.server.static_files.precompressed {
+                "yes (.br, then .gz)"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "      directory index: {}",
+            if config.server.static_files.directory_index {
+                "index.html, with a redirect from the bare path"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "      dotfiles:        {:?}",
+            config.server.static_files.dotfiles
+        );
+        println!(
+            "      cache-control:   {}",
+            config.server.static_files.cache_control
+        );
+    } else {
+        println!("    (disabled: every request goes to a backend)");
     }
 
     let mut dirs = extra_php_dirs.to_vec();

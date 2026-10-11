@@ -101,10 +101,19 @@ struct Server {
 
 impl Server {
     fn start(binary: &Path, config: &Path) -> Option<Self> {
+        Server::start_with(binary, config, &[])
+    }
+
+    /// Start the server with extra command-line arguments.
+    ///
+    /// `--document-root` is one of those: it is what routing *and* static serving
+    /// resolve against, so a test that writes a file elsewhere has to say so.
+    fn start_with(binary: &Path, config: &Path, extra: &[&str]) -> Option<Self> {
         let child = Command::new(binary)
             .arg("serve")
             .arg("--config")
             .arg(config)
+            .args(extra)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -372,12 +381,20 @@ fn serve_answers_an_http_request_and_a_fastcgi_request_at_once() {
 #[derive(Debug)]
 struct HttpResponse {
     status: u16,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
 impl HttpResponse {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -405,15 +422,20 @@ fn http_get(address: &str, path: &str) -> HttpResponse {
             )
         });
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();
-    let status = head
-        .lines()
+    let mut lines = head.lines();
+    let status = lines
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse().ok())
         .unwrap_or_else(|| panic!("no status in {head:?}"));
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+        .collect();
 
     HttpResponse {
         status,
+        headers,
         body: raw[split + 4..].to_vec(),
     }
 }
@@ -703,6 +725,85 @@ fn serve_reaches_a_persistent_php_worker_over_the_stokehold_protocol() {
         request(&server.address, &params, marker.as_bytes()).expect("the request completed");
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&format!("payload: {marker}")), "{body}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Start the server with both listeners, a worker backend and static files.
+///
+/// The document root is the temp directory the test writes its own file into, so
+/// the file is served by the *shipped binary* reading the *shipped config* —
+/// nothing about this path is exercised only in a library test.
+fn start_static_server(binary: &Path, root: &Path) -> Option<Server> {
+    let config_path = root.join("stokehold.toml");
+    let command = toml_string(&format!("php \"{}\"", example_worker().display()));
+    let config = format!(
+        "default_backend = \"app\"\n\n[server]\nhttp = \"127.0.0.1:0\"\nfastcgi = \"127.0.0.1:0\"\n\n[server.static_files]\nenabled = true\ncache_control = \"public, max-age=60\"\n\n[backends.app]\nkind = \"worker\"\ncommand = {command}\nworkers = 2\n",
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+    Server::start_with(
+        binary,
+        &config_path,
+        &["--document-root", &root.display().to_string()],
+    )
+}
+
+/// The static layer, end to end through the shipped binary.
+///
+/// One config, two answers: a path that names a file is served from disk without
+/// waking PHP, and a path that does not is still the front controller's. The
+/// second half is what proves the layer is a *routing* decision and not a
+/// replacement for the application.
+#[test]
+fn serve_serves_a_static_file_and_still_reaches_php_for_a_route() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built (run `cargo build`)");
+        return;
+    };
+    if find_php().is_none() {
+        eprintln!("skipping: no php on PATH");
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!("stokehold-static-smoke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    std::fs::write(root.join("style.css"), "body { margin: 0 }").expect("write a static file");
+
+    let Some(server) = start_static_server(&binary, &root) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let Some(http_address) = server.http_address.clone() else {
+        panic!("the HTTP listener did not report an address; the banner was not parsed");
+    };
+
+    // A real file: served from disk, with the MIME type and the caching the
+    // configuration asked for.
+    let response = http_get(&http_address, "/style.css");
+    assert_eq!(response.status, 200, "{response:?}");
+    assert_eq!(response.text(), "body { margin: 0 }");
+    assert!(
+        response
+            .header("content-type")
+            .is_some_and(|value| value.starts_with("text/css")),
+        "the file's type is missing: {response:?}"
+    );
+    assert_eq!(
+        response.header("cache-control"),
+        Some("public, max-age=60"),
+        "the configured caching applies"
+    );
+
+    // Not a file: the front controller answers, so the worker's own body arrives
+    // and the static layer has not swallowed the application.
+    let response = http_get(&http_address, "/health");
+    assert_eq!(response.status, 200, "{response:?}");
+    assert!(
+        response.text().contains("ok"),
+        "the application is still reachable: {}",
+        response.text()
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

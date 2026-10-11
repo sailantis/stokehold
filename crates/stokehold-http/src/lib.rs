@@ -16,6 +16,11 @@
 //! directly would stall the runtime's worker thread, and enough of those stalls
 //! would starve every other connection.
 //!
+//! The static layer is the one part of this crate that does its filesystem work
+//! on the runtime, through `tokio::fs`, which is why it is not behind
+//! `spawn_blocking` — and why a `std::fs::File` is opened off the runtime and
+//! handed to `tokio::fs::File`. See [`listener::open_file`].
+//!
 //! # What is deliberately not here
 //!
 //! TLS, HTTP/2 over TLS (ALPN) and HTTP/3. `hyper` handles HTTP/1.1 and HTTP/2
@@ -25,6 +30,7 @@
 
 pub mod error;
 pub mod listener;
+pub mod static_files;
 
 pub use error::HttpError;
-pub use listener::{HttpLimits, HttpListener, HttpShutdown, HttpStats, RunningHttp};
+pub use listener::{HttpLimits, HttpListener, HttpShutdown, HttpStats, RunningHttp, StaticState};

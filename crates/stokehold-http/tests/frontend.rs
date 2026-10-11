@@ -19,7 +19,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use stokehold_core::config::{BackendConfig, Config, ServerConfig, WorkerConfig};
@@ -201,7 +201,7 @@ impl Server {
 
         let listener = runtime.block_on(HttpListener::bind(
             "127.0.0.1:0",
-            Arc::new(Mutex::new(dispatcher)),
+            Arc::new(dispatcher),
             routing,
             limits,
             statics,

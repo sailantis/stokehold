@@ -218,7 +218,7 @@ fn is_running(pid: u32) -> bool {
 #[test]
 fn starts_a_pool_of_real_workers_and_serves_through_all_of_them() {
     let _serial = serial();
-    let Some(mut pool) = start(3) else {
+    let Some(pool) = start(3) else {
         return;
     };
 
@@ -254,7 +254,7 @@ fn starts_a_pool_of_real_workers_and_serves_through_all_of_them() {
 #[test]
 fn a_request_body_reaches_the_application() {
     let _serial = serial();
-    let Some(mut pool) = start(1) else {
+    let Some(pool) = start(1) else {
         return;
     };
 
@@ -278,7 +278,7 @@ fn a_request_body_reaches_the_application() {
 #[test]
 fn a_large_body_is_chunked_and_arrives_whole() {
     let _serial = serial();
-    let Some(mut pool) = start(1) else {
+    let Some(pool) = start(1) else {
         return;
     };
 
@@ -303,7 +303,7 @@ fn a_large_body_is_chunked_and_arrives_whole() {
 #[test]
 fn an_uncaught_application_error_is_a_500_and_the_worker_survives() {
     let _serial = serial();
-    let Some(mut pool) = start(1) else {
+    let Some(pool) = start(1) else {
         return;
     };
 
@@ -334,7 +334,7 @@ fn an_uncaught_application_error_is_a_500_and_the_worker_survives() {
 #[test]
 fn worker_telemetry_reaches_the_backend_stderr() {
     let _serial = serial();
-    let Some(mut pool) = start(1) else {
+    let Some(pool) = start(1) else {
         return;
     };
 
@@ -353,7 +353,7 @@ fn worker_telemetry_reaches_the_backend_stderr() {
 #[test]
 fn a_killed_worker_is_replaced_in_place() {
     let _serial = serial();
-    let Some(mut pool) = start(1) else {
+    let Some(pool) = start(1) else {
         return;
     };
 
@@ -380,7 +380,7 @@ fn recycling_replaces_the_worker_after_max_requests() {
 
     let mut config = config(1);
     config.max_requests = Some(2);
-    let mut pool = WorkerPool::start("test", &config).expect("pool starts");
+    let pool = WorkerPool::start("test", &config).expect("pool starts");
     let original = pool.pids()[0];
 
     for _ in 0..2 {
@@ -407,7 +407,7 @@ fn recycling_replaces_the_worker_after_max_requests() {
 #[test]
 fn a_worker_that_asks_to_be_recycled_is_replaced() {
     let _serial = serial();
-    let Some(mut pool) = start(1) else {
+    let Some(pool) = start(1) else {
         return;
     };
 
@@ -440,7 +440,7 @@ fn a_worker_that_asks_to_be_recycled_is_replaced() {
 #[test]
 fn the_pool_reports_the_peak_memory_its_workers_measured() {
     let _serial = serial();
-    let Some(mut pool) = start(1) else {
+    let Some(pool) = start(1) else {
         return;
     };
 
@@ -467,7 +467,7 @@ fn a_memory_limit_recycles_a_worker_that_exceeds_it() {
     // know the exact figure the runtime reports.
     let mut config = config(1);
     config.memory_limit_mb = Some(1);
-    let mut pool = WorkerPool::start("test", &config).expect("pool starts");
+    let pool = WorkerPool::start("test", &config).expect("pool starts");
     let original = pool.pids()[0];
 
     let response = pool.request(&get("/health")).expect("a worker answered");
@@ -520,6 +520,88 @@ fn a_pool_dropped_without_shutdown_still_stops_its_workers() {
             "pid {pid} survived the pool being dropped"
         );
     }
+}
+
+#[test]
+fn concurrent_requests_overlap_rather_than_queueing() {
+    let _serial = serial();
+    require_sdk!();
+
+    // A worker with a route that takes measurable time. Written here rather than
+    // added to the SDK's example, because it exists only to make overlap
+    // observable.
+    let dir = std::env::temp_dir().join(format!("stokehold-slow-worker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("slow-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Stokehold\Request;
+use Stokehold\Response;
+use Stokehold\Worker;
+$worker = Worker::create();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    $path = (string) parse_url($request->uri, PHP_URL_PATH);
+    if ($path === '/slow') {{
+        usleep(500000);
+    }}
+    return Response::json(['pid' => getmypid()]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let workers = 4;
+    let config = WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers,
+        memory_limit_mb: None,
+        max_requests: None,
+        working_dir: None,
+        env: Default::default(),
+    };
+    let pool = WorkerPool::start("test", &config).expect("pool starts");
+
+    // One request per worker, all at once. Each sleeps 500 ms.
+    let started = std::time::Instant::now();
+    let answers: Vec<Option<u16>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    pool.request(&get("/slow"))
+                        .ok()
+                        .map(|response| response.parse_status_headers().0)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect()
+    });
+    let elapsed = started.elapsed();
+
+    for answer in &answers {
+        assert_eq!(*answer, Some(200), "every request should have been served");
+    }
+
+    // Served in parallel this takes about one sleep; served one-at-a-time it
+    // takes `workers` sleeps. The threshold sits between the two, well clear of
+    // either, so the test is not sensitive to machine speed.
+    let serial_minimum = Duration::from_millis(500) * workers;
+    let threshold = Duration::from_millis(1500);
+    assert!(
+        elapsed < threshold,
+        "{workers} concurrent requests took {elapsed:?}, which is close to the {serial_minimum:?} a \
+         serialised pool would need — the requests are queueing rather than overlapping"
+    );
+
+    drop(pool);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

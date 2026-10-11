@@ -7,14 +7,19 @@
 //! keep the code readable, and avoid an executor in a program whose real work is
 //! process supervision.
 //!
-//! The dispatcher is behind a mutex for the same reason: serialising dispatch is
-//! not a compromise, it is what the backends already require. When the worker
-//! pool lands and a slot can truly serve concurrently, this is the single place
-//! that has to change.
+//! The dispatcher is shared without a lock of its own: each backend slot
+//! synchronises internally, so a request to one worker does not hold up a
+//! request to another. That is what makes `workers` mean parallelism as well as
+//! recycling, and it is the change this comment used to say would be needed here
+//! once the worker pool landed.
+//!
+//! Thread-per-connection is deliberate. Threads map onto the number of backend
+//! slots directly, keep the code readable, and avoid an executor in a program
+//! whose real work is process supervision.
 
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dispatch::Dispatcher;
@@ -65,7 +70,7 @@ impl Stats {
 /// A running FastCGI listener.
 pub struct FastCgiListener {
     listener: TcpListener,
-    dispatcher: Arc<Mutex<Dispatcher>>,
+    dispatcher: Arc<Dispatcher>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Stats>,
     limits: Limits,
@@ -77,10 +82,11 @@ impl FastCgiListener {
     /// Binding happens here rather than inside `run`, so a port conflict is
     /// reported before any backend is started.
     ///
-    /// The dispatcher arrives behind an `Arc<Mutex<_>>` because it is shared: the
-    /// HTTP front-end serves the same backends, so there is one set of processes
-    /// behind one routing decision, whichever protocol a request arrived on.
-    pub fn bind(address: &str, dispatcher: Arc<Mutex<Dispatcher>>, limits: Limits) -> Result<Self> {
+    /// The dispatcher arrives as an `Arc` because it is shared: the HTTP
+    /// front-end serves the same backends, so there is one set of processes
+    /// behind one routing decision, whichever protocol a request arrived on. It
+    /// needs no lock because each backend synchronises internally.
+    pub fn bind(address: &str, dispatcher: Arc<Dispatcher>, limits: Limits) -> Result<Self> {
         let listener = TcpListener::bind(address).map_err(|source| ServerError::Misconfigured {
             backend: "<listener>".to_string(),
             reason: format!("cannot bind {address}: {source}"),
@@ -187,7 +193,7 @@ impl ShutdownHandle {
 /// Serve requests on one connection until the peer closes or keep-alive ends.
 fn serve_connection(
     mut stream: std::net::TcpStream,
-    dispatcher: Arc<Mutex<Dispatcher>>,
+    dispatcher: Arc<Dispatcher>,
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
     max_connections: usize,
@@ -245,12 +251,7 @@ fn serve_connection(
         let keep_conn = incoming.keep_conn;
         let request_id = stokehold_fcgi::REQUEST_ID;
 
-        let response = {
-            let mut dispatcher = dispatcher
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            dispatcher.dispatch_to_default(&incoming.into_backend_request())
-        };
+        let response = dispatcher.dispatch_to_default(&incoming.into_backend_request());
 
         match response {
             Ok(response) => {
@@ -340,13 +341,10 @@ mod tests {
         let dispatcher = Dispatcher::from_config(&config, stokehold_fcgi::Routing::default())
             .expect("dispatcher");
 
-        let err = FastCgiListener::bind(
-            &address,
-            std::sync::Arc::new(Mutex::new(dispatcher)),
-            Limits::default(),
-        )
-        .err()
-        .unwrap_or_else(|| panic!("binding {address} should have failed"));
+        let err =
+            FastCgiListener::bind(&address, std::sync::Arc::new(dispatcher), Limits::default())
+                .err()
+                .unwrap_or_else(|| panic!("binding {address} should have failed"));
         assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");
         assert!(err.to_string().contains("cannot bind"), "{err}");
     }

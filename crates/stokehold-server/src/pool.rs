@@ -17,6 +17,8 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use stokehold_core::config::SpawnCgiConfig;
@@ -114,7 +116,12 @@ fn retryable(err: &stokehold_fcgi::FcgiError) -> bool {
 #[derive(Debug)]
 pub struct CgiPool {
     name: String,
-    slots: Vec<Slot>,
+    /// Each slot behind its own lock, so the pool serves as many requests at once
+    /// as it has slots. `php-cgi` processes one request at a time, so the lock is
+    /// per process rather than per pool.
+    slots: Vec<Mutex<Slot>>,
+    /// Round-robin position, so work and therefore memory are spread evenly.
+    cursor: AtomicUsize,
     binary: PathBuf,
     bind_host: String,
     max_requests: Option<u64>,
@@ -143,6 +150,7 @@ impl CgiPool {
         let mut pool = CgiPool {
             name: name.to_string(),
             slots: Vec::with_capacity(count as usize),
+            cursor: AtomicUsize::new(0),
             binary: config.binary.clone(),
             bind_host: config.bind_host.clone(),
             max_requests: config.max_requests,
@@ -162,7 +170,7 @@ impl CgiPool {
                     })?;
             }
             let slot = pool.spawn_slot(port)?;
-            pool.slots.push(slot);
+            pool.slots.push(Mutex::new(slot));
             port = port
                 .checked_add(1)
                 .ok_or_else(|| ServerError::Misconfigured {
@@ -260,10 +268,10 @@ impl CgiPool {
 
     /// Send a request through the pool.
     ///
-    /// Slots are used in order and each one handles one request at a time, which
-    /// is exactly what `php-cgi` supports. Replacing the child process is
+    /// Takes `&self`, so one request per slot runs at a time and a request to a
+    /// free slot does not wait for a busy one. Replacing the child process is
     /// `restart`'s job.
-    pub fn request(&mut self, request: &Request) -> Result<Response> {
+    pub fn request(&self, request: &Request) -> Result<Response> {
         if self.slots.is_empty() {
             return Err(ServerError::NoWorker {
                 backend: self.name.clone(),
@@ -271,13 +279,22 @@ impl CgiPool {
         }
 
         let index = self.next_slot_index();
-        let response = self.slots[index].request(request)?;
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let response = slot.request(request)?;
 
         // Recycle on the request count, mirroring `pm.max_requests`: this is what
         // bounds the effect of any leak in the application under test.
         if let Some(max) = self.max_requests {
-            if self.slots[index].served >= max {
-                self.restart(index)?;
+            if slot.served >= max {
+                let port = slot.port;
+                let mut replacement = self.spawn_slot(port)?;
+                replacement.served = 0;
+                let old = std::mem::replace(&mut *slot, replacement);
+                let mut old = old;
+                let _ = old.child.kill();
+                let _ = old.child.wait();
             }
         }
         Ok(response)
@@ -287,40 +304,67 @@ impl CgiPool {
     ///
     /// A slot that died is restarted in place so the pool keeps its size; the
     /// alternative is a pool that silently shrinks under repeated crashes.
-    fn next_slot_index(&mut self) -> usize {
-        for index in 0..self.slots.len() {
-            if self.slots[index].is_alive() {
+    fn next_slot_index(&self) -> usize {
+        let count = self.slots.len();
+        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..count {
+            let index = (base + offset) % count;
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_alive() {
                 return index;
             }
             // Give up on restart here rather than in a dispatch path: if this
             // fails the slot is replaced lazily on the next tick.
             tracing::warn!(
                 backend = %self.name,
-                port = self.slots[index].port,
+                port = slot.port,
                 "a php-cgi slot died; restarting"
             );
-            if self.restart(index).is_err() {
-                break;
+            if let Err(err) = self.replace_locked(&mut slot) {
+                tracing::warn!(backend = %self.name, %err, "could not restart a slot");
+                continue;
             }
+            return index;
         }
+        // Every slot is gone; the first one will be replaced on the next request.
         0
     }
 
     /// Replace the process in a slot, keeping its port.
-    pub fn restart(&mut self, index: usize) -> Result<()> {
-        let port = self.slots[index].port;
-        let mut replacement = self.spawn_slot(port)?;
+    pub fn restart(&self, index: usize) -> Result<()> {
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.replace_locked(&mut slot)
+    }
+
+    /// Replace a locked slot's process with a fresh one on the same port.
+    ///
+    /// The replacement is booted before the old process is killed, so a slot that
+    /// cannot be restarted keeps working rather than being left dead.
+    fn replace_locked(&self, slot: &mut Slot) -> Result<()> {
+        let mut replacement = self.spawn_slot(slot.port)?;
         replacement.served = 0;
-        let old = std::mem::replace(&mut self.slots[index], replacement);
-        let mut old = old;
+        let mut old = std::mem::replace(slot, replacement);
         let _ = old.child.kill();
         let _ = old.child.wait();
         Ok(())
     }
 
     /// Stop every slot, waiting for it to exit.
+    ///
+    /// `&mut self` because stopping means emptying the pool, and only the owner
+    /// may do that. Nothing on the request path needs it: the server drops the
+    /// pool, and `Drop` calls this.
     pub fn shutdown(&mut self) {
         for slot in &mut self.slots {
+            // `get_mut`: the pool is exclusively borrowed, so there is nothing to
+            // synchronise against.
+            let slot = slot
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let _ = slot.child.kill();
             let _ = slot.child.wait();
         }
@@ -329,12 +373,23 @@ impl CgiPool {
 
     /// The ports in use, for diagnostics.
     pub fn ports(&self) -> Vec<u16> {
-        self.slots.iter().map(|slot| slot.port).collect()
+        self.locked_slots().iter().map(|slot| slot.port).collect()
     }
 
     /// The process ids of the slots, for diagnostics and tests.
     pub fn pids(&self) -> Vec<u32> {
-        self.slots.iter().map(|slot| slot.child.id()).collect()
+        self.locked_slots()
+            .iter()
+            .map(|slot| slot.child.id())
+            .collect()
+    }
+
+    /// Every slot, locked in turn, for a read that does not span a request.
+    fn locked_slots(&self) -> Vec<std::sync::MutexGuard<'_, Slot>> {
+        self.slots
+            .iter()
+            .map(|slot| slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+            .collect()
     }
 }
 

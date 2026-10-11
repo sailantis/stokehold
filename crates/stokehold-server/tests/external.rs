@@ -125,7 +125,7 @@ fn an_external_backend_serves_requests_over_its_socket() {
         r#"<?php echo "EXT="; echo file_get_contents("php://input");"#,
     );
 
-    let mut dispatcher = dispatcher_for(&server.socket(), &root);
+    let dispatcher = dispatcher_for(&server.socket(), &root);
     assert_eq!(dispatcher.default_backend(), "fpm");
     assert_eq!(dispatcher.backend_names(), vec!["fpm"]);
 
@@ -157,7 +157,7 @@ fn an_external_backend_reuses_its_connection_across_requests() {
         r#"<?php echo "N="; echo file_get_contents("php://input");"#,
     );
 
-    let mut dispatcher = dispatcher_for(&server.socket(), &root);
+    let dispatcher = dispatcher_for(&server.socket(), &root);
 
     // Several requests in a row: the backend must not need a new connection each
     // time, and must not fail if the server does close between requests.
@@ -192,7 +192,7 @@ fn an_external_backend_reconnects_after_the_server_is_replaced() {
         r#"<?php echo "RC="; echo file_get_contents("php://input");"#,
     );
 
-    let mut dispatcher = dispatcher_for(&server.socket(), &root);
+    let dispatcher = dispatcher_for(&server.socket(), &root);
     dispatcher
         .dispatch(&request_for(&root, "before"))
         .expect("served before the restart");
@@ -249,7 +249,7 @@ fn a_socket_that_is_not_listening_fails_the_request_not_the_startup() {
     // Attaching to a socket is lazy: the dispatcher must start even when nothing
     // is listening, because php-fpm may be starting alongside us. The failure
     // then belongs to the request.
-    let mut dispatcher = dispatcher_for("127.0.0.1:1", &root);
+    let dispatcher = dispatcher_for("127.0.0.1:1", &root);
     let err = dispatcher
         .dispatch(&request_for(&root, "x"))
         .expect_err("nothing is listening on port 1");

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
@@ -226,13 +226,13 @@ fn serve(
 
     // Backends start before a listener binds: a misconfigured backend should be
     // reported before a port is occupied. One dispatcher serves both front-ends,
-    // behind a mutex because a backend slot serves one request at a time whichever
-    // protocol arrives.
+    // shared without a lock because each backend slot synchronises internally —
+    // so two requests to two workers run at the same time.
     let dispatcher = Dispatcher::from_config(&config, routing.clone())?;
     for name in dispatcher.backend_names() {
         tracing::info!(backend = %name, "backend ready");
     }
-    let dispatcher = Arc::new(Mutex::new(dispatcher));
+    let dispatcher = Arc::new(dispatcher);
 
     println!("stokehold");
     println!("  document root:    {}", document_root.display());

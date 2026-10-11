@@ -98,7 +98,7 @@ impl Dispatcher {
     }
 
     /// Send a request to the backend its route selects.
-    pub fn dispatch(&mut self, request: &Request) -> Result<Response> {
+    pub fn dispatch(&self, request: &Request) -> Result<Response> {
         let name = self.backend_for(request).to_string();
         self.dispatch_to(&name, request)
     }
@@ -106,16 +106,16 @@ impl Dispatcher {
     /// Send a request to the default backend, ignoring the route table.
     ///
     /// An alias used by the listener, where "default" is the meaningful word.
-    pub fn dispatch_to_default(&mut self, request: &Request) -> Result<Response> {
+    pub fn dispatch_to_default(&self, request: &Request) -> Result<Response> {
         let name = self.default.clone();
         self.dispatch_to(&name, request)
     }
 
     /// Send a request to a named backend.
-    pub fn dispatch_to(&mut self, name: &str, request: &Request) -> Result<Response> {
+    pub fn dispatch_to(&self, name: &str, request: &Request) -> Result<Response> {
         let backend = self
             .backends
-            .get_mut(name)
+            .get(name)
             .ok_or_else(|| ServerError::NoWorker {
                 backend: name.to_string(),
             })?;
@@ -123,6 +123,9 @@ impl Dispatcher {
     }
 
     /// Stop every backend.
+    ///
+    /// `&mut self`, and only reachable by the owner: `Drop` is what reaps the
+    /// processes, so this is not on the request path.
     pub fn shutdown(&mut self) {
         for backend in self.backends.values_mut() {
             backend.shutdown();
@@ -190,7 +193,7 @@ mod tests {
             ],
             "app",
         );
-        let mut dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
+        let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
 
         assert_eq!(dispatcher.default_backend(), "app");
         let mut names = dispatcher.backend_names();
@@ -206,7 +209,7 @@ mod tests {
     #[test]
     fn dispatch_to_an_unknown_backend_reports_it_by_name() {
         let config = config_with(&[("app", unreachable_backend())], "app");
-        let mut dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
+        let dispatcher = Dispatcher::from_config(&config, cgi::Routing::default()).unwrap();
 
         let err = dispatcher
             .dispatch_to("nope", &Request::default())

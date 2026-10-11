@@ -24,8 +24,14 @@ pub struct LifecycleGuard {
 }
 
 // The job handle is owned exclusively by this guard; the type-level invariant
-// is what makes sending it between threads sound.
+// is what makes using it from another thread sound.
 unsafe impl Send for LifecycleGuard {}
+
+// The guard is only ever *used* (adopting a child into the job), and adopting is
+// safe from any thread: the job object itself is safe to share. Marking it
+// `Sync` is what lets a pool that holds it be shared across the request threads,
+// which is exactly what per-slot parallelism needs.
+unsafe impl Sync for LifecycleGuard {}
 
 impl LifecycleGuard {
     /// Create the guard for this process's children.

@@ -3,6 +3,8 @@
 //! One enum covers every backend shape from the configuration, so the
 //! dispatcher and both front-ends have exactly one thing to call.
 
+use std::sync::Mutex;
+
 use stokehold_core::config::BackendConfig;
 use stokehold_fcgi::{Endpoint, Request, Response};
 
@@ -20,7 +22,9 @@ pub enum Backend {
     External {
         name: String,
         endpoint: Endpoint,
-        client: Option<stokehold_fcgi::Client>,
+        /// Shared behind its own lock: one backend serves both front-ends, so a
+        /// `&mut` here would make the whole dispatcher exclusive again.
+        client: Mutex<Option<stokehold_fcgi::Client>>,
     },
     /// A pool of `php-cgi` processes that stokehold starts and supervises.
     SpawnCgi { name: String, pool: CgiPool },
@@ -45,7 +49,7 @@ impl Backend {
                 Ok(Backend::External {
                     name: name.to_string(),
                     endpoint,
-                    client: None,
+                    client: Mutex::new(None),
                 })
             }
             BackendConfig::SpawnCgi(cgi) => Ok(Backend::SpawnCgi {
@@ -89,7 +93,11 @@ impl Backend {
     }
 
     /// Send a request to this backend.
-    pub fn request(&mut self, request: &Request) -> Result<Response> {
+    ///
+    /// `&self`: a backend is shared between the two front-ends and across
+    /// request threads, so it must not need exclusive access. Each pool does its
+    /// own synchronisation, and only around the work that actually needs it.
+    pub fn request(&self, request: &Request) -> Result<Response> {
         match self {
             Backend::External { .. } => self.request_external(request),
             Backend::SpawnCgi { pool, .. } => pool.request(request),
@@ -106,7 +114,7 @@ impl Backend {
     /// reused connection that fails at the transport level is re-established
     /// once, which is indistinguishable from the client's point of view and
     /// immune to the backend's choice.
-    fn request_external(&mut self, request: &Request) -> Result<Response> {
+    fn request_external(&self, request: &Request) -> Result<Response> {
         let Backend::External {
             name,
             endpoint,
@@ -115,6 +123,10 @@ impl Backend {
         else {
             unreachable!("only called for the external backend")
         };
+
+        let mut client = client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         for attempt in 0..2 {
             let reused = client.is_some();
@@ -158,13 +170,21 @@ impl Backend {
     }
 
     /// Stop the backend and everything it started.
+    ///
+    /// `&mut self`, and only reachable by the owner: `Drop` is what actually
+    /// reaps the processes, so nothing on the request path calls this.
     pub fn shutdown(&mut self) {
         match self {
             Backend::SpawnCgi { pool, .. } => pool.shutdown(),
             Backend::Worker { pool, .. } => pool.shutdown(),
             Backend::External { client, .. } => {
                 // Nothing was started, so there is nothing to stop; dropping the
-                // connection is the whole cleanup.
+                // connection is the whole cleanup. `get_mut` because the pool is
+                // already exclusively borrowed here — taking the lock would be
+                // pointless.
+                let client = client
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 *client = None;
             }
         }

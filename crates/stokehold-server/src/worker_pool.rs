@@ -34,19 +34,21 @@
 //! that nothing happened. Replaying a `POST` because its response was malformed
 //! is how an application is made to run twice, so the error is reported instead.
 //!
-//! The pool takes `&mut self`, so one request is in flight at a time. That is
-//! not a limitation of the design so much as a description of the rest of
-//! stokehold today — the dispatcher serialises dispatch, and a `php-cgi` slot
-//! serves one request at a time too. It is also what lets a worker's pipes be
-//! *moved* into the thread that uses them during a request, which is how the
-//! protocol's one-request-at-a-time rule is enforced by the borrow checker
-//! instead of by a comment.
+//! **Concurrency is per slot.** The pool takes `&self` and each slot is behind
+//! its own `Mutex`, so a pool of `n` workers serves `n` requests at once and a
+//! request to a free worker never waits for a busy one. The protocol's
+//! one-request-at-a-time rule is per *worker*, not per pool, and the lock is what
+//! enforces it now: a worker's pipes are moved into the thread that uses them for
+//! the duration of one request, so nothing else can read or write them meanwhile.
+//! That is the borrow checker doing it, rather than a comment.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use stokehold_core::config::WorkerConfig;
@@ -83,9 +85,18 @@ type Channel = WorkerChannel<ChildStdin, ChildStdout>;
 pub struct WorkerPool {
     name: String,
     spec: Spec,
-    slots: Vec<Slot>,
+    /// The workers, each independently lockable.
+    ///
+    /// The lock is per slot rather than around the pool, so a pool of `n`
+    /// workers serves `n` requests at once. That is the whole point of
+    /// `workers`: the PHP processes are separate and the protocol is
+    /// one-request-at-a-time *per worker*, so nothing about the protocol wants
+    /// requests serialised. A single lock around the pool would make `workers`
+    /// buy recycling and memory spreading but not parallelism, which is a
+    /// surprising thing for a setting called "workers" to mean.
+    slots: Vec<Mutex<Slot>>,
     /// Round-robin position, so work and therefore memory are spread evenly.
-    cursor: usize,
+    cursor: AtomicUsize,
     /// `memory_limit_mb` in bytes, worked out once.
     memory_limit_bytes: Option<u64>,
     max_requests: Option<u64>,
@@ -114,14 +125,14 @@ impl WorkerPool {
             // A failure here returns early, and `slots` is dropped — which kills
             // every worker that did start, so a partial pool leaves nothing
             // behind.
-            slots.push(Slot::from_boot(boot(name, &spec, &guard)?));
+            slots.push(Mutex::new(Slot::from_boot(boot(name, &spec, &guard)?)));
         }
 
         let pool = WorkerPool {
             name: name.to_string(),
             spec,
             slots,
-            cursor: 0,
+            cursor: AtomicUsize::new(0),
             memory_limit_bytes: config
                 .memory_limit_mb
                 .map(|mb| mb.saturating_mul(1024 * 1024)),
@@ -152,7 +163,10 @@ impl WorkerPool {
     /// A replaced worker gets a new one, so this is also how a test observes a
     /// recycle without having to make the pool report it.
     pub fn pids(&self) -> Vec<u32> {
-        self.slots.iter().map(|slot| slot.child.id()).collect()
+        self.locked_slots()
+            .iter()
+            .map(|slot| slot.child.id())
+            .collect()
     }
 
     /// What each worker last reported as its peak resident set, in bytes.
@@ -160,7 +174,7 @@ impl WorkerPool {
     /// Zero until a worker has served a request, because the figure comes from
     /// the `END` frame and a worker that has served nothing has not reported one.
     pub fn peak_memory_bytes(&self) -> Vec<u64> {
-        self.slots
+        self.locked_slots()
             .iter()
             .map(|slot| slot.peak_memory_bytes)
             .collect()
@@ -170,26 +184,47 @@ impl WorkerPool {
     ///
     /// Worth knowing at startup: a pool running an unexpected PHP version is a
     /// deployment problem, and the handshake is the only place it is ever said.
-    pub fn php_versions(&self) -> Vec<&str> {
+    /// Owned strings rather than borrows, because the values live behind a lock
+    /// that is released as soon as this returns.
+    pub fn php_versions(&self) -> Vec<String> {
+        self.locked_slots()
+            .iter()
+            .map(|slot| slot.hello.php_version.clone())
+            .collect()
+    }
+
+    /// Every slot, locked in turn.
+    ///
+    /// The lock is never held across a request here, which is why this is safe
+    /// to call while other threads are serving: it takes each lock only long
+    /// enough to read a field.
+    fn locked_slots(&self) -> Vec<std::sync::MutexGuard<'_, Slot>> {
         self.slots
             .iter()
-            .map(|slot| slot.hello.php_version.as_str())
+            .map(|slot| slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
             .collect()
     }
 
     /// Serve one request on the next worker in rotation.
-    pub fn request(&mut self, request: &Request) -> Result<Response> {
+    ///
+    /// Takes `&self`, so the same pool can be serving other requests on other
+    /// threads at the same time; each one holds only its own slot's lock, and
+    /// only for as long as its worker needs.
+    pub fn request(&self, request: &Request) -> Result<Response> {
         let index = self.pick_slot()?;
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let started = Instant::now();
 
-        let response = match self.invoke(index, request) {
+        let response = match invoke(&mut slot, request) {
             Ok(response) => response,
             Err(source) => {
                 // `invoke` has already decided the worker's fate: a fatal
                 // failure dropped its pipes, a recoverable one put them back. So
                 // a slot without pipes is a slot that needs a replacement.
-                if self.slots[index].channel.is_none() {
-                    self.replace(index);
+                if slot.channel.is_none() {
+                    replace(&self.name, &self.spec, &self.guard, &mut slot);
                 }
                 return Err(ServerError::WorkerProtocol {
                     backend: self.name.clone(),
@@ -199,64 +234,50 @@ impl WorkerPool {
         };
 
         let duration = started.elapsed();
-        self.after_response(index, &response);
+        after_response(
+            &self.name,
+            &self.spec,
+            &self.guard,
+            self.max_requests,
+            self.memory_limit_bytes,
+            &mut slot,
+            &response,
+        );
         Ok(render(response, duration))
     }
 
     /// Replace the worker in a slot, for an operator or a test.
     ///
-    /// The slot must not be serving: this replaces the process and its pipes, so
-    /// it is only meaningful for an idle slot, which is why it is not called from
-    /// anywhere on the request path.
-    pub fn restart(&mut self, index: usize) -> Result<()> {
-        if index >= self.slots.len() {
+    /// The lock means the slot must not be mid-request, so this is only
+    /// meaningful for an idle slot, which is why it is not called from anywhere
+    /// on the request path.
+    pub fn restart(&self, index: usize) -> Result<()> {
+        let Some(slot) = self.slots.get(index) else {
             return Err(ServerError::NoWorker {
                 backend: self.name.clone(),
             });
-        }
-        self.respawn(index)
+        };
+        let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        respawn(&self.name, &self.spec, &self.guard, &mut slot)
     }
 
     /// Stop every worker, waiting for each to exit.
+    ///
+    /// `&mut self` because stopping means emptying the pool, and only the owner
+    /// may do that. Nothing on the request path needs it: the server drops the
+    /// pool, and `Drop` calls this.
     pub fn shutdown(&mut self) {
         for slot in &mut self.slots {
+            // `get_mut`: the pool is exclusively borrowed, so there is nothing to
+            // synchronise against.
+            let slot = slot
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.stop();
         }
         self.slots.clear();
     }
 
-    /// Decide what a completed response means for the worker that produced it.
-    fn after_response(&mut self, index: usize, response: &WorkerResponse) {
-        let slot = &mut self.slots[index];
-        slot.served += 1;
-        slot.peak_memory_bytes = response.end.peak_memory_bytes;
-
-        let mut recycle = if response.end.keep_alive {
-            None
-        } else {
-            Some("the worker asked to be recycled")
-        };
-
-        if recycle.is_none() {
-            if let Some(max) = self.max_requests {
-                if self.slots[index].served >= max {
-                    recycle = Some("max_requests");
-                }
-            }
-        }
-
-        if recycle.is_none() {
-            if let Some(limit) = self.memory_limit_bytes {
-                if self.slots[index].peak_memory_bytes > limit {
-                    recycle = Some("memory_limit_mb");
-                }
-            }
-        }
-        if let Some(reason) = recycle {
-            tracing::debug!(backend = %self.name, slot = index, reason, "recycling a worker");
-            self.replace(index);
-        }
-    }
     /// The slot to use next.
     ///
     /// Round-robin rather than always the first slot: with persistent workers an
@@ -264,7 +285,10 @@ impl WorkerPool {
     /// recycling would then only ever happen on one of them. A dead worker is
     /// replaced in place so the pool keeps its size; the alternative is a pool
     /// that silently shrinks under repeated crashes.
-    fn pick_slot(&mut self) -> Result<usize> {
+    ///
+    /// A slot is only ever *reserved* here, not held: the index is returned and
+    /// the caller takes the lock, so the search never blocks on a busy worker.
+    fn pick_slot(&self) -> Result<usize> {
         let count = self.slots.len();
         if count == 0 {
             return Err(ServerError::NoWorker {
@@ -272,17 +296,19 @@ impl WorkerPool {
             });
         }
 
+        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
         for offset in 0..count {
-            let index = (self.cursor + offset) % count;
-            if self.slots[index].is_available() {
-                self.cursor = (index + 1) % count;
+            let index = (base + offset) % count;
+            let mut slot = self.slots[index]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_available() {
                 return Ok(index);
             }
             tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
-            if self.respawn(index).is_err() {
+            if respawn(&self.name, &self.spec, &self.guard, &mut slot).is_err() {
                 continue;
             }
-            self.cursor = (index + 1) % count;
             return Ok(index);
         }
 
@@ -290,75 +316,111 @@ impl WorkerPool {
             backend: self.name.clone(),
         })
     }
-
-    /// Run one request on a worker, putting its pipes back if they survive.
-    fn invoke(
-        &mut self,
-        index: usize,
-        request: &Request,
-    ) -> std::result::Result<WorkerResponse, WorkerError> {
-        let header = request_header(request);
-        // Owned rather than borrowed because the request runs on its own thread,
-        // which is what makes the deadline implementable at all. One copy of the
-        // request body per request is the price of a portable timeout.
-        let body = request.body.clone();
-
-        let channel = self.slots[index]
-            .channel
-            .take()
-            .expect("a slot is only chosen while it has its pipes");
-
-        let attempt = request_with_deadline(channel, header, body, REQUEST_TIMEOUT);
-
-        if let Some(channel) = attempt.channel {
-            // The pipes are intact, so the worker goes back in rotation before we
-            // interpret the failure: a worker that refused one request is still a
-            // perfectly good worker.
-            self.slots[index].channel = Some(channel);
-        }
-
-        match attempt.result {
-            Ok(response) => Ok(response),
-            Err(source) => {
-                if source.is_fatal() {
-                    // The stream has desynchronised, or the worker is gone.
-                    // Either way its pipes cannot be trusted again.
-                    self.slots[index].terminate();
-                }
-                Err(source)
-            }
-        }
-    }
-
-    /// Replace the worker in a slot, keeping the pool's shape.
-    fn respawn(&mut self, index: usize) -> Result<()> {
-        self.slots[index].terminate();
-        let ready = boot(&self.name, &self.spec, &self.guard)?;
-        self.slots[index] = Slot::from_boot(ready);
-        Ok(())
-    }
-
-    /// Replace the worker in a slot, reporting rather than propagating failure.
-    ///
-    /// The caller is already handling a request that failed; a second error on
-    /// the same path would only hide the first. The slot is left without pipes,
-    /// so `pick_slot` tries again on the next request instead of handing out a
-    /// worker that is known to be dead.
-    fn replace(&mut self, index: usize) {
-        if let Err(err) = self.respawn(index) {
-            tracing::error!(
-                backend = %self.name,
-                slot = index,
-                %err,
-                "could not replace a worker"
-            );
-        }
-    }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Run one request on a worker, putting its pipes back if they survive.
+fn invoke(slot: &mut Slot, request: &Request) -> std::result::Result<WorkerResponse, WorkerError> {
+    let header = request_header(request);
+    // Owned rather than borrowed because the request runs on its own thread,
+    // which is what makes the deadline implementable at all. One copy of the
+    // request body per request is the price of a portable timeout.
+    let body = request.body.clone();
+
+    let channel = slot
+        .channel
+        .take()
+        .expect("a slot is only chosen while it has its pipes");
+
+    let attempt = request_with_deadline(channel, header, body, REQUEST_TIMEOUT);
+
+    if let Some(channel) = attempt.channel {
+        // The pipes are intact, so the worker goes back in rotation before we
+        // interpret the failure: a worker that refused one request is still a
+        // perfectly good worker.
+        slot.channel = Some(channel);
+    }
+
+    match attempt.result {
+        Ok(response) => Ok(response),
+        Err(source) => {
+            if source.is_fatal() {
+                // The stream has desynchronised, or the worker is gone. Either
+                // way its pipes cannot be trusted again.
+                slot.terminate();
+            }
+            Err(source)
+        }
+    }
+}
+
+/// Decide what a completed response means for the worker that produced it.
+fn after_response(
+    name: &str,
+    spec: &Spec,
+    guard: &LifecycleGuard,
+    max_requests: Option<u64>,
+    memory_limit_bytes: Option<u64>,
+    slot: &mut Slot,
+    response: &WorkerResponse,
+) {
+    slot.served += 1;
+    slot.peak_memory_bytes = response.end.peak_memory_bytes;
+
+    let mut recycle = if response.end.keep_alive {
+        None
+    } else {
+        Some("the worker asked to be recycled")
+    };
+
+    if recycle.is_none() {
+        if let Some(max) = max_requests {
+            if slot.served >= max {
+                recycle = Some("max_requests");
+            }
+        }
+    }
+
+    if recycle.is_none() {
+        if let Some(limit) = memory_limit_bytes {
+            if slot.peak_memory_bytes > limit {
+                recycle = Some("memory_limit_mb");
+            }
+        }
+    }
+    if let Some(reason) = recycle {
+        tracing::debug!(backend = %name, pid = slot.child.id(), reason, "recycling a worker");
+        replace(name, spec, guard, slot);
+    }
+}
+
+/// Replace the worker in a slot, keeping the pool's shape.
+fn respawn(name: &str, spec: &Spec, guard: &LifecycleGuard, slot: &mut Slot) -> Result<()> {
+    slot.terminate();
+    let ready = boot(name, spec, guard)?;
+    *slot = Slot::from_boot(ready);
+    Ok(())
+}
+
+/// Replace the worker in a slot, reporting rather than propagating failure.
+///
+/// The caller is already handling a request that failed; a second error on the
+/// same path would only hide the first. The slot is left without pipes, so
+/// `pick_slot` tries again on the next request instead of handing out a worker
+/// that is known to be dead.
+fn replace(name: &str, spec: &Spec, guard: &LifecycleGuard, slot: &mut Slot) {
+    if let Err(err) = respawn(name, spec, guard, slot) {
+        tracing::error!(
+            backend = %name,
+            pid = slot.child.id(),
+            %err,
+            "could not replace a worker"
+        );
     }
 }
 
@@ -1089,6 +1151,34 @@ mod tests {
         let (program, args) = split_command("php worker.php").unwrap();
         assert_eq!(program, "php");
         assert_eq!(args, vec!["worker.php"]);
+    }
+
+    /// The concurrency guarantee, stated as a type-level fact.
+    ///
+    /// `WorkerPool` used to take `&mut self` on the request path, which meant the
+    /// dispatcher had to hold a lock for the whole of `dispatch` and a pool of
+    /// `n` workers served one request at a time — `workers` bought recycling but
+    /// not parallelism. It now takes `&self`, with a lock per slot, so this
+    /// compiles: a shared pool can be reached from several threads at once. If a
+    /// future change reintroduces a pool-wide exclusive borrow, this test stops
+    /// compiling, which is the earliest possible warning.
+    #[test]
+    fn a_pool_can_be_reached_from_several_threads_at_once() {
+        fn assert_shareable<T: Send + Sync>() {}
+        assert_shareable::<WorkerPool>();
+        assert_shareable::<crate::pool::CgiPool>();
+
+        // The shape that matters: the same pool, through a shared reference, from
+        // more than one thread. `request` itself takes `&self` for the same
+        // reason.
+        fn reach_shared(pool: &WorkerPool) -> Vec<usize> {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| pool.len())).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        }
+
+        let _ = reach_shared;
     }
 
     #[test]

@@ -259,7 +259,7 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
         routes: Vec::new(),
     };
     config.validate().expect("valid config");
-    let mut dispatcher =
+    let dispatcher =
         Dispatcher::from_config(&config, stokehold_fcgi::Routing::default()).expect("dispatcher");
 
     let wire = {

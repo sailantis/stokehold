@@ -27,7 +27,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -139,7 +139,10 @@ impl HttpShutdown {
 
 /// Everything one connection needs, shared across tasks.
 struct FrontEnd {
-    dispatcher: Arc<Mutex<Dispatcher>>,
+    /// Shared without a lock of its own: the dispatcher and its backends
+    /// synchronise internally, per backend slot, so requests to different
+    /// workers genuinely run at the same time.
+    dispatcher: Arc<Dispatcher>,
     routing: Routing,
     limits: HttpLimits,
     stats: Arc<HttpStats>,
@@ -193,7 +196,7 @@ impl RunningHttp {
     /// conflict is reported to the caller rather than to a thread.
     pub fn start(
         address: &str,
-        dispatcher: Arc<Mutex<Dispatcher>>,
+        dispatcher: Arc<Dispatcher>,
         routing: Routing,
         limits: HttpLimits,
         statics: StaticState,
@@ -268,7 +271,7 @@ impl HttpListener {
     /// any backend is reached.
     pub async fn bind(
         address: &str,
-        dispatcher: Arc<Mutex<Dispatcher>>,
+        dispatcher: Arc<Dispatcher>,
         routing: Routing,
         limits: HttpLimits,
         statics: StaticState,
@@ -480,11 +483,10 @@ async fn prepare(
             front_end.server_port,
             &remote_addr,
         )?;
-        let mut dispatcher = front_end
+        front_end
             .dispatcher
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        dispatcher.dispatch(&cgi_request).map_err(map_server_error)
+            .dispatch(&cgi_request)
+            .map_err(map_server_error)
     });
 
     let response = blocking

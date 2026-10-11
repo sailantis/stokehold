@@ -35,7 +35,7 @@ pub mod error;
 pub mod header;
 pub mod message;
 
-pub use codec::{WorkerChannel, MAX_BODY_CHUNK};
+pub use codec::{RequestStage, WorkerChannel, MAX_BODY_CHUNK};
 pub use error::{Result, WorkerError};
 pub use header::{
     crc32c, flags, write_frame, Header, MessageType, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_VERSION,

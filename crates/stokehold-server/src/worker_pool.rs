@@ -15,9 +15,12 @@
 //!    it is also the only place a syntax error or an uncaught fatal ever
 //!    appears.
 //! 2. **Every wait has a deadline, and the deadline is enforced by killing the
-//!    worker.** A pipe read has no portable timeout, so each exchange runs on a
+//!    worker.** A pipe read has no portable timeout, so the exchange runs on a
 //!    thread the caller is free to stop waiting on, and the worker is killed to
-//!    end it. The process *is* the cancellation token.
+//!    end it. The process *is* the cancellation token. Every worker owns that
+//!    thread for its whole life — a request is handed to it and answered over a
+//!    channel — so the deadline costs one `recv_timeout` and never a thread
+//!    creation.
 //! 3. **Recycling is the pool's business, not the client's.** A worker that
 //!    reported `keep_alive = false`, hit `max_requests`, or exceeded
 //!    `memory_limit_mb` is replaced in place, so the pool keeps its size and the
@@ -26,34 +29,39 @@
 //!    exits by itself; killing is the fallback, never the first move.
 //!
 //! One difference from the FastCGI backends is deliberate and worth stating,
-//! because the other two do the opposite: **a failed request is not retried.**
-//! There, a transport error means the request never reached the application — the
-//! bytes of a half-written frame cannot have been executed — so replaying it is
-//! safe. Here, a failure can happen *after* the application ran and produced
-//! side effects, and a frame the server did not finish reading is not evidence
-//! that nothing happened. Replaying a `POST` because its response was malformed
-//! is how an application is made to run twice, so the error is reported instead.
+//! because the other two do the opposite: **a failed request is retried only when
+//! the method says replaying it is safe.** There, a transport error means the
+//! request never reached the application — the bytes of a half-written frame
+//! cannot have been executed — so replaying any method is safe. Here, a failure can
+//! happen *after* the application ran and produced side effects, and a frame the
+//! server did not finish reading is not evidence that nothing happened. So
+//! `GET`/`HEAD`/`OPTIONS`/`TRACE`/`PUT`/`DELETE` are replayed on a fresh worker when
+//! the old one's stream ended, and `POST`/`PATCH` are reported as failures instead:
+//! replaying a `POST` because its response was malformed is how an application is
+//! made to run twice.
 //!
 //! **Concurrency is per slot.** The pool takes `&self` and each slot is behind
 //! its own `Mutex`, so a pool of `n` workers serves `n` requests at once and a
 //! request to a free worker never waits for a busy one. The protocol's
-//! one-request-at-a-time rule is per *worker*, not per pool, and the lock is what
-//! enforces it now: a worker's pipes are moved into the thread that uses them for
-//! the duration of one request, so nothing else can read or write them meanwhile.
-//! That is the borrow checker doing it, rather than a comment.
+//! one-request-at-a-time rule is per *worker*, not per pool, and each slot's
+//! exchange thread is what enforces it now: a request is handed to that thread
+//! and the answer comes back on the slot's own channel, so two requests cannot
+//! reach one worker at once. The lock means a caller holds its slot for the
+//! duration, which is the same guarantee the borrow checker used to give.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use stokehold_core::config::WorkerConfig;
 use stokehold_fcgi::protocol::ProtocolStatus;
 use stokehold_fcgi::{EndRequest, NameValuePairs, Request, Response};
+use stokehold_worker::codec::RequestStage;
 use stokehold_worker::codec::WorkerResponse;
 use stokehold_worker::{
     Control, HelloAck, LogRecord, MessageType, RequestHeader, WorkerChannel, WorkerError,
@@ -211,7 +219,31 @@ impl WorkerPool {
     /// threads at the same time; each one holds only its own slot's lock, and
     /// only for as long as its worker needs.
     pub fn request(&self, request: &Request) -> Result<Response> {
-        let index = self.pick_slot()?;
+        match self.attempt(request) {
+            Err(failure) if failure.retryable => {
+                // The worker died while this request was in flight, and the pool
+                // has already replaced it. `invoke` decided a replay is sound: the
+                // stage says whether the request could have been delivered, and the
+                // verb says whether delivering it twice would matter. Without this
+                // a recycled worker answers the request that landed during the
+                // restart with a 502, which is a routine event rather than a fault:
+                // `max_requests` recycling, a memory-limit recycle and a worker that
+                // crashed and was restarted all land here.
+                self.attempt(request).map_err(|failure| failure.source)
+            }
+            outcome => outcome.map_err(|failure| failure.source),
+        }
+    }
+
+    /// One try at a request, with the slot chosen here so a retry can pick a
+    /// different one.
+    fn attempt(&self, request: &Request) -> std::result::Result<Response, FailedAttempt> {
+        let index = self.pick_slot().map_err(|source| FailedAttempt {
+            source,
+            // Nothing was sent, so nothing can be repeated: a missing worker is a
+            // configuration or capacity condition, not a lost request.
+            retryable: false,
+        })?;
         let mut slot = self.slots[index]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -219,16 +251,19 @@ impl WorkerPool {
 
         let response = match invoke(&mut slot, request) {
             Ok(response) => response,
-            Err(source) => {
+            Err(AttemptError { source, retryable }) => {
                 // `invoke` has already decided the worker's fate: a fatal
-                // failure dropped its pipes, a recoverable one put them back. So
-                // a slot without pipes is a slot that needs a replacement.
-                if slot.channel.is_none() {
+                // failure dropped its exchange, a recoverable one put it back. So
+                // a slot without an exchange is a slot that needs a replacement.
+                if slot.exchange.is_none() {
                     replace(&self.name, &self.spec, &self.guard, &mut slot);
                 }
-                return Err(ServerError::WorkerProtocol {
-                    backend: self.name.clone(),
-                    source,
+                return Err(FailedAttempt {
+                    source: ServerError::WorkerProtocol {
+                        backend: self.name.clone(),
+                        source,
+                    },
+                    retryable,
                 });
             }
         };
@@ -324,39 +359,67 @@ impl Drop for WorkerPool {
     }
 }
 
-/// Run one request on a worker, putting its pipes back if they survive.
-fn invoke(slot: &mut Slot, request: &Request) -> std::result::Result<WorkerResponse, WorkerError> {
+/// Run one request on a worker, putting the slot back into rotation if the pipes
+/// survived.
+fn invoke(slot: &mut Slot, request: &Request) -> std::result::Result<WorkerResponse, AttemptError> {
     let header = request_header(request);
-    // Owned rather than borrowed because the request runs on its own thread,
-    // which is what makes the deadline implementable at all. One copy of the
-    // request body per request is the price of a portable timeout.
-    let body = request.body.clone();
+    // No copy of the body: the exchange thread borrows it for the duration of
+    // the call, and the slot's lock keeps nothing else from touching the worker
+    // meanwhile. The deadline costs a `recv_timeout`, not a thread and not a
+    // body.
+    let result = match slot.exchange.as_mut() {
+        Some(exchange) => exchange.request(&header, &request.body, REQUEST_TIMEOUT),
+        // A slot is only chosen while it has an exchange, so this cannot happen;
+        // it is reported rather than panicked because a panic here would take the
+        // whole server down for one request.
+        None => Err((
+            RequestStage::Sending,
+            WorkerError::Closed("the worker has no exchange".to_string()),
+        )),
+    };
 
-    let channel = slot
-        .channel
-        .take()
-        .expect("a slot is only chosen while it has its pipes");
-
-    let attempt = request_with_deadline(channel, header, body, REQUEST_TIMEOUT);
-
-    if let Some(channel) = attempt.channel {
-        // The pipes are intact, so the worker goes back in rotation before we
-        // interpret the failure: a worker that refused one request is still a
-        // perfectly good worker.
-        slot.channel = Some(channel);
-    }
-
-    match attempt.result {
+    match result {
         Ok(response) => Ok(response),
-        Err(source) => {
+        Err((stage, source)) => {
             if source.is_fatal() {
                 // The stream has desynchronised, or the worker is gone. Either
-                // way its pipes cannot be trusted again.
+                // way this slot must not serve again until it is replaced, and
+                // `Slot::exchange` is what `pick_slot` and `request` read to
+                // decide that.
                 slot.terminate();
             }
-            Err(source)
+            // Whether the request may be replayed is decided where both the
+            // failure and the request are known: the stage says whether it was
+            // delivered, the verb says whether delivering it twice would matter,
+            // and neither alone is enough. See `may_retry`.
+            Err(AttemptError {
+                retryable: may_retry(stage, request),
+                source,
+            })
         }
     }
+}
+
+/// A failed attempt at one request, and whether it may be made again.
+#[derive(Debug)]
+struct AttemptError {
+    /// Why the attempt failed.
+    source: WorkerError,
+    /// Whether the request may be sent to the backend again.
+    retryable: bool,
+}
+
+/// The same decision, at the boundary of one whole backend call.
+///
+/// Carried out of `attempt` so `request` can act on it without recomputing the
+/// stage-and-verb rule, and so that a retry decision is made exactly once, in
+/// `invoke`, where the failing exchange actually happened.
+#[derive(Debug)]
+struct FailedAttempt {
+    /// The backend-level failure, reported if the retry is not made or also fails.
+    source: ServerError,
+    /// Whether the request may be sent to the backend again.
+    retryable: bool,
 }
 
 /// Decide what a completed response means for the worker that produced it.
@@ -426,13 +489,14 @@ fn replace(name: &str, spec: &Spec, guard: &LifecycleGuard, slot: &mut Slot) {
 
 /// One worker process and the pipes to talk to it on.
 ///
-/// `channel` is `None` whenever the worker must not be used: while a request is
-/// in flight (the pipes have been moved into the request thread), after a fatal
-/// protocol failure, and after the worker has been stopped.
+/// `exchange` is `None` whenever the worker must not be used: after a fatal
+/// protocol failure, and after the worker has been stopped. A request in flight
+/// leaves it `Some` — the exchange thread stays alive across requests, and the
+/// slot's lock is what keeps two requests off one worker.
 #[derive(Debug)]
 struct Slot {
     child: Child,
-    channel: Option<Channel>,
+    exchange: Option<ChannelExchange>,
     /// The handshake answer, kept so a diagnostic can say which PHP and SAPI the
     /// slot is actually running.
     hello: HelloAck,
@@ -463,7 +527,7 @@ impl Slot {
     fn from_boot(ready: Ready) -> Self {
         Slot {
             child: ready.child,
-            channel: Some(ready.channel),
+            exchange: Some(ready.exchange),
             hello: ready.ack,
             served: 0,
             peak_memory_bytes: 0,
@@ -478,14 +542,13 @@ impl Slot {
     /// matters: a worker that died leaves its pipes at end-of-file, so without it
     /// the pool would confidently hand out a worker that is already gone.
     fn is_available(&mut self) -> bool {
-        self.channel.is_some() && matches!(self.child.try_wait(), Ok(None))
+        self.exchange.is_some() && matches!(self.child.try_wait(), Ok(None))
     }
-
     /// Kill the worker and drop its pipes.
     fn terminate(&mut self) {
-        // The pipes go first, so nothing can read a half-written frame while the
-        // process is being reaped.
-        self.channel = None;
+        // The exchange thread goes first, so nothing can read or write a
+        // half-written frame while the process is being reaped.
+        self.exchange = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -495,14 +558,20 @@ impl Slot {
     /// Two signals go out, in this order: a `CONTROL drain` frame so the worker
     /// can flush and clean up, then end-of-file on its stdin, which is the
     /// shutdown mechanism that cannot fail — the worker's read loop returns and
-    /// the process exits on its own. Waiting for the acknowledgement would need a
-    /// reader thread and a deadline for no gain, because the frame is already in
-    /// the pipe buffer when the pipe closes, so the worker sees both signals in
-    /// order. Killing is only the fallback for a worker that ignores both.
+    /// the process exits on its own. The frame is queued ahead of the close, so
+    /// the worker sees both signals in order. Waiting for the acknowledgement
+    /// would need a deadline for no gain. Killing is only the fallback for a
+    /// worker that ignores both.
     fn stop(&mut self) {
-        if let Some(mut channel) = self.channel.take() {
-            let _ = channel.send_json(MessageType::Control, UNSOLICITED, &Control::Drain, 0);
-            // Dropping the channel closes stdin.
+        if let Some(mut exchange) = self.exchange.take() {
+            // The control frame is unsolicited — no request id — and the
+            // exchange thread will not return an answer, because nothing reads
+            // it: the next thing to happen is the close below.
+            let payload =
+                <stokehold_worker::Json as stokehold_worker::Codec>::encode(&Control::Drain)
+                    .expect("a unit enum serializes");
+            let _ = exchange.send(MessageType::Control, UNSOLICITED, &payload, 0);
+            exchange.close();
         }
         self.wait_or_kill(EXIT_TIMEOUT);
     }
@@ -533,7 +602,7 @@ impl Drop for Slot {
 #[derive(Debug)]
 struct Ready {
     child: Child,
-    channel: Channel,
+    exchange: ChannelExchange,
     ack: HelloAck,
 }
 
@@ -653,7 +722,7 @@ fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
             );
             Ok(Ready {
                 child,
-                channel,
+                exchange: ChannelExchange::start(channel),
                 ack,
             })
         }
@@ -727,49 +796,263 @@ fn handshake_with_timeout(
     }
 }
 
-/// The outcome of one deadline-bounded request.
-struct Attempt {
-    /// The pipes, unless they were left behind in a thread that is still blocked
-    /// and therefore cannot be used again.
-    channel: Option<Channel>,
-    result: std::result::Result<WorkerResponse, WorkerError>,
+/// What the exchange thread is asked to do, and what the caller is told.
+///
+/// `WorkerChannel::request` and `send_frame` answer one exchange each, so the
+/// `request_id` that matches a response lives inside the channel and the caller
+/// only has to say which call it made. Both answer `None` for a response, because
+/// the only exchange that produces one is [`Exchange::Request`] — the handshake is
+/// already done by the time this thread starts.
+enum Exchange {
+    /// Send one request and collect its whole response.
+    Request {
+        header: RequestHeader,
+        body: Vec<u8>,
+    },
+    /// Send one frame from an already-encoded payload.
+    Send {
+        message_type: MessageType,
+        request_id: u32,
+        payload: Vec<u8>,
+        extra_flags: u16,
+    },
 }
 
-/// Send one request and collect its response, giving up after `timeout`.
-///
-/// The channel is *moved* into the thread, so nothing else can read or write
-/// these pipes while the request is in flight — the borrow checker is what
-/// enforces the protocol's one-request-at-a-time rule here.
-fn request_with_deadline(
-    mut channel: Channel,
-    header: RequestHeader,
-    body: Vec<u8>,
-    timeout: Duration,
-) -> Attempt {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = channel.request(&header, &body);
-        let _ = sender.send((channel, result));
-    });
+impl Exchange {
+    /// Run this exchange on a live channel.
+    ///
+    /// `on_stage` is called as the request moves from writing to reading, so a
+    /// failure can be attributed to the half it happened in. Only
+    /// [`Exchange::Request`] has two phases; every other exchange reports `Reading`
+    /// once, because a control or a frame write has nothing to read and its result
+    /// is not retried.
+    fn run(
+        self,
+        channel: &mut Channel,
+        on_stage: &mut dyn FnMut(RequestStage),
+    ) -> std::result::Result<Option<WorkerResponse>, WorkerError> {
+        match self {
+            Exchange::Request { header, body } => {
+                let result = channel.request_staged(&header, &body, &mut *on_stage);
+                result.map(Some)
+            }
+            Exchange::Send {
+                message_type,
+                request_id,
+                payload,
+                extra_flags,
+            } => {
+                on_stage(RequestStage::Reading);
+                channel.send_frame(message_type, request_id, &payload, extra_flags)?;
+                Ok(None)
+            }
+        }
+    }
+}
 
-    match receiver.recv_timeout(timeout) {
-        Ok((channel, result)) => Attempt {
-            channel: Some(channel),
-            result,
-        },
-        // Timed out. The channel is inside a thread that is still blocked in a
-        // read, so the caller has to kill the worker: that is what makes the read
-        // return so the thread can exit and drop the pipes.
-        Err(RecvTimeoutError::Timeout) => Attempt {
-            channel: None,
-            result: Err(WorkerError::Timeout(timeout)),
-        },
-        Err(RecvTimeoutError::Disconnected) => Attempt {
-            channel: None,
-            result: Err(WorkerError::Closed(
-                "the request thread ended without answering".to_string(),
+/// A worker's pipes, and the thread that owns them.
+///
+/// **This is the fix for the per-request thread cost.** A pipe read has no
+/// portable timeout on any platform stokehold runs on, so the deadline has to be
+/// enforced by something outside the read: the worker process is killed, which is
+/// what makes the read return. A thread is what can then be given up on — but it
+/// does *not* have to be a new thread per request. One thread per worker, alive
+/// for the worker's whole life, does the same job and is created once: a request
+/// is posted to it on a channel, and the deadline is a `recv_timeout` on that
+/// channel. Measured on the trivial handler this was worth about half the arm's
+/// throughput (worker 20,422 rps vs `spawn_cgi` 29,950 at concurrency 32).
+///
+/// Two consequences, both deliberate:
+///
+/// - **A timeout still leaks this thread and its pipes.** The thread is blocked
+///   in `read` and will not return, so nothing may be sent to it again — the
+///   caller drops the whole exchange and kills the worker, and the process exit
+///   is what finally ends the read. Sending a second request to a worker whose
+///   first one timed out is the one thing that must not happen, and dropping the
+///   exchange is what makes it impossible.
+/// - **A write error means the thread has ended.** The sender is kept for the
+///   whole call rather than re-sent, so nothing is delivered to a stale request's
+///   answer.
+#[derive(Debug)]
+struct ChannelExchange {
+    /// The thread's inbox. Dropped by `close` to end the thread.
+    work: Option<Sender<Exchange>>,
+    /// The thread's answers, exactly one per exchange.
+    answers: mpsc::Receiver<Answer>,
+    /// Set once the thread has ended, so a write to a dead thread is reported as
+    /// "closed" rather than as an unexplained send failure.
+    ended: bool,
+}
+
+/// The thread's answers, exactly one per exchange.
+///
+/// A failure carries the [`RequestStage`] it happened in, because that is what says
+/// whether the request could have been delivered.
+type Answer = std::result::Result<Option<WorkerResponse>, (RequestStage, WorkerError)>;
+
+impl ChannelExchange {
+    /// Start the exchange thread that owns a freshly handshaken worker's pipes.
+    ///
+    /// Takes ownership of the channel and never gives it back: the thread ends
+    /// when the channel is dropped, which is what `close` arranges.
+    pub fn start(mut channel: Channel) -> Self {
+        let (work_tx, work_rx) = mpsc::channel::<Exchange>();
+        let (answer_tx, answers) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            while let Ok(exchange) = work_rx.recv() {
+                // The stage is tracked here, in the only place that can know it: a
+                // failure is stamped with the half of the request it happened in.
+                // The default is the send phase, so a failure before the callback
+                // fires is still attributed to the write.
+                let mut stage = RequestStage::Sending;
+                let result = exchange.run(&mut channel, &mut |reported| stage = reported);
+                // The receiver is gone only if the caller dropped this exchange,
+                // which happens on a timeout. Then the answer is dropped with the
+                // thread — the caller has already decided not to wait.
+                if answer_tx.send(result.map_err(|source| (stage, source))).is_err() {
+                    break;
+                }
+            }
+        });
+
+        ChannelExchange {
+            work: Some(work_tx),
+            answers,
+            ended: false,
+        }
+    }
+
+    /// Run one request, giving up after `timeout`.
+    ///
+    /// Still one copy of the request body per request, and it is worth being
+    /// honest about why: the work item is moved to the exchange thread, so it must
+    /// own its bytes, and a channel of borrowed data would need a lifetime the
+    /// standard library's channels cannot express. Removing that copy means
+    /// `Request::body` becoming something cheap to share (`Arc<[u8]>`), which is a
+    /// change to the FastCGI layer every backend shares — not worth it while the
+    /// cost is one `memcpy` the previous design also paid. What is gone is the
+    /// thread, which was the measured cost.
+    pub fn request(
+        &mut self,
+        header: &RequestHeader,
+        body: &[u8],
+        timeout: Duration,
+    ) -> std::result::Result<WorkerResponse, (RequestStage, WorkerError)> {
+        let exchange = Exchange::Request {
+            header: header.clone(),
+            body: body.to_vec(),
+        };
+
+        match self.round_trip(exchange, timeout) {
+            Ok(Some(response)) => Ok(response),
+            // `request` always answers with a response, so a `None` here would be
+            // the thread misbehaving rather than a protocol condition.
+            Ok(None) => Err((
+                RequestStage::Reading,
+                WorkerError::Closed(
+                    "the exchange thread answered without a response".to_string(),
+                ),
             )),
-        },
+            Err(failure) => Err(failure),
+        }
+    }
+
+    /// Write one frame, without waiting for anything to come back.
+    ///
+    /// The payload arrives already encoded — `CONTROL drain` is a fixed byte
+    /// string — so this needs no serializer and does not force one on this crate.
+    /// A control frame is unsolicited, so its id is not a request id and is not
+    /// correlated: the answer is drained because the thread produces one per
+    /// exchange, and leaving it in the channel would make the *next* request read
+    /// it and fail for a reason that has nothing to do with the request.
+    pub fn send(
+        &mut self,
+        message_type: MessageType,
+        request_id: u32,
+        payload: &[u8],
+        extra_flags: u16,
+    ) -> std::result::Result<(), WorkerError> {
+        let exchange = Exchange::Send {
+            message_type,
+            request_id,
+            payload: payload.to_vec(),
+            extra_flags,
+        };
+
+        match self.round_trip(exchange, Duration::from_secs(1)).map_err(|(_, source)| source)? {
+            // `Send` writes a frame and reads nothing, so its answer carries no
+            // response and never can.
+            None => Ok(()),
+            Some(_) => Err(WorkerError::Closed(
+                "the exchange thread answered a frame write with a response".to_string(),
+            )),
+        }
+    }
+    /// End the exchange thread by closing the worker's stdin.
+    ///
+    /// Dropping the sender ends the thread's `recv`, and dropping the channel then
+    /// closes the pipes. This is the shutdown signal that cannot fail, and it is
+    /// deliberately not a method on `WorkerChannel`: the worker sees end-of-file on
+    /// its next read and exits under its own control.
+    pub fn close(self) {
+        let ChannelExchange { work, answers, .. } = self;
+        drop(work);
+        drop(answers);
+    }
+
+    /// Post one exchange and wait for its answer.
+    ///
+    /// Exactly one exchange is in flight per worker at a time, so the single
+    /// answer on `answers` is necessarily this one's and no request id needs to
+    /// travel with it to say so. That is a property of the slot's lock, and it is
+    /// why this is not a general-purpose multiplexer.
+    fn round_trip(
+        &mut self,
+        exchange: Exchange,
+        timeout: Duration,
+    ) -> std::result::Result<Option<WorkerResponse>, (RequestStage, WorkerError)> {
+        // Fail fast once the thread is known to be gone. Without this the send below
+        // would succeed — the sender is still alive, only the answer end is closed —
+        // and the call would block until the timeout for a worker that cannot answer.
+        if self.ended {
+            return Err((
+                RequestStage::Reading,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            ));
+        }
+
+        let Some(work) = self.work.as_ref() else {
+            return Err((
+                RequestStage::Sending,
+                WorkerError::Closed("the worker's exchange thread has already ended".to_string()),
+            ));
+        };
+
+        work.send(exchange).map_err(|_| {
+            self.ended = true;
+            (
+                RequestStage::Sending,
+                WorkerError::Closed("the worker's exchange thread has ended".to_string()),
+            )
+        })?;
+
+        match self.answers.recv_timeout(timeout) {
+            Ok(result) => result,
+            // Timed out. The thread is blocked in a read on this worker, so the
+            // caller has to kill the worker: that is what makes the read return so
+            // the thread can exit and drop the pipes.
+            Err(RecvTimeoutError::Timeout) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.ended = true;
+                Err((
+                    RequestStage::Reading,
+                    WorkerError::Closed(
+                        "the exchange thread ended without answering".to_string(),
+                    ),
+                ))
+            }
+        }
     }
 }
 
@@ -845,6 +1128,41 @@ fn text_param(params: &NameValuePairs, name: &str) -> Option<String> {
         .iter()
         .find(|(key, _)| key.as_slice() == name.as_bytes())
         .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
+}
+
+/// Whether a failed request may be sent to the backend again.
+///
+/// Two conditions, and both are needed. The stage decides what the failure proves
+/// about whether the application ran; the verb decides whether running it twice
+/// would matter. Neither alone is enough, and using the stage alone is the bug that
+/// makes an application execute a `POST` twice.
+fn may_retry(stage: RequestStage, request: &Request) -> bool {
+    match stage {
+        // The bytes never left, so there is nothing to run twice.
+        RequestStage::Sending => true,
+        // The request was delivered. A replay is a second execution, which is only
+        // acceptable for a method that means the same thing twice.
+        RequestStage::Reading => is_idempotent(request),
+    }
+}
+
+/// Whether replaying this request cannot cause a second write.
+///
+/// HTTP defines which methods are idempotent, and that is the criterion a pool
+/// retry needs. `GET`, `HEAD`, `OPTIONS` and `TRACE` are safe by definition; `PUT`
+/// and `DELETE` are idempotent by definition. `POST` and `PATCH` are neither, so a
+/// retried one is a second write — and the pool deliberately does not make that
+/// decision for an application.
+///
+/// The check reads the method from the CGI parameters, which is the same place
+/// `request_header` reads it, so a retry cannot disagree with the frame that was
+/// sent. An absent or unrecognised method is treated as not idempotent: the safe
+/// answer is to report the failure rather than to guess.
+fn is_idempotent(request: &Request) -> bool {
+    matches!(
+        text_param(&request.params, "REQUEST_METHOD").as_deref(),
+        Some("GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE")
+    )
 }
 
 /// Rebuild HTTP headers from the CGI parameters.

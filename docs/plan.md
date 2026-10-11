@@ -430,26 +430,58 @@ against the specification and secondary implementations, and are confirmed by fi
     arm's p99 goes 458 µs → 5.27 ms between concurrency 16 and 32 while its rps is flat, which is
     the signature of a queue forming behind a saturated pool rather than a throughput problem.
 
-25. **The worker arm still spends a thread per request, and that is what caps it.** On the trivial
-    handler the piped worker reaches 20,422 rps at concurrency 32 while `spawn_cgi` with the *same*
-    12 slots reaches 29,950 — and RoadRunner's piped worker, speaking the same protocol shape,
-    reaches **31,525**. So stokehold currently *loses* the direct worker-versus-worker comparison
-    by about 54% at concurrency 32, having been level up to concurrency 8 (17,471 vs 16,610). The
-    difference on the worker path is `request_with_deadline`
+25. **The worker arm spent a thread per request, and removing that turned the only losing arm into
+    a winning one.** On the trivial handler the piped worker used to reach 20,422 rps at concurrency
+    32 while `spawn_cgi` with the *same* 12 slots reached 29,950 — and RoadRunner's piped worker,
+    speaking the same protocol shape, reached **31,525**. So stokehold *lost* the direct
+    worker-versus-worker comparison by about 54% at concurrency 32, having been level up to
+    concurrency 8 (17,471 vs 16,610). The cause was `request_with_deadline`
     (`crates/stokehold-server/src/worker_pool.rs`): a pipe read has no portable timeout, so each
-    request spawns a `std::thread` to run the exchange and takes the result through an
-    `mpsc::recv_timeout`, while `CgiPool::request` calls straight into the slot. So every request
-    costs a thread create and a channel handoff, and the pool reaches its ceiling *below* the
-    point where PHP is saturated — the signature is the piped arm's `p99` climbing to 5.48 ms
-    while its rps stays flat. The fix has to keep the deadline: a persistent per-slot reader
-    thread with a channel handoff preserves it, and the timeout then becomes a `recv_timeout` on
-    a channel that already exists rather than one created per request. Not yet done.
+    request spawned a `std::thread` to run the exchange and took the result through an
+    `mpsc::recv_timeout`, while `CgiPool::request` calls straight into the slot. Every request paid
+    a thread create and a channel handoff, so the pool reached its ceiling *below* the point where
+    PHP was saturated — the signature was the piped arm's `p99` climbing to 5.48 ms while its rps
+    stayed flat.
 
-    The consolation is that this is the *only* arm where stokehold is behind: the `external`
-    backend, once hazard 22 was fixed, beats RoadRunner 36,341 to 31,525 at concurrency 32 — and
-    with a real database query in the request the piped worker is ahead of every FastCGI arm at
-    low concurrency (hazard 27), which suggests the deficit is amortised away by any request that
-    does actual work. It is still a real cost on the path of every request and worth removing.
+    **Fixed.** `ChannelExchange` owns one thread per worker for the worker's whole life and owns
+    the `WorkerChannel`; a request is posted to it on an `mpsc` channel, so the deadline is now a
+    `recv_timeout` on a channel that already exists and no thread is created per request. Two
+    things fell out of doing it that were not obvious from the outside:
+
+    - **The retry that a recycle needs became possible, and had to be made safe.** A request that
+      lands on a worker being recycled now fails as `Closed`/`BrokenPipe` and used to become a 502.
+      The pool retries it, but only when replaying cannot execute an application twice, which needs
+      *two* facts: `WorkerChannel::request_staged` reports the `RequestStage` it failed in (a
+      failure while sending proves the `REQUEST` frame never left, so nothing can have run), and
+      `is_idempotent` reads the verb from the CGI params (a `POST` replayed is a second write).
+      Stage alone would have made every `POST` retryable — the exact bug. Measured on the VM, a
+      `GET` that lands in the kill window is now answered by the replacement, and a `POST` in the
+      same window is reported instead of replayed.
+    - **A dead worker is detected on the read, not the write.** Windows reports a write to a dead
+      pipe as `BrokenPipe` only when the write fails; `is_available`'s `try_wait` catches the
+      already-reaped case at `pick_slot`, so the read path is what a mid-request death actually
+      hits.
+
+    **Re-measured on the 12-core VM, 12 workers, 5 s, trivial handler (`WORKERS=12 bash bench.sh`):**
+
+    | arm | 1 | 2 | 4 | 8 | 16 | 32 |
+    |---|---|---|---|---|---|---|
+    | B piped worker, before | 2,875 | 5,653 | 10,664 | 17,471 | 19,737 | 20,422 |
+    | **B piped worker, after** | **3,307** | **7,219** | **13,751** | **24,383** | **32,386** | **36,876** |
+    | E RoadRunner piped | 3,105 | 6,131 | 11,858 | 17,126 | 22,808 | 32,733 |
+    | A static (front-end ceiling) | 5,680 | 11,683 | 24,079 | 35,698 | 37,011 | 36,691 |
+
+    **Stokehold now leads RoadRunner at every concurrency** — +10% at 32, +42% at 16, +42% at 8 —
+    where before it trailed by 54% at 32. Three repetitions gave `B` 23.0/23.5/24.5k at concurrency 8
+    against `E` 17.4/17.0/17.1k and `B` 38.7/38.5/38.3k at 32 against `E` 32.0/32.1/32.0k, so the
+    margin is stable to about ±3%. Two things are worth noting alongside it: the piped worker now
+    *matches the static-file arm* at concurrency 32 (36,876 vs 36,691), which means PHP is no longer
+    what limits it; and `spawn_cgi` did **not** move (29,950 → 30,429), which is the control that
+    says the change altered the worker path and nothing else.
+
+    The `external` backend, once hazard 22 was fixed, beats RoadRunner 36,341 to 31,525 at
+    concurrency 32 — and with a real database query in the request the piped worker is ahead of
+    every FastCGI arm at low concurrency (hazard 27).
 
 26. **`php-cgi -b` accepts a unix socket where the platform has one.** `-b <address:port>|<port>`
     is not TCP-only: `fcgi_listen` (`main/fastcgi.c`) treats a bind path that contains no `:` as

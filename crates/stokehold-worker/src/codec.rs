@@ -31,6 +31,20 @@ use crate::message::{
 /// so a frame length stays far from the protocol's sanity limit.
 pub const MAX_BODY_CHUNK: usize = 64 * 1024;
 
+/// Which half of a request `WorkerChannel::request_staged` reached.
+///
+/// The distinction exists for one reason: a caller that may retry a non-idempotent
+/// request needs to know whether the request could have been delivered. A failure
+/// while [`RequestStage::Sending`] proves it could not; one while
+/// [`RequestStage::Reading`] means it may have been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestStage {
+    /// The `REQUEST` frame and its body were being written.
+    Sending,
+    /// The request was written in full; the response was being read.
+    Reading,
+}
+
 /// One decoded frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -159,6 +173,49 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         self.send_json(MessageType::Request, request_id, &head, 0)?;
         self.send_body(request_id, body)?;
 
+        self.collect_response(request_id)
+    }
+
+    /// The same request, with the send and receive phases kept apart.
+    ///
+    /// The two failure modes look nearly identical on the wire but prove different
+    /// things, and a caller that may retry the request has to know which happened:
+    ///
+    /// - A failure in [`RequestStage::Sending`] means the `REQUEST` frame or one of
+    ///   its body frames could not be written. Nothing was delivered, so replaying
+    ///   the request cannot execute it twice — for *any* method.
+    /// - A failure in [`RequestStage::Reading`] means the request was written in
+    ///   full and the answer was not read. The application may be running it right
+    ///   now, so a replay is a second execution and only an idempotent method can
+    ///   accept that.
+    ///
+    /// [`WorkerChannel::request`] is the version for callers that cannot retry and
+    /// do not care which phase failed.
+    pub fn request_staged(
+        &mut self,
+        request: &RequestHeader,
+        body: &[u8],
+        mut on_stage: impl FnMut(RequestStage),
+    ) -> Result<WorkerResponse> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        if self.next_request_id == crate::UNSOLICITED {
+            self.next_request_id = crate::FIRST_REQUEST_ID;
+        }
+
+        let head = RequestHeader {
+            body_len: body.len() as u64,
+            ..request.clone()
+        };
+
+        // Everything up to the last byte of the body is the send phase. The
+        // callbacks are reported before returning, so a failure that happens
+        // *during* the write is still attributed to `Sending`.
+        on_stage(RequestStage::Sending);
+        self.send_json(MessageType::Request, request_id, &head, 0)?;
+        self.send_body(request_id, body)?;
+
+        on_stage(RequestStage::Reading);
         self.collect_response(request_id)
     }
 
@@ -359,9 +416,25 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         extra_flags: u16,
     ) -> Result<()> {
         let payload = Json::encode(value)?;
-        let mut header = Header::new(message_type, request_id, &payload)?;
+        self.send_frame(message_type, request_id, &payload, extra_flags)
+    }
+
+    /// Write one frame from a payload that is already encoded.
+    ///
+    /// The counterpart of [`WorkerChannel::send_json`] for a caller that holds
+    /// bytes rather than a value — the pool relays a serialized control frame it
+    /// built elsewhere, and re-encoding it here would mean this crate's server
+    /// side needed a serializer of its own.
+    pub fn send_frame(
+        &mut self,
+        message_type: MessageType,
+        request_id: u32,
+        payload: &[u8],
+        extra_flags: u16,
+    ) -> Result<()> {
+        let mut header = Header::new(message_type, request_id, payload)?;
         header.flags |= extra_flags;
-        write_frame(&mut self.writer, &header, &payload)
+        write_frame(&mut self.writer, &header, payload)
     }
 
     /// Read one frame, tolerating nothing: a malformed frame is an error.
@@ -563,6 +636,64 @@ mod tests {
             .map(|(header, _)| header.message_type)
             .collect();
         assert_eq!(types, vec![MessageType::Request]);
+    }
+
+    #[test]
+    fn a_staged_request_reports_the_send_phase_before_the_read_phase() {
+        // The send/read split is what lets the pool decide whether a failed
+        // request may be replayed, so the order and the count are both load
+        // bearing: exactly one call per phase, send first. A codec that reported
+        // both after the fact, or read first, would make every failure look
+        // replayable and could re-run a POST.
+        let mut script = WorkerScript::default();
+        script
+            .head(1, 200, 0)
+            .json(MessageType::End, 1, &RequestEnd::default());
+        let mut channel = script.channel();
+
+        let mut stages = Vec::new();
+        channel
+            .request_staged(&RequestHeader::default(), b"", |stage| stages.push(stage))
+            .unwrap();
+
+        assert_eq!(stages, vec![RequestStage::Sending, RequestStage::Reading]);
+    }
+
+    #[test]
+    fn a_staged_request_that_fails_while_sending_is_reported_as_such() {
+        // A body large enough to need several frames, against a writer that reports
+        // the pipe closed: the write of the first frame fails, and the stage must say
+        // so rather than reporting the read phase. That distinction is the
+        // difference between "this POST was never delivered, retry is safe" and
+        // "this POST may have run already, do not retry".
+        let body = vec![b'z'; MAX_BODY_CHUNK * 4];
+
+        let mut channel = WorkerChannel::new(ClosedWriter, std::io::Cursor::new(Vec::new()));
+        let mut stages = Vec::new();
+        let result = channel.request_staged(&RequestHeader::default(), &body, |stage| {
+            stages.push(stage)
+        });
+
+        assert!(result.is_err(), "a write to a closed pipe must fail");
+        assert_eq!(
+            stages,
+            vec![RequestStage::Sending],
+            "the failure happened while sending, so the read phase was never reached"
+        );
+    }
+
+    /// A writer that always reports the pipe as closed.
+    #[derive(Debug)]
+    struct ClosedWriter;
+
+    impl std::io::Write for ClosedWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

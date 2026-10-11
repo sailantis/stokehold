@@ -523,6 +523,57 @@ fn a_pool_dropped_without_shutdown_still_stops_its_workers() {
 }
 
 #[test]
+fn a_request_landing_on_a_killed_worker_is_answered_by_the_replacement() {
+    let _serial = serial();
+    let Some(pool) = start(1) else {
+        return;
+    };
+
+    let before = pool.pids()[0];
+    kill(before);
+    // No sleep: the request is meant to arrive while the pool's view of the worker
+    // is still "alive but about to be found dead", which is exactly the window a
+    // real recycle opens. If the kill has not been reaped yet the pool finds the
+    // pipes closed and retries; if it already has, `pick_slot` replaces first. Both
+    // are the recovery under test.
+    let response = pool
+        .request(&get("/health"))
+        .expect("the replacement answered the request");
+    assert_eq!(response.parse_status_headers().0, 200);
+    assert_ne!(pool.pids()[0], before, "the dead worker was replaced");
+}
+
+#[test]
+fn a_post_that_lands_on_a_killed_worker_is_reported_not_replayed() {
+    let _serial = serial();
+    let Some(pool) = start(1) else {
+        return;
+    };
+
+    // The same window as above, but with a method HTTP does not define as
+    // idempotent. A retry would be a second write, so the pool must surface the
+    // failure rather than silently run the application twice. A `POST` that
+    // *succeeds* (the worker was already replaced before the request was picked) is
+    // fine — the assertion is that it never reports success by replaying.
+    let before = pool.pids()[0];
+    kill(before);
+
+    match pool.request(&request("POST", "/echo", b"x")) {
+        Ok(response) => {
+            // Only legitimate if the replacement served it in one attempt.
+            assert_eq!(response.parse_status_headers().0, 200);
+            assert_ne!(pool.pids()[0], before);
+        }
+        Err(err) => {
+            assert!(
+                !err.is_timeout(),
+                "a killed worker should not look like a timeout: {err}"
+            );
+        }
+    }
+}
+
+#[test]
 fn concurrent_requests_overlap_rather_than_queueing() {
     let _serial = serial();
     require_sdk!();

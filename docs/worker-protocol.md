@@ -286,21 +286,18 @@ server side cannot detect it:
 writes the cookie naming it into the response headers. Over a pipe neither happens, so a worker that
 wants sessions must read the id in and write the `Set-Cookie` out itself.
 
-There is a further trap in the CLI SAPI. `ext/session/session.c` refuses to start a session when
-`session.use_cookies` is on and `SG(headers_sent)` is already set, and the CLI SAPI sets
-`headers_sent` at process startup — so **a session cannot be started in a CLI worker at all** until
-`session.use_cookies` is turned off. It cannot be turned off from inside PHP either: `ini_set()` is
-refused for session settings once headers have been sent, as is `session_name()`. The only place
-PHP still accepts those settings is the command line, which is why a worker that wants sessions is
-started as:
+The half that is easy to get wrong is the second one. A worker's SAPI does not deliver headers at
+all — under `cli`, `header()`, `setcookie()` and `headers_list()` are all no-ops — so the cookie has
+to be built by the adapter and carried to the client on the response. PHP's own attempt is not
+merely redundant, it is invisible, which makes the failure silent: the session is created, the
+worker logs nothing, and the id never reaches the client.
 
-```toml
-command = "php -d session.use_cookies=0 -d session.cache_limiter= -d session.name=_s worker.php"
-```
+The session id also has to be reset between requests. `session_id()` outlives the request in a
+long-lived process, so a client arriving with no cookie would otherwise inherit the previous
+client's session from the process rather than from its own request.
 
-The failure mode without the flags is silent, not loud: the worker boots, serves every request, and
-only loses session state. `azera-stokehold` prints a one-line warning to stderr the first time it
-would have used a session, since stderr is not the protocol channel.
+Both adapters share one implementation of this, `Azera\Http\WorkerSession` in
+`sailantis/azera-framework`, which is where a third one should look first.
 
 ## The server's side of the contract
 

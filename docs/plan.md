@@ -350,6 +350,22 @@ against the specification and secondary implementations, and are confirmed by fi
     `STOKEHOLD_E2E=1` makes a skip a failure, which is what CI should set; it is deliberately off
     by default so a laptop with no PHP stays green.
 
+21. **A lock held for the length of a request makes `workers` a lie.** The dispatcher kept its
+    `Dispatcher` behind one `Arc<Mutex<_>>` and the pools took `&mut self`, so *every* request in
+    the whole server queued on one lock. Measured on the homepage, throughput was flat at ~65 rps
+    from concurrency 1 to 16 while RoadRunner on the same site scaled linearly to ~765. The
+    per-request cost was never the difference — both did ~66 rps at concurrency 1, so stokehold was
+    simply never using more than one core. The protocol's one-request-at-a-time rule is *per
+    worker*, not per pool, so nothing about the design wanted that serialisation: the pools now
+    lock per slot and the request path takes `&self`. Two lessons worth keeping. First, a
+    concurrency bug looks like a *constant*, not an error — no failure, no latency regression at
+    low load, just a ceiling nobody set. Second, the obvious regression test is a trap: asserting
+    that concurrent requests come back with distinct worker pids passes even when the pool is
+    fully serialised, because round-robin hands consecutive requests to different workers whether
+    or not they queue. The test that actually bites measures **overlap** — four 500 ms requests
+    against four workers must finish in about one sleep, not four — and it was confirmed to fail
+    (2.08 s) with a pool-wide lock deliberately reintroduced.
+
 ## 6. Phases
 
 Phase 0 — skeleton and baseline

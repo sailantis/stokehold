@@ -515,57 +515,67 @@ against the specification and secondary implementations, and are confirmed by fi
     A loopback connect plus authentication to MariaDB is that cheap, which is why benchmarking an
     application that reconnects per request still produces believable numbers.
 
-28. **With a real framework in the request, the warm model's advantage is an order of magnitude,
-    not a rounding error — and the trivial handler hid it completely.** This was the open question
-    from the whole benchmarking effort: on a handler that returns 34 bytes, warm and cold differ by
-    about 10% (hazard 27's numbers move ~10% between the piped and `php-cgi` arms), which made the
-    worker backend look like a marginal optimisation. It is not marginal. The same application,
-    served two ways by the *same server*, first at concurrency 1:
+28. **With a real framework in the request, the warm model's advantage is a multiple, not a rounding
+    error — and the trivial handler hid it completely.** This was the open question from the whole
+    benchmarking effort: on a handler that returns 34 bytes, warm and cold differ by about 10%
+    (hazard 27's arms move ~10% between the piped and `php-cgi` transports), which made the worker
+    backend look like a marginal optimisation. It is not marginal. **The trustworthy evidence is the
+    harness's own published dataset** (`azera-competition: results/real-deployments.json`, real
+    servers, real HTTP, same applications as the in-process harness), comparing RoadRunner's resident
+    worker against nginx + php-fpm, which re-runs the entry script per request:
 
-    | arm (deployment model) | azera `GET /` | azera `GET /items/1` | laravel `GET /` | laravel `GET /items/1` |
-    |---|---|---|---|---|
-    | warm — stokehold resident worker | 2,569 | 2,047 | 664 | 452 |
-    | warm — RoadRunner resident worker | 2,768 | 2,052 | 641 | 447 |
-    | cold — stokehold `spawn_cgi` | 1,115 | 646 | 21.8 | 19.8 |
-    | cold — nginx + php-fpm | 402 | 288 | 49.5 | 41.4 |
+    | app, `GET /` | RoadRunner (warm) | nginx + php-fpm (cold) | ratio |
+    |---|---|---|---|
+    | azera (boot 0.47 ms) | 0.255 ms | 0.785 ms | **3.1×** |
+    | laravel (boot 3.0 ms) | 0.591 ms | 4.42 ms | **7.5×** |
 
-    **The ratio scales with what the application has to boot.** For azera — a small container,
-    measured boot 0.47 ms — warm over cold is 2.3× against `spawn_cgi` and 6.4× against php-fpm. For
-    Laravel it is **30× against `spawn_cgi`** and 13× against php-fpm, because Laravel's bootstrap is
-    the dominant cost of a cheap route. This is the answer to "does the worker model pay off": on
-    an empty handler almost not at all, on a real framework by an order of magnitude.
+    **The ratio scales with what the application has to boot.** A 0.47 ms container costs 3× per
+    request to redo; a 3 ms Laravel bootstrap costs 7.5×, and Laravel's `GET /` is otherwise almost
+    free, so the boot is most of the request. Against ~1.1× on the trivial handler (hazard 25), this
+    is the answer to "does the worker model pay off": on an empty handler hardly at all, on a real
+    framework by a multiple. `deploy/stoke/` and `scripts/fw-bench.sh` in `azera-competition` add
+    stokehold as a third server so the comparison has two independent server pairs rather than one.
 
-    Two things have to be said about the cold arms, because they **disagree with each other** and
-    that disagreement is the honest state of this measurement:
+    **What is deliberately not claimed here: my own four-arm run's cold numbers.** In that run
+    stokehold's `spawn_cgi` beat php-fpm on azera (1,115 vs 402 rps) and lost to it badly on Laravel
+    (21.8 vs 49.5), and neither figure reconciles with the published FPM rows above (azera should be
+    ~1,274 rps, not 402). A cold-versus-cold disagreement in *both* directions means the cold arms
+    are measuring something other than the deployment model, so they are not evidence for anything
+    and the published dataset is used instead. The warm-over-cold ratio measured *within* stokehold
+    (resident worker vs `spawn_cgi`, same server, same app: 2.3× azera, 30× Laravel) brackets the
+    published ratios and agrees on the magnitude, which is the most that can be said for it.
 
-    - **`spawn_cgi` is faster than php-fpm on azera (1,115 vs 402) and slower on Laravel (21.8 vs
-      49.5).** A 2.8× better and a 2.3× worse in the same run rules out load and rules out "one
-      server is faster"; the cause is opcache behaviour in the child. `opcache_get_status` inside
-      the running `spawn_cgi` slot reports `enabled=yes, cached=147` for azera, but across four
-      consecutive requests `hits` stays 0 and `cached` never grows — **the php-cgi child does not
-      keep its opcode cache across requests**, while php-fpm's worker obviously does. So
-      `spawn_cgi` recompiles on every request and php-fpm does not, which is a real difference in the
-      deployment model and not a fair fight for a large framework. The wrapper the harness stamps
-      (`-d opcache.enable_cli=1`, necessary because php-cgi reads that flag and php-fpm does not)
-      fixes the *enabling* but not the *survival*; that is a follow-up in `pool.rs`, not a
-      configuration mistake.
-    - **A php-cgi pool leaked on SIGTERM, and it leaked into the numbers.** `ctrlc::set_handler`
-      handled SIGINT only, so SIGTERM — what `systemctl stop`, `docker stop` and a plain `kill`
-      send — killed the process before any destructor ran and left every php-cgi child alive. One
-      benchmark host accumulated **68 orphans**, each holding a port and a PHP state. Fixed by
-      enabling `ctrlc`'s `termination` feature; a clean SIGTERM now logs `shutting down` and reaps
-      the pool. Both the harness and the earlier runs were contaminated by this, which is why the
-      first cold-arm numbers (measured with 68 orphans competing for 12 cores) were 3× low.
+    Three things were learned while finding that out, all worth keeping:
+
+    - **A first `spawn_cgi` measurement was 3× low because of ini, not architecture.** php-cgi as
+      installed has `opcache.enable_cli = Off` and `xdebug.mode = develop`, and it *reads* that flag
+      while php-fpm does not. The harness now runs php-cgi through a wrapper with the same settings
+      the FPM pools use (`scripts/fw-bench.sh`). Before the wrapper, Laravel's cold arm measured
+      16.6 rps against php-fpm's 49 — a gap with nothing to do with the server.
+    - **A diagnostic probe was itself confounded, and it is worth remembering why.**
+      `opcache.file_update_protection` defaults to 2 seconds, and opcache refuses to cache a file
+      whose mtime is newer than that. Writing a probe script and calling it immediately makes it
+      miss on every request *by design*, which looks exactly like an opcache that does not survive
+      between requests. Any future opcache experiment must `touch` the script and wait before
+      measuring.
+    - **A php-cgi pool leaked on SIGTERM, and it leaked into the numbers** — see hazard 29.
+      `ctrlc::set_handler` covered SIGINT only, so `systemctl stop`, `docker stop` and a plain `kill`
+      ended the process before any destructor ran and left every php-cgi child alive. One benchmark
+      host accumulated **68 orphans**, each holding a port and a PHP state and competing for the 12
+      cores under test. Fixed by enabling `ctrlc`'s `termination` feature.
 
 29. **`max_requests = 0` meant "recycle after every request" — the opposite of php-fpm.**
     `pm.max_requests = 0` in a php-fpm pool and `max_jobs: 0` in a RoadRunner config both mean *never
     recycle*, and a php-fpm pool config is exactly what an operator copies when configuring a Worker
     backend. Both pools compared `served >= max` unguarded, so copying that line made stokehold boot
-    the application once per request — the deployment model the backend exists to avoid. Found while
-    writing the framework benchmark, where it produced 11 rps where 2,569 was expected; it is the
-    single most consequential configuration footgun in the project, because it silently degrades
-    rather than failing. Fixed in `worker_pool.rs` and `pool.rs` (`max > 0`), with a test named for
-    the value that goes wrong, and both config doc comments now state the zero case.
+    the application once per request — the deployment model the backend exists to avoid. It was found
+    while writing the framework benchmark, where it produced 11 rps where 2,569 was expected, and it
+    is the most consequential configuration footgun in the project precisely because it degrades
+    silently instead of failing. Fixed in `worker_pool.rs` and `pool.rs` (`max > 0`), with a test named
+    for the value that goes wrong, and both config doc comments now state the zero case.
+
+    That SIGTERM leak was the *other* bug found the same way, and it is the same shape: a correct-
+    looking configuration (`Ctrl-C works`) with a silently wrong failure mode (`kill` does not).
 
 ## 6. Phases
 

@@ -374,6 +374,33 @@ fn a_killed_worker_is_replaced_in_place() {
 }
 
 #[test]
+fn max_requests_zero_means_never_recycle_not_recycle_every_request() {
+    let _serial = serial();
+    require_sdk!();
+
+    // The value a php-fpm deployment is most likely to copy: `pm.max_requests = 0`
+    // there means the pool never recycles. A bare `served >= max` comparison would
+    // destroy the worker after every request instead, which is one application boot
+    // per request — the exact thing this backend exists to avoid. So this is not a
+    // boundary case, it is the case.
+    let mut config = config(1);
+    config.max_requests = Some(0);
+    let pool = WorkerPool::start("test", &config).expect("pool starts");
+    let original = pool.pids()[0];
+
+    for _ in 0..5 {
+        pool.request(&get("/health")).expect("a worker answered");
+    }
+
+    assert_eq!(
+        pool.pids()[0],
+        original,
+        "max_requests = 0 must mean never, not recycle after every request"
+    );
+    assert!(is_running(original), "the worker should still be the original");
+}
+
+#[test]
 fn recycling_replaces_the_worker_after_max_requests() {
     let _serial = serial();
     require_sdk!();

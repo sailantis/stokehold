@@ -443,7 +443,11 @@ fn after_response(
 
     if recycle.is_none() {
         if let Some(max) = max_requests {
-            if slot.served >= max {
+            // `0` means "never", not "immediately" — php-fpm's `pm.max_requests = 0`
+            // and RoadRunner's `max_jobs: 0` both mean a pool that never recycles, and
+            // a bare `served >= max` comparison would instead destroy the worker after
+            // every request. The tests cover the distinction directly.
+            if max > 0 && slot.served >= max {
                 recycle = Some("max_requests");
             }
         }

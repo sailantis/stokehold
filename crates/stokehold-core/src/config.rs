@@ -299,6 +299,14 @@ pub struct WorkerConfig {
     pub memory_limit_mb: Option<u64>,
 
     /// Recycle a worker after this many requests.
+    ///
+    /// **`0` means "never recycle"**, matching php-fpm's `pm.max_requests = 0` and
+    /// RoadRunner's `max_jobs: 0`. That is the opposite of what a bare
+    /// `served >= max` comparison would do, and the difference is not academic: a
+    /// php-fpm pool config carrying `pm.max_requests = 0` is the common production
+    /// case, and copying it here used to destroy the worker after every request —
+    /// one application boot per request, which is the deployment model this backend
+    /// exists to avoid. Absent and zero therefore both mean "no limit".
     #[serde(default)]
     pub max_requests: Option<u64>,
 
@@ -349,7 +357,7 @@ pub struct SpawnCgiConfig {
     pub base_port: u16,
 
     /// Recycle a slot after this many requests, the equivalent of php-fpm's
-    /// `pm.max_requests`.
+    /// `pm.max_requests`. **`0` means never recycle**, as it does there.
     #[serde(default)]
     pub max_requests: Option<u64>,
 }

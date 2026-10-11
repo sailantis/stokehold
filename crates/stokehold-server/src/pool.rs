@@ -189,9 +189,9 @@ impl CgiPool {
     }
 
     /// Recycle a slot after this many requests, the equivalent of php-fpm's
-    /// `pm.max_requests`.
+    /// `pm.max_requests`. **`0` means never recycle**, as it does there.
     pub fn with_max_requests(mut self, max_requests: Option<u64>) -> Self {
-        self.max_requests = max_requests;
+        self.max_requests = max_requests.filter(|max| *max > 0);
         self
     }
 
@@ -226,7 +226,10 @@ impl CgiPool {
             // php-cgi exits a child after 500 requests by default, and its own
             // check is `if (max_requests && requests == max_requests)`, so 0
             // means never. Recycling is the pool's decision here, so that
-            // `max_requests` means the same thing for every backend.
+            // `max_requests` means the same thing for every backend — and that
+            // meaning is php-fpm's, where `0` is also "never": see
+            // `WorkerConfig::max_requests` for why the pool treats 0 that way
+            // rather than recycling after every request.
             .env("PHP_FCGI_CHILDREN", "0")
             .env("PHP_FCGI_MAX_REQUESTS", "0")
             .stdin(Stdio::null())
@@ -285,8 +288,9 @@ impl CgiPool {
         let response = slot.request(request)?;
 
         // Recycle on the request count, mirroring `pm.max_requests`: this is what
-        // bounds the effect of any leak in the application under test.
-        if let Some(max) = self.max_requests {
+        // bounds the effect of any leak in the application under test. `0` means
+        // never, as it does for php-fpm — see `WorkerConfig::max_requests`.
+        if let Some(max) = self.max_requests.filter(|max| *max > 0) {
             if slot.served >= max {
                 let port = slot.port;
                 let mut replacement = self.spawn_slot(port)?;

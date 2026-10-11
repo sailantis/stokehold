@@ -349,11 +349,20 @@ fn wait_for_shutdown() {
 /// can still be waited on.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Stop the listeners on the first Ctrl-C.
+/// Stop the listeners on the first Ctrl-C or SIGTERM.
 ///
-/// A second Ctrl-C forces an exit, so a stuck shutdown cannot trap the operator.
-/// Forcing is safe because the lifecycle guard reaps the PHP processes when the
-/// process dies.
+/// A second signal forces an exit, so a stuck shutdown cannot trap the operator.
+///
+/// **SIGTERM is what a supervisor actually sends**, and until this handled it the
+/// process died on the spot with no chance to run a destructor — so `systemctl stop`,
+/// `docker stop` and a plain `kill` all left the php-cgi children of a `spawn_cgi`
+/// pool running. They accumulated: a benchmark host reached 68 orphans, and each one
+/// held its port, its PHP state and its share of the CPU. The `termination` feature of
+/// `ctrlc` is what makes the handler cover SIGTERM as well as SIGINT; without it this
+/// function only ever saw a Ctrl-C.
+///
+/// Forcing is safe now, and was not before: the lifecycle guard reaps the PHP
+/// processes when the process dies, *provided* the death is one it can observe.
 ///
 /// The FastCGI listener takes a [`ShutdownHandle`], which is a shared flag. The
 /// HTTP listener runs on another thread and is stopped by *dropping* its handle,
@@ -366,16 +375,17 @@ fn install_shutdown_handler(shutdown: Option<stokehold_server::ShutdownHandle>) 
             eprintln!("\nforced exit");
             std::process::exit(130);
         }
-        eprintln!("\nshutting down; press Ctrl-C again to force");
+        eprintln!("\nshutting down; signal again to force");
         SHUTDOWN.store(true, Ordering::Relaxed);
         if let Some(shutdown) = &shutdown {
             shutdown.shutdown();
         }
     });
     if let Err(err) = result {
-        // Not fatal: without a handler the listener runs until the process is
-        // signalled, and the lifecycle guard still reaps the children.
-        tracing::debug!(%err, "no Ctrl-C handler; stop the process with a signal");
+        // Not fatal, but it means a SIGTERM will leak the pools: say so at a level
+        // an operator sees, because the symptom (surviving PHP processes) appears
+        // long after the cause.
+        tracing::warn!(%err, "no signal handler installed; stopping this process may leave its PHP children running");
     }
 }
 

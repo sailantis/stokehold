@@ -257,3 +257,73 @@ fn a_socket_that_is_not_listening_fails_the_request_not_the_startup() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn concurrent_requests_reach_the_backend_at_the_same_time() {
+    let _serial = serial();
+    let Some(binary) = find_php_cgi() else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+
+    // The regression test for `docs/plan.md` hazard 22. The backend used to hold
+    // one `Mutex<Option<Client>>` for the whole request, so a pool of any size
+    // served exactly one request at a time. A backend that can only be talked to
+    // through one connection is invisible to a sequential test — every request
+    // succeeds and every response is correct — so the assertion has to be about
+    // *time*, not about correctness.
+    //
+    // Four requests that each sleep 300 ms must finish in about one sleep, not
+    // four. The bound is deliberately loose (1 s rather than 400 ms) because this
+    // is not a benchmark: it only has to separate "at the same time" from "one
+    // after another", and 1.2 s of serialisation is unambiguous.
+    const REQUESTS: usize = 4;
+    const SLEEP_US: u64 = 300_000;
+
+    let root = std::env::temp_dir().join(format!("stokehold-concurrent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the document root");
+    write_script(
+        &root,
+        "index.php",
+        &format!(
+            "<?php $body = file_get_contents(\"php://input\"); usleep({SLEEP_US}); \
+             echo \"S=\"; echo $body;"
+        ),
+    );
+
+    let server = ExternalServer::start(&binary);
+    let dispatcher = dispatcher_for(&server.socket(), &root);
+
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..REQUESTS)
+            .map(|index| {
+                let dispatcher = &dispatcher;
+                let root = &root;
+                scope.spawn(move || {
+                    let marker = format!("c{index}");
+                    let response = dispatcher
+                        .dispatch(&request_for(root, &marker))
+                        .unwrap_or_else(|err| panic!("request {index} failed: {err}"));
+                    response.check_protocol().expect("completed");
+                    let stdout = String::from_utf8_lossy(&response.stdout);
+                    assert!(stdout.contains(&format!("S={marker}")), "{stdout:?}");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("no request thread panicked");
+        }
+    });
+    let elapsed = started.elapsed();
+
+    let serial = Duration::from_micros(SLEEP_US) * REQUESTS as u32;
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "{REQUESTS} concurrent requests took {elapsed:?}, which is close to the \
+         {serial:?} they would take if they were serialised on one connection"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

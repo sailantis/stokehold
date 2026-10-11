@@ -12,6 +12,119 @@ use crate::error::{Result, ServerError};
 use crate::pool::CgiPool;
 use crate::worker_pool::WorkerPool;
 
+/// How many idle connections to an external backend to hold open.
+///
+/// Exactly one, which is not an arbitrary small number. `php-fpm` accepts a
+/// connection *into a child* and then waits for the request on it, and a child
+/// blocked in that read counts as **active** in php-fpm's own scoreboard — so
+/// every connection parked there permanently removes one child from the set the
+/// master is willing to dispatch to. Retaining more than one therefore costs
+/// capacity in proportion to the cap, which is real and measurable: against a
+/// 12-child pool, retaining 4 cost 7% of throughput at concurrency 32 (34,250 vs
+/// 36,906 rps) and retaining 12 cost 26% (27,407 vs 36,906).
+///
+/// One is worth that single child, because the reconnect it saves is on the path
+/// of *every* request: keeping a warm connection raised concurrency-1 throughput
+/// from 2,986 to 3,598 rps, and cost nothing at concurrency 32 (36,497 vs 36,906,
+/// inside the noise). More than one buys nothing further — 2 measured 3,578 at
+/// concurrency 1, the same within noise as 1.
+///
+/// `nginx` retains *zero* upstream connections and reconnects for every request,
+/// which is the correct default when the front-end is nginx and the connection is
+/// a unix socket. stokehold's front-end is not nginx, and the reconnect is
+/// measurable, so one is kept.
+const MAX_IDLE_CONNECTIONS: usize = 1;
+
+/// Connections to one external backend, checked out per request.
+///
+/// One FastCGI connection carries one request at a time — it is a conversation,
+/// and the codec has no request-id demultiplexer, so multiplexing is not an
+/// option. A single connection therefore caps the whole backend at one request
+/// at a time no matter how large its `pm.max_children` is, which is what
+/// `docs/plan.md` hazard 22 records. This type is the fix: as many connections as
+/// there are requests in flight, each reused when it comes back.
+///
+/// Connections themselves are not limited, because the number in flight is
+/// already bounded by the front-end's connection limit, and refusing to open a
+/// connection would turn a busy backend into a 503. Only *retention* is capped,
+/// at [`MAX_IDLE_CONNECTIONS`], which see for why the number is one.
+///
+/// Public only because it is a field of the public [`Backend`] enum; every method
+/// below is private, so the only way to a connection is through the backend.
+#[derive(Debug)]
+pub struct ClientPool {
+    endpoint: Endpoint,
+    /// Warm connections, checked out by `acquire` and returned by `release`.
+    idle: Mutex<Vec<stokehold_fcgi::Client>>,
+}
+
+impl ClientPool {
+    fn new(endpoint: Endpoint) -> Self {
+        ClientPool {
+            endpoint,
+            idle: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Take a connection, reusing a warm one when there is one.
+    ///
+    /// A connection taken from the pool is not proven alive: the backend may have
+    /// closed it since it was returned, and there is no way to tell without
+    /// sending something. `request_external` recovers from exactly that, so the
+    /// pooled connection is handed out as-is rather than probed — a probe would
+    /// cost the same round trip as the request it is trying to avoid.
+    fn acquire(&self, backend: &str) -> Result<stokehold_fcgi::Client> {
+        let pooled = {
+            let mut idle = self
+                .idle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            idle.pop()
+        };
+        if let Some(client) = pooled {
+            return Ok(client);
+        }
+
+        stokehold_fcgi::Client::connect(&self.endpoint, None).map_err(|source| {
+            ServerError::Worker {
+                backend: backend.to_string(),
+                source,
+            }
+        })
+    }
+
+    /// Give a connection back, or drop it when it cannot serve another request.
+    fn release(&self, client: stokehold_fcgi::Client) {
+        if !client.is_reusable() {
+            // Dropping closes the socket, which is the correct end for a
+            // connection the backend refused to keep. Checked before taking the
+            // lock so a busy pool is not locked for a connection it will not keep.
+            return;
+        }
+
+        let mut idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if idle.len() < MAX_IDLE_CONNECTIONS {
+            idle.push(client);
+        }
+    }
+
+    /// Close every idle connection.
+    fn clear(&mut self) {
+        let idle = self
+            .idle
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        idle.clear();
+    }
+}
+
 /// A backend, ready to serve requests.
 #[derive(Debug)]
 pub enum Backend {
@@ -21,10 +134,9 @@ pub enum Backend {
     /// `pm.max_requests` and per-pool users. We only speak FastCGI to it.
     External {
         name: String,
-        endpoint: Endpoint,
         /// Shared behind its own lock: one backend serves both front-ends, so a
         /// `&mut` here would make the whole dispatcher exclusive again.
-        client: Mutex<Option<stokehold_fcgi::Client>>,
+        pool: ClientPool,
     },
     /// A pool of `php-cgi` processes that stokehold starts and supervises.
     SpawnCgi { name: String, pool: CgiPool },
@@ -48,8 +160,7 @@ impl Backend {
                 })?;
                 Ok(Backend::External {
                     name: name.to_string(),
-                    endpoint,
-                    client: Mutex::new(None),
+                    pool: ClientPool::new(endpoint),
                 })
             }
             BackendConfig::SpawnCgi(cgi) => Ok(Backend::SpawnCgi {
@@ -107,6 +218,10 @@ impl Backend {
 
     /// Serve a request from an externally managed FastCGI server.
     ///
+    /// A connection is taken from the pool for the duration of one request, so
+    /// the backend serves as many requests at once as it has workers rather than
+    /// as many as it has *sockets* — see `docs/plan.md` hazard 22.
+    ///
     /// The retry is not belt-and-braces: `FCGI_KEEP_CONN` is only a *request*,
     /// and `php-cgi` in particular closes the connection after each response
     /// even when keep-alive was asked for. Verified against php-cgi 8.3.31: the
@@ -115,41 +230,33 @@ impl Backend {
     /// once, which is indistinguishable from the client's point of view and
     /// immune to the backend's choice.
     fn request_external(&self, request: &Request) -> Result<Response> {
-        let Backend::External {
-            name,
-            endpoint,
-            client,
-        } = self
-        else {
+        let Backend::External { name, pool } = self else {
             unreachable!("only called for the external backend")
         };
 
-        let mut client = client
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut client = pool.acquire(name)?;
+        let reused = client.is_reusable();
 
         for attempt in 0..2 {
-            let reused = client.is_some();
-            if client.as_ref().map(|c| !c.is_reusable()).unwrap_or(true) {
-                let connection =
-                    stokehold_fcgi::Client::connect(endpoint, None).map_err(|source| {
-                        ServerError::Worker {
-                            backend: name.clone(),
-                            source,
-                        }
-                    })?;
-                *client = Some(connection);
-            }
-
-            let connection = client.as_mut().expect("connected above");
-            match connection.request(request) {
-                Ok(response) => return Ok(response),
+            match client.request(request) {
+                Ok(response) => {
+                    pool.release(client);
+                    return Ok(response);
+                }
                 Err(source) if reused && attempt == 0 && is_transport_error(&source) => {
+                    // The backend closed a connection it had agreed to keep; ask
+                    // for a fresh one. The failed client is dropped here, so a
+                    // connection that cannot be trusted never goes back in.
                     tracing::debug!(
                         backend = %name,
                         "the backend closed a reused connection; reconnecting"
                     );
-                    *client = None;
+                    client = stokehold_fcgi::Client::connect(pool.endpoint(), None).map_err(
+                        |source| ServerError::Worker {
+                            backend: name.clone(),
+                            source,
+                        },
+                    )?;
                 }
                 Err(source) => {
                     return Err(ServerError::Worker {
@@ -177,15 +284,12 @@ impl Backend {
         match self {
             Backend::SpawnCgi { pool, .. } => pool.shutdown(),
             Backend::Worker { pool, .. } => pool.shutdown(),
-            Backend::External { client, .. } => {
-                // Nothing was started, so there is nothing to stop; dropping the
-                // connection is the whole cleanup. `get_mut` because the pool is
+            Backend::External { pool, .. } => {
+                // Nothing was started, so there is nothing to stop; closing the
+                // connections is the whole cleanup. `get_mut` because the pool is
                 // already exclusively borrowed here — taking the lock would be
                 // pointless.
-                let client = client
-                    .get_mut()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *client = None;
+                pool.clear();
             }
         }
     }

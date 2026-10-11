@@ -366,6 +366,114 @@ against the specification and secondary implementations, and are confirmed by fi
     against four workers must finish in about one sleep, not four — and it was confirmed to fail
     (2.08 s) with a pool-wide lock deliberately reintroduced.
 
+22. **An external backend is one connection, so it is one request at a time — and nobody told the
+    front-end.** `Backend::External` kept a single `Client` behind a `Mutex`, and
+    `request_external` held that lock for the *whole* request. That was correct as written: one
+    FastCGI connection is a conversation, and multiplexing requests onto it is not in the codec.
+    The defect was that nothing bounded how much work is offered: a pool of 12 php-fpm workers
+    behind one socket served exactly one request at a time, for ever. Measured on a 12-core Linux
+    box against a 12-worker php-fpm pool with `pm = static`, throughput was **3,916 rps at
+    concurrency 1 and 3,907 / 5,709 / 5,460 / 5,472 / 5,481 at 2 / 4 / 8 / 16 / 32** — it peaked at
+    *concurrency 1* and was then flat, while nginx over the same socket and the same pool did
+    3,908 → 43,740. This was hazard 21's shape at a smaller scale: the ceiling is real, invisible
+    in a single-request test, and looks like the *pool* being slow rather than the client being
+    serial.
+
+    **Fixed.** `Backend::External` now owns a `ClientPool`: one connection per in-flight request,
+    taken for the duration of a request and put back when it comes back, which took the arm from
+    flat-at-5,500 to **3,614 / 7,075 / 12,993 / 21,719 / 27,504 / 27,657** at concurrency 1→32.
+    Reuse is unconditional for any connection the backend agreed to keep, because a pooled
+    connection cannot be proven alive without spending the round trip it is trying to save — and
+    `request_external` already recovered from a stale connection by reconnecting once, so handing
+    one out costs nothing when it is dead and saves a connect when it is not.
+
+    Only *retention* is capped, and the cap is **one**, which is not arbitrary. `php-fpm` accepts a
+    connection *into a child* and then waits for the request on it, and a child blocked in that
+    read counts as **active** in php-fpm's own scoreboard, so every parked connection permanently
+    removes a child from the set the master will dispatch to. Retaining 4 cost 7% of throughput at
+    concurrency 32 (34,250 vs 36,906 rps) and retaining 12 cost 26% (27,407 vs 36,906) — measured
+    by making the cap an environment variable and sweeping it. One is worth a single child,
+    because the reconnect it saves is on the path of *every* request: it raised concurrency-1
+    throughput from 2,986 to 3,598 rps and cost nothing at concurrency 32 (36,497 vs 36,906,
+    inside the noise). Two bought nothing further (3,578).
+
+    The comparison that makes the cap legible: **nginx reuses nothing.** Read from php-fpm's own
+    `accepted conn` counter (`pm.status_path`, polled over the unix socket with a hand-rolled
+    FastCGI client because nginx's default `fastcgi_keep_conn` is off and a direct unix-socket
+    `curl` resets), an nginx run served ~135,370 requests with **138,076 accepted connections** —
+    one connect per request — while reaching 43,265 rps. So the residual gap to nginx is not
+    connection handling at all: with retention at one, arm D now matches arm A, static file
+    serving by the same Rust front-end with no PHP in the path, so the backend is no longer what
+    D is limited by. Regression test:
+    `crates/stokehold-server/tests/external.rs::concurrent_requests_reach_the_backend_at_the_same_time`
+    — four requests sleeping 300 ms each must finish in under a second, and it fails at 1.26 s
+    against the single-connection version (verified by reverting).
+
+23. **The pipe is not the problem on Linux; the *SAPI* is.** Measured on 12 cores, 12 workers, same
+    trivial JSON handler in every arm: piped worker **2,936 / 5,789 / 11,101 / 18,050 / 20,984 /
+    20,864** (concurrency 1→32) versus php-cgi over TCP **2,937 / 5,969 / 11,105 / 19,230 / 25,351 /
+    30,278**. Identical to within noise up to concurrency 8, then the TCP path pulls away. So the
+    ~15 ms floor measured on Windows was indeed a Windows pipe/timer artifact and does *not*
+    generalise: on Linux a pipe round trip is a direct wake-up, and the two transports start out
+    equal. What separates them is later: the CGI arm keeps scaling to 32 while the piped arm
+    plateaus at ~21k. The practical consequence is that the choice between a piped worker and
+    `php-cgi` on Linux is not about speed at all — it is about superglobals, POST and `$_FILES`,
+    all of which the real CGI SAPI supplies for free and a piped worker must reimplement in PHP.
+    Choose the SAPI you want, then measure.
+
+24. **`workers` and the machine's cores are unrelated numbers.** On Windows the homepage ran 12
+    workers on 8 logical CPUs and beat a 12-worker RoadRunner; here, 12 workers on 12 cores put
+    static-file serving at 36–37k rps, which is *above* the 12-worker application ceiling by
+    design — a static request never touches PHP. Sweeping to concurrency 32 on 12 cores still
+    improved the CGI arm (30,278 rps), so the useful sweep is `cores × 2–3`, not "as many as
+    possible". Recording it because the per-arm `p99` is the number that moves first: the piped
+    arm's p99 goes 458 µs → 5.27 ms between concurrency 16 and 32 while its rps is flat, which is
+    the signature of a queue forming behind a saturated pool rather than a throughput problem.
+
+25. **The worker arm still spends a thread per request, and that is what caps it.** The piped
+    worker reaches 20,864 rps at concurrency 32 while `spawn_cgi` with the *same* 12 slots reaches
+    30,278. The difference on the worker path is `request_with_deadline`
+    (`crates/stokehold-server/src/worker_pool.rs`): a pipe read has no portable timeout, so each
+    request spawns a `std::thread` to run the exchange and takes the result through an
+    `mpsc::recv_timeout`, while `CgiPool::request` calls straight into the slot. So every request
+    costs a thread create and a channel handoff, and the pool reaches its ceiling *below* the
+    point where PHP is saturated — the signature is the piped arm's `p99` climbing to 5.27 ms
+    while its rps stays flat. The fix has to keep the deadline: a persistent per-slot reader
+    thread with a channel handoff preserves it, and the timeout then becomes a `recv_timeout` on
+    a channel that already exists rather than one created per request. Not yet done.
+
+26. **`php-cgi -b` accepts a unix socket where the platform has one.** `-b <address:port>|<port>`
+    is not TCP-only: `fcgi_listen` (`main/fastcgi.c`) treats a bind path that contains no `:` as
+    an `AF_UNIX` path on anything that is not Windows — `unlink`s it and binds it — and only
+    falls back to TCP when `:` is present or the argument is all digits. So a `spawn_cgi` pool can
+    be given unix sockets on Linux, which removes the loopback-TCP hop. On Windows the same code
+    path is a named pipe, which is a different feature and not what `-b 127.0.0.1:port` does
+    there. Relevant because the TCP arm's advantage over the piped arm at high concurrency is a
+    per-request cost, and a unix socket is the cheaper version of the same shape.
+
+27. **With a real database in the request, the four arms converge — and the piped worker stops
+    being behind.** One `SELECT` of one row from a local MariaDB, `p:`-prefixed persistent
+    connections, 12 workers, concurrency 1→32: piped worker **2,073 / 4,085 / 7,844 / 12,987 /
+    15,415 / 16,264**, `external` php-fpm **1,989 / 3,505 / 6,084 / 10,561 / 14,768 / 17,439**,
+    nginx over the *same pool and socket* **1,799 / 3,683 / 6,700 / 12,714 / 17,517 / 19,424**, and
+    `php-cgi` **1,551 / 3,280 / 6,361 / 10,225 / 13,312 / 14,858**. Every arm loses ~55% of its
+    trivial-handler throughput, so all the transport differences that dominate an empty request
+    are noise next to one round trip to the database. Two things follow. First, **the question
+    "does php-fpm fall back" has no single answer**: at concurrency 1 the piped worker wins
+    (2,073), and above it `external`/nginx win (17,439 vs 16,264 at 32) — so neither backend is
+    uniformly better and the choice should follow the SAPI you want, not the graph. Second, **the
+    piped worker is not paying a pipe tax here**: it is ahead of both FastCGI arms at concurrency
+    1 and within 7% at 32, where a per-request transport cost would show up most. The earlier
+    "piped worker looks slow" reading was the thread-per-request cost of hazard 25 amortised over
+    a very short request; a real request hides it.
+
+    Worth recording alongside it: the **naive pattern is indistinguishable from the persistent
+    one.** A fresh `mysqli` connect per request measured 1,382 / 2,734 / 5,026 / 8,337 / 10,389 /
+    11,173 for the piped worker, against 2,073 / 4,085 / 7,844 / 12,987 / 15,415 / 16,264 with a
+    persistent connection — only ~20% apart, not the order of magnitude a connect cost suggests.
+    A loopback connect plus authentication to MariaDB is that cheap, which is why benchmarking an
+    application that reconnects per request still produces believable numbers.
+
 ## 6. Phases
 
 Phase 0 — skeleton and baseline

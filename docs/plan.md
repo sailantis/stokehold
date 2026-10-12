@@ -942,6 +942,70 @@ against the specification and secondary implementations, and are confirmed by fi
       it would have been public API with no caller. The allocation counts above are what would
       justify revisiting it.
 
+---
+
+<br>
+
+**37. The request path rewrote the whole request three times.** Hazard 34 fixed the *response*
+    side and asked whether the request side had the same shape. It did, and worse: three separate
+    stages each held an owned copy of every header, and all three ran on every request.
+
+    The router first, which both listeners call before anything else and which had been left
+    alone:
+
+    | | before | after |
+    |---|---|---|
+    | `percent_decode` | copied the whole path, though nearly every request has no `%` | `Cow` — borrows when there is nothing to decode |
+    | forbidden-extension guard | `decoded.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase())` **inside `any`** — one copy of the path plus one per configured extension | byte compare — constant |
+    | `/items` routed to the front controller | **13** allocations | **6** |
+
+    The forbidden guard is the same defect that `has_php_extension` was fixed for in hazard 34 —
+    a `to_ascii_lowercase()` to answer a question about a few trailing bytes — and that fix walked
+    past this call site without noticing the sibling next to it.
+
+    One syscall was also being spent per request for nothing. `route` tested `candidate.is_file()`
+    and `has_php_extension(relative)` together, so a path that could not be a PHP script was
+    still resolved and `stat`ed before the extension check rejected it. The two are pure
+    predicates, so the answer is identical either way, but with a front controller configured a
+    path naming no script is the common case and now never reaches the filesystem.
+
+    Then the worker path, which copied the same headers three times:
+
+    - **`request_staged` deep-cloned the header to stamp in `body_len`** —
+      `RequestHeader { body_len, ..request.clone() }`: five `String`s plus two per header, per
+      request, to change one integer. It serializes a borrowed view now.
+    - **The pool cloned the header into its work item and the codec copied it again.** The
+      exchange carries an `Arc<RequestHeader>`, so the listener thread and the exchange thread
+      share one allocation.
+    - **`Dispatcher::dispatch` allocated a `String` for a backend name it only reads.** The
+      borrow is still live at the `dispatch_to` call, so the clone bought nothing.
+
+    For a 16-header request: **90** allocations across the parts this touched before (13 router,
+    38 codec clone, 38 exchange clone, 1 backend name), **6** after. Neither remaining term scales
+    with the header count.
+
+    The method that found all of it, for the third pass running: **write the counter before
+    believing the reading.** A slope test — the same work with 2 headers and with 40 — localises
+    a per-header cost immediately, and it caught two of these that reading had not. The clone in
+    `request_staged` is four lines and looks harmless; it is 38 allocations.
+
+    Both halves are pinned, deliberately split by crate. `stokehold-worker`'s
+    `tests/request_path.rs` drives a whole round trip over the real codec, so a reintroduced
+    clone anywhere on that path fails there; `stokehold-fcgi`'s `tests/allocations.rs` holds the
+    router. A slope test in the crate whose source changed is worth more than an exact count in
+    a crate that only consumes it.
+
+    The one thing to know when writing these: **compare bytes, not decoded structs.** Every field
+    of `RequestHeader` except `method` and `uri` carries a serde `default`, so a field missing
+    from the borrowed serialization view would not fail a `Json::decode::<RequestHeader>`
+    round-trip at all — it would arrive empty. The byte-equality test exists for exactly that.
+
+    **`stokehold-core` is not a target.** It was the question this pass started from, and the
+    answer is that it is cold path: configuration, PHP discovery and preflight all run once at
+    startup. Its only per-request functions are `RouteConfig::matches` and `Config::route_backend`,
+    and `route_backend` is **dead code** — `Dispatcher::backend_for` duplicates the filter-and-max
+    rule inline, so a route change has two implementations to keep in step.
+
 ## 6. Phases
 
 Phase 0 — skeleton and baseline

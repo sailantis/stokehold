@@ -1540,3 +1540,68 @@ Later milestone
   rather than relying on the host not having exported it.
 - **The plan lives in `docs/` in the repo** so it can be opened and commented on in VS Code,
   which was the friction that blocked review of the previous plan.
+
+## 10. Where the work stands
+
+Written to be the briefing a fresh checkout can read on its own, because the benchmark plan
+that drove the last stretch of this work lived only in a chat session and is **not** in any of
+these repositories. Nothing in it was lost — the two things it knew that no repository does are
+the name research and the open steps below — but it cannot be re-read, so this section replaces
+it.
+
+### The published benchmark predates the current build
+
+`stokehold-competition/results/report.md` names its build as **`841c963`** (14:48). The
+five-arm run behind it was taken at **15:28**, and `main` is now at **`553c4a1`** (18:55). Four
+commits between them carry **code**, not docs or tests:
+
+| commit | what it changes |
+| --- | --- |
+| `9308ac4` | assemble a FastCGI response into a single write |
+| `270d20d` | stop rebuilding the request the pool already had *(request path)* |
+| `26e4f11` | reuse the reply frame buffer and size the body once |
+| `2549eb1` | the per-frame checksum becomes optional and negotiated |
+
+The report already says its two CPU-attribution tables are carried over from the previous
+build. It does **not** say the throughput tables predate these four — so a re-run of the five
+arms is the one measurement that is genuinely outstanding, and the `checksum = "optional"` knob
+is the only one of the four with a plausible throughput effect (hazard 41: ~0.26% of one
+request, unclaimed until measured). Hazards 40 and 42 claim no throughput at all.
+
+### The rename, if it is ever made
+
+Researched against the registries that actually bind a project — crates.io, the GitHub
+namespace, npm, PyPI, Docker Hub and DNS. `stokehold` itself is **still free on crates.io**.
+
+| name | crates.io | GitHub | domain |
+| --- | --- | --- | --- |
+| `jetfuel` | **TAKEN** — placeholder crate, 2022, ~1.5k downloads | user taken | `.dev`/`.io`/`.app` registered |
+| `firebox` | free | org taken (dormant since 2015) | `.dev`/`.sh` free, `.io` registered |
+| `propellant` | free | org taken (dormant since 2017) | `.dev`/`.io` registered, `.sh` free |
+| `scramjet` | free | user taken | `.dev`/`.sh` registered |
+| `bowshock` | free | user taken | **`.dev` free, `.sh` free** |
+| `combustor` | free | user taken | **`.dev` free, `.sh` free** |
+| `zephyrix` / `plasmax` | free | user taken | both free |
+
+- `jetfuel` is gone on crates.io and its npm, PyPI, Docker Hub and GitHub-user entries are all
+  occupied. Not a clean rename target.
+- **Every** candidate is taken as a GitHub *user* — that is what happens to short dictionary
+  words. It does not block a crate, a Packagist package, a Docker image or a domain, and the
+  project org stays `sailantis`.
+- **Recommendation: `combustor`** — the chamber that contains and directs the burn, fitting the
+  engine metaphor `stokehold` came from, and clean on crates.io, npm and both domains.
+  `bowshock` (the shock wave ahead of a supersonic vehicle) is the better pure-speed metaphor and
+  equally clean; `zephyrix`/`plasmax` are the invented-fantasy option.
+
+### Open decisions, restated
+
+Open decisions 1, 2 and 5 are unresolved; 3 and 4 are answered in place. Of the hazards, 23 and
+26 are closed (23 by hazard 33's CPU attribution, 26 by the shipped `spawn_cgi` socket support),
+and 27 and 28 are recorded findings rather than open questions. What is left is a short list:
+
+1. **Default backend out of the box** — open decision 1.
+2. **msgpack behind the codec boundary** — open decision 2, deferred pending a profile.
+3. **Configuration reload on `SIGHUP`** — open decision 5, *deliberately not built*, with the
+   three options and the reason a half-reload is worse than none.
+4. **The rename** — a product decision, above.
+5. **The re-run** — the five arms against current `main`, above.

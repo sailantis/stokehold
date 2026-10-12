@@ -52,7 +52,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -64,7 +64,7 @@ use stokehold_fcgi::{EndRequest, NameValuePairs, Request, Response};
 use stokehold_worker::codec::RequestStage;
 use stokehold_worker::codec::WorkerResponse;
 use stokehold_worker::{
-    Control, HelloAck, LogRecord, MessageType, RequestHeader, WorkerChannel, WorkerError,
+    BoundedChannel, Control, HelloAck, LogRecord, MessageType, RequestHeader, WorkerError,
     UNSOLICITED,
 };
 
@@ -85,8 +85,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a worker has to exit after being told to, before it is killed.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Both directions of one worker's pipes.
-type Channel = WorkerChannel<ChildStdin, ChildStdout>;
+/// Both directions of one worker's pipes, buffered.
+///
+/// Buffered because every frame is written as a header and then a payload and read the same
+/// way: over an unbuffered `ChildStdin`/`ChildStdout` each of those calls is its own syscall,
+/// and each read its own wakeup of the exchange thread. See [`BoundedChannel`].
+type Channel = BoundedChannel;
 
 /// A pool of persistent PHP workers.
 #[derive(Debug)]
@@ -716,7 +720,7 @@ fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
         drain_stderr(name.to_string(), child.id(), stderr);
     }
 
-    let channel = WorkerChannel::new(stdin, stdout);
+    let channel = BoundedChannel::new(stdin, stdout);
     match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT) {
         Ok((channel, ack)) => {
             tracing::debug!(

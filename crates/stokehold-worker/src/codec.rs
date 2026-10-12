@@ -16,7 +16,7 @@
 //!   arriving in the middle of a response is normal, so the reader skips it and
 //!   hands it back rather than failing the request.
 
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 use crate::error::{Result, WorkerError};
 use crate::header::{flags, write_frame, Header, MessageType};
@@ -30,6 +30,114 @@ use crate::message::{
 /// Bounded so a large upload does not require the whole body in memory twice and
 /// so a frame length stays far from the protocol's sanity limit.
 pub const MAX_BODY_CHUNK: usize = 64 * 1024;
+
+/// The capacity of [`BoundedChannel`]'s buffers.
+///
+/// Sized to hold a whole small request, a response head and an `End` frame — `MAX_BODY_CHUNK`
+/// is twice this and the writer flushes rather than splitting a frame, so a full body chunk
+/// cannot deadlock behind a full buffer (see [`BoundedChannel`]). The reader's buffer only
+/// needs to cover a frame header plus a payload worth reading in one go; a larger buffer would
+/// not remove a syscall, because a frame larger than it still takes several.
+const BUFFER_CAPACITY: usize = 8 * 1024;
+
+/// The writer half of a [`BoundedChannel`]: a buffered pipe that flushes per frame.
+pub type BufferedWriter = BufWriter<Box<dyn Write + Send>>;
+
+/// The reader half of a [`BoundedChannel`]: a buffered pipe shared by the exchange thread.
+pub type BufferedReader = BufReader<Box<dyn Read + Send>>;
+
+/// A [`WorkerChannel`] over a real pipe, with both directions buffered.
+///
+/// This exists because of what the channel does to an unbuffered pipe. Every frame is written
+/// as a header and then a payload, and read as a header and then a payload, and each of those
+/// calls lands on the operating system directly. On a pipe that makes a request cost two
+/// `write(2)`s and at least two `read(2)`s for the frames plus one more for every payload,
+/// where one of each would do — and each read is also a separate wakeup of the thread serving
+/// the request, which is the expensive half on a pipe. `stokehold-fcgi`'s client assembles a
+/// whole FastCGI request and issues "one write, one flush" for the same reason; the worker
+/// channel is the fastest deployment option and was the one left counting on each call landing
+/// on a syscall.
+///
+/// The writer is flushed after every frame, by [`write_frame`] rather than here, and the
+/// channel is half-duplex: the worker answers only once the request is complete, so a frame
+/// left in the buffer would be a deadlock rather than a latency win.
+///
+/// ```text
+///   channel frame            unbuffered pipe   this type
+///   REQUEST: header+payload       2 writes        1 write(2)
+///   RESPONSE head+payload         3 reads         1 read(2)  (typical)
+///   BODY:   header+payload
+///   END:    header+payload
+/// ```
+///
+/// It is deliberately **not** `Debug`: a `BufReader` over `ChildStdout` is, but deriving it
+/// would be a statement about state we do not want printed.
+pub struct BoundedChannel {
+    channel: WorkerChannel<BufferedWriter, BufferedReader>,
+}
+
+impl BoundedChannel {
+    /// Wrap a worker's stdin and stdout, buffered in both directions.
+    pub fn new(writer: impl Write + Send + 'static, reader: impl Read + Send + 'static) -> Self {
+        BoundedChannel {
+            channel: WorkerChannel::new(
+                BufWriter::with_capacity(BUFFER_CAPACITY, Box::new(writer)),
+                BufReader::with_capacity(BUFFER_CAPACITY, Box::new(reader)),
+            ),
+        }
+    }
+
+    /// The request id that will be used next, forwarded from the inner channel.
+    pub fn next_request_id(&self) -> u32 {
+        self.channel.next_request_id()
+    }
+
+    /// Perform the handshake: send `HELLO`, require a matching `HELLO_ACK`.
+    pub fn handshake(&mut self) -> Result<HelloAck> {
+        self.channel.handshake()
+    }
+
+    /// Send a request and collect its whole response.
+    pub fn request(&mut self, request: &RequestHeader, body: &[u8]) -> Result<WorkerResponse> {
+        self.channel.request(request, body)
+    }
+
+    /// The same request, with the send and receive phases kept apart.
+    ///
+    /// The pool needs the stage, not the response: a failure while sending can be replayed
+    /// for any method, one while reading only for an idempotent one. See
+    /// [`WorkerChannel::request_staged`].
+    pub fn request_staged(
+        &mut self,
+        request: &RequestHeader,
+        body: &[u8],
+        on_stage: impl FnMut(RequestStage),
+    ) -> Result<WorkerResponse> {
+        self.channel.request_staged(request, body, on_stage)
+    }
+
+    /// Write one frame from a payload that is already encoded.
+    pub fn send_frame(
+        &mut self,
+        message_type: MessageType,
+        request_id: u32,
+        payload: &[u8],
+        extra_flags: u16,
+    ) -> Result<()> {
+        self.channel
+            .send_frame(message_type, request_id, payload, extra_flags)
+    }
+
+    /// Ask a worker for its health without serving a request.
+    pub fn ping(&mut self) -> Result<()> {
+        self.channel.ping()
+    }
+
+    /// Send a control message and wait for its acknowledgement.
+    pub fn control(&mut self, control: &Control) -> Result<()> {
+        self.channel.control(control)
+    }
+}
 
 /// A borrowed `RequestHeader`, with `body_len` supplied by the caller.
 ///
@@ -117,6 +225,16 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             logs: Vec::new(),
             metrics: Vec::new(),
         }
+    }
+
+    /// Push everything written so far through to the writer.
+    ///
+    /// A no-op for an unbuffered writer; the meaningful call for a [`BufWriter`]. The channel
+    /// never flushes on its own — [`write_frame`] does it after each frame, because whether a
+    /// frame may be batched depends on what follows it, which only the caller knows.
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// The request id that will be used next.
@@ -444,6 +562,9 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     }
 
     /// Serialize `value` and write it as one frame.
+    ///
+    /// The counterpart of [`WorkerChannel::send_frame`] for a caller that holds a value rather
+    /// than bytes. The pool relays a control frame it built elsewhere through the other one.
     pub fn send_json<T: serde::Serialize>(
         &mut self,
         message_type: MessageType,

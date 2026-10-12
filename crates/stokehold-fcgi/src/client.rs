@@ -14,7 +14,7 @@
 //! - **Keep-alive is reported, not assumed.** `FCGI_KEEP_CONN` is a request; the
 //!   backend may still close. The caller decides whether to reuse.
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::error::{FcgiError, Result};
@@ -32,6 +32,15 @@ pub const REQUEST_ID: u16 = 1;
 
 /// `GET_VALUES` is not tied to a request, so it uses request id 0.
 pub const MANAGEMENT_REQUEST_ID: u16 = 0;
+
+/// The capacity of the buffer the transport is read through.
+///
+/// A FastCGI record's content length is a `u16` and a 12 KB page arrives as a handful of
+/// records, so this covers a whole response in the common case and several records in any
+/// case. It is kept below the 8 KiB a socket returns in a single read: asking for more than
+/// the kernel will hand over means the buffer is never full, so every `read` still enters the
+/// kernel once — just far fewer times than one per record field.
+const BUF_LEN: usize = 8 * 1024;
 
 /// What to send to a backend for one request.
 #[derive(Debug, Clone, Default)]
@@ -357,9 +366,21 @@ pub fn split_response_body(stdout: &[u8]) -> &[u8] {
 /// A client bound to one backend connection.
 ///
 /// Generic over the transport so the protocol can be tested without a socket.
+///
+/// The transport is a [`BufReader`] around `T` rather than `T` itself, and reads go through
+/// `get_mut` so that a write bypasses the read buffer. The reason is on the read side: a
+/// FastCGI response arrives as a sequence of records, each framed as a header followed by a
+/// content payload, and `record::read_record` asks for the two separately. Unbuffered that is
+/// two entries into the kernel per record, so a two-record reply costs four reads — and over a
+/// socket each one is a `read(2)` that could have been answered from what the previous one
+/// already brought in. Measured on loopback: four reads for an answer small enough to arrive in
+/// one segment. Buffered, it is one.
+///
+/// Writes still go out as one call per request, exactly as before, because `get_mut` hands the
+/// underlying transport back without touching the buffer.
 #[derive(Debug)]
 pub struct Client<T = Stream> {
-    stream: T,
+    stream: BufReader<T>,
     /// The request being built, reused across requests.
     ///
     /// A request is assembled here rather than written straight to the stream
@@ -407,7 +428,11 @@ impl<T: Read + Write> Client<T> {
     /// Wrap an already-connected transport, or a test double.
     pub fn from_stream(stream: T) -> Self {
         Client {
-            stream,
+            // Sized for the largest FastCGI record a backend can send: a record's content
+            // length is a `u16`, so nothing is ever larger than that, and most responses fit
+            // in one fill. `BUF_LEN` is kept below the 8 KiB a socket hands over in one go so
+            // the buffer covers a fill rather than asking for a second read to top it up.
+            stream: BufReader::with_capacity(BUF_LEN, stream),
             // Sized for a typical request so the common case never grows the
             // buffer; a larger one still works, it just reallocates once.
             out: Vec::with_capacity(1024),
@@ -466,9 +491,10 @@ impl<T: Read + Write> Client<T> {
         );
 
         // One write, one flush. A failure here is the write phase, which is what
-        // `may_retry` needs to know — see `request_staged`.
-        self.stream.write_all(&self.out)?;
-        self.stream.flush()?;
+        // `may_retry` needs to know — see `request_staged`. `get_mut` writes around the
+        // read buffer rather than through it, so this is still a single call.
+        self.stream.get_mut().write_all(&self.out)?;
+        self.stream.get_mut().flush()?;
         Ok(())
     }
 
@@ -517,7 +543,7 @@ impl<T: Read + Write> Client<T> {
     {
         let payload = nvpair::encode_pairs(names.into_iter().map(|name| (name, &b""[..])));
         record::write_records(
-            &mut self.stream,
+            self.stream.get_mut(),
             RecordType::GetValues,
             MANAGEMENT_REQUEST_ID,
             &payload,
@@ -700,7 +726,7 @@ mod tests {
         assert!(client.is_reusable());
 
         // Decode exactly what the client wrote.
-        let written = client.stream.written().to_vec();
+        let written = client.stream.get_ref().written().to_vec();
         let mut cursor = written.as_slice();
         let begin = record::read_record(&mut cursor).unwrap().unwrap();
         assert_eq!(begin.record_type(), RecordType::BeginRequest);
@@ -945,7 +971,7 @@ mod tests {
         assert_eq!(values[0].0, b"max_connections");
         assert_eq!(values[0].1, b"10");
 
-        let written = client.stream.written().to_vec();
+        let written = client.stream.get_ref().written().to_vec();
         let record = record::read_record(&mut written.as_slice())
             .unwrap()
             .unwrap();

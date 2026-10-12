@@ -526,3 +526,138 @@ fn the_request_builder_reuses_its_buffers_across_requests() {
         "{many} allocations for 64 headers is too close to one per header"
     );
 }
+
+/// Counts the calls a transport makes that become syscalls.
+///
+/// `Client::receive` reads one FastCGI record at a time — a header and then a content
+/// payload — and each of those calls goes straight to the socket. On loopback TCP or a unix
+/// socket that is one `read(2)` per field of every record, and the same shape of waste that
+/// `stokehold-worker`'s channel had. The counts are thread-local so the parallel harness
+/// cannot pollute them.
+#[derive(Default)]
+struct CountingLoopback {
+    inner: Loopback,
+}
+
+thread_local! {
+    static READS: Cell<usize> = const { Cell::new(0) };
+    static WRITES: Cell<usize> = const { Cell::new(0) };
+}
+
+impl std::io::Read for CountingLoopback {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        READS.with(|count| count.set(count.get() + 1));
+        std::io::Read::read(&mut self.inner, buf)
+    }
+}
+
+impl std::io::Write for CountingLoopback {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        WRITES.with(|count| count.set(count.get() + 1));
+        std::io::Write::write(&mut self.inner, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.inner)
+    }
+}
+
+#[test]
+fn reading_a_response_does_not_spend_a_syscall_per_record_field() {
+    // A response is a `STDOUT` record and an `END_REQUEST` record, each framed as a header
+    // followed by a content payload, and `read_record` asks for the two separately. Written
+    // straight to the socket that is four reads for the smallest possible answer, plus one per
+    // record beyond. The transport is read through a buffer, so the first read brings the whole
+    // reply in and the remaining fields are slices of it.
+    use stokehold_fcgi::{Client, Request};
+
+    let stdout = b"Status: 200 OK\r\nContent-Type: text/html\r\n\r\nhello";
+    let mut client: Client<CountingLoopback> = Client::from_stream(CountingLoopback {
+        inner: Loopback {
+            out: Vec::new(),
+            input: std::io::Cursor::new(framed_reply(stdout)),
+        },
+    });
+    let request = Request {
+        params: vec![(b"REQUEST_METHOD".to_vec(), b"GET".to_vec())],
+        body: Vec::new(),
+        keep_conn: true,
+    };
+
+    let _ = READS.try_with(|count| count.set(0));
+    let _ = WRITES.try_with(|count| count.set(0));
+    let response = client.request(&request).expect("the request");
+    assert_eq!(response.stdout, stdout);
+
+    let reads = READS.with(Cell::get);
+    let writes = WRITES.with(Cell::get);
+
+    // The write side is already one call: the client assembles the whole request and issues
+    // "one write, one flush". Pinned so it cannot regress into eight.
+    assert_eq!(writes, 1, "the request is still written in one call");
+
+    // The read side used to be four — two records × (header + content) — and each was a
+    // `read(2)` the previous one could have answered. One fill covers the whole reply, and the
+    // buffer stops at exactly this: a body too large for it costs a second fill per buffer,
+    // which is the kernel's chunking rather than the framing being charged for again.
+    assert_eq!(
+        reads, 1,
+        "a two-record reply costs {reads} reads; the whole reply arrives in one segment"
+    );
+}
+
+#[test]
+fn the_fastcgi_read_count_does_not_grow_with_the_number_of_records() {
+    // The property that matters: reads must scale with the size of the answer, not with the
+    // number of records it is split into. A 12 KB page sent as many small records — which is
+    // what a FastCGI backend that flushes often produces — must not cost a read per record.
+    use stokehold_fcgi::{Client, Request};
+
+    fn reads_for_stdout(stdout: &[u8], records: usize) -> usize {
+        let mut reply = Vec::new();
+        for chunk in stdout.chunks(stdout.len().div_ceil(records)) {
+            let header = stokehold_fcgi::Header::new(stokehold_fcgi::RecordType::Stdout, 1, chunk.len() as u16);
+            reply.extend_from_slice(&header.encode());
+            reply.extend_from_slice(chunk);
+            reply.extend(std::iter::repeat_n(0u8, header.padding_length as usize));
+        }
+        let end = stokehold_fcgi::EndRequest::complete();
+        let header = stokehold_fcgi::Header::new(
+            stokehold_fcgi::RecordType::EndRequest,
+            1,
+            end.encode().len() as u16,
+        );
+        reply.extend_from_slice(&header.encode());
+        reply.extend_from_slice(&end.encode());
+
+        let mut client: Client<CountingLoopback> = Client::from_stream(CountingLoopback {
+            inner: Loopback {
+                out: Vec::new(),
+                input: std::io::Cursor::new(reply),
+            },
+        });
+        let request = Request {
+            params: vec![(b"REQUEST_METHOD".to_vec(), b"GET".to_vec())],
+            body: Vec::new(),
+            keep_conn: true,
+        };
+
+        let _ = READS.try_with(|count| count.set(0));
+        let response = client.request(&request).expect("the request");
+        assert_eq!(response.stdout, stdout);
+        READS.with(Cell::get)
+    }
+
+    let stdout = vec![b'x'; 12 * 1024];
+    let few = reads_for_stdout(&stdout, 1);
+    let many = reads_for_stdout(&stdout, 40);
+
+    // Both are four pages of 4 KB and change nothing about how much has to cross the socket, so
+    // both cost about the same. Unbuffered this would be 40 extra reads for the 40-record case:
+    // two per record instead of one per fill.
+    assert!(
+        many <= few + 2,
+        "reads grew from {few} to {many} for the same 12 KB split into 40 records instead of \
+         one; reads must track the size of the answer, not the number of records"
+    );
+}

@@ -1006,7 +1006,76 @@ against the specification and secondary implementations, and are confirmed by fi
     and `route_backend` is **dead code** — `Dispatcher::backend_for` duplicates the filter-and-max
     rule inline, so a route change has two implementations to keep in step.
 
-## 6. Phases
+**38. Both transports entered the kernel once per frame field.** Hazard 37 asked where the
+    request path rewrote a request it already had. This pass asked the neighbouring question —
+    where it *entered the kernel* more than it had to — and the answer was every transport in
+    the project.
+
+    The rule the codebase already knew, in `stokehold-fcgi`'s client: *"assemble the whole request
+    in `self.out` and write it once… the number of `write(2)` calls changes, from eight to one."*
+    It had been applied to the client's **write** side in an earlier pass and to nothing else.
+    Every **read** side was still unbuffered, and every write side of the two servers was still
+    field-by-field.
+
+    | | transport | before | after |
+    |---|---|---|---|
+    | worker `REQUEST` + body | `ChildStdin` | 2 writes | **1** |
+    | worker response, 3 frames | `ChildStdout` | 6 reads | **1** |
+    | worker response, 100 KB body | `ChildStdout` | 6 reads | ≤ 14, tracks size not framing |
+    | FastCGI client response, 2 records | `Stream` | 4 reads | **1** |
+    | FastCGI front-end request, 1 record | `TcpStream` | 7 reads | **1** |
+    | FastCGI front-end request, 12 records | `TcpStream` | **40 reads** | **1** |
+
+    The counts are exact and measured, not estimated — `pipe_calls.rs`, `allocations.rs` and
+    `frontend_syscalls.rs` wrap the real codecs with a counting `Read`/`Write` and drive the
+    production call pattern. A `Cursor` makes every one of these free, which is precisely why
+    no existing test noticed: the whole suite runs over in-memory streams.
+
+    Three fixes, one per transport:
+
+    - **`stokehold-worker` gained `BoundedChannel`**, a `WorkerChannel` over
+      `BufWriter<Box<dyn Write + Send>>` and `BufReader<Box<dyn Read + Send>>`. It is a new type
+      rather than a change to `WorkerChannel` because that type is generic over its streams on
+      purpose — the tests drive it over a `Cursor` — and because the buffering is a property of
+      talking to a *pipe*, not of the protocol.
+    - **`stokehold-fcgi`'s `Client` now holds `BufReader<T>`** rather than `T`. Writes go through
+      `get_mut()`, so the one-write-per-request guarantee is untouched and `client.stream`
+      became `client.stream.get_ref()` at the two test sites that inspect what was written.
+    - **`stokehold-server`'s listener wraps its accepted socket in a `BufReader`** and writes
+      through `get_mut()`.
+
+    Two details that matter more than they look:
+
+    - **`write_frame` already flushed after every frame**, which is what makes a `BufWriter` safe
+      here. The channel is half-duplex: the worker answers only once the request is complete, so
+      a frame left in the buffer is a deadlock, not a latency win. Nothing had to be added; the
+      flush was already there for its own reasons.
+    - **A full buffer cannot deadlock a body.** `MAX_BODY_CHUNK` is 64 KiB and the buffer is
+      8 KiB, which looks alarming until you check the order: the reader drains the worker's
+      output while the writer is still filling stdin, so the child's stdout cannot block. The
+      writer flushes when the buffer fills, so a chunk larger than the buffer is not lost.
+
+    **The `BoundedChannel` name is a misnomer** and should probably be `PipedChannel` or
+    `BufferedChannel`; it reads like it is about a bounded queue, which is a different thing this
+    project does not have.
+
+    One thing this pass did **not** settle: `read_next` decodes each `PARAMS` record
+    independently, so an environment split **mid-pair** would fail with a truncated pair. nginx
+    appears to split at pair boundaries (its module emits one `PARAMS` record per request), but
+    that is inherited belief rather than something verified here — I could not confirm it from
+    nginx's source within a reasonable budget. Hazard 34's lesson was that a `to_ascii_lowercase`
+    lived in two places and only one was fixed; this is the same shape of doubt and deserves the
+    same treatment. `frontend_syscalls.rs` models the split at pair boundaries and says so rather
+    than asserting it.
+
+    What is still unbuffered, deliberately recorded rather than fixed: the **HTTP front end**
+    (`stokehold-http`) uses hyper's own buffered IO and is not affected; the **static file**
+    path is dominated by the file read itself; and `stokehold-server`'s listener still flushes
+    the response once per record, which the tests pin at five writes for a response with no
+    `STDERR` — assembling it first would make it two, but the response is written once per
+    request and the reads were the expensive half.
+
+
 
 Phase 0 — skeleton and baseline
 1. `skeleton-workspace` — Cargo workspace, crate layout, CLI stub, error types, `tracing`.

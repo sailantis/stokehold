@@ -32,6 +32,14 @@ use crate::frontend::fastcgi::{self, ServerErrorKind};
 /// ever, and enough of them would exhaust the process's threads.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How much of a request to read ahead of the codec.
+///
+/// A front-end sends the environment in records of up to `MAX_CONTENT_LEN`, but the common case
+/// is a handful of small ones, and the codec asks for each record's header and content
+/// separately. This is sized so an ordinary environment arrives in one fill; a larger one costs
+/// one read per buffer rather than one per field.
+const READ_BUFFER_LEN: usize = 8 * 1024;
+
 /// Limits on concurrent connections, so a misbehaving client cannot make the
 /// process allocate unboundedly many threads.
 #[derive(Debug, Clone, Copy)]
@@ -192,7 +200,7 @@ impl ShutdownHandle {
 
 /// Serve requests on one connection until the peer closes or keep-alive ends.
 fn serve_connection(
-    mut stream: std::net::TcpStream,
+    stream: std::net::TcpStream,
     dispatcher: Arc<Dispatcher>,
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
@@ -210,6 +218,13 @@ fn serve_connection(
         .map_err(ServerError::Io)?;
     let _ = stream.set_nodelay(true);
 
+    // Buffered, because every record the front-end sends is a header followed by a content
+    // payload and the codec asks for the two separately: unbuffered, a request whose environment
+    // arrives as a dozen small records costs about three `read(2)`s each, and every one of them
+    // is a syscall the previous one could have answered. Measured: 40 reads for a 12-record
+    // request, 7 for the same request in one record. Writes go through `get_mut`, so a response
+    // still leaves in its records rather than being held back, and the read half stays buffered.
+    let mut stream = std::io::BufReader::with_capacity(READ_BUFFER_LEN, stream);
     let max_connections_string = max_connections.to_string();
     let mut requests_string = String::new();
 
@@ -235,7 +250,7 @@ fn serve_connection(
                     ("max_connections", max_connections_string.as_str()),
                     ("requests", requests_string.as_str()),
                 ];
-                fastcgi::write_get_values(&mut stream, &values)?;
+                fastcgi::write_get_values(stream.get_mut(), &values)?;
                 continue;
             }
             fastcgi::NextRequest::Request(incoming) => incoming,
@@ -266,7 +281,7 @@ fn serve_connection(
                     );
                 }
                 fastcgi::write_response(
-                    &mut stream,
+                    stream.get_mut(),
                     request_id,
                     &response.stdout,
                     &response.stderr,
@@ -277,7 +292,7 @@ fn serve_connection(
                 stats.failed.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(%err, "dispatch failed");
                 fastcgi::write_error(
-                    &mut stream,
+                    stream.get_mut(),
                     request_id,
                     &err.to_string(),
                     ServerErrorKind::Backend,

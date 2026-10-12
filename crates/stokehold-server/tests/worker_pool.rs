@@ -171,6 +171,19 @@ fn socket_config(workers: u32) -> WorkerConfig {
     }
 }
 
+/// A pool configuration that reaches the worker over its own stdio, **explicitly**.
+///
+/// `config()` takes whatever transport the platform defaults to, which is the honest thing for
+/// most tests here — it is what a deployment gets. It is the wrong thing for the comparison
+/// below, and the day the default became platform-dependent this helper is what stopped that
+/// test from comparing the socket transport with itself on Windows.
+fn pipe_config(workers: u32) -> WorkerConfig {
+    WorkerConfig {
+        transport: stokehold_core::config::WorkerTransport::Pipe,
+        ..config(workers)
+    }
+}
+
 /// A socket-transport pool serves exactly what a pipe-transport pool serves.
 ///
 /// This is what makes `transport = "socket"` a supported configuration rather than a
@@ -189,7 +202,7 @@ fn a_socket_transport_pool_serves_the_same_bytes_as_a_pipe_one() {
     }
 
     for (label, settings) in [
-        ("pipe", config(2)),
+        ("pipe", pipe_config(2)),
         ("socket", socket_config(2)),
     ] {
         let mut pool = WorkerPool::start(label, &settings)

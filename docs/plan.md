@@ -1874,3 +1874,14 @@ is a race, and it is not what the test is about.
 The `accept_with_deadline` doc comment was also wrong — it claimed the listener was polled
 *rather than* put in non-blocking mode, when the code does set it non-blocking and only restores
 blocking on the *accepted* stream. Corrected.
+
+**A third instance of the same class, in the tests.** The integration suite's `config()` helper
+returns `transport: Default::default()`, deliberately — it is what a deployment gets. Once that
+default became platform-dependent, every integration pool on Windows moved to the socket, and
+`a_socket_transport_pool_serves_the_same_bytes_as_a_pipe_one` — whose whole purpose is to compare
+the two transports — began comparing the socket with itself, silently, because its "pipe" arm was
+`config(2)`. Nothing failed; the test simply stopped testing the pipe. That is the same trap as
+the `create()` fixture, one level up: **a default that depends on the platform is invisible at
+every call site that relies on it**, so each place that means a *specific* transport now says so
+(`pipe_config()`, `socket_config()`) and only the sites that genuinely mean "whatever the
+deployment gets" are left on `Default`.

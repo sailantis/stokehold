@@ -685,6 +685,54 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
 }
 
 #[test]
+fn a_pool_configured_for_an_optional_checksum_negotiates_it_and_serves() {
+    let _serial = serial();
+    require_sdk!();
+
+    // The end-to-end version of the option, through the pool rather than the channel: the pool
+    // offers it in the handshake, the real SDK accepts, and requests then cross the pipe with no
+    // checksum in either direction. What this catches that the channel test cannot is the *wiring*
+    // — a `WorkerConfig` that never reached `Spec`, or a `Spec` that never reached `boot`.
+    let mut config = config(1);
+    config.checksum = stokehold_core::config::ChecksumMode::Optional;
+    let pool = WorkerPool::start("test", &config).expect("pool starts");
+
+    // The answer is what is observable: the pool does not keep the channel (the exchange thread
+    // owns it), but the `HELLO_ACK` recorded at boot says what each worker agreed to, and that is
+    // the thing an operator wants to see.
+    assert_eq!(
+        pool.no_checksum_agreed(),
+        vec![true],
+        "the one worker should have agreed to skip the checksum"
+    );
+
+    // And a request still works, which is the part that would break if either end wrote
+    // `NO_CHECKSUM` without the other agreeing.
+    let response = pool.request(&get("/health")).expect("a worker answered");
+    assert_eq!(response.parse_status_headers().0, 200);
+    assert!(body_of(&response).contains("\"status\":\"ok\""));
+
+    drop(pool);
+}
+
+#[test]
+fn a_pool_left_on_the_default_does_not_offer_the_option() {
+    let _serial = serial();
+    let Some(pool) = start(1) else {
+        return;
+    };
+
+    // The same observation from the other side, and the one that matters more: the default must
+    // still produce a checked exchange. A `[backends.x]` that says nothing is what every existing
+    // deployment has.
+    assert_eq!(
+        pool.no_checksum_agreed(),
+        vec![false],
+        "a pool that did not offer the option must not have it accepted"
+    );
+}
+
+#[test]
 fn a_worker_that_cannot_boot_is_refused_at_startup() {
     let _serial = serial();
     require_sdk!();

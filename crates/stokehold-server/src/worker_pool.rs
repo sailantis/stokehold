@@ -206,6 +206,20 @@ impl WorkerPool {
             .collect()
     }
 
+    /// Whether each worker agreed to omit the per-frame checksum.
+    ///
+    /// The worker's *answer*, recorded from its `HELLO_ACK`, not the pool's configuration: a
+    /// worker running an SDK that predates the option answers `false` whatever was offered, and
+    /// an operator comparing this against `checksum = "optional"` is the only way to see the
+    /// difference. A `false` here while the configuration says `optional` means that worker is
+    /// still hashing every frame.
+    pub fn no_checksum_agreed(&self) -> Vec<bool> {
+        self.locked_slots()
+            .iter()
+            .map(|slot| slot.hello.no_checksum)
+            .collect()
+    }
+
     /// Every slot, locked in turn.
     ///
     /// The lock is never held across a request here, which is why this is safe

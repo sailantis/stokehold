@@ -1605,3 +1605,51 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
    three options and the reason a half-reload is worse than none.
 4. **The rename** — a product decision, above.
 5. **The re-run** — the five arms against current `main`, above.
+
+### What the first real Linux run found
+
+`STOKEHOLD_E2E=1 cargo test --workspace` had never been run on Linux with a real PHP
+present. It found three defects that cannot exist on Windows, which is where the suite
+had been exercised:
+
+- **43. The concurrency test did not fail, it hung.** `concurrent_requests_reach_the_backend_at_the_same_time`
+  pointed an `external` backend at a lone `php-cgi -b` and expected four concurrent
+  responses. A single Linux `php-cgi` serves its connections **one at a time**: it takes
+  the next request on the connection it is already holding, because the client asked for
+  keep-alive, and `PHP_FCGI_CHILDREN` is read only in the Windows branch of
+  `sapi/cgi/cgi_main.c` (`cgi_main.c:1972`; the Linux path calls
+  `fcgi_init_request(fcgi_fd, NULL, NULL, NULL)` at line 1969 with no accept hooks), so
+  there is no child pool to distribute to. The four request threads sat in `recv` inside
+  `Stream::read` for **17 minutes** with no timeout set — three in `wait_woken`, one on
+  the scope's join futex. Measured directly: one request passes in 0.3 s, **two hang past
+  60 s**. A real `php-fpm` is a master over a child pool and answers as many at once as
+  `pm.max_children` allows, which is the thing `ClientPool` exists for — so the *fixture*
+  could not exhibit the property under test. The test now uses a FastCGI server that
+  answers each connection in its own thread (a stricter backend than php-fpm: one request
+  per connection, then close), and a bounded receive turns a regression into a failure in
+  five seconds. Negative control: serialising that server behind a mutex makes it fail in
+  1.20 s with "close to the 1.2s they would take if they were serialised".
+
+- **44. The socket-bound test never tested the bound.** `"a".repeat(..)` is a *relative*
+  path, so `validate_cgi_socket` rejected it as relative before reaching the length check,
+  and the `expect` passed for the wrong reason. On Windows the whole body was inside
+  `if cfg!(unix)` and asserted nothing at all. The fixtures are now absolute and sit
+  exactly on the boundary, with the boundary arithmetic itself asserted.
+
+- **The checksum negotiation had never met a real PHP.** Both the worker-level and the
+  pool-level test failed against the SDK at `5ede306`, which predates the flag — the ack
+  came back `false` because the offer was ignored, which is precisely the documented
+  backward-compatible behaviour and not a defect in either side. With the SDK at
+  `a028ce3` both pass, so `NO_CHECKSUM` is now verified end to end with real PHP on both
+  ends for the first time. **The polarity choice is what made this benign:** with
+  `NO_CHECKSUM` (rather than `CHECKSUM`), zero means status quo, so an old peer keeps
+  verifying and simply never agrees.
+
+**And the claim that mattered:** the five-arm benchmark needed **no PHP-side change at
+all**, because the application pins a SDK that predates the flag. An old SDK still serves
+correctly against a new server — the compatibility direction that a `CHECKSUM` flag would
+have broken silently. That is now a measured fact rather than a design argument.
+
+Also worth recording because it is about the benchmark rather than the code: the first
+`STOKEHOLD_E2E=1` run on the *same* tree was still passing when the harness was written,
+so "the tests pass" was never evidence that the Linux path had been exercised.

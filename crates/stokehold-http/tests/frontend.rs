@@ -131,6 +131,7 @@ fn worker_config(workers: u32) -> Config {
                 working_dir: None,
                 env: Default::default(),
                 checksum: Default::default(),
+                transport: Default::default(),
             }),
         )]
         .into_iter()

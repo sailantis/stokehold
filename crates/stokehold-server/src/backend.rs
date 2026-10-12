@@ -366,6 +366,7 @@ mod tests {
                 working_dir: None,
                 env: Default::default(),
                 checksum: Default::default(),
+                transport: Default::default(),
             }),
         )
         .unwrap_err();

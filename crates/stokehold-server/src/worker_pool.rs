@@ -50,7 +50,8 @@
 //! duration, which is the same guarantee the borrow checker used to give.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,7 +60,7 @@ use std::borrow::Cow;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use stokehold_core::config::{ChecksumMode, WorkerConfig};
+use stokehold_core::config::{ChecksumMode, WorkerConfig, WorkerTransport, WORKER_SOCKET_ENV};
 use stokehold_fcgi::protocol::ProtocolStatus;
 use stokehold_fcgi::{EndRequest, NameValuePairs, Request, Response};
 use stokehold_worker::codec::RequestStage;
@@ -85,6 +86,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a worker has to exit after being told to, before it is killed.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often a socket-transport pool looks for a worker that has not connected yet.
+///
+/// The connection is made by a process this server has just spawned, so it arrives within a
+/// millisecond of being made and the poll interval is the whole cost of finding out. It is
+/// short for that reason: this delay is paid once per worker at startup, not per request.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Both directions of one worker's pipes, buffered.
 ///
@@ -589,12 +597,14 @@ impl Slot {
     /// Ask the worker to stop, and make sure that it does.
     ///
     /// Two signals go out, in this order: a `CONTROL drain` frame so the worker
-    /// can flush and clean up, then end-of-file on its stdin, which is the
+    /// can flush and clean up, then the close of the connection, which is the
     /// shutdown mechanism that cannot fail — the worker's read loop returns and
-    /// the process exits on its own. The frame is queued ahead of the close, so
-    /// the worker sees both signals in order. Waiting for the acknowledgement
-    /// would need a deadline for no gain. Killing is only the fallback for a
-    /// worker that ignores both.
+    /// the process exits on its own. On the default transport the close is
+    /// end-of-file on the worker's stdin; on the socket transport it is the socket
+    /// closing, which the worker's read sees the same way. The frame is queued ahead
+    /// of the close, so the worker sees both signals in order. Waiting for the
+    /// acknowledgement would need a deadline for no gain. Killing is only the
+    /// fallback for a worker that ignores both.
     fn stop(&mut self) {
         if let Some(mut exchange) = self.exchange.take() {
             // The control frame is unsolicited — no request id — and the
@@ -655,6 +665,26 @@ struct Spec {
     /// `optional` at startup and then respawned a worker under `required` would have one
     /// worker verifying and the rest not, which is a difference nothing would report.
     checksum: Checksum,
+    /// How to connect to the worker. On the spec for the same reason as `checksum`: a
+    /// replaced worker must be reached the same way as the one it replaces.
+    transport: WorkerTransport,
+}
+
+/// The pieces of a worker specification `boot` does not read.
+///
+/// `boot` resolves no program and parses no command — those checks already happened in
+/// `Spec::from_config` — so a test driving startup failures can leave the binary as a path
+/// that does not exist.
+#[cfg(test)]
+fn bare_spec(transport: WorkerTransport) -> Spec {
+    Spec {
+        binary: PathBuf::from("php"),
+        args: Vec::new(),
+        working_dir: None,
+        env: BTreeMap::new(),
+        checksum: Checksum::Optional,
+        transport,
+    }
 }
 
 impl Spec {
@@ -700,7 +730,72 @@ impl Spec {
                 ChecksumMode::Required => Checksum::Required,
                 ChecksumMode::Optional => Checksum::Optional,
             },
+            transport: config.transport,
         })
+    }
+}
+
+/// Wait for a socket-transport worker to connect back, and give up rather than hang.
+///
+/// A blocking `accept` here has no deadline, and the failure it waits for is a quiet one: a
+/// worker that starts but connects to the wrong address, or does not connect at all, produces
+/// no error anywhere — the accept simply never returns. That turns a misconfiguration into a
+/// server that hangs at startup instead of one that says what is wrong, which is the same
+/// failure the named-pipe transport had to solve for reads (plan hazard 43).
+///
+/// The listener is polled rather than put in non-blocking mode for the duration: this runs
+/// once per worker at startup, so the 2 ms granularity is not on any request path, and it
+/// keeps the accepted stream blocking, which is what the exchange thread wants.
+fn accept_with_deadline(
+    listener: &TcpListener,
+    spec: &Spec,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| ServerError::Spawn {
+            binary: spec.binary.clone(),
+            source,
+        })?;
+
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Restore blocking before the stream is handed to the exchange thread.
+                let _ = stream.set_nonblocking(false);
+                return Ok(stream);
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                // A worker that has already exited will never connect. Saying so is far more
+                // useful than waiting out the full handshake budget, and the exit status is
+                // usually the reason: a fatal error, a missing extension, a bad path.
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(ServerError::StartupExited {
+                        binary: spec.binary.clone(),
+                        status: status.to_string(),
+                    });
+                }
+                if Instant::now() >= deadline {
+                    return Err(ServerError::StartupTimeout {
+                        binary: spec.binary.clone(),
+                        address: listener
+                            .local_addr()
+                            .map(|found| found.to_string())
+                            .unwrap_or_else(|_| "the worker socket".to_string()),
+                        timeout,
+                    });
+                }
+                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(source) => {
+                return Err(ServerError::Spawn {
+                    binary: spec.binary.clone(),
+                    source,
+                })
+            }
+        }
     }
 }
 
@@ -710,19 +805,57 @@ impl Spec {
 /// a worker that cannot boot is a startup error, not a mystery on the first
 /// request that happens to reach it.
 fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
+    // A socket-transport worker is connected to a listener that has to exist *before* the
+    // process starts, because the address is handed to it as an environment variable
+    // rather than discovered by it. So the listener is bound first and the worker spawns
+    // into a connection that is already waiting.
+    let listener = if spec.transport.is_pipe() {
+        None
+    } else {
+        Some(TcpListener::bind(("127.0.0.1", 0)).map_err(|source| ServerError::Spawn {
+            binary: spec.binary.clone(),
+            source,
+        })?)
+    };
+    let socket_address = match &listener {
+        Some(listener) => Some(listener.local_addr().map_err(|source| ServerError::Spawn {
+            binary: spec.binary.clone(),
+            source,
+        })?),
+        None => None,
+    };
+
     let mut command = Command::new(&spec.binary);
     command
-        .args(&spec.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdin(if spec.transport.is_pipe() {
+            Stdio::piped()
+        } else {
+            // With the protocol on a socket, stdio is free to be nothing. Leaving stdin
+            // piped would also work, but a worker that reads the wrong stream should fail
+            // loudly rather than block, and `null` gives it immediate end-of-file.
+            Stdio::null()
+        })
+        .stdout(if spec.transport.is_pipe() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         // Piped, never nulled: PHP writes its diagnostics here, and a worker
         // whose stderr pipe fills up blocks for ever on its next write.
         .stderr(Stdio::piped());
+    command.args(&spec.args);
     if let Some(dir) = &spec.working_dir {
         command.current_dir(dir);
     }
     for (key, value) in &spec.env {
         command.env(key, value);
+    }
+    if let Some(address) = socket_address {
+        // Set *after* the configured `env`, so the address always wins. A configuration
+        // that carries its own `env` map would otherwise be able to point the worker at a
+        // different address than the listener we are about to accept on, and the failure
+        // would be a worker that boots and never connects.
+        command.env(WORKER_SOCKET_ENV, address.to_string());
     }
     configure_command(&mut command);
 
@@ -748,13 +881,39 @@ fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
         });
     }
 
-    let stdin = child.stdin.take().expect("stdin was piped");
-    let stdout = child.stdout.take().expect("stdout was piped");
     if let Some(stderr) = child.stderr.take() {
         drain_stderr(name.to_string(), child.id(), stderr);
     }
 
-    let channel = BoundedChannel::new(stdin, stdout);
+    let channel = match listener {
+        // The worker connects back to the listener bound above. The timeout matters: a
+        // worker that never connects must fail here rather than hold startup for ever, and
+        // it is bounded by the same budget the handshake gets.
+        Some(listener) => {
+            let accepted = match accept_with_deadline(&listener, spec, &mut child, HANDSHAKE_TIMEOUT) {
+                Ok(stream) => stream,
+                Err(source) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(source);
+                }
+            };
+            // The protocol is latency-sensitive and its frames are small; Nagle would
+            // only add delay to a request that is written frame by frame.
+            let _ = accepted.set_nodelay(true);
+            let reader = accepted.try_clone().map_err(|source| ServerError::Spawn {
+                binary: spec.binary.clone(),
+                source,
+            })?;
+            BoundedChannel::new(accepted, reader)
+        }
+        None => {
+            let stdin = child.stdin.take().expect("stdin was piped");
+            let stdout = child.stdout.take().expect("stdout was piped");
+            BoundedChannel::new(stdin, stdout)
+        }
+    };
+
     match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT, spec.checksum) {
         Ok((channel, ack)) => {
             tracing::debug!(
@@ -1842,6 +2001,105 @@ mod tests {
         assert!(err.contains("empty"), "{err}");
     }
 
+    /// A socket-transport worker that never connects back fails startup, promptly.
+    ///
+    /// `boot` originally called a bare `listener.accept()`, which has no deadline. A worker
+    /// that connects to the wrong address therefore hung startup for ever with nothing
+    /// logged, because no step in the sequence reports a *missing* connection. The test
+    /// asserts the two things that make the difference visible: the error names the cause,
+    /// and it arrives in about a second rather than never.
+    ///
+    /// A short timeout is passed instead of the real 30 s handshake budget so the test stays
+    /// fast; the deadline arithmetic is the same either way.
+    #[test]
+    fn a_socket_worker_that_never_connects_times_out_rather_than_hanging() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // A process that has already exited, standing in for the worker that failed to
+        // connect — this is the case where waiting out the deadline would be the wrong
+        // answer, and the one `boot` must recognise by exit status.
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit 3"]
+            } else {
+                vec!["-c", "exit 3"]
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let started = Instant::now();
+        let err = accept_with_deadline(
+            &listener,
+            &bare_spec(WorkerTransport::Socket),
+            &mut child,
+            Duration::from_secs(5),
+        )
+        .expect_err("a listener nobody connects to must not succeed");
+        let elapsed = started.elapsed();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the failure must be reported as soon as the worker is known to be gone, \
+             not after the full budget: took {elapsed:?}"
+        );
+        assert!(
+            matches!(err, ServerError::StartupExited { .. }),
+            "a worker that exited cannot connect, so its exit status is the useful part: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("php"),
+            "the error names the binary that failed: {err}"
+        );
+    }
+
+    /// The timeout path itself: a live worker that never dials back.
+    #[test]
+    fn a_live_socket_worker_that_never_connects_hits_the_startup_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        // Long enough to outlive the deadline below, and silent on both streams.
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+            .args(if cfg!(windows) {
+                vec!["/C", "ping -n 6 127.0.0.1 >NUL"]
+            } else {
+                vec!["5"]
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let err = accept_with_deadline(
+            &listener,
+            &bare_spec(WorkerTransport::Socket),
+            &mut child,
+            Duration::from_millis(200),
+        )
+        .expect_err("a live worker that never connects must not hold startup for ever");
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        match err {
+            ServerError::StartupTimeout {
+                address: found,
+                timeout,
+                ..
+            } => {
+                assert_eq!(found, address.to_string(), "the error names the address waited on");
+                assert_eq!(timeout, Duration::from_millis(200));
+            }
+            other => panic!("expected a startup timeout, got {other:?}"),
+        }
+    }
+
     #[test]
     fn cgi_header_names_are_rebuilt_in_canonical_form() {
         assert_eq!(header_name("ACCEPT_ENCODING"), "Accept-Encoding");
@@ -2078,6 +2336,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             checksum: Default::default(),
+            transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
         assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");
@@ -2097,6 +2356,7 @@ mod tests {
             working_dir: Some(binary),
             env: Default::default(),
             checksum: Default::default(),
+            transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
         assert!(err.to_string().contains("is not a directory"), "{err}");
@@ -2112,6 +2372,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             checksum: Default::default(),
+            transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");

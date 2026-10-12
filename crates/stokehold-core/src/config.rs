@@ -327,7 +327,48 @@ pub struct WorkerConfig {
     /// simply keeps checksumming — see [`ChecksumMode`].
     #[serde(default)]
     pub checksum: ChecksumMode,
+
+    /// How the server and a worker are connected.
+    ///
+    /// Defaults to [`WorkerTransport::Pipe`], which is what every stokehold release before
+    /// this option did. `socket` exists because of a measured Windows problem: PHP's stream
+    /// layer takes **~8 ms median (15 ms p95)** to return from a blocking read on a pipe
+    /// there, while the same read on a **socket** returns in **~0.09 ms**. A Rust process
+    /// reading the identical pipe returns in 0.010 ms, and RoadRunner — a different server
+    /// with a different protocol — measured the same 15 ms, so the cost is PHP-on-Windows
+    /// rather than anything stokehold does. On Linux a pipe is fine, which is why the
+    /// default does not change. See `docs/plan.md` hazard 46.
+    #[serde(default)]
+    pub transport: WorkerTransport,
 }
+
+/// How a worker process is connected to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerTransport {
+    /// The worker's own `stdin`/`stdout`. Portable, needs nothing from the worker, and
+    /// the fastest option on Linux and macOS.
+    #[default]
+    Pipe,
+    /// A loopback TCP socket, for Windows, where PHP's pipe reads are slow. The server
+    /// listens on an ephemeral loopback port and passes it to the worker as
+    /// `STOKEHOLD_WORKER_SOCKET`; the worker connects back. The transport is
+    /// indistinguishable to the protocol, which is why nothing above this setting changes.
+    Socket,
+}
+
+impl WorkerTransport {
+    /// True when the transport is the worker's own stdio.
+    pub fn is_pipe(self) -> bool {
+        matches!(self, WorkerTransport::Pipe)
+    }
+}
+
+/// The environment variable carrying the address a socket-transport worker must connect to.
+///
+/// The server listens before starting the worker, so the address is known up front and the
+/// worker is told rather than having to discover it.
+pub const WORKER_SOCKET_ENV: &str = "STOKEHOLD_WORKER_SOCKET";
 
 /// How strictly the worker protocol's per-frame `crc32c` is enforced.
 ///

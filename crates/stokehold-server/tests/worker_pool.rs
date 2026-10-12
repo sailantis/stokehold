@@ -130,6 +130,7 @@ fn config(workers: u32) -> WorkerConfig {
         working_dir: None,
         env: Default::default(),
         checksum: Default::default(),
+        transport: Default::default(),
     }
 }
 
@@ -151,6 +152,67 @@ fn start(workers: u32) -> Option<WorkerPool> {
 /// A GET request routed through the real CGI environment.
 fn get(uri: &str) -> Request {
     request("GET", uri, &[])
+}
+
+/// A pool configuration that reaches the worker over a loopback socket.
+///
+/// The worker connects back to `STOKEHOLD_WORKER_SOCKET`, which the server sets itself; see
+/// `stokehold_core::config::WorkerTransport` for why the option exists.
+///
+/// This found a real ordering bug the first time it ran. `boot` set the address before
+/// applying the configuration's own `env` map, so a configuration carrying any `env` at all
+/// replaced the address — and the workers then sat waiting for a connection that was never
+/// coming, for ever, because nothing about "connected to the wrong place" looks like a
+/// failure. The address is now set *after* `env` so it always wins.
+fn socket_config(workers: u32) -> WorkerConfig {
+    WorkerConfig {
+        transport: stokehold_core::config::WorkerTransport::Socket,
+        ..config(workers)
+    }
+}
+
+/// A socket-transport pool serves exactly what a pipe-transport pool serves.
+///
+/// This is what makes `transport = "socket"` a supported configuration rather than a
+/// documented possibility. The two pools run the same worker file, the same request and the
+/// same assertion; only the transport differs.
+///
+/// It is worth having even though the socket path is one branch in `boot`, because the
+/// failure modes it guards are silent ones: a worker that connects to the wrong address, or
+/// a channel built from a stream that does not carry the protocol, would still *start*.
+#[test]
+fn a_socket_transport_pool_serves_the_same_bytes_as_a_pipe_one() {
+    let _serial = serial();
+    if let Some(reason) = skip_reason() {
+        report_skip(reason);
+        return;
+    }
+
+    for (label, settings) in [
+        ("pipe", config(2)),
+        ("socket", socket_config(2)),
+    ] {
+        let mut pool = WorkerPool::start(label, &settings)
+            .unwrap_or_else(|err| panic!("the {label} pool starts: {err}"));
+
+        assert_eq!(pool.len(), 2, "the {label} pool keeps its size");
+
+        for index in 0..4 {
+            let response = pool
+                .request(&get("/health"))
+                .unwrap_or_else(|err| panic!("the {label} pool answered: {err}"));
+            let body = String::from_utf8_lossy(&response.stdout);
+            // The example worker answers `/health` with a JSON status, so the assertion is
+            // on the application's own output rather than on a status code alone.
+            assert!(
+                body.contains("ok"),
+                "the {label} pool returned {body:?} for request {index}"
+            );
+        }
+
+        pool.shutdown();
+        assert!(pool.is_empty(), "the {label} pool stopped");
+    }
 }
 
 /// A request routed through the real CGI environment, with a body.
@@ -643,6 +705,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         working_dir: None,
         env: Default::default(),
         checksum: Default::default(),
+        transport: Default::default(),
     };
     let pool = WorkerPool::start("test", &config).expect("pool starts");
 
@@ -753,6 +816,7 @@ fn a_worker_that_cannot_boot_is_refused_at_startup() {
         working_dir: None,
         env: Default::default(),
         checksum: Default::default(),
+        transport: Default::default(),
     };
 
     let err = WorkerPool::start("test", &config).unwrap_err();

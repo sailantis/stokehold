@@ -104,6 +104,18 @@ one `memcpy` of the page costs per frame, which on a request that spends its tim
 application is close to nothing; it is a knob to measure with, not a promised speed-up. See
 [`docs/worker-protocol.md`](docs/worker-protocol.md) for the wire details and the flag.
 
+`transport = "socket"` moves the worker protocol off the child's stdio and onto a loopback socket.
+It exists for one measured reason, and it is a large one: **on Windows, PHP takes ~8 ms median
+(15 ms at p95) to return from a blocking read on a pipe, where the same read on a socket returns in
+~0.09 ms.** A Rust process reading the identical pipe returns in 0.010 ms, and RoadRunner measured
+the same 15 ms on the same host, so this is PHP's Windows stream layer rather than anything
+stokehold does — but it is per request, not per connection, so it decides which deployment model
+wins. On Linux the pipe is fine and remains the default; on Windows, set this. The worker opts in
+with `Stokehold\Worker::connect()` (an SDK at or after the release that added it) and needs no
+other change, because the protocol does not know which transport it is on. See
+[`docs/plan.md`](docs/plan.md) hazard 46 for the measurements and the alternatives that were ruled
+out.
+
 ```toml
 default_backend = "app"
 
@@ -116,6 +128,8 @@ kind = "worker"
 command = "php worker.php"
 memory_limit_mb = 256
 checksum = "optional"
+# Windows only; the pipe is faster on Linux.
+# transport = "socket"
 
 [backends.fpm]
 kind = "external"

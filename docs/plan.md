@@ -1710,3 +1710,86 @@ so "the tests pass" was never evidence that the Linux path had been exercised.
   already shipped, so the pipe is a Windows-only mechanism. It also does not re-open the
   `PHP_FCGI_CHILDREN` question — each pipe carries its own slot's instance, so one process per slot
   is still what the pool wants.
+
+- **46. On Windows, PHP reads a pipe 90–150× slower than a socket — so the warm arm loses to
+  the cold one, and the published conclusion is Linux-specific.** This was found by running the
+  five-arm benchmark on Windows and getting a result that contradicted the published one: the
+  *warm* worker measured 15.24 ms median on `/items` against the *cold* `spawn_cgi` arm's
+  4.86 ms, where on Linux the same arms are 0.556 ms and 1.523 ms. A cold start twice as fast as
+  a resident process is not a plausible result, so it was treated as a defect until it was
+  separated from one.
+
+  **What it is not.** Every alternative was eliminated by measurement rather than argument:
+
+  | hypothesis | experiment | result |
+  | --- | --- | --- |
+  | Windows timer granularity | `timeBeginPeriod(1)` around the run | no change, still 15.2 ms |
+  | Rust channel or timed wait | 4 shapes of `recv_timeout`, incl. the pool's own | 0.00–0.06 ms |
+  | the pool, threads, HTTP | direct codec, no pool and no threads | still 15.085 ms |
+  | which direction | client and worker stamps on one clock | **request 14.47 ms, response 0.71 ms** |
+  | the pipe itself | Rust child echoing 8 bytes on the same pipe | **0.010 ms** |
+  | the read strategy | `stream_select` vs `stream_get_contents` vs `fread`/`feof` loop | all identical |
+  | a PHP version regression | 8.3.31 and 8.5.9 | identical |
+  | this server, or this SDK | RoadRunner 3.0.0, `relay: pipes`, same app, 12 workers | **15.15 ms vs 15.24 ms** |
+
+  Two independent servers and two independent SDKs agreeing to 0.6% is what makes it a property
+  of the platform rather than of either implementation.
+
+  **What it is.** PHP's own read, timed inside PHP, with the wake measured as `after − write_time`
+  so that a `usleep` interval cannot be mistaken for latency, and with the write verified to have
+  been issued after the stamp:
+
+  | what PHP is reading | median | p95 |
+  | --- | --- | --- |
+  | a **pipe** | ~8 ms | ~15.4 ms |
+  | a **socket** | **0.09–0.12 ms** (0.098 / 0.090 / 0.093 across 3 repeats) | — |
+
+  So the transport is not merely slower, it is slower by ~100×, and the cost is *per request*
+  rather than per connection. **Caveat, stated rather than buried:** the pipe and socket figures
+  use the same function (`stream_get_contents`) on different stream types, which is as close to
+  apples-to-apples as PHP allows but is not the SDK's exact read path. The signal is far too large
+  to be an artefact of that difference, but the precise ratio should be re-taken before it is
+  published as a headline number.
+
+  **Consequence, implemented.** `transport = "socket"` on a `worker` backend: the server binds a
+  loopback listener before spawning, passes the address as `STOKEHOLD_WORKER_SOCKET`, and the
+  worker dials back instead of using stdio. The PHP side is one call — `Worker::connect()` — which
+  is `Worker::create()` plus the decision, so an application does not change and the protocol does
+  not know which transport it is on.
+
+  **The end-to-end result**, `GET /items` on the same application, same 12 workers, same host, the
+  repository's own `latency.php`, 1000 requests × 9 runs per arm, marker verified on every run:
+
+  | arm | median | worst run median | best run median |
+  | --- | --- | --- | --- |
+  | warm worker over a **pipe** | 15.24 ms | 15.274 ms | 15.203 ms |
+  | warm worker over a **socket** | **0.72 ms** | 0.785 ms | 0.671 ms |
+
+  **21× faster, a 0.06 ms spread across runs, and the two ranges do not overlap by two orders of
+  magnitude** — the socket's *worst* run is 19× faster than the pipe's *best*. It puts Windows back
+  in line with the Linux figure for the same arm (0.556 ms), which is what makes it a transport
+  result rather than a Windows result.
+
+  **The two defects the first version of this had**, both of which are the same class as hazard 43
+  — a failure that hangs instead of failing:
+
+  - **`accept()` had no deadline.** The comment said the timeout mattered; no timeout was
+    implemented. A worker that connects to the wrong address produced no error anywhere, because
+    nothing in the sequence reports a *missing* connection, so startup held for ever. It now polls
+    against the handshake budget, and checks `try_wait` first: a worker that has already exited
+    cannot connect, so its exit status is the useful part of the story and is reported
+    immediately rather than after the full budget.
+  - **`Worker::connect()` did not exist when this was first written**, which is a real
+    compatibility trap rather than a test artefact: the worker file the *integration tests* drive
+    is the SDK's example, and a checkout of the SDK that predates the method dies with a fatal
+    error that the server correctly reports as "unsupported protocol version 97" — 97 being `a`,
+    the first byte of PHP's error text. The same thing happened on the VM, whose SDK checkout was
+    a plain checkout without the change, and again in `stokehold-competition`, whose `vendor/`
+    pins the SDK at `5ede306`. **A worker file that calls a method the pinned SDK does not have is
+    a fatal error on startup, not a degraded path**, so the pin has to move with the server.
+
+  **What it does not decide.** `Pipe` remains the default, because it is faster on Linux and Linux
+  is where the unix-socket equivalent also lives; `Socket` is the Windows recommendation. Making
+  it the Windows *default* would be the right call on the evidence, but it is a behaviour change
+  for existing deployments and belongs with the other open decisions rather than in a transport
+  patch.

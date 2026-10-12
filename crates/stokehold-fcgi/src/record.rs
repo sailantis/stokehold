@@ -137,6 +137,42 @@ pub fn write_records<W: Write>(
     Ok(())
 }
 
+/// Append a payload as one or more records to a buffer.
+///
+/// The byte-for-byte equivalent of [`write_records`], but onto a `Vec` so a caller
+/// can build a whole request and put it on the wire in one `write`. The duplication
+/// is deliberate and the two are kept adjacent and tested against each other
+/// (`append_and_write_produce_the_same_bytes`): making `write_records` delegate to
+/// this one would allocate a `Vec` per request on every path that uses the plain
+/// writer, which is the opposite of the point.
+pub fn append_records(
+    out: &mut Vec<u8>,
+    record_type: RecordType,
+    request_id: u16,
+    content: &[u8],
+    terminate: bool,
+) {
+    for chunk in content.chunks(MAX_CONTENT_LEN) {
+        let header = Header::new(record_type, request_id, chunk.len() as u16);
+        out.extend_from_slice(&header.encode());
+        out.extend_from_slice(chunk);
+        append_padding(out, header.padding_length);
+    }
+
+    if terminate || content.is_empty() && record_type.is_stream() {
+        let header = Header::new(record_type, request_id, 0);
+        out.extend_from_slice(&header.encode());
+    }
+}
+
+fn append_padding(out: &mut Vec<u8>, padding: u8) {
+    if padding > 0 {
+        // Padding must be zero bytes.
+        const ZEROS: [u8; 8] = [0u8; 8];
+        out.extend_from_slice(&ZEROS[..padding as usize]);
+    }
+}
+
 fn write_padding<W: Write>(writer: &mut W, padding: u8) -> Result<(), FcgiError> {
     if padding > 0 {
         // Padding must be zero bytes.
@@ -315,5 +351,41 @@ mod tests {
     #[test]
     fn eof_between_records_is_clean() {
         assert_eq!(read_record(&mut [].as_slice()).unwrap(), None);
+    }
+
+    /// `append_records` exists so a request can be built in memory and written in
+    /// one call. If the two paths ever disagree the fast path sends a different
+    /// request from the tested one, which is exactly the bug that would be hardest
+    /// to see — a working request with a subtly different framing.
+    #[test]
+    fn append_and_write_produce_the_same_bytes() {
+        let cases: Vec<(Vec<u8>, bool)> = vec![
+            (vec![], true),
+            (vec![], false),
+            (b"a".to_vec(), true),
+            (b"short params".to_vec(), false),
+            (vec![b'p'; 7], true),
+            (vec![b'p'; 8], true),
+            (vec![b'p'; 9], true),
+            (vec![b'z'; MAX_CONTENT_LEN], true),
+            (vec![b'z'; MAX_CONTENT_LEN + 1], true),
+            (vec![b'z'; MAX_CONTENT_LEN * 2], false),
+        ];
+
+        for (content, terminate) in cases {
+            for record_type in [RecordType::Params, RecordType::Stdin] {
+                let mut written = Vec::new();
+                write_records(&mut written, record_type, 7, &content, terminate).unwrap();
+
+                let mut appended = Vec::new();
+                append_records(&mut appended, record_type, 7, &content, terminate);
+
+                assert_eq!(
+                    appended, written,
+                    "record_type {record_type:?}, {} bytes, terminate={terminate}",
+                    content.len()
+                );
+            }
+        }
     }
 }

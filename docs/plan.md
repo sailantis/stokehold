@@ -591,32 +591,52 @@ against the specification and secondary implementations, and are confirmed by fi
     That SIGTERM leak was the *other* bug found the same way, and it is the same shape: a correct-
     looking configuration (`Ctrl-C works`) with a silently wrong failure mode (`kill` does not).
 
-30. **On a real page the FastCGI arms lose most of their throughput to loopback TCP, and a unix socket
-    gets it back — so hazard 23's "the TCP path pulls away" was partly a TCP artifact.** Hazard 23
-    measured `spawn_cgi` over TCP beating the piped worker at high concurrency and concluded that
-    "what separates them is later: the CGI arm keeps scaling to 32 while the piped arm plateaus at
-    ~21k". That plateau was hazard 25's thread-per-request cost and is gone. What hazard 23 did *not*
-    isolate is the transport: it compared a piped worker against a TCP CGI arm, so the transport and
+30. **Loopback TCP is worth about 10% to `spawn_cgi`, not an order of magnitude — and the
+    first diagnosis of it was wrong twice.** Hazard 23 measured `spawn_cgi` over TCP beating
+    the piped worker at high concurrency and concluded "what separates them is later: the
+    CGI arm keeps scaling to 32 while the piped arm plateaus at ~21k". The plateau was
+    hazard 25's thread-per-request cost and is gone. What hazard 23 never isolated was the
+    transport, since it compared a piped worker against a TCP CGI arm, so the transport and
     the SAPI moved together.
 
-    Measured on the framework page (`GET /items`, one ORM query plus a template render), 12 slots,
-    concurrency 1, same server, same model, same SAPI, only the transport differing:
+    The clean comparison — same server, same model, same SAPI, same entry script, only the
+    transport differing — was run twice and gave two different answers, and the second is
+    the one to keep.
 
-    | transport | rps | p50 | p75 | stdev |
-    |---|---|---|---|---|
-    | loopback TCP | 138 | 3.43 ms | 21.77 ms | 13.5 ms |
-    | unix socket | **283** | 3.17 ms | 3.30 ms | 6.8 ms |
+    **First attempt: a single wrk connection per arm.** T collapsed to 198–281 rps while U
+    reached 8,107, a ratio of **29x** at concurrency 32, with an unchanged p50 and a 110 ms
+    one. That was reported here as a real transport cost and explained as delayed ACK. Both
+    the size and the explanation were wrong:
 
-    A 2.05x difference at concurrency 1, and the shape is diagnostic rather than incidental: the p50 is
-    the same while the TCP arm's p75 is **6.6x** the unix arm's, on identical work. An unchanged median
-    plus a ~40 ms tail is a timer-based stall, and 40 ms is the Linux **delayed-ACK** timer rather than
-    the RTO, which starts in the hundreds of milliseconds — a response needing more than one write
-    waits for the peer's delayed acknowledgement. It scales with how many chunks the response is written
-    in, which is why `/` (5 KB) shows **1.0x** T/U and `/items` (10 KB) collapses; a unix socket has no
-    Nagle and no delayed ACK. Note that the mechanism is the evidence rather than the two data points —
-    what the run shows directly is the shape (identical p50, a 40 ms tail, 1.0x on the small endpoint
-    and 3.5x at c=1 / 29x at c=32 on the large one), with server, model, SAPI and entry script held
-    equal.
+    - `tcpdump` per connection showed stokehold sending each request as 8 TCP segments —
+      one per 8-byte FastCGI record header — where nginx sends 1–2, because the client sets
+      `TCP_NODELAY` and php-cgi only sets it on its own side *after* it reads the request.
+      That was a genuine inefficiency, and fixing it (`Client::send` now assembles the
+      request in a reused buffer and writes once) measured **1.572 -> 1.509 ms, about 4%**.
+      Real, and not the cause.
+    - php-cgi sets `TCP_NODELAY` itself (`main/fastcgi.c:1087`, inside `fcgi_accept_request`,
+      before any response byte) whenever keep-alive was requested, and `transport.rs` sets
+      it too — so a delayed-ACK explanation was wrong on the facts. It was published before
+      the source was read.
+    - The 29x itself was an artifact: **one wrk connection lands on one pool slot**, so that
+      slot serialises while the other eleven and the aggregate rate are unaffected. Stated
+      as a pool measurement, the column measures one slot.
+
+    **Second attempt: two independent measurements of the same pair.**
+
+    | measurement | `/items` | `/` |
+    |---|---|---|
+    | sequential latency, one reused connection | T 1.656 ms vs U 1.466 ms — **13%** | 0.663 vs 0.656 — **1%** |
+    | sequential `curl`, fresh connection per request | T and U **identical**, 1.8 ms | identical |
+
+    So a unix socket is worth roughly 10% on a large response and nothing on a small one or
+    on a fresh connection. Loopback TCP's per-packet cost is real — `ss` reports `minrtt`
+    11 us against 2 us, so ~9 us more per round trip — but a request pays only a handful of
+    round trips. The 59 ms tail is single-connection-only and **remains unexplained**; it is
+    not Nagle, and it is not the 8-segment write.
+
+    `socket = "unix:..."` (hazard 26) is still worth having, for about 10% on a large
+    response, but it is not the order of magnitude this plan claimed for a while.
 
     Two consequences. First, **`spawn_cgi` over loopback TCP should not be the recommended
     configuration on Linux** where a unix socket is available; this is the concrete reason

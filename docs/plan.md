@@ -245,7 +245,7 @@ against the specification and secondary implementations, and are confirmed by fi
    waiting on it; the worker is then *killed*, which is what makes the pending read return so the
    thread can exit and drop the pipes. The consequence to remember is that a timed-out worker's
    pipes must not be reused — the reader may still be inside a read.
-   `crates/stokehold-server/src/worker_pool.rs`.
+   `crates/stokehold-server/src/worker_pool/` (`exchange.rs`).
 8. **Draining `STDERR` on the caller's thread is the same hang as not draining it.** A worker
    whose stderr pipe fills blocks for ever on its next write, which is why one reader thread per
    backend is mandatory. But reading that pipe to end-of-file *blocks until the worker exits*, so
@@ -436,7 +436,7 @@ against the specification and secondary implementations, and are confirmed by fi
     speaking the same protocol shape, reached **31,525**. So stokehold *lost* the direct
     worker-versus-worker comparison by about 54% at concurrency 32, having been level up to
     concurrency 8 (17,471 vs 16,610). The cause was `request_with_deadline`
-    (`crates/stokehold-server/src/worker_pool.rs`): a pipe read has no portable timeout, so each
+    (`crates/stokehold-server/src/worker_pool/exchange.rs`): a pipe read has no portable timeout, so each
     request spawned a `std::thread` to run the exchange and took the result through an
     `mpsc::recv_timeout`, while `CgiPool::request` calls straight into the slot. Every request paid
     a thread create and a channel handoff, so the pool reached its ceiling *below* the point where
@@ -592,7 +592,7 @@ against the specification and secondary implementations, and are confirmed by fi
     the application once per request — the deployment model the backend exists to avoid. It was found
     while writing the framework benchmark, where it produced 11 rps where 2,569 was expected, and it
     is the most consequential configuration footgun in the project precisely because it degrades
-    silently instead of failing. Fixed in `worker_pool.rs` and `pool.rs` (`max > 0`), with a test named
+    silently instead of failing. Fixed in `worker_pool/` and `pool.rs` (`max > 0`), with a test named
     for the value that goes wrong, and both config doc comments now state the zero case.
 
     That SIGTERM leak was the *other* bug found the same way, and it is the same shape: a correct-
@@ -923,7 +923,7 @@ against the specification and secondary implementations, and are confirmed by fi
 **36. Left deliberately on the table.** Recorded so the next pass does not rediscover them as
     findings, and so a later decision has the reasoning rather than just the code.
 
-    - **`request_header` in `worker_pool.rs` allocates an owned `String` per CGI parameter** (about
+    - **`request_header` in `worker_pool/request.rs` allocates an owned `String` per CGI parameter** (about
       seven) and two per header, via `text_param` and `headers_from_params`. The worker protocol
       carries a JSON `RequestHeader`, which owns its strings, so this is inherent to the protocol
       rather than to the translation — removing it means a borrowed or `Cow` header threaded through

@@ -349,7 +349,7 @@ Both adapters share one implementation of this, `Azera\Http\WorkerSession` in
 
 Everything above is the wire format. This section is the policy the server applies on top of it,
 because a worker cannot enforce any of it and an application author needs to know what to expect —
-`crates/stokehold-server/src/worker_pool.rs` is the implementation.
+`crates/stokehold-server/src/worker_pool/` is the implementation.
 
 **When a worker is replaced.** A worker is not replaced because it failed a request; it is
 replaced on exactly three signals, all of which come from the worker itself or from

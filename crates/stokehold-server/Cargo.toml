@@ -11,6 +11,10 @@ repository.workspace = true
 stokehold-core.workspace = true
 stokehold-fcgi.workspace = true
 stokehold-worker.workspace = true
+# Serializes the request frame's head. The server builds that head by borrowing it out of
+# the CGI environment, so it implements `Serialize` for its own borrowed header type rather
+# than collecting owned pairs for the worker crate to serialize.
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

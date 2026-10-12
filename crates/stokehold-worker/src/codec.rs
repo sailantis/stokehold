@@ -116,6 +116,19 @@ impl BoundedChannel {
         self.channel.request_staged(request, body, on_stage)
     }
 
+    /// A request whose head was encoded on the caller's side of the thread boundary.
+    ///
+    /// The pool's path: it borrows the head out of the CGI environment, so it encodes there and
+    /// sends the bytes rather than an owned header. See [`WorkerChannel::request_encoded`].
+    pub fn request_encoded(
+        &mut self,
+        head: Vec<u8>,
+        body: &[u8],
+        on_stage: impl FnMut(RequestStage),
+    ) -> Result<WorkerResponse> {
+        self.channel.request_encoded(head, body, on_stage)
+    }
+
     /// Write one frame from a payload that is already encoded.
     pub fn send_frame(
         &mut self,
@@ -141,21 +154,85 @@ impl BoundedChannel {
 
 /// A borrowed `RequestHeader`, with `body_len` supplied by the caller.
 ///
-/// Exists so the request frame can be serialized without cloning the header. Field
-/// names and order match [`RequestHeader`] exactly — that is a protocol requirement, not
-/// a style preference, because the PHP SDK decodes this JSON — so the two must be changed
-/// together. `the_borrowed_request_frame_is_byte_identical_to_the_owned_encoding` is what
-/// enforces it.
+/// Exists so the request frame can be serialized without cloning the header, and so the header
+/// can be *built* without owning anything: every field is borrowed from wherever it came from,
+/// and `headers` is an iterator of borrowed pairs rather than a `Vec` of owned `String`s. Field
+/// names and order match [`RequestHeader`] exactly — that is a protocol requirement, not a style
+/// preference, because the PHP SDK decodes this JSON — so the two must be changed together, and
+/// the derive is deliberately still what decides the field names.
+/// `the_borrowed_request_frame_is_byte_identical_to_the_owned_encoding` is what enforces it.
+///
+/// `I` and `P` are generic because the server reads the request headers out of the CGI
+/// environment and can produce them on the fly: a `&[(String, String)]` would force it to collect
+/// owned pairs into a `Vec` first, which is the allocation this type exists to avoid. The explicit
+/// bound replaces serde's inferred `I: Serialize`, which an iterator does not implement.
 #[derive(serde::Serialize)]
-struct RequestHeaderJson<'a> {
-    method: &'a str,
-    uri: &'a str,
-    protocol: &'a str,
-    headers: &'a [(String, String)],
-    remote_addr: &'a str,
-    body_len: u64,
-    script_filename: &'a str,
-    https: bool,
+#[serde(bound(serialize = "I: Iterator<Item = P> + Clone, P: serde::Serialize"))]
+pub struct RequestHeaderJson<'a, I, P = (&'a str, &'a str)>
+where
+    I: Iterator<Item = P> + Clone,
+    P: serde::Serialize,
+{
+    pub method: &'a str,
+    pub uri: &'a str,
+    pub protocol: &'a str,
+    pub headers: BorrowedHeaders<'a, I>,
+    pub remote_addr: &'a str,
+    pub body_len: u64,
+    pub script_filename: &'a str,
+    pub https: bool,
+}
+
+/// The request's headers, as a sequence of serializable pairs.
+///
+/// Wrapped rather than serialized directly because serde has no built-in way to say "serialize
+/// this iterator as an array of two-element arrays": the iterator is not `Serialize`, and
+/// `collect` would be the allocation the wrapper exists to avoid. `Clone` is part of the contract
+/// — serializing a sequence of unknown length asks for the iterator once, so cloning is what makes
+/// the borrow in `Serialize::serialize` enough.
+pub struct BorrowedHeaders<'a, I>(I, std::marker::PhantomData<&'a ()>);
+
+impl<'a, I> BorrowedHeaders<'a, I> {
+    /// Wrap an iterator of header pairs for serialization.
+    pub fn new(pairs: I) -> Self {
+        BorrowedHeaders(pairs, std::marker::PhantomData)
+    }
+}
+
+impl<'a, I, P> serde::Serialize for BorrowedHeaders<'a, I>
+where
+    I: Iterator<Item = P> + Clone,
+    P: serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(None)?;
+        for pair in self.0.clone() {
+            sequence.serialize_element(&pair)?;
+        }
+        sequence.end()
+    }
+}
+
+/// A `RequestHeader`'s own header pairs, borrowed as `&str`.
+///
+/// Exists so [`RequestHeader::draft`](crate::RequestHeader::draft) can name the iterator it hands
+/// to the codec: a `Map<Iter, fn(..)>` would name the same thing through a function pointer, and a
+/// `Clone` iterator adapter names it without one.
+#[derive(Clone)]
+pub struct HeaderPairs<'a>(pub std::slice::Iter<'a, (String, String)>);
+
+impl<'a> Iterator for HeaderPairs<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0
+            .next()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
 }
 
 /// Which half of a request `WorkerChannel::request_staged` reached.
@@ -213,6 +290,12 @@ pub struct WorkerChannel<W: Write, R: Read> {
     next_request_id: u32,
     logs: Vec<LogRecord>,
     metrics: Vec<MetricRecord>,
+    /// Where the request frame's JSON is built.
+    ///
+    /// Belongs to the channel because the channel outlives a request, so a sequence of requests
+    /// costs one allocation for the head rather than a `Vec` per request. Cleared, never shrunk,
+    /// so the capacity that made the last request free is kept.
+    payload: Vec<u8>,
 }
 
 impl<W: Write, R: Read> WorkerChannel<W, R> {
@@ -224,6 +307,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             next_request_id: crate::FIRST_REQUEST_ID,
             logs: Vec::new(),
             metrics: Vec::new(),
+            payload: Vec::new(),
         }
     }
 
@@ -315,28 +399,70 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
 
     /// Write the request frame, declaring `body_len` for the body frames that follow.
     ///
-    /// The length is stamped in here, from the bytes that are about to be framed, so the
-    /// declared length and the bytes sent cannot disagree. That used to be done with
-    /// `RequestHeader { body_len, ..request.clone() }`, which deep-cloned five `String`s and
-    /// two more per header on every request to change one integer; the borrowed view in
-    /// [`RequestHeaderJson`] serializes to byte-identical JSON without copying anything.
-    fn send_request(
+    /// The length is stamped in here, from the bytes that are about to be framed, so the declared
+    /// length and the bytes sent cannot disagree. That used to be done with
+    /// `RequestHeader { body_len, ..request.clone() }`, which deep-cloned five `String`s and two
+    /// more per header on every request to change one integer; the borrowed view in
+    /// [`RequestHeaderJson`] serializes to byte-identical JSON without copying anything, and into
+    /// this channel's own buffer rather than a `Vec` per request.
+    fn send_request<I, P>(&mut self, head: RequestHeaderJson<'_, I, P>, body: &[u8]) -> Result<u32>
+    where
+        I: Iterator<Item = P> + Clone,
+        P: serde::Serialize,
+    {
+        let request_id = self.take_request_id();
+        // Taken out of `self` for the duration of the write, so `self` can still be borrowed
+        // mutably to write the frame while the buffer is in hand.
+        let mut payload = std::mem::take(&mut self.payload);
+        payload.clear();
+        let head = RequestHeaderJson { body_len: body.len() as u64, ..head };
+
+        let mut outcome = Json::encode_into(&mut payload, &head);
+        if outcome.is_ok() {
+            outcome = self.send_frame(MessageType::Request, request_id, &payload, 0);
+        }
+        if outcome.is_ok() {
+            outcome = self.send_body(request_id, body);
+        }
+
+        // Home on every path, including a failure: a failed request must not cost the next one
+        // its capacity.
+        self.payload = payload;
+        outcome.map(|()| request_id)
+    }
+
+    /// Send a request whose head was encoded on the caller's side of the thread boundary.
+    ///
+    /// This is how the pool reaches the channel, and it is decided by where the two halves live.
+    /// The pool's head *borrows* the CGI environment — that is the point of `borrowed_request`,
+    /// which exists so a request does not build nine `String`s that are dropped unread — and a
+    /// borrow cannot travel to the exchange thread, because on a timeout the thread outlives the
+    /// call that made it. So the head arrives already encoded, as bytes.
+    ///
+    /// That costs one `Vec` per request, so the head's allocation moves rather than disappears.
+    /// It is still worth doing, because the exchange already copied the body into a `Vec` to move
+    /// it across: the head is now carried in that same copy, and the request pays one buffer where
+    /// the owned translation paid eleven.
+    ///
+    /// The JSON goes straight out as the `REQUEST` payload — no framing, no re-serialization — and
+    /// the worker cannot tell which side of the process boundary encoded it.
+    pub fn request_encoded(
         &mut self,
-        request: &RequestHeader,
-        request_id: u32,
-        body_len: u64,
-    ) -> Result<()> {
-        let head = RequestHeaderJson {
-            method: &request.method,
-            uri: &request.uri,
-            protocol: &request.protocol,
-            headers: &request.headers,
-            remote_addr: &request.remote_addr,
-            body_len,
-            script_filename: &request.script_filename,
-            https: request.https,
-        };
-        self.send_json(MessageType::Request, request_id, &head, 0)
+        head: Vec<u8>,
+        body: &[u8],
+        mut on_stage: impl FnMut(RequestStage),
+    ) -> Result<WorkerResponse> {
+        let request_id = self.take_request_id();
+
+        // Everything up to the last byte of the body is the send phase. The callbacks are
+        // reported before returning, so a failure that happens *during* the write is still
+        // attributed to `Sending`.
+        on_stage(RequestStage::Sending);
+        self.send_frame(MessageType::Request, request_id, &head, 0)?;
+        self.send_body(request_id, body)?;
+
+        on_stage(RequestStage::Reading);
+        self.collect_response(request_id)
     }
 
     /// The same request, with the send and receive phases kept apart.
@@ -360,14 +486,11 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         body: &[u8],
         mut on_stage: impl FnMut(RequestStage),
     ) -> Result<WorkerResponse> {
-        let request_id = self.take_request_id();
-
-        // Everything up to the last byte of the body is the send phase. The
-        // callbacks are reported before returning, so a failure that happens
-        // *during* the write is still attributed to `Sending`.
+        // Everything up to the last byte of the body is the send phase. The callbacks are
+        // reported before returning, so a failure that happens *during* the write is still
+        // attributed to `Sending`.
         on_stage(RequestStage::Sending);
-        self.send_request(request, request_id, body.len() as u64)?;
-        self.send_body(request_id, body)?;
+        let request_id = self.send_request(request.draft(body.len() as u64), body)?;
 
         on_stage(RequestStage::Reading);
         self.collect_response(request_id)

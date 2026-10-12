@@ -72,6 +72,30 @@ impl RequestHeader {
     pub fn content_type(&self) -> Option<&str> {
         self.header("content-type")
     }
+
+    /// A borrowed view of this header, with `body_len` supplied by the caller.
+    ///
+    /// Every field is borrowed, so this allocates nothing. It exists so an owned
+    /// `RequestHeader` can be framed without cloning it, and so the frame's shape has one
+    /// definition: the `body_len` that matters is the length of the body about to be framed,
+    /// which the caller holds and this type cannot see.
+    pub fn draft(
+        &self,
+        body_len: u64,
+    ) -> crate::codec::RequestHeaderJson<'_, crate::codec::HeaderPairs<'_>> {
+        crate::codec::RequestHeaderJson {
+            method: &self.method,
+            uri: &self.uri,
+            protocol: &self.protocol,
+            headers: crate::codec::BorrowedHeaders::new(crate::codec::HeaderPairs(
+                self.headers.iter(),
+            )),
+            remote_addr: &self.remote_addr,
+            body_len,
+            script_filename: &self.script_filename,
+            https: self.https,
+        }
+    }
 }
 
 /// The response head a worker sends before its body.
@@ -209,6 +233,13 @@ pub struct ErrorReport {
 /// A payload encoder. JSON today; the indirection is the extension point.
 pub trait Codec {
     fn encode<T: Serialize>(value: &T) -> crate::Result<Vec<u8>>;
+    /// The same encoding, into a buffer the caller owns and will reuse.
+    ///
+    /// The request frame is encoded once per request, and the channel that sends it lives
+    /// for many requests, so a `Vec` per request is pure churn: the bytes are handed to
+    /// [`write_frame`] and dropped immediately. The buffer is cleared, not shrunk, so the
+    /// capacity outlives the request that needed it.
+    fn encode_into<T: Serialize + ?Sized>(out: &mut Vec<u8>, value: &T) -> crate::Result<()>;
     fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> crate::Result<T>;
 }
 
@@ -219,6 +250,12 @@ pub struct Json;
 impl Codec for Json {
     fn encode<T: Serialize>(value: &T) -> crate::Result<Vec<u8>> {
         Ok(serde_json::to_vec(value)?)
+    }
+
+    fn encode_into<T: Serialize + ?Sized>(out: &mut Vec<u8>, value: &T) -> crate::Result<()> {
+        out.clear();
+        serde_json::to_writer(std::io::Cursor::new(&mut *out), value)?;
+        Ok(())
     }
 
     fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> crate::Result<T> {

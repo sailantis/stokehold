@@ -1148,6 +1148,86 @@ against the specification and secondary implementations, and are confirmed by fi
     stokehold FastCGI → php-cgi, 30/30 requests over keep-alive, correct HTML, and an empty
     nginx error log.
 
+**39. The worker path rebuilt the whole request, for the third time.** Hazard 37 removed the
+    *copies* the worker path made of a request it already had. This pass asked what it still
+    *built*: reading `to_cgi` showed `RequestInfo` had to own its strings because it flows into
+    the worker's `RequestHeader`, so a `Cow` refactor there would only move the allocations —
+    but the flow itself was the finding. A request on the piped worker was translated twice and
+    rebuilt once:
+
+    ```
+    to_cgi        → RequestInfo { 9 owned Strings }        (measured: 30 fixed + 2/header)
+    build_params  → NameValuePairs { 2 heap Vecs per pair }
+    request_header→ RequestHeader { 9 owned Strings }      ← the third rebuild
+    → dropped after the worker answered; nothing reads it
+    ```
+
+    Every number below was measured by counting, not read: a counter around each translation,
+    then both translations driven through the real channel over a `Cursor` with a canned reply
+    so the comparison is one host, one binary, one request. `request_header` was previously
+    unpinned; `tests/request_header_allocations.rs` is new and now holds all of it.
+
+    | request headers | owned round trip | borrowed round trip | owned translation | borrowed translation |
+    |---|---|---|---|---|
+    | 0 | 28 | **12** | 12 | **0** |
+    | 10 | 49 | **13** | 32 | **0** |
+    | 20 | 70 | **14** | 52 | **0** |
+
+    So the translation cost **30 fixed plus two per request header** and now costs **zero at any
+    header count**, and a whole request on the worker path dropped from 70 to 14 allocations at
+    twenty headers.
+
+    The fix is `borrowed_request`, the counterpart of `request_header`: every field is a slice of
+    the CGI environment it came from — a CGI variable's value *is* the client's header value, so
+    the value needs no copy at all — and the one value that cannot be a slice, the
+    `HTTP_ACCEPT_ENCODING` → `Accept-Encoding` name, is rendered into a **stack buffer** while
+    the JSON is being written rather than into a `String` first. That keeps the name off the heap
+    in the common case, with `header_name` as the fallback for a name that is too long or not
+    ASCII, where the character-wise case fold differs from the byte-wise one.
+
+    **Two implementations of one protocol rule is how they drift**, so the guarantee is pinned
+    rather than argued: `the_borrowed_translation_encodes_identically_to_the_owned_one` compares
+    the encodings of the whole frame head **byte for byte** across environments chosen for their
+    corners — no request headers, the ordinary set, a `HTTP_` prefix that names nothing (which
+    both must drop), and a value that is not UTF-8 (which both must render lossily the same way).
+    Byte-equality rather than a round trip, for the reason hazard 37 recorded: every field but
+    `method` and `uri` carries a serde default, so a field the borrowed translation forgot would
+    not fail decoding at all — it would arrive empty.
+
+    The interesting part is the boundary, and it is worth writing down because the obvious
+    designs do not work:
+
+    - The head **cannot** be borrowed across the thread boundary. The pool hands the exchange to a
+      per-worker thread, and on a timeout that thread outlives the call that made it, so a
+      reference into the CGI environment would dangle. (A `transmute` to `'static` "works" and is
+      exactly the pattern Miri rejects for that reason.)
+    - The **channel's** buffer cannot move to the caller either, or it is an allocation per
+      request — the thing being removed.
+    - So the boundary is crossed in the one direction that is sound: the head is **serialized on
+      the pool's side** and the bytes travel. That costs one `Vec` per request, so the head's
+      allocation moves rather than disappears — and it is still worth doing, because the exchange
+      **already** copied the body into a `Vec` to move it across. The request now pays one buffer
+      where the owned translation paid eleven.
+    - `ChannelExchange::request` therefore takes `Vec<u8>` rather than `Arc<RequestHeader>`, and
+      `body_len` is stamped in by the pool, at the one place that holds both the head and the
+      body. **Getting that wrong is what a test caught**: the first version let the channel stamp
+      it in as before, but the channel now receives bytes that are already framed, so
+      `body_len` stayed 0 and PHP silently received an empty body — `serve_reaches_a_persistent_php_worker`
+      failed with `body: 0 bytes` for a request that carried a marker. The owned path stamps it
+      in `send_request` as it always did; the encoded path cannot, so the pool does.
+
+    Three things this leaves, deliberately:
+
+    - **`to_cgi` still owns nine `String`s** to build `RequestInfo`, which is measured and
+      unchanged at 30 fixed + 2 per header. It is a smaller prize than it looked: the environment
+      is handed to a `CgiPool`/`WorkerPool` as a `Request`, and an `Arc<NameValuePairs>` shared
+      into the exchange is the shape that would remove it — a larger change across both pools,
+      recorded here rather than attempted.
+    - **`BoundedChannel` is still a misnomer** and should be `PipedChannel` or `BufferedChannel`
+      (hazard 38).
+    - The **`render_logs` per-record `String`** and the **`static_files.rs` stats** stand as
+      recorded in hazard 38.
+
 
 
 Phase 0 — skeleton and baseline

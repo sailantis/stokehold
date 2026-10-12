@@ -130,25 +130,35 @@ pub fn route(path: &str, routing: &Routing) -> Route {
 /// Requiring the extension means PHP is only ever asked to run something it is
 /// meant to run, and every other path falls through to the front controller as
 /// application input.
+///
+/// Boundaries are walked rather than collected into a `Vec`, and each candidate is
+/// tested on the bytes: the collection allocated once per request, and the old
+/// `has_php_extension(&head)` lowercased the candidate prefix, so a path of *n* segments
+/// allocated *n* times with each allocation proportional to its prefix. Asking the
+/// *suffixes* first means only a boundary that can actually be a PHP script goes on to
+/// build a path and call `is_file`, which is the expensive part.
 fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, &'a str)> {
-    let mut boundaries: Vec<usize> = relative
-        .match_indices('/')
-        .map(|(index, _)| index)
-        .collect();
-    boundaries.push(relative.len());
-
-    for boundary in boundaries {
+    let bytes = relative.as_bytes();
+    for (boundary, _) in relative.match_indices('/') {
         let head = &relative[..boundary];
         if head.is_empty() {
             continue;
         }
-        if !has_php_extension(head) {
+        if !php_extension_of(&bytes[..boundary]) {
             continue;
         }
         let candidate = routing.document_root.join(head);
         if candidate.is_file() {
             let rest = relative[boundary..].trim_start_matches('/');
             return Some((head.to_string(), rest));
+        }
+    }
+
+    // The whole path as one candidate, which is the bare `/index.php` case.
+    if !relative.is_empty() && php_extension_of(bytes) {
+        let candidate = routing.document_root.join(relative);
+        if candidate.is_file() {
+            return Some((relative.to_string(), ""));
         }
     }
     None
@@ -158,9 +168,28 @@ fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, 
 ///
 /// Shared with the static layer, which must not serve one of these as a file:
 /// serving `index.php` from disk sends its *source* to the client.
+///
+/// Case-insensitive without allocating, which is why this does not lowercase the whole
+/// path: it used to call `to_ascii_lowercase()` and allocate a copy of the path on every
+/// request, to answer a question about its last five bytes.
+///
+/// The comparison is on a byte slice, not on a `&str` suffix, because a byte offset taken
+/// from the end of a `&str` can land inside a multi-byte character and slicing there
+/// panics. A path with non-ASCII bytes in it must still be answerable, so callers pass
+/// the bytes and no boundary is ever needed.
 pub fn has_php_extension(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".php") || lower.ends_with(".php3") || lower.ends_with(".phtml")
+    php_extension_of(path.as_bytes())
+}
+
+/// PHP extensions this server will execute, as ASCII bytes for a case-insensitive
+/// suffix comparison.
+const PHP_EXTENSIONS: [&[u8]; 3] = [b".php", b".php3", b".phtml"];
+
+/// Whether a byte slice ends with one of [`PHP_EXTENSIONS`], case-insensitively.
+fn php_extension_of(bytes: &[u8]) -> bool {
+    PHP_EXTENSIONS
+        .iter()
+        .any(|ext| bytes.len() >= ext.len() && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext))
 }
 
 /// Percent-decode a URL path.
@@ -232,11 +261,29 @@ impl RequestInfo {
 ///
 /// The variable set follows what a FastCGI client must send for php-fpm to
 /// populate `$_SERVER`, `$_GET`, `$_POST` and `$_COOKIE` correctly.
+///
+/// Routing happens here. A caller that has *already* routed the request — the HTTP
+/// front-end does, so it can turn "no script" into a 404 rather than a 502 — should pass
+/// its answer to [`build_params_for`] instead: this would otherwise route a second time,
+/// which walks the path and calls `is_file` again for nothing.
 pub fn build_params(info: &RequestInfo, routing: &Routing) -> Result<NameValuePairs> {
-    let path = info.uri.split('?').next().unwrap_or(&info.uri).to_string();
-    let route = route(&path, routing);
+    let path = info.uri.split('?').next().unwrap_or(&info.uri);
+    let route = route(path, routing);
+    build_params_for(info, routing, &route)
+}
 
-    let (script_filename, script_name, path_info) = match &route {
+/// Build the FastCGI `PARAMS` for a request whose route is already known.
+///
+/// Identical to [`build_params`] except that it does not route: the caller supplies the
+/// [`Route`] it resolved. This exists because the HTTP front-end has to route before it
+/// builds the environment — a path that names no script is a 404 there, not a 502 — and
+/// having both do it meant the router ran twice per request, `is_file` syscalls included.
+pub fn build_params_for(
+    info: &RequestInfo,
+    routing: &Routing,
+    route: &Route,
+) -> Result<NameValuePairs> {
+    let (script_filename, script_name, path_info) = match route {
         Route::Script {
             script_filename,
             script_name,
@@ -261,40 +308,39 @@ pub fn build_params(info: &RequestInfo, routing: &Routing) -> Result<NameValuePa
     };
 
     let mut pairs: NameValuePairs = Vec::with_capacity(32);
-    let mut push = |name: &str, value: &str| {
-        pairs.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
-    };
 
-    push("GATEWAY_INTERFACE", "FastCGI/1.0");
-    push("REQUEST_METHOD", &info.method);
-    push("REQUEST_URI", &info.uri);
-    push("QUERY_STRING", &info.query_string);
-    push("SERVER_PROTOCOL", &info.protocol);
-    push(
+    push_pair(&mut pairs, "GATEWAY_INTERFACE", "FastCGI/1.0");
+    push_pair(&mut pairs, "REQUEST_METHOD", &info.method);
+    push_pair(&mut pairs, "REQUEST_URI", &info.uri);
+    push_pair(&mut pairs, "QUERY_STRING", &info.query_string);
+    push_pair(&mut pairs, "SERVER_PROTOCOL", &info.protocol);
+    push_pair(
+        &mut pairs,
         "SERVER_SOFTWARE",
         concat!("stokehold/", env!("CARGO_PKG_VERSION")),
     );
-    push("SERVER_NAME", &info.server_name);
-    push("SERVER_PORT", &info.server_port.to_string());
-    push("REMOTE_ADDR", &info.remote_addr);
-    push(
+    push_pair(&mut pairs, "SERVER_NAME", &info.server_name);
+    push_pair(&mut pairs, "SERVER_PORT", &info.server_port.to_string());
+    push_pair(&mut pairs, "REMOTE_ADDR", &info.remote_addr);
+    push_pair(
+        &mut pairs,
         "DOCUMENT_ROOT",
         &routing.document_root.display().to_string(),
     );
-    push("SCRIPT_FILENAME", &script_filename);
-    push("SCRIPT_NAME", &script_name);
-    push("REDIRECT_STATUS", "200");
+    push_pair(&mut pairs, "SCRIPT_FILENAME", &script_filename);
+    push_pair(&mut pairs, "SCRIPT_NAME", &script_name);
+    push_pair(&mut pairs, "REDIRECT_STATUS", "200");
     if !path_info.is_empty() && path_info != "/" {
-        push("PATH_INFO", &path_info);
+        push_pair(&mut pairs, "PATH_INFO", &path_info);
     }
     if info.https {
-        push("HTTPS", "on");
+        push_pair(&mut pairs, "HTTPS", "on");
     }
 
     // CONTENT_LENGTH is always sent when there is a body. See the module docs:
     // omitting it makes PHP drop the body silently.
     if info.body_len > 0 {
-        push("CONTENT_LENGTH", &info.body_len.to_string());
+        push_pair(&mut pairs, "CONTENT_LENGTH", &info.body_len.to_string());
     }
 
     // The request's own headers become HTTP_*, except Content-Type and
@@ -306,20 +352,54 @@ pub fn build_params(info: &RequestInfo, routing: &Routing) -> Result<NameValuePa
             continue;
         }
         if name.eq_ignore_ascii_case("content-type") {
-            push("CONTENT_TYPE", value);
+            push_pair(&mut pairs, "CONTENT_TYPE", value);
             continue;
         }
-        let key = format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"));
-        push(&key, value);
+        push_http_header(&mut pairs, name, value);
     }
 
     // A POST with a body but no declared type would have no CONTENT_TYPE at all,
     // which PHP treats as a form-urlencoded body.
     if info.body_len > 0 && info.header("content-type").is_none() {
-        push("CONTENT_TYPE", "application/x-www-form-urlencoded");
+        push_pair(
+            &mut pairs,
+            "CONTENT_TYPE",
+            "application/x-www-form-urlencoded",
+        );
     }
 
     Ok(pairs)
+}
+
+/// Append one name-value pair.
+fn push_pair(pairs: &mut NameValuePairs, name: &str, value: &str) {
+    pairs.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
+}
+
+/// Append one request header under its CGI name: `HTTP_` plus the name uppercased with
+/// `-` replaced by `_`.
+///
+/// Built straight into the pair's own buffer rather than through
+/// `format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"))`. That expression was
+/// three intermediate `String`s per request header — an uppercase copy, a replaced copy
+/// and the formatted result — and then the pair's own two. Six allocations per header, for
+/// a name that is a fixed prefix, a case fold and a byte substitution, none of which needs
+/// an intermediate at all. The allocation counter in `tests/allocations.rs` is what showed
+/// the size of it.
+fn push_http_header(pairs: &mut NameValuePairs, name: &str, value: &str) {
+    let mut key = Vec::with_capacity(5 + name.len());
+    key.extend_from_slice(b"HTTP_");
+    for byte in name.bytes() {
+        // `to_ascii_uppercase` on a byte, not on a `String`: the name is ASCII by the time
+        // it gets here (it arrived as a header name), and a non-ASCII byte is passed through
+        // unchanged exactly as `str::to_ascii_uppercase` would leave it.
+        key.push(if byte == b'-' {
+            b'_'
+        } else {
+            byte.to_ascii_uppercase()
+        });
+    }
+    pairs.push((key, value.as_bytes().to_vec()));
 }
 
 /// Convenience: the script PHP would execute for a URL path.
@@ -432,6 +512,90 @@ mod tests {
                 assert_eq!(path_info, "/foo/bar");
             }
             other => panic!("expected a split, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_extension_is_matched_case_insensitively_without_lowercasing() {
+        // The suffix check used to lowercase the whole path, which allocated a copy of
+        // it on every request to ask about its last five bytes. The predicate must not
+        // change: PHP itself accepts an upper-case extension.
+        assert!(has_php_extension("/index.php"));
+        assert!(has_php_extension("/INDEX.PHP"));
+        assert!(has_php_extension("/Index.Php3"));
+        assert!(has_php_extension("index.phtml"));
+        assert!(!has_php_extension("/index.php.bak"));
+        assert!(!has_php_extension("/index.ph"));
+        assert!(!has_php_extension(""));
+        // A path may carry non-ASCII bytes, and the suffix comparison must not slice
+        // at a byte offset that is not a character boundary — the reason this compares
+        // bytes rather than a `&str`.
+        assert!(has_php_extension("/caf\u{e9}/index.php"));
+        assert!(!has_php_extension("/caf\u{e9}"));
+    }
+
+    #[test]
+    fn a_non_ascii_path_does_not_panic_the_router() {
+        // The naive optimisation of this function was `path[path.len() - 5..]`, which
+        // panics when the offset lands inside a multi-byte character. This path has one
+        // exactly there.
+        let root = fixture("nonascii", &[("index.php", "<?php")]);
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+
+        for path in ["/caf\u{e9}", "/\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", "/a\u{1f600}b"] {
+            match route(path, &routing) {
+                Route::Script { script_name, .. } => assert_eq!(script_name, "/index.php"),
+                other => panic!("{path}: expected the front controller, got {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_script_deeper_in_the_path_still_wins_over_the_front_controller() {
+        // The routing rewrite changed how boundaries are walked, so pin the ordering it
+        // is supposed to preserve: the *first* boundary that names an existing script wins,
+        // which is the longest leading sequence.
+        let root = fixture(
+            "deep",
+            &[
+                ("index.php", "<?php"),
+                ("admin/index.php", "<?php"),
+                ("admin/tools/report.php", "<?php"),
+            ],
+        );
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+
+        for (path, script, info) in [
+            ("/admin/index.php/settings", "/admin/index.php", "/settings"),
+            (
+                "/admin/tools/report.php/today",
+                "/admin/tools/report.php",
+                "/today",
+            ),
+            // No real script, so the front controller takes it with the path as input.
+            ("/admin/missing/page", "/index.php", "/admin/missing/page"),
+        ] {
+            match route(path, &routing) {
+                Route::Script {
+                    script_name,
+                    path_info,
+                    ..
+                } => {
+                    assert_eq!(script_name, script, "{path}");
+                    assert_eq!(path_info, info, "{path}");
+                }
+                other => panic!("{path}: expected a script, got {other:?}"),
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -637,6 +801,104 @@ mod tests {
         assert_eq!(lookup("CONTENT_TYPE").as_deref(), Some("application/json"));
         // Content-Type keeps its CGI name rather than becoming HTTP_CONTENT_TYPE.
         assert_eq!(lookup("HTTP_CONTENT_TYPE"), None);
+    }
+
+    #[test]
+    fn a_precomputed_route_builds_the_same_environment_as_building_it_fresh() {
+        // `build_params_for` exists so the HTTP front-end does not route twice — it has to
+        // route first, because "no script" is a 404 there and not a 502. This pins the two
+        // entry points to each other, so the optimisation cannot drift from the original.
+        let root = fixture(
+            "precomputed",
+            &[("index.php", "<?php"), ("admin/index.php", "<?php")],
+        );
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+
+        for (uri, headers) in [
+            ("/index.php", Vec::new()),
+            ("/admin/index.php/settings", Vec::new()),
+            ("/items", Vec::new()),
+            (
+                "/items",
+                vec![
+                    ("Host".to_string(), "example.test".to_string()),
+                    ("Accept".to_string(), "*/*".to_string()),
+                ],
+            ),
+        ] {
+            let info = RequestInfo {
+                uri: uri.to_string(),
+                headers,
+                ..RequestInfo::default()
+            };
+            let fresh = build_params(&info, &routing).expect("build_params");
+            let known = route(info.uri.split('?').next().unwrap_or(&info.uri), &routing);
+            let precomputed = build_params_for(&info, &routing, &known).expect("build_params_for");
+            assert_eq!(fresh, precomputed, "{uri}");
+        }
+
+        // A path with no script is still the same error through both, so the front-end's
+        // 404 decision and the builder cannot disagree about what is routable.
+        let routing_no_front = Routing {
+            document_root: root.clone(),
+            front_controller: None,
+            ..Routing::default()
+        };
+        let info = RequestInfo {
+            uri: "/nothing".to_string(),
+            ..RequestInfo::default()
+        };
+        let known = route("/nothing", &routing_no_front);
+        assert!(matches!(known, Route::NotFound));
+        assert!(build_params(&info, &routing_no_front).is_err());
+        assert!(build_params_for(&info, &routing_no_front, &known).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The CGI name of a request variable, as `format!` used to produce it.
+    ///
+    /// The reference expression, kept here so the in-place version can be checked against
+    /// it. It is not what the code does any more: it allocates three `String`s per header.
+    fn reference_http_key(name: &str) -> String {
+        format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"))
+    }
+
+    #[test]
+    fn the_in_place_cgi_name_matches_the_formatting_it_replaced() {
+        // The rewrite of the key construction is only worth having if it is the same
+        // function. This compares the two directly across the shapes a header name takes:
+        // short, long, already upper-case, mixed, dotted, underscored, numeric, and a name
+        // long enough to force the `Vec` to grow.
+        let names = [
+            "Host",
+            "Accept",
+            "accept-language",
+            "ACCEPT-LANGUAGE",
+            "X-Forwarded-For",
+            "X-Forwarded-Proto",
+            "If-None-Match",
+            "Range",
+            "X-Custom-Header-With-A-Fairly-Long-Name-After-The-Prefix",
+            "X-2",
+            "X-A_B",
+            "x-a.b",
+        ];
+
+        for name in names {
+            let mut pairs: NameValuePairs = Vec::new();
+            push_http_header(&mut pairs, name, "v");
+            let produced = String::from_utf8(pairs[0].0.clone()).expect("ASCII");
+            assert_eq!(
+                produced,
+                reference_http_key(name),
+                "the key for {name:?} must be byte-for-byte what the format produced"
+            );
+        }
     }
 
     #[test]

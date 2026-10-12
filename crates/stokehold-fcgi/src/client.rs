@@ -63,6 +63,21 @@ pub struct Response {
     pub duration: Duration,
 }
 
+/// A parsed header block, borrowed from the payload it was found in.
+///
+/// `&str` pairs rather than `(String, String)`: locating a header is a byte scan,
+/// so copying each name and each value into its own `String` was two allocations
+/// and two `memcpy`s per header — on the order of twenty allocations for a page
+/// that sends ten headers — to hand back bytes that are still alive at every call
+/// site ([`Response::parse`] already returns a body borrowing the same payload, so
+/// no caller was gaining anything from the ownership). A caller that needs an owned
+/// `String` — the worker's JSON protocol does — converts at that boundary, where
+/// the copy is unavoidable.
+///
+/// Text rather than bytes because that is what a header is: the parse already
+/// rejects non-ASCII, and ASCII is a subset of UTF-8, so the conversion is free.
+pub type ParsedHeaders<'a> = Vec<(&'a str, &'a str)>;
+
 impl Response {
     /// The application status reported by `END_REQUEST`, if any.
     pub fn app_status(&self) -> Option<u32> {
@@ -99,8 +114,9 @@ impl Response {
     ///
     /// Only needed when a caller wants the HTTP status rather than passing the
     /// bytes through, so the hot path never calls this.
-    pub fn parse_status_headers(&self) -> (u16, Vec<(String, String)>) {
-        parse_response_headers(&self.stdout)
+    pub fn parse_status_headers(&self) -> (u16, ParsedHeaders<'_>) {
+        let (status, headers, _) = parse_response(&self.stdout);
+        (status, headers)
     }
 
     /// Status, headers and body located in a single pass over `STDOUT`.
@@ -111,7 +127,7 @@ impl Response {
     /// makes each one hunt for the same blank line, which is a full scan of the
     /// payload apiece — `perf` attributed 13.6% of the server process's CPU to the
     /// pair before they were combined into this.
-    pub fn parse(&self) -> (u16, Vec<(String, String)>, &[u8]) {
+    pub fn parse(&self) -> (u16, ParsedHeaders<'_>, &[u8]) {
         parse_response(&self.stdout)
     }
 }
@@ -132,7 +148,7 @@ impl Response {
 /// not valid UTF-8 can no longer influence the headers — a real bug the lossy
 /// conversion hid, because a replacement character inside the body could move
 /// the located header terminator.
-pub fn parse_response_headers(stdout: &[u8]) -> (u16, Vec<(String, String)>) {
+pub fn parse_response_headers(stdout: &[u8]) -> (u16, ParsedHeaders<'_>) {
     let (status, headers, _) = parse_response(stdout);
     (status, headers)
 }
@@ -142,47 +158,99 @@ pub fn parse_response_headers(stdout: &[u8]) -> (u16, Vec<(String, String)>) {
 /// The one entry point a front-end should use: [`parse_response_headers`] and
 /// [`split_response_body`] both delegate here, so a caller that needs both pays
 /// for one search rather than two.
-pub fn parse_response(stdout: &[u8]) -> (u16, Vec<(String, String)>, &[u8]) {
+///
+/// The headers come back as slices of `stdout` rather than as owned `String`s,
+/// which removes the two allocations per header that used to go with locating
+/// one — see [`ParsedHeaders`]. The payload must outlive the result, which every
+/// call site already arranges because the body borrows it too.
+pub fn parse_response<'a>(stdout: &'a [u8]) -> (u16, ParsedHeaders<'a>, &'a [u8]) {
     let (head, body) = match find_header_end(stdout) {
-        Some((head, separator)) => (&stdout[..head], &stdout[head + separator..]),
-        // No blank line at all. The whole payload is read as the header block,
-        // which is also why the body comes back empty: a real FastCGI response
-        // always carries a header and a terminator, so this is a malformed
-        // response and the choice is only about which half to call it.
+        Some((ends_at, separator)) => {
+            // `find_header_end` only ever returns an index whose separator fits
+            // inside the payload, so this cannot go out of range; `get` says so in
+            // the type rather than leaving a panic path behind an invariant held in
+            // another function.
+            (&stdout[..ends_at], stdout.get(ends_at + separator..).unwrap_or(&[]))
+        }
+        // No blank line at all. The whole payload is read as the header block, which
+        // is also why the body comes back empty: a real FastCGI response always
+        // carries a header and a terminator, so this is a malformed response and the
+        // choice is only about which half to call it. This case costs nothing in
+        // practice — it cannot happen for a well-formed backend — so the reading that
+        // recovers the most information wins over the cheapest one.
         None => (stdout, &[][..]),
     };
 
     let mut status = 200u16;
-    let mut headers = Vec::new();
-    for (index, line) in head.split(|&byte| byte == b'\n').enumerate() {
+    // Sixteen bytes per header is a typical line. Reserving saves the first few
+    // doublings on a response carrying the usual dozen headers.
+    let mut headers: ParsedHeaders<'a> = Vec::with_capacity(head.len() / 16);
+
+    let mut lines = head.split(|&byte| byte == b'\n');
+    // The status line is the first line with anything on it. Consuming it here rather
+    // than comparing an index inside the loop is what makes the rest of the loop a
+    // plain `for` — and it fixes the index: the old `enumerate()` counted lines that
+    // the empty-line `continue` had skipped, so a block that opened with a line break
+    // made the real first line `index == 1` and its `Status:` was silently ignored.
+    for line in lines.by_ref() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             continue;
         }
-        let Some(colon) = line.iter().position(|&byte| byte == b':') else {
-            continue;
-        };
-        let (name, value) = (&line[..colon], &line[colon + 1..]);
-
-        // Only a `Status:` on the first line is the response status; anywhere
-        // else it is an ordinary header.
-        if index == 0 && name.eq_ignore_ascii_case(b"status") {
-            status = parse_status_code(trim_ascii(value)).unwrap_or(200);
-            continue;
+        if let Some((name, value)) = header_parts(line) {
+            if name.eq_ignore_ascii_case(b"status") {
+                status = parse_status_code(value).unwrap_or(200);
+            } else {
+                push_ascii(&mut headers, name, value);
+            }
         }
-
-        // A header name or value that is not ASCII cannot be sent as an HTTP
-        // header anyway; the lossy conversion used to mangle it and then try.
-        // Skipping is the honest outcome, and it keeps this free of
-        // `String::from_utf8_lossy`.
-        let (Some(name), Some(value)) = (ascii_of(trim_ascii(name)), ascii_of(trim_ascii(value)))
-        else {
-            continue;
-        };
-        headers.push((name, value));
+        break;
+    }
+    for line in lines {
+        push_header(&mut headers, line.strip_suffix(b"\r").unwrap_or(line));
     }
 
     (status, headers, body)
+}
+
+/// Keep one header line, if it is a usable header.
+fn push_header<'a>(headers: &mut ParsedHeaders<'a>, line: &'a [u8]) {
+    if let Some((name, value)) = header_parts(line) {
+        push_ascii(headers, name, value);
+    }
+}
+
+/// Keep one already-split header, if it is ASCII.
+///
+/// A name or value that is not ASCII cannot be sent as an HTTP header anyway; the
+/// lossy conversion used to mangle it and then try. Skipping is the honest outcome,
+/// and it keeps this free of `String::from_utf8_lossy`. The two checks are separate
+/// `let`s on purpose: a tuple pattern would scan the value even when the name had
+/// already failed.
+fn push_ascii<'a>(headers: &mut ParsedHeaders<'a>, name: &'a [u8], value: &'a [u8]) {
+    let Some(name) = ascii_of(name) else {
+        return;
+    };
+    let Some(value) = ascii_of(value) else {
+        return;
+    };
+    headers.push((name, value));
+}
+
+/// Split one header line into its trimmed name and trimmed value.
+///
+/// `None` for an empty line or a line with no colon, which are the two cases the
+/// caller skips. The `Status:` line goes through this as well, so a space before
+/// the colon (`Status : 200`, which HTTP forbids but nothing else checks) is
+/// treated the same for the status as for every ordinary header rather than
+/// landing in the header list while the status stays `200`.
+fn header_parts(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let colon = line.iter().position(|&byte| byte == b':')?;
+    let (name, value) = (trim_ascii(&line[..colon]), trim_ascii(&line[colon + 1..]));
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, value))
 }
 
 /// Where the header block ends and how long its separator is.
@@ -190,24 +258,29 @@ pub fn parse_response(stdout: &[u8]) -> (u16, Vec<(String, String)>, &[u8]) {
 /// One forward pass, checking both `\r\n\r\n` and `\n\n` at every byte that
 /// could start either. That is equivalent to the minimum of two independent
 /// searches — the earliest match wins, and the two patterns cannot begin at the
-/// same offset because one starts with `\r` and the other with `\n` — but it
-/// reads the payload once instead of twice.
+/// same offset because one starts with `\r` and the other with `\n`.
 ///
-/// The check is gated on the byte being `\r` or `\n`, so an ordinary body byte
-/// costs one comparison. `windows(4).position(...)`, which this replaces, compared
-/// four bytes at every offset of a 12 KB payload, twice.
+/// The scan is a hand-written loop rather than `memchr::memmem::find`, because
+/// `memchr` is not a dependency here and the scan stops at the end of the *header*
+/// block, which is tens to a few hundred bytes in practice — a vectorised skip loop
+/// would have nothing to skip. What the loop does avoid is comparing four bytes at
+/// every offset: the `bytes[index]` match is what gates the slice comparison, so an
+/// ordinary header byte costs one comparison rather than two slice compares.
+///
+/// The slice comparisons rather than four indexed loads are deliberate: the bound
+/// guard becomes `starts_with`'s own, and comparing the same way everywhere is what
+/// lets the comparison go through the slice `PartialEq` (a `memcmp` for a fixed
+/// length) instead of three separate byte checks.
 fn find_header_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    let len = bytes.len();
     let mut index = 0;
-    while index + 1 < bytes.len() {
+    // Both terminators are at least two bytes long, so the last offset one can start
+    // at is `len - 2`. This bound is too strict for a future one-byte terminator —
+    // worth knowing before adding one.
+    while index + 1 < len {
         match bytes[index] {
-            b'\r' if index + 4 <= bytes.len()
-                && bytes[index + 1] == b'\n'
-                && bytes[index + 2] == b'\r'
-                && bytes[index + 3] == b'\n' =>
-            {
-                return Some((index, 4));
-            }
-            b'\n' if bytes[index + 1] == b'\n' => return Some((index, 2)),
+            b'\r' if bytes[index..].starts_with(b"\r\n\r\n") => return Some((index, 4)),
+            b'\n' if bytes[index..].starts_with(b"\n\n") => return Some((index, 2)),
             _ => {}
         }
         index += 1;
@@ -217,25 +290,32 @@ fn find_header_end(bytes: &[u8]) -> Option<(usize, usize)> {
 
 /// The leading and trailing whitespace-free slice, as `str::trim` (which trims
 /// ASCII whitespace and Unicode spaces) did for the ASCII that headers contain.
+///
+/// This delegates to `[u8]::trim_ascii` in std, which arrived in Rust 1.80. The
+/// workspace's MSRV is 1.85, so it is available — and the MSRV is 1.85 because the
+/// dependency tree needs it, not because this function does: `clap`, `hyper-util`,
+/// `indexmap` and `hashbrown` all declare 1.85. The hand-rolled `position`/`rposition`
+/// pair this replaced was correct, but it was two passes where one call will do.
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |at| at + 1);
-    &bytes[start..end]
+    bytes.trim_ascii()
 }
 
 /// Interpret a header name or value as ASCII, or nothing.
-fn ascii_of(bytes: &[u8]) -> Option<String> {
+///
+/// Borrowed, not owned: the previous version built a `String` here, which was two
+/// allocations and two `memcpy`s per header on every response. The ASCII check *is*
+/// the UTF-8 validation (ASCII is a subset), so the returned `&str` costs nothing
+/// beyond the scan that was already being made.
+///
+/// A `&[u8]` that is already ASCII would be accepted by `from_utf8` as well; the
+/// difference is only the extra validity scan, which is why the check comes first.
+fn ascii_of(bytes: &[u8]) -> Option<&str> {
     if bytes.is_ascii() {
-        // Sound without a lossy conversion or a validity scan, which is the
-        // point: `from_utf8` is what the previous implementation paid for.
-        Some(String::from_utf8(bytes.to_vec()).expect("ASCII is valid UTF-8"))
+        // SAFETY: `is_ascii` guarantees valid UTF-8, which is exactly the
+        // precondition of `from_utf8_unchecked`.
+        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
     } else {
+        // `std::str::from_utf8` would re-scan to say the same thing more slowly.
         None
     }
 }
@@ -251,9 +331,6 @@ fn parse_status_code(value: &[u8]) -> Option<u16> {
 
 /// Split a FastCGI `STDOUT` payload into its header block and its body.
 ///
-/// The inverse of [`parse_response_headers`], and delegates to the same
-/// single-pass [`parse_response`] rather than searching for the separator again.
-///
 /// A payload with no blank line at all is treated as having no body. That is the
 /// existing behaviour and it is worth naming rather than leaving to be
 /// rediscovered: a real FastCGI response always carries at least one header and a
@@ -263,8 +340,18 @@ fn parse_status_code(value: &[u8]) -> Option<u16> {
 ///
 /// The body is located on the bytes rather than through a lossy `String`, because
 /// the body is arbitrary application bytes.
+///
+/// This finds the terminator itself rather than delegating to [`parse_response`],
+/// even though that would agree — the parse builds the header list, and a caller that
+/// wants only the body would pay for a `Vec` it never reads. There is an allocation
+/// test for exactly this (`tests/allocations.rs`), which is how it was noticed.
 pub fn split_response_body(stdout: &[u8]) -> &[u8] {
-    parse_response(stdout).2
+    match find_header_end(stdout) {
+        // The offset cannot exceed the length: `find_header_end` only returns a
+        // separator that fits.
+        Some((head, separator)) => stdout.get(head + separator..).unwrap_or(&[]),
+        None => &[],
+    }
 }
 
 /// A client bound to one backend connection.
@@ -288,6 +375,14 @@ pub struct Client<T = Stream> {
     /// hot path never allocates; this is `&mut self` in `send`, so a single `self`
     /// needs no borrow juggling to write its own buffer.
     out: Vec<u8>,
+    /// The encoded `PARAMS` payload, kept separately from `out` so it can be built
+    /// without borrowing the buffer it is then appended to.
+    ///
+    /// Same reasoning as `out`: the environment is a few hundred bytes and is rebuilt
+    /// identically for every request, so holding it across requests turns a per-request
+    /// allocation into a one-off. It is also what lets `send` stay `&mut self` — the
+    /// encoding writes here, then `append_records` copies it into `out`.
+    params: Vec<u8>,
     /// Whether the last request asked for keep-alive.
     keep_conn_requested: bool,
     /// Set once reuse is known to be unsafe.
@@ -316,6 +411,7 @@ impl<T: Read + Write> Client<T> {
             // Sized for a typical request so the common case never grows the
             // buffer; a larger one still works, it just reallocates once.
             out: Vec::with_capacity(1024),
+            params: Vec::with_capacity(512),
             keep_conn_requested: false,
             closed_by_backend: false,
         }
@@ -345,13 +441,22 @@ impl<T: Read + Write> Client<T> {
             .extend_from_slice(&Header::new(RecordType::BeginRequest, REQUEST_ID, 8).encode());
         self.out.extend_from_slice(&begin.encode());
 
-        let params = nvpair::encode_pairs(
+        // Encoded into its own reused buffer, then framed into `out`. Doing it straight
+        // into `out` would need `out` borrowed mutably by two calls at once.
+        nvpair::encode_pairs_into(
+            &mut self.params,
             request
                 .params
                 .iter()
                 .map(|(name, value)| (name.as_slice(), value.as_slice())),
         );
-        record::append_records(&mut self.out, RecordType::Params, REQUEST_ID, &params, true);
+        record::append_records(
+            &mut self.out,
+            RecordType::Params,
+            REQUEST_ID,
+            &self.params,
+            true,
+        );
         record::append_records(
             &mut self.out,
             RecordType::Stdin,
@@ -491,7 +596,7 @@ mod tests {
         let header = Header::new(record_type, REQUEST_ID, content.len() as u16);
         header.write(&mut out).unwrap();
         out.extend_from_slice(content);
-        out.extend(std::iter::repeat(0u8).take(header.padding_length as usize));
+        out.extend(std::iter::repeat_n(0u8, header.padding_length as usize));
         out
     }
 
@@ -644,11 +749,8 @@ mod tests {
         let (status, headers) = parse_response_headers(stdout);
         assert_eq!(status, 404);
         assert_eq!(headers.len(), 2);
-        assert_eq!(
-            headers[0],
-            ("Content-Type".to_string(), "text/html".to_string())
-        );
-        assert_eq!(headers[1], ("X-Test".to_string(), "1".to_string()));
+        assert_eq!(headers[0], ("Content-Type", "text/html"));
+        assert_eq!(headers[1], ("X-Test", "1"));
     }
 
     #[test]
@@ -757,7 +859,7 @@ mod tests {
         let (status, headers) =
             parse_response_headers(b"Status: 200\r\nX-\xFF: v\r\nX-A: b\r\n\r\n");
         assert_eq!(status, 200);
-        assert_eq!(headers, vec![("X-A".to_string(), "b".to_string())]);
+        assert_eq!(headers, vec![("X-A", "b")]);
     }
 
     #[test]
@@ -769,6 +871,58 @@ mod tests {
         assert_eq!(parse_response_headers(b"Status:\t500\tboom\r\n\r\n").0, 500);
         assert_eq!(parse_response_headers(b"Status:   201   \r\n\r\n").0, 201);
         assert_eq!(parse_response_headers(b"Status:404\r\n\r\n").0, 404);
+    }
+
+    #[test]
+    fn a_blank_line_before_the_status_line_does_not_hide_it() {
+        // A header block that opens with a line break is legal, and the status
+        // line is then the *first non-empty* line. Counting loop iterations
+        // instead made this `index == 1` and the `404` was silently dropped.
+        let stdout = b"\r\nStatus: 404 Not Found\r\nX-A: b\r\n\r\nbody";
+        let (status, headers) = parse_response_headers(stdout);
+        assert_eq!(status, 404);
+        assert_eq!(headers, vec![("X-A", "b")]);
+        // And the same with a bare `\n`, which `find_header_end` also accepts.
+        let stdout = b"\nStatus: 500\r\n\r\n";
+        assert_eq!(parse_response_headers(stdout).0, 500);
+        // Empty lines anywhere else are skipped just as before.
+        let (_, headers) = parse_response_headers(b"X-A: b\r\n\r\nX-B: c\r\n\r\n");
+        assert_eq!(headers, vec![("X-A", "b")]);
+    }
+
+    #[test]
+    fn a_status_line_with_a_space_before_the_colon_is_read_like_any_other_header() {
+        // HTTP forbids the space, and nothing else in this parser checks, so the rule
+        // is simply that a header name is trimmed: `Status : 404` therefore names the
+        // status header, and every ordinary header is trimmed the same way. What this
+        // pins is the *consistency*: the name used to be compared for the status
+        // untrimmed but pushed into the header list trimmed, so one line was read as
+        // both `200` and a `Status` header at once.
+        let (status, headers) = parse_response_headers(b"Status : 404\r\n\r\n");
+        assert_eq!(status, 404);
+        assert!(headers.is_empty(), "{headers:?}");
+
+        let stdout = b"X-A : b\r\n\r\n";
+        assert_eq!(parse_response_headers(stdout).1, vec![("X-A", "b")]);
+    }
+
+    #[test]
+    fn an_owned_copy_of_the_headers_can_still_be_made() {
+        // The worker protocol carries headers as JSON, so it needs owned `String`s
+        // and converts at that boundary. This is that conversion, and it is the only
+        // place an allocation is still unavoidable.
+        let (_, headers) = parse_response_headers(b"Content-Type: text/html\r\nX-A: b\r\n\r\n");
+        let owned: Vec<(String, String)> = headers
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        assert_eq!(
+            owned,
+            vec![
+                ("Content-Type".to_string(), "text/html".to_string()),
+                ("X-A".to_string(), "b".to_string())
+            ]
+        );
     }
 
     #[test]

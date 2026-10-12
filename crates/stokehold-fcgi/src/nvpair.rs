@@ -57,6 +57,22 @@ pub fn encode_pair(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+/// Encode a whole `PARAMS` payload into a caller-provided buffer.
+///
+/// The client uses this rather than [`encode_pairs`] because a request is built and
+/// thrown away per request: with a buffer that outlives the request, the environment
+/// costs no allocation at all. The buffer is cleared, not drained — shrinking it
+/// would throw away the capacity that makes the next request free.
+pub(crate) fn encode_pairs_into<'a, I>(out: &mut Vec<u8>, pairs: I)
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    out.clear();
+    for (name, value) in pairs {
+        encode_pair(out, name, value);
+    }
+}
+
 /// Encode a whole `PARAMS` payload from name-value pairs.
 ///
 /// Names are kept in the order given: FastCGI does not require any order, but

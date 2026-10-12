@@ -34,7 +34,7 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
+use hyper::header::{HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -547,15 +547,19 @@ fn to_cgi(
         .unwrap_or("/");
     let query = parts.uri.query().unwrap_or("");
 
-    // Resolved before building the environment so a missing or forbidden path
-    // can be told apart from a backend failure. `build_params` would report both
-    // as a bad request, which is right for FastCGI and wrong for HTTP: a path
-    // that names no script is a 404.
-    match cgi::route(path, routing) {
+    // Resolved once, before building the environment, so a missing or forbidden path
+    // can be told apart from a backend failure. `build_params` would report both as a
+    // bad request, which is right for FastCGI and wrong for HTTP: a path that names no
+    // script is a 404.
+    //
+    // The answer is then handed to `build_params_for`, which does not route again. Doing
+    // it twice walked the path and called `is_file` on its candidates a second time on
+    // every request, for a result already in hand.
+    let route = match cgi::route(path, routing) {
         Route::NotFound => return Err(HttpError::NotFound(path.to_string())),
         Route::Forbidden => return Err(HttpError::Forbidden(path.to_string())),
-        Route::Script { .. } => {}
-    }
+        resolved => resolved,
+    };
 
     let host = parts
         .headers
@@ -590,7 +594,7 @@ fn to_cgi(
         https: false,
     };
 
-    let params = cgi::build_params(&info, routing).map_err(map_cgi_error)?;
+    let params = cgi::build_params_for(&info, routing, &route).map_err(map_cgi_error)?;
 
     Ok(stokehold_fcgi::Request {
         params,
@@ -613,14 +617,29 @@ fn from_cgi(response: stokehold_fcgi::Response) -> Result<Response<ResponseBody>
     // One pass for status, headers and body. Asking for the headers and then the
     // body separately made each search the payload for the same blank line, and
     // `perf` attributed 13.6% of the server process's CPU to the pair.
+    //
+    // `hyper` needs `HeaderName`/`HeaderValue`, which own their bytes, so a copy is
+    // unavoidable here — but only the headers `hyper` actually accepts are copied,
+    // and only once. The parser itself hands back slices of `stdout` instead of a
+    // `String` per header, so the wasted allocation happens nowhere at all.
     let (status, headers, body) = response.parse();
     let body = body.to_vec();
 
     let mut builder = Response::builder().status(status);
     for (name, value) in headers {
-        if is_hop_by_hop(&name) || name.eq_ignore_ascii_case("content-length") {
+        // An unusable header from the application used to panic here, because
+        // `Builder::header` panics on a name or value `hyper` rejects: the
+        // connection was dropped with no response at all. Skipping is what a
+        // gateway should do — the rest of the response is still sendable.
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        if is_hop_by_hop(name.as_str()) || name == CONTENT_LENGTH {
             continue;
         }
+        let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) else {
+            continue;
+        };
         builder = builder.header(name, value);
     }
     builder = builder.header(CONTENT_LENGTH, body.len());

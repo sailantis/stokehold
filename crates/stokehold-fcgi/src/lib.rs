@@ -13,6 +13,8 @@ pub mod client;
 pub mod error;
 pub mod message;
 pub mod nvpair;
+#[cfg(windows)]
+pub mod pipe;
 pub mod protocol;
 pub mod record;
 pub mod transport;

@@ -44,10 +44,10 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// A `php-cgi` server that is killed when the test ends, however it ends.
+/// The `php-cgi` fixture, reachable over whichever transport the platform offers.
 struct PhpCgi {
     child: Child,
-    port: u16,
+    endpoint: Endpoint,
 }
 
 impl PhpCgi {
@@ -64,9 +64,51 @@ impl PhpCgi {
             .spawn()
             .unwrap_or_else(|err| panic!("failed to start {}: {err}", binary.display()));
 
-        let mut server = PhpCgi { child, port };
+        let mut server = PhpCgi {
+            child,
+            endpoint: Endpoint::Tcp(format!("127.0.0.1:{port}")),
+        };
         if !server.wait_until_listening(Duration::from_secs(10)) {
             panic!("php-cgi did not start listening on port {port}");
+        }
+        Some(server)
+    }
+
+    /// Start `php-cgi` bound to a named pipe instead of a port.
+    ///
+    /// `label` distinguishes the pipe from every other test's, because a pipe name
+    /// is a global namespace: two tests sharing one name bind two servers onto the
+    /// same pipe (php-cgi creates it with `PIPE_UNLIMITED_INSTANCES`) and then race
+    /// for clients, and killing one server breaks the other's connection. Tests in
+    /// one binary run in parallel, so this is not hypothetical.
+    ///
+    /// `PHP_FCGI_CHILDREN=0` because the variable is read from php-cgi's own
+    /// environment and a host may have exported it for php-fpm: its default of 1
+    /// would fork a child per connection, and 20 under it — see the pool's
+    /// `spawn_slot` for the measurement. One process, one pipe, is what these tests
+    /// are about.
+    #[cfg(windows)]
+    fn start_on_pipe(label: &str) -> Option<Self> {
+        let binary = find_php_cgi()?;
+        let name = pipe_name(label);
+
+        let child = Command::new(&binary)
+            .arg("-b")
+            .arg(&name)
+            .env("PHP_FCGI_CHILDREN", "0")
+            .env("PHP_FCGI_MAX_REQUESTS", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|err| panic!("failed to start {}: {err}", binary.display()));
+
+        let mut server = PhpCgi {
+            child,
+            endpoint: Endpoint::Pipe(name),
+        };
+        if !server.wait_until_listening(Duration::from_secs(10)) {
+            panic!("php-cgi did not start listening on pipe {}", server.endpoint);
         }
         Some(server)
     }
@@ -77,7 +119,7 @@ impl PhpCgi {
             if let Some(status) = self.child.try_wait().expect("poll php-cgi") {
                 panic!("php-cgi exited during startup with {status}");
             }
-            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            if self.endpoint.connect(Some(Duration::from_millis(250))).is_ok() {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -86,8 +128,15 @@ impl PhpCgi {
     }
 
     fn endpoint(&self) -> Endpoint {
-        Endpoint::Tcp(format!("127.0.0.1:{}", self.port))
+        self.endpoint.clone()
     }
+}
+
+/// A pipe name unique to this process *and* this test, so two tests running in
+/// parallel cannot bind the same pipe.
+#[cfg(windows)]
+fn pipe_name(label: &str) -> String {
+    format!(r"\\.\pipe\stokehold-it-{}-{label}", std::process::id())
 }
 
 impl Drop for PhpCgi {
@@ -373,4 +422,155 @@ echo "INPUT=", file_get_contents('php://input');
     assert!(stdout.contains("INPUT=field=value"), "{stdout}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A named pipe is a first-class transport, not a Windows curiosity.
+///
+/// On Windows `php-cgi -b` takes a pipe name instead of `host:port`, and the SAPI
+/// detects which it was given with `!GetNamedPipeInfo(..)`. This is the same
+/// request the TCP test above sends, over that pipe, and it is the end-to-end
+/// proof that `Endpoint::Pipe` reaches real PHP and gets real bytes back.
+///
+/// It is deliberately *not* a test of the client's protocol handling — that is
+/// covered above — so it asserts only that the transport carried a complete
+/// exchange and that PHP's answer is intact.
+#[cfg(windows)]
+#[test]
+fn serves_a_script_over_a_named_pipe() {
+    let Some(server) = PhpCgi::start_on_pipe("serve") else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+
+    let script = write_script("pipe", r#"<?php echo "PIPE-OK";"#);
+    let mut client = Client::connect(&server.endpoint(), Some(Duration::from_secs(5)))
+        .expect("connect to the php-cgi pipe");
+
+    let response = client
+        .request(&Request {
+            params: params_for(&script, "GET", 0),
+            body: Vec::new(),
+            keep_conn: true,
+        })
+        .expect("php-cgi answered over the pipe");
+
+    response
+        .check_protocol()
+        .expect("the backend completed the request over a pipe");
+
+    let stdout = String::from_utf8_lossy(&response.stdout);
+    assert!(
+        stdout.contains("PIPE-OK"),
+        "body missing from the pipe response: {stdout:?}"
+    );
+    let (status, headers) = response.parse_status_headers();
+    assert_eq!(status, 200, "php-cgi defaults to 200 over a pipe too: {stdout:?}");
+    assert!(
+        header(&headers, "Content-type").is_some(),
+        "php-cgi sends a Content-type header over a pipe: {headers:?}"
+    );
+
+    let _ = std::fs::remove_file(&script);
+}
+
+/// A pipe read that is never answered times out; it does not hang for ever.
+///
+/// This is the property the whole overlapped-I/O arrangement exists for, and the
+/// one this project has already paid for once: a request path with no read
+/// deadline sat for **17 minutes** in a test that should have failed instead
+/// (hazard 43). A blocking `ReadFile` on a pipe has no deadline of its own, so
+/// without the check below a backend that accepts and then goes quiet would hold
+/// a request thread indefinitely.
+///
+/// The connection is made and *nothing* is sent, so `php-cgi` has no request to
+/// answer and the read cannot complete. The assertion is on wall-clock time, not
+/// just the error kind, because a timeout that arrives after two minutes is not a
+/// timeout in any useful sense.
+#[cfg(windows)]
+#[test]
+fn a_pipe_read_without_an_answer_times_out_rather_than_hanging() {
+    use std::io::Read as _;
+
+    let Some(server) = PhpCgi::start_on_pipe("timeout") else {
+        eprintln!("skipping: no php-cgi on PATH");
+        return;
+    };
+
+    let deadline = Duration::from_millis(300);
+    let mut stream = server
+        .endpoint()
+        .connect(Some(deadline))
+        .expect("connect to the php-cgi pipe");
+
+    let mut buf = [0u8; 8];
+    let started = Instant::now();
+    let outcome = stream.read(&mut buf);
+    let elapsed = started.elapsed();
+
+    let err = outcome.expect_err("an unanswered read must not report success");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut,
+        "a read with no answer should time out, not fail some other way: {err:?}"
+    );
+    assert!(
+        elapsed >= deadline,
+        "the read returned before its deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the deadline was not honoured: waited {elapsed:?} for a {deadline:?} timeout"
+    );
+
+    // The connection must still be usable rather than left with a stale completion
+    // that the next operation would misread. A second read on the *same* stream is
+    // what proves it: it has to drain the abandoned operation first, then time out
+    // again on its own rather than returning a stale result or blocking.
+    let started = Instant::now();
+    let outcome = stream.read(&mut buf);
+    let elapsed = started.elapsed();
+    let err = outcome.expect_err("the second read must not report success either");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut,
+        "the second read should time out like the first: {err:?}"
+    );
+    assert!(
+        elapsed >= deadline && elapsed < Duration::from_secs(3),
+        "the second read did not honour its deadline: {elapsed:?}"
+    );
+}
+///
+/// This is the property that makes a pipe usable behind a supervisor: a stale
+/// configuration or a backend that never came up has to be an error at connect
+/// time. The name carries a process id and a nanosecond counter so no other
+/// process can be holding it.
+/// A pipe with nobody listening on it fails; it does not wait for ever.
+///
+/// This is the property that makes a pipe usable behind a supervisor: a stale
+/// configuration or a backend that never came up has to be an error at connect
+/// time. The name carries a process id and a nanosecond counter so no other
+/// process can be holding it.
+#[cfg(windows)]
+#[test]
+fn connecting_to_an_absent_pipe_fails_promptly() {
+    let name = format!(
+        r"\\.\pipe\stokehold-absent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let endpoint = Endpoint::parse(&name).expect("a pipe name parses");
+
+    let started = Instant::now();
+    let outcome = endpoint.connect(Some(Duration::from_millis(500)));
+    let elapsed = started.elapsed();
+
+    assert!(outcome.is_err(), "an absent pipe must not connect");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "an absent pipe must fail promptly, took {elapsed:?}"
+    );
 }

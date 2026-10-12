@@ -504,11 +504,14 @@ against the specification and secondary implementations, and are confirmed by fi
     `Endpoint` rather than a port, and recovers the bind address from it for recycling and restart,
     so there is no second field that could drift out of agreement with where the slot actually
     listens. And the `unix:` form is **rejected at validation time** on Windows rather than accepted
-    and silently ignored, because the same `-b` argument there means a named pipe that this backend
-    does not drive. The path-length check accounts for the per-slot suffix, so a prefix that fits
-    for slot 0 but not slot 11 is a startup error rather than a late surprise. The startup probe
-    connects through the slot's endpoint, which is the only probe that proves the *client* can
-    reach the address rather than that something is listening somewhere.
+    and silently ignored, because the same `-b` argument there means a named pipe. The path-length
+    check accounts for the per-slot suffix, so a prefix that fits for slot 0 but not slot 11 is a
+    startup error rather than a late surprise. The startup probe connects through the slot's
+    endpoint, which is the only probe that proves the *client* can reach the address rather than
+    that something is listening somewhere.
+
+    When this was written the sentence ended "…means a named pipe **that this backend does not
+    drive**". It now does — see hazard 45.
 
 27. **With a real database in the request, the four arms converge — and the piped worker stops
     being behind.** One `SELECT` of one row from a local MariaDB, `p:`-prefixed persistent
@@ -1653,3 +1656,57 @@ have broken silently. That is now a measured fact rather than a design argument.
 Also worth recording because it is about the benchmark rather than the code: the first
 `STOKEHOLD_E2E=1` run on the *same* tree was still passing when the harness was written,
 so "the tests pass" was never evidence that the Linux path had been exercised.
+
+- **45. The Windows named pipe is not just reachable, it is the faster transport — and the one
+  that needed a deadline built into it.** `-b` on Windows goes down the `CreateNamedPipe` branch of
+  `fcgi_listen`, and the SAPI detects it with `!GetNamedPipeInfo(..)`. That branch had been
+  dismissed as a "different feature" for as long as the TCP arm looked adequate; with the pool's
+  other options priced, it was worth measuring rather than assuming.
+
+  **The measurement.** A 4 KiB FastCGI exchange over a *persistent* connection — which is
+  `spawn_cgi`'s steady state, since `ClientPool::acquire` keeps one client alive per slot — 2000
+  requests per sample, 9 samples:
+
+  | transport | median | best | worst |
+  | --- | --- | --- | --- |
+  | loopback TCP | 210.9 µs | 207.9 µs | 222.5 µs |
+  | named pipe | **168.3 µs** | 164.1 µs | 169.4 µs |
+
+  The pipe is **20% faster and the spreads do not overlap** — the pipe's worst sample sits below
+  TCP's best — so this is a signal rather than the noise-floor drift the five-arm re-run was
+  careful not to claim. It is the mechanism `php-fpm` already uses on unix: a kernel object
+  instead of a trip through the loopback stack. On the cold `/items` arm, where the backend leg is
+  roughly 40% of a request, that is an end-to-end effect of about **8%** — larger than the last
+  four optimisations put together.
+
+  **Implemented** as `socket = '\\.\pipe\stokehold-cgi'` on a `spawn_cgi` backend, which
+  `validate_cgi_socket` now accepts and `cgi_socket_path` turns into one pipe per slot (the index
+  is appended to the *name*, as it is to a path). The protocol layer needed no change at all:
+  `Client::from_stream` already accepts any `Read + Write`, so this is purely a transport addition,
+  plus an `Endpoint::Pipe` variant and a `SlotAddress::Pipe`. A pool-level test proves a two-slot
+  pipe pool serves the same bytes the TCP pool does.
+
+  **Three things the transport has to get right**, none of which a happy path would catch:
+
+  - **Every operation is overlapped, because a blocking pipe read has no deadline.** This is
+    hazard 43's missing timeout in new clothes: the handle is opened `FILE_FLAG_OVERLAPPED` and
+    each read and write is bounded with `WaitForSingleObject`, so a backend that accepts and then
+    goes quiet becomes `TimedOut` rather than a 17-minute hang. A test pins it — a stream that
+    sends nothing must fail inside its deadline — and a *second* read on the same stream repeats
+    the check, which is what exercises the drain path below.
+  - **The `OVERLAPPED` must outlive the call that started it.** `CancelIoEx` only *asks* the kernel
+    to cancel; the operation may still complete, and until it does the kernel owns the
+    `OVERLAPPED` and writes its result into it. A stack-local structure would therefore be a
+    use-after-free that no passing test reveals, so each direction owns a persistent `OVERLAPPED`
+    in the stream, and one abandoned operation is drained before the next is started.
+  - **`CreateFileW` fails with `ERROR_PIPE_BUSY` whenever the server is between clients** — the
+    normal state for a per-request client, since `php-cgi -b` accepts one client at a time.
+    `WaitNamedPipeW` in a loop bounded by the caller's deadline is what makes a reconnect work;
+    measured before the transport existed, that path needed **0.88 busy-retries per open**.
+    `FlushFileBuffers` is deliberately *not* used for `flush`: on a pipe it waits until the peer has
+    read everything already written, and fails outright while the client is still connecting.
+
+  **What it does not change.** Linux is unaffected: `php-cgi` binds a unix socket there and `unix:`
+  already shipped, so the pipe is a Windows-only mechanism. It also does not re-open the
+  `PHP_FCGI_CHILDREN` question — each pipe carries its own slot's instance, so one process per slot
+  is still what the pool wants.

@@ -118,11 +118,13 @@ fn retryable(err: &stokehold_fcgi::FcgiError) -> bool {
     is_connection_error(err)
 }
 
-/// Where a slot binds: a loopback port, or a unix socket path.
+/// Where a slot binds: a loopback port, a unix socket path, or a Windows pipe.
 #[derive(Debug, Clone)]
 enum SlotAddress {
     Port(u16),
     Socket(PathBuf),
+    #[cfg(windows)]
+    Pipe(PathBuf),
 }
 
 impl SlotAddress {
@@ -131,6 +133,8 @@ impl SlotAddress {
         match self {
             SlotAddress::Port(port) => format!("{bind_host}:{port}"),
             SlotAddress::Socket(path) => path.display().to_string(),
+            #[cfg(windows)]
+            SlotAddress::Pipe(name) => name.display().to_string(),
         }
     }
 
@@ -151,6 +155,8 @@ impl SlotAddress {
                     }
                 })
             }
+            #[cfg(windows)]
+            SlotAddress::Pipe(name) => Ok(Endpoint::Pipe(name.display().to_string())),
         }
     }
 }
@@ -169,6 +175,8 @@ fn slot_address_of(endpoint: &Endpoint) -> SlotAddress {
                     panic!("a TCP endpoint always carries a port, got {spec:?}")
                 }),
         ),
+        #[cfg(windows)]
+        Endpoint::Pipe(name) => SlotAddress::Pipe(PathBuf::from(name)),
         #[cfg(unix)]
         Endpoint::Unix(path) => SlotAddress::Socket(PathBuf::from(path)),
     }
@@ -225,9 +233,20 @@ impl CgiPool {
         let mut port = config.base_port;
         for index in 0..count {
             let slot_address = match &config.socket {
-                Some(prefix) => SlotAddress::Socket(stokehold_core::config::cgi_socket_path(
-                    prefix, index,
-                )),
+                Some(prefix) => {
+                    let path = stokehold_core::config::cgi_socket_path(prefix, index);
+                    #[cfg(windows)]
+                    if path
+                        .to_str()
+                        .is_some_and(|p| p.starts_with(r"\\.\pipe\"))
+                    {
+                        SlotAddress::Pipe(path)
+                    } else {
+                        SlotAddress::Socket(path)
+                    }
+                    #[cfg(not(windows))]
+                    SlotAddress::Socket(path)
+                }
                 None => {
                     // Skip ports that are already taken rather than failing the whole
                     // pool: another service on 19001 should not stop startup.
@@ -468,7 +487,8 @@ impl CgiPool {
         }
     }
 
-    /// The ports in use, for diagnostics. Unix-socket slots are not represented.
+    /// The ports in use, for diagnostics. Unix-socket and pipe slots are not
+    /// represented: they hold no port.
     pub fn ports(&self) -> Vec<u16> {
         self.locked_slots()
             .iter()
@@ -476,6 +496,8 @@ impl CgiPool {
                 Endpoint::Tcp(spec) => spec
                     .rsplit_once(':')
                     .and_then(|(_, port)| port.parse::<u16>().ok()),
+                #[cfg(windows)]
+                Endpoint::Pipe(_) => None,
                 #[cfg(unix)]
                 Endpoint::Unix(_) => None,
             })
@@ -620,6 +642,28 @@ mod tests {
         assert!(err.to_string().contains("cannot be a unix socket"), "{err}");
     }
 
+    /// A Windows pipe slot hands `php-cgi` the bare pipe name and connects to it.
+    #[cfg(windows)]
+    #[test]
+    fn a_pipe_slot_address_binds_and_connects_by_name() {
+        let pipe = SlotAddress::Pipe(PathBuf::from(r"\\.\pipe\stokehold-cgi.0"));
+        assert_eq!(
+            pipe.bind_argument("127.0.0.1"),
+            r"\\.\pipe\stokehold-cgi.0",
+            "php-cgi takes the pipe name verbatim, not `host:port`"
+        );
+        assert_eq!(
+            pipe.endpoint("127.0.0.1").expect("a pipe is always an endpoint"),
+            Endpoint::Pipe(r"\\.\pipe\stokehold-cgi.0".to_string())
+        );
+        // And the round trip has to come back to the same place, or a recycled slot
+        // would bind a differently named pipe.
+        assert!(matches!(
+            slot_address_of(&pipe.endpoint("127.0.0.1").unwrap()),
+            SlotAddress::Pipe(_)
+        ));
+    }
+
     #[test]
     fn a_slot_address_round_trips_through_an_endpoint() {
         // `slot_address_of` recovers the bind address from a live endpoint, which
@@ -630,6 +674,8 @@ mod tests {
         match slot_address_of(&endpoint) {
             SlotAddress::Port(recovered) => assert_eq!(recovered, 19_444),
             SlotAddress::Socket(path) => panic!("expected a port, got {path:?}"),
+            #[cfg(windows)]
+            SlotAddress::Pipe(name) => panic!("expected a port, got pipe {name:?}"),
         }
     }
 
@@ -643,6 +689,8 @@ mod tests {
                 assert_eq!(recovered, PathBuf::from("/run/stokehold/cgi.3.sock"));
             }
             SlotAddress::Port(port) => panic!("expected a socket, got port {port}"),
+            #[cfg(windows)]
+            SlotAddress::Pipe(name) => panic!("expected a socket, got pipe {name:?}"),
         }
     }
 

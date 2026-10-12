@@ -1,19 +1,24 @@
 //! Transports a FastCGI client can use to reach a backend.
 //!
 //! `php-fpm` is normally reached over a unix socket, `php-cgi -b` over loopback
-//! TCP (its only option on Windows). Both are exposed behind one type so the
-//! client above it does not care which it is talking to.
+//! TCP or a unix socket. On Windows `php-cgi -b` can bind neither: the same
+//! argument means a *named pipe* there. All three are exposed behind one type so
+//! the client above it does not care which it is talking to.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::error::{FcgiError, Result};
+#[cfg(windows)]
+use crate::pipe::PipeStream;
 
-/// A connected backend, over either transport.
+/// A connected backend, over any transport.
 #[derive(Debug)]
 pub enum Stream {
     Tcp(TcpStream),
+    #[cfg(windows)]
+    Pipe(PipeStream),
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
 }
@@ -61,13 +66,16 @@ fn arm_immediate_ack(fd: std::os::fd::RawFd) {
     }
 }
 
-/// A parsed backend address: either `host:port` or `unix:/path`.
+/// A parsed backend address: `host:port`, `unix:/path`, or on Windows a pipe
+/// name.
 ///
-/// The `Unix` variant only exists where unix sockets do, so no code path can
-/// construct one on Windows.
+/// The `Unix` variant only exists where unix sockets do and `Pipe` only where
+/// named pipes do, so no code path can construct either on the wrong platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
     Tcp(String),
+    #[cfg(windows)]
+    Pipe(String),
     #[cfg(unix)]
     Unix(String),
 }
@@ -78,19 +86,31 @@ impl std::fmt::Display for Endpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Endpoint::Tcp(spec) => write!(f, "{spec}"),
+            #[cfg(windows)]
+            Endpoint::Pipe(path) => write!(f, "{path}"),
             #[cfg(unix)]
             Endpoint::Unix(path) => write!(f, "unix:{path}"),
         }
     }
 }
 
+/// The prefix that marks a Windows pipe name, matching what `php-cgi -b` takes.
+#[cfg(windows)]
+pub const PIPE_PREFIX: &str = r"\\.\pipe\";
+
 impl Endpoint {
-    /// Parse `host:port` or `unix:/path`.
+    /// Parse `host:port`, `unix:/path`, or a Windows pipe name.
     ///
     /// The `unix:` prefix is stokehold's own convention, matching the
-    /// configuration surface (`socket = "unix:/run/php/php8.3-fpm.sock"`).
+    /// configuration surface (`socket = "unix:/run/php/php8.3-fpm.sock"`). A pipe
+    /// needs no convention: `\\.\pipe\name` is what `php-cgi -b` is given
+    /// verbatim, so a configuration can carry the same string to both.
     pub fn parse(spec: &str) -> Result<Self> {
         let spec = spec.trim();
+        #[cfg(windows)]
+        if spec.starts_with(PIPE_PREFIX) {
+            return Ok(Endpoint::Pipe(spec.to_string()));
+        }
         if let Some(path) = spec.strip_prefix("unix:") {
             if path.is_empty() {
                 return Err(FcgiError::Io(std::io::Error::new(
@@ -102,7 +122,11 @@ impl Endpoint {
             {
                 return Err(FcgiError::Io(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
-                    format!("unix sockets are not available on this platform: {spec}"),
+                    format!(
+                        "unix sockets are not available on this platform, so {spec:?} cannot be \
+                         used; php-cgi's `-b` binds a named pipe here — write \
+                         `{PIPE_PREFIX}name` instead"
+                    ),
                 )));
             }
             #[cfg(unix)]
@@ -136,6 +160,8 @@ impl Endpoint {
                 let _ = stream.set_nodelay(true);
                 Ok(Stream::Tcp(stream))
             }
+            #[cfg(windows)]
+            Endpoint::Pipe(path) => Ok(Stream::Pipe(PipeStream::connect(path, timeout)?)),
             #[cfg(unix)]
             Endpoint::Unix(path) => {
                 let stream = std::os::unix::net::UnixStream::connect(path)?;
@@ -168,6 +194,8 @@ impl Read for Stream {
         }
         match self {
             Stream::Tcp(stream) => stream.read(buf),
+            #[cfg(windows)]
+            Stream::Pipe(stream) => stream.read(buf),
             #[cfg(unix)]
             Stream::Unix(stream) => stream.read(buf),
         }
@@ -178,6 +206,8 @@ impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Stream::Tcp(stream) => stream.write(buf),
+            #[cfg(windows)]
+            Stream::Pipe(stream) => stream.write(buf),
             #[cfg(unix)]
             Stream::Unix(stream) => stream.write(buf),
         }
@@ -186,6 +216,8 @@ impl Write for Stream {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Stream::Tcp(stream) => stream.flush(),
+            #[cfg(windows)]
+            Stream::Pipe(stream) => stream.flush(),
             #[cfg(unix)]
             Stream::Unix(stream) => stream.flush(),
         }
@@ -216,6 +248,33 @@ mod tests {
     fn unix_sockets_are_reported_as_unsupported_on_windows() {
         let err = Endpoint::parse("unix:/run/php.sock").unwrap_err();
         assert!(err.to_string().contains("not available"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_a_named_pipe_endpoint() {
+        // A pipe name is what `php-cgi -b` is given on Windows, so it has to parse
+        // as itself rather than as `host:port`.
+        assert_eq!(
+            Endpoint::parse(r"\\.\pipe\stokehold-cgi-0").unwrap(),
+            Endpoint::Pipe(r"\\.\pipe\stokehold-cgi-0".to_string())
+        );
+        assert_eq!(
+            Endpoint::parse(r"  \\.\pipe\trimmed  ").unwrap(),
+            Endpoint::Pipe(r"\\.\pipe\trimmed".to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pipe_endpoint_round_trips_through_display() {
+        // The string must survive a log line or an error message unchanged, because
+        // it is also what the pool hands to `php-cgi -b`.
+        for spec in [r"\\.\pipe\stokehold-cgi-0", r"\\.\pipe\a"] {
+            let endpoint = Endpoint::parse(spec).unwrap();
+            assert_eq!(endpoint.to_string(), spec);
+            assert_eq!(Endpoint::parse(&endpoint.to_string()).unwrap(), endpoint);
+        }
     }
 
     #[test]

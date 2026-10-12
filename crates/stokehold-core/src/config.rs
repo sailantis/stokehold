@@ -622,9 +622,36 @@ pub const UNIX_SOCKET_PATH_MAX: usize = 107;
 /// `.<slot>.sock` — see [`SpawnCgiConfig::socket`]. The per-slot suffix is
 /// accounted for here so a prefix that only fits because of a low slot number is
 /// rejected at startup rather than at the twelfth worker.
+///
+/// On Windows the same setting means a **named pipe** rather than a unix socket,
+/// because that is what `php-cgi -b` binds there. A pipe name carries no path
+/// length limit worth enforcing, so only the name itself is checked.
 pub fn validate_cgi_socket(spec: &str) -> std::result::Result<(), String> {
+    #[cfg(windows)]
+    if let Some(name) = spec.strip_prefix(r"\\.\pipe\") {
+        if name.is_empty() {
+            return Err(format!("{spec:?} has an empty pipe name"));
+        }
+        if name.contains('\\') {
+            return Err(format!(
+                "pipe name {name:?} may not contain a backslash; a pipe's name is a single \
+                 component, e.g. `\\\\\\\\.\\\\pipe\\\\stokehold-cgi`"
+            ));
+        }
+        if spec.contains('\0') {
+            return Err("pipe name contains a NUL byte".to_string());
+        }
+        return Ok(());
+    }
+
     let path = spec.strip_prefix("unix:").ok_or_else(|| {
-        format!("{spec:?} must start with `unix:`, e.g. `unix:/run/stokehold/cgi`")
+        #[cfg(windows)]
+        return format!(
+            "{spec:?} must start with `unix:` or `\\\\.\\pipe\\`, e.g. \
+             `unix:/run/stokehold/cgi` or `\\\\.\\pipe\\stokehold-cgi`"
+        );
+        #[cfg(not(windows))]
+        return format!("{spec:?} must start with `unix:`, e.g. `unix:/run/stokehold/cgi`");
     })?;
     if path.is_empty() {
         return Err("unix socket path is empty".to_string());
@@ -639,9 +666,7 @@ pub fn validate_cgi_socket(spec: &str) -> std::result::Result<(), String> {
     }
     if cfg!(not(unix)) {
         return Err(format!(
-            "unix sockets are not available on this platform, so {spec:?} cannot be used; \
-             php-cgi's `-b` binds a named pipe here, which this backend does not drive — \
-             drop `socket` to use loopback TCP"
+            "unix sockets are not available on this platform, so {spec:?} cannot be used"
         ));
     }
     // `.<slot>.sock`: a dot, up to 10 digits of `u32`, then ".sock".
@@ -655,8 +680,17 @@ pub fn validate_cgi_socket(spec: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// The socket path slot `index` binds, given a `unix:` prefix.
+/// The socket or pipe name slot `index` binds, given a prefix.
+///
+/// A unix socket gets `.<index>.sock` appended because a path names a file. A
+/// Windows pipe name is a namespace rather than a path, and `php-cgi`'s own
+/// instances are already unlimited (`PIPE_UNLIMITED_INSTANCES`), so the slot's
+/// name is qualified with the index instead, keeping one pipe per slot.
 pub fn cgi_socket_path(prefix: &str, index: u32) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(name) = prefix.strip_prefix(r"\\.\pipe\") {
+        return PathBuf::from(format!(r"\\.\pipe\{name}.{index}"));
+    }
     let base = prefix.strip_prefix("unix:").unwrap_or(prefix);
     PathBuf::from(format!("{base}.{index}.sock"))
 }

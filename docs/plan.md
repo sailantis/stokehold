@@ -487,10 +487,14 @@ against the specification and secondary implementations, and are confirmed by fi
     is not TCP-only: `fcgi_listen` (`main/fastcgi.c`) treats a bind path that contains no `:` as
     an `AF_UNIX` path on anything that is not Windows — `unlink`s it and binds it — and only
     falls back to TCP when `:` is present or the argument is all digits. So a `spawn_cgi` pool can
-    be given unix sockets on Linux, which removes the loopback-TCP hop. On Windows the same code
-    path is a named pipe, which is a different feature and not what `-b 127.0.0.1:port` does
-    there. Relevant because the TCP arm's advantage over the piped arm at high concurrency is a
-    per-request cost, and a unix socket is the cheaper version of the same shape.
+    be given unix sockets on Linux. On Windows the same code path is a named pipe, which is a
+    different feature and not what `-b 127.0.0.1:port` does there.
+
+    This was originally justified by the TCP arm's cost, which hazard 30 later showed was a bug
+    on stokehold's side rather than a property of loopback TCP. With that fixed the two transports
+    measure the same (1.238 ms against 1.219 ms), so the option is kept on its own merits —
+    convention, and a filesystem path being easier to police with permissions than a port — and
+    **not** as a performance recommendation.
 
     **Implemented** as `socket = "unix:/run/stokehold/cgi"` in a `spawn_cgi` backend
     (`SpawnCgiConfig::socket`). Three things about it are deliberate rather than incidental. The
@@ -591,60 +595,177 @@ against the specification and secondary implementations, and are confirmed by fi
     That SIGTERM leak was the *other* bug found the same way, and it is the same shape: a correct-
     looking configuration (`Ctrl-C works`) with a silently wrong failure mode (`kill` does not).
 
-30. **Loopback TCP is worth about 10% to `spawn_cgi`, not an order of magnitude — and the
-    first diagnosis of it was wrong twice.** Hazard 23 measured `spawn_cgi` over TCP beating
-    the piped worker at high concurrency and concluded "what separates them is later: the
-    CGI arm keeps scaling to 32 while the piped arm plateaus at ~21k". The plateau was
-    hazard 25's thread-per-request cost and is gone. What hazard 23 never isolated was the
-    transport, since it compared a piped worker against a TCP CGI arm, so the transport and
-    the SAPI moved together.
+30. **A Linux `php-cgi` never sets `TCP_NODELAY`, and that cost `spawn_cgi` over loopback TCP
+    34x — a flat 42 ms per request. FIXED.** Getting here took three wrong answers, so the
+    wrong ones are kept below. The correct one first.
 
-    The clean comparison — same server, same model, same SAPI, same entry script, only the
-    transport differing — was run twice and gave two different answers, and the second is
-    the one to keep.
+    **The mechanism.** `main/fastcgi.c:1088` guards its `TCP_NODELAY` call with
+    `req->keep && req->tcp`, and `req->tcp` is assigned in exactly one place — line 897,
+    under `#ifdef _WIN32`. On Linux it keeps the zero `calloc` gave it, so `req->tcp` is
+    permanently 0 and **the call is never reached**. A loopback php-cgi therefore runs with
+    Nagle enabled. That is harmless on its own. It becomes a 40 ms stall because php-cgi
+    flushes its response in 8 KiB chunks (`out_buf[1024*8]`, line 222): any response larger
+    than 8 KiB leaves a short final segment, Nagle withholds it until the previous data is
+    ACKed, and on an idle keep-alive connection Linux's ACK is a *delayed* ACK — 40 ms.
 
-    **First attempt: a single wrk connection per arm.** T collapsed to 198–281 rps while U
-    reached 8,107, a ratio of **29x** at concurrency 32, with an unchanged p50 and a 110 ms
-    one. That was reported here as a real transport cost and explained as delayed ACK. Both
-    the size and the explanation were wrong:
+    The reason it was invisible for so long: the withheld tail is still unacknowledged when
+    the **next** request arrives on that connection, and keep-alive means the connection is
+    always reused. The stall is therefore not a first-request cost that a warm-up hides —
+    it recurs on every single request. That is why `/`, a 5 KB page, was slow too: the
+    previous response's tail is permanently outstanding.
 
-    - `tcpdump` per connection showed stokehold sending each request as 8 TCP segments —
-      one per 8-byte FastCGI record header — where nginx sends 1–2, because the client sets
-      `TCP_NODELAY` and php-cgi only sets it on its own side *after* it reads the request.
-      That was a genuine inefficiency, and fixing it (`Client::send` now assembles the
-      request in a reused buffer and writes once) measured **1.572 -> 1.509 ms, about 4%**.
-      Real, and not the cause.
-    - php-cgi sets `TCP_NODELAY` itself (`main/fastcgi.c:1087`, inside `fcgi_accept_request`,
-      before any response byte) whenever keep-alive was requested, and `transport.rs` sets
-      it too — so a delayed-ACK explanation was wrong on the facts. It was published before
-      the source was read.
-    - The 29x itself was an artifact: **one wrk connection lands on one pool slot**, so that
-      slot serialises while the other eleven and the aggregate rate are unaffected. Stated
-      as a pool measurement, the column measures one slot.
+    **The measurement.** Same host, same harness, same requests, one slot, `/items`,
+    5 x 2000 sequential:
 
-    **Second attempt: two independent measurements of the same pair.**
-
-    | measurement | `/items` | `/` |
+    | | before | after |
     |---|---|---|
-    | sequential latency, one reused connection | T 1.656 ms vs U 1.466 ms — **13%** | 0.663 vs 0.656 — **1%** |
-    | sequential `curl`, fresh connection per request | T and U **identical**, 1.8 ms | identical |
+    | T over loopback TCP | **42.005 ms** | **1.238 ms** |
+    | U over unix socket | 1.222 ms | 1.219 ms |
+    | `TcpExtDelayedACKs` | 10,054 | **0** |
+    | T, 12 slots, p95 | 42.09 ms | 1.77 ms |
 
-    So a unix socket is worth roughly 10% on a large response and nothing on a small one or
-    on a fresh connection. Loopback TCP's per-packet cost is real — `ss` reports `minrtt`
-    11 us against 2 us, so ~9 us more per round trip — but a request pays only a handful of
-    round trips. The 59 ms tail is single-connection-only and **remains unexplained**; it is
-    not Nagle, and it is not the 8-segment write.
+    42.005 with a spread of 0.05 ms is the tell: that is not a throughput limit, it is a
+    timer. `TcpExtDelayedACKs` was ~1 per request on T and **exactly 0** on U, and the wire
+    trace showed php-cgi's trailing 1728-byte segment leaving **10 us after** stokehold's ACK
+    arrived 40.7 ms after the data — sender-side Nagle, receiver-side delayed ACK.
 
-    `socket = "unix:..."` (hazard 26) is still worth having, for about 10% on a large
-    response, but it is not the order of magnitude this plan claimed for a while.
+    **The fix** is receiver-side and belongs in `stokehold-fcgi`: `TCP_QUICKACK` immediately
+    before each `read` on a TCP backend (`transport.rs`). The kernel clears the flag after
+    using it and after every `recv`, so it is re-armed per read rather than set once at
+    connect time. It takes effect from the next read, which is exactly the read whose ACKs
+    would otherwise be delayed. A `setsockopt` failure is ignored: a non-TCP socket or a
+    kernel without the option reports `EINVAL`, and correct delivery never depended on this,
+    only latency. This is also why **nginx was never affected** — it sets `TCP_NODELAY` on
+    its side and drains promptly, and its php-cgi over TCP measured a healthy 848 rps in the
+    isolation test all along. The bug was ours, not the transport's.
 
-    Two consequences. First, **`spawn_cgi` over loopback TCP should not be the recommended
-    configuration on Linux** where a unix socket is available; this is the concrete reason
-    `socket = "unix:..."` exists (hazard 26), and it is worth far more than the loopback hop it was
-    justified by. Second, **any earlier FastCGI measurement taken over TCP understates its arm**, so
-    the piped worker's standing against the FastCGI arms (hazards 22, 23, 25, 27) is at least as good
-    as those figures say. The `/`-endpoint figures in this repository are unaffected: same arms, same
-    host, and the response is small enough that the write fits the first segment.
+    Corrected consequence: **loopback TCP and a unix socket are now equivalent** (1.238 vs
+    1.219 ms, ~1.5%), so `socket = "unix:..."` (hazard 26) is worth keeping for tidiness and
+    for Windows-absent deployments rather than for speed. Any FastCGI measurement taken
+    over TCP before this fix understates its arm, so the piped worker's standing against the
+    FastCGI arms (hazards 22, 23, 25, 27) is at least as good as those figures say.
+
+    ---
+
+    The three wrong answers, kept because each was plausible and each was refuted by a
+    measurement rather than by argument:
+
+    **Wrong answer 1 — "loopback TCP costs 29x".** A single wrk connection per arm showed T
+    collapsing to 198–281 rps against U's 8,107. Reported as a real transport cost. It was an
+    artifact: **one wrk connection lands on one pool slot**, so that slot serialises while the
+    other eleven — and the aggregate rate — are unaffected. The column measured one slot. The
+    same artifact is what made the sweep show T at 281 rps on `/items` while sequential latency
+    on a *single* connection showed 42 ms: both were one slot, one of them while 12 were
+    saturated around it.
+
+    **Wrong answer 2 — "it is delayed ACK, from php-cgi setting `TCP_NODELAY` late".** Half
+    right, for entirely the wrong reason. The claim was that php-cgi sets the flag only *after*
+    `fcgi_accept_request` reads the request, so stokehold's writes fall in a Nagle-eligible
+    window. Reading the guard at line 1088 shows the flag is never set on Linux at all, so the
+    window never closes rather than closing late. The conclusion happened to be delayed ACK;
+    the reasoning was refuted by source.
+
+    **Wrong answer 3 — "the 8-segment write".** `tcpdump` showed stokehold sending each request
+    as 8 TCP segments, one per 8-byte record header, against nginx's 1–2. That was real and was
+    fixed (`Client::send` assembles in a reused buffer and writes once), and it measured
+    **1.572 -> 1.509 ms, about 4%** — genuine, and not the cause. It also produced the second
+    measurement above (13% on `/items`, 1% on `/`, *identical* with fresh connections), all of
+    which was consistent with a 4% fix and none of which would have found a 40 ms timer,
+    because a reused connection with one outstanding response is precisely the shape that the
+    stall distorts least obviously.
+
+    The lesson worth keeping from all three: **a number that is suspiciously round in wall
+    time is a timer, not a rate.** 42 ms is 40 ms of kernel timer plus ~2 ms of work. Looking
+    for the timer first would have skipped all of the above.
+
+31. **The warm model's advantage is real at concurrency 1-2 and gone by 16, and the crossover
+    is the shape of the answer — not a single ratio.** Hazard 28 established that a resident
+    worker beats a per-request boot by a multiple per request; hazard 30's bug made the cold
+    arms look worse still. Neither answered the question a deployment faces: *at what load*.
+
+    The two existing measurements were at the two extremes. `latency.php` holds concurrency at
+    1, where a cold arm pays its whole framework boot with nothing to overlap it. A wrk sweep
+    holds it at the slot count, where that boot is overlapped by eleven other requests and
+    vanishes from the aggregate rate. So the same pair of servers reads as **2.07x** and
+    **1.00x** depending on which one is asked, and both are correct.
+
+    `scripts/crossover.php` measures the middle: N closed-loop clients, one process each, each
+    running the same blocking request loop `latency.php` uses. `/items`, median of 3 runs x 500
+    iterations per client, ms:
+
+    | conc | P stokehold | R RoadRunner | F php-fpm | U stokehold unix | T stokehold TCP |
+    |---|---|---|---|---|---|
+    | 1 | 0.613 | 0.599 | 1.213 | 1.445 | 1.497 |
+    | 2 | 0.617 | 0.601 | 1.198 | 1.326 | 1.317 |
+    | 4 | 0.676 | 0.634 | 1.240 | 1.348 | 1.334 |
+    | 8 | 0.793 | 0.741 | 1.401 | 1.590 | 1.607 |
+    | 12 | 0.917 | 0.839 | 1.497 | 1.884 | 1.892 |
+    | 16 | 1.008 | 0.945 | 1.823 | 2.118 | 2.094 |
+
+    Three things worth keeping:
+
+    - **The advantage does not cross over.** It shrinks from 1.98x at concurrency 1 to 1.63x at
+      16 and is still 1.63x there. It shrinks faster than "queueing catches up" would explain,
+      and the reason is that it is the *cold* arm that starts queueing first: php-fpm has 12
+      children and each is busy for 1.2 ms of real work, so its 12 slots saturate at ~10,000
+      rps, while stokehold's warm worker does 0.6 ms of work per request and reaches ~20,000.
+      Past 12 the cold arm is queueing and the warm arm is not, so the gap should *widen*; it
+      narrows only because the client cannot push enough load — see the caveat.
+    - **The two transports are the same**, now that hazard 30 is fixed: T and U agree to 3% at
+      every concurrency. That is the clean answer to hazard 23's original question.
+    - **P and R agree to 10%**, two independent servers on the same model, which is what makes
+      the warm half of the table credible.
+
+    **Caveat, stated rather than hidden:** past concurrency 12 the *client* is the limit. All N
+    client processes share the same 12 cores as the servers, and every measured latency rises
+    roughly linearly with N for every arm — including two warm arms that have no boot to pay.
+    So the absolute values above 12 are not trustworthy; only the ratio between arms at the same
+    concurrency is, and even that is muddied once clients steal scheduled time from server slots.
+    A second machine to generate load is the fix, and it is not available here.
+
+    Also worth recording: the first version of this measurement was wrong in exactly the way
+    this project keeps being wrong. Driving N handles from one process with `curl_multi`, it
+    reported concurrency 2 as *exactly* twice the latency of concurrency 1, on three unrelated
+    servers, with throughput flat between them — which no real server does. Two client bugs:
+    `curl_getinfo` read after `curl_multi_remove_handle` (every status 0), and
+    `curl_multi_select($multi, 0.05)` whose timeout is 50 **milliseconds**, a retry floor that
+    cost 1,516 rps where `wrk` got 3,211 at concurrency 2. A hand-tuned timeout would have
+    fixed it; running N processes and using the already-validated blocking loop removes the
+    class of bug instead. Validated against `latency.php` at concurrency 1: 0.616 ms against
+    0.617 ms.
+
+32. **The cold model wastes about a third of the machine, and that — not the transport and not
+    the SAPI — is what the warm model's advantage actually is.** A saturated run was observed
+    using only ~84% of the 12 cores, with twelve php-cgi children at ~72% each. The obvious
+    explanation is wrong: it is not the pool size. Raising `workers` from 12 to 24 to 36 at
+    concurrency 32 left throughput flat and slightly lower (7,634 / 7,738 / 7,250 rps), so the
+    children were never the limit.
+
+    Measuring CPU per request explains it exactly:
+
+    | arm | rps @ conc 32 | cores used | % of 12 | **CPU per request** |
+    |---|---|---|---|---|
+    | P worker (warm) | 15,563 | 10.37 | 86% | 666 us |
+    | T spawn_cgi (cold) | 7,900 | 8.40 | 70% | **1,063 us** |
+
+    Both numbers close arithmetically: `15,563 x 666 us = 10.37 cores` and
+    `7,900 x 1,063 us = 8.40 cores`. So the per-request model costs ~1.06 ms of CPU per request
+    against ~0.67 ms, a ratio of 1.60 — and since the cold arm's own 1.06 ms is its *entire*
+    budget, it cannot be run faster by adding workers. It is not idle capacity waiting to be
+    used; it is the cost of booting PHP and the framework per request.
+
+    The idle 16% is the other half of the same story. `php-cgi` is single-threaded and its
+    request cycle is not all CPU: some of it is waiting on its own socket for the next request.
+    Twelve such processes leave a core or two unscheduled, and no amount of concurrency fixes
+    that, because concurrency is bounded by the 12 children — a php-cgi child serves one request
+    at a time. This is a structural property of the cold model, and it is a clean, measurable one:
+    **the cold model has a duty cycle, and its ceiling is the pool size times that duty cycle.**
+
+    Which makes the deployment-model result a CPU-efficiency result. The warm model wins because
+    it does less work per request, not because it waits less. That also explains why the advantage
+    survives to concurrency 16 in hazard 31: the cold arm saturates its cores at ~7,500 rps while
+    the warm arm reaches 15,500, so the warm arm is further from its own ceiling at every
+    concurrency.
 
 ## 6. Phases
 

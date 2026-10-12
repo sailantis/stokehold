@@ -580,6 +580,7 @@ dependencies = [
 name = "stokehold-fcgi"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "stokehold-core",
  "thiserror",
  "tracing",

@@ -18,6 +18,49 @@ pub enum Stream {
     Unix(std::os::unix::net::UnixStream),
 }
 
+/// Ask the kernel to stop delaying this connection's ACKs.
+///
+/// A Linux `php-cgi` child never sets `TCP_NODELAY`. `main/fastcgi.c` guards that
+/// call with `req->keep && req->tcp`, and `req->tcp` is assigned only under
+/// `#ifdef _WIN32` (line 897), so on Linux it keeps the zero `calloc` gave it and
+/// the call is never reached. The child therefore runs with **Nagle enabled**.
+///
+/// That only matters because php-cgi flushes in 8 KiB chunks (`out_buf[1024*8]`).
+/// A response larger than 8 KiB leaves a short final segment, and Nagle withholds
+/// it until the previous data is acknowledged. The `FCGI_KEEP_CONN` connection stays
+/// open, so Linux's ACK is a delayed ACK — 40 ms on this host. Because the withheld
+/// tail is still outstanding when the *next* request begins, the stall is not a
+/// one-off: it repeats for every request on that connection, and it is the reason a
+/// 12 KB page measured a flat 42.0 ms per request over loopback TCP against 1.2 ms
+/// over a unix socket.
+///
+/// `TCP_QUICKACK` is the receiver's lever: it disables delayed ACKs for the bytes
+/// that follow, so the withheld segment is released at once. The kernel resets the
+/// flag after it has been used (and after every `recv`), so it has to be re-armed
+/// before each read rather than set once at connect time — see [`Stream::read`].
+///
+/// It takes effect from the *next* read, so arming it before reading a response is
+/// timely: the ACKs being delayed are exactly the ones that read will generate.
+///
+/// A failure is not actionable — a non-TCP socket or a kernel without the option
+/// reports `EINVAL` — and it is deliberately ignored rather than turned into a
+/// request failure: correct delivery never depended on this, only latency.
+#[cfg(target_os = "linux")]
+fn arm_immediate_ack(fd: std::os::fd::RawFd) {
+    // SAFETY: `fd` is an open socket owned by the caller for the duration of this
+    // call, and `TCP_QUICKACK` takes an `int` argument, which is what is passed.
+    unsafe {
+        let one: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            std::ptr::addr_of!(one).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 /// A parsed backend address: either `host:port` or `unix:/path`.
 ///
 /// The `Unix` variant only exists where unix sockets do, so no code path can
@@ -86,7 +129,10 @@ impl Endpoint {
                 stream.set_read_timeout(timeout)?;
                 stream.set_write_timeout(timeout)?;
                 // FastCGI requests are small and latency-sensitive; Nagle only
-                // adds delay to the header/PARAMS/STDIN sequence.
+                // adds delay to the header/PARAMS/STDIN sequence. This is our own
+                // sending side. The receiving side needs the other half of the
+                // pair — see `arm_immediate_ack` for why, and for what a Linux
+                // php-cgi backend does instead.
                 let _ = stream.set_nodelay(true);
                 Ok(Stream::Tcp(stream))
             }
@@ -112,6 +158,14 @@ fn resolve(spec: &str) -> Result<SocketAddr> {
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Re-armed per read on purpose: the kernel clears `TCP_QUICKACK` after using
+        // it (and after every `recv`), so a single call at connect time would cover
+        // only the first response. See `arm_immediate_ack` for why this matters.
+        #[cfg(target_os = "linux")]
+        if let Stream::Tcp(stream) = self {
+            use std::os::fd::AsRawFd;
+            arm_immediate_ack(stream.as_raw_fd());
+        }
         match self {
             Stream::Tcp(stream) => stream.read(buf),
             #[cfg(unix)]
@@ -199,5 +253,77 @@ mod tests {
         // Port 1 on loopback is not listening; this must be an error, not a panic.
         let endpoint = Endpoint::Tcp("127.0.0.1:1".to_string());
         assert!(endpoint.connect(Some(Duration::from_millis(200))).is_err());
+    }
+
+    /// The option has to be accepted by a real TCP socket, and by a unix socket too.
+    ///
+    /// This does not prove the effect — `getsockopt(TCP_QUICKACK)` reads 1 both before
+    /// and after setting it, because it reports the negation of the kernel's
+    /// `icsk_ack.pingpong` and that is already 0 on a fresh socket either way. What it
+    /// does cover is the mistake that would otherwise fail silently: a wrong option
+    /// number, a wrong level, or a wrong argument size, all of which the kernel rejects
+    /// with `EINVAL` and which `arm_immediate_ack` deliberately ignores. A `setsockopt`
+    /// that returns -1 is invisible at every call site, so it is checked here instead.
+    ///
+    /// The effect itself is verified by measurement, not by a unit test: see hazard 30
+    /// in `docs/plan.md` for the 42.005 ms -> 1.238 ms before/after on a real php-cgi.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_immediate_ack_option_is_accepted_by_a_real_socket() {
+        use std::os::fd::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        for (name, fd) in [("client", client.as_raw_fd()), ("server", server.as_raw_fd())] {
+            let one: libc::c_int = 1;
+            // SAFETY: both descriptors are open for the duration of the call, and
+            // `TCP_QUICKACK` takes an `int` argument, which is what is passed.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_QUICKACK,
+                    std::ptr::addr_of!(one).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "TCP_QUICKACK was rejected on the {name} socket: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // And a unix socket must not be handed a TCP-level option: the arm function is
+        // only called for `Stream::Tcp`, but proving `EINVAL` here is what keeps that
+        // guard honest if the match arm is ever widened.
+        let dir = std::env::temp_dir().join(format!("stokehold-qa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("s.sock");
+        let bound = std::os::unix::net::UnixListener::bind(&path).expect("bind unix");
+        let _peer = std::os::unix::net::UnixStream::connect(&path).expect("connect unix");
+        let (accepted, _) = bound.accept().expect("accept unix");
+        let one: libc::c_int = 1;
+        // SAFETY: as above; the descriptor is open and the argument is an `int`.
+        let rc = unsafe {
+            libc::setsockopt(
+                accepted.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                std::ptr::addr_of!(one).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_ne!(
+            rc, 0,
+            "a unix socket must reject a TCP-level option; if this ever succeeds, the \
+             Stream::Tcp guard in arm_immediate_ack is not doing anything"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

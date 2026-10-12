@@ -11,3 +11,9 @@ repository.workspace = true
 stokehold-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+# `TCP_QUICKACK` has no wrapper in std, and it is a Linux-only option: it is the
+# receiver-side half of the Nagle/delayed-ACK interaction documented on
+# `Stream::arm_immediate_ack`. Nothing else here needs libc.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

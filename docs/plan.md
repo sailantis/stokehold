@@ -693,28 +693,35 @@ against the specification and secondary implementations, and are confirmed by fi
     running the same blocking request loop `latency.php` uses. `/items`, median of 3 runs x 500
     iterations per client, ms:
 
-    | conc | P stokehold | R RoadRunner | F php-fpm | U stokehold unix | T stokehold TCP |
-    |---|---|---|---|---|---|
-    | 1 | 0.613 | 0.599 | 1.213 | 1.445 | 1.497 |
-    | 2 | 0.617 | 0.601 | 1.198 | 1.326 | 1.317 |
-    | 4 | 0.676 | 0.634 | 1.240 | 1.348 | 1.334 |
-    | 8 | 0.793 | 0.741 | 1.401 | 1.590 | 1.607 |
-    | 12 | 0.917 | 0.839 | 1.497 | 1.884 | 1.892 |
-    | 16 | 1.008 | 0.945 | 1.823 | 2.118 | 2.094 |
+    | conc | P stokehold | R RoadRunner | F php-fpm | U stokehold unix | T stokehold TCP | R/F |
+    |---|---|---|---|---|---|---|
+    | 1 | 0.645 | 0.595 | 1.240 | 1.464 | 1.490 | **2.08x** |
+    | 2 | 0.646 | 0.580 | 1.177 | 1.348 | 1.381 | 2.03x |
+    | 4 | 0.672 | 0.616 | 1.231 | 1.358 | 1.370 | 2.00x |
+    | 8 | 0.786 | 0.720 | 1.377 | 1.595 | 1.556 | 1.91x |
+    | 12 | 0.931 | 0.802 | 1.528 | 1.895 | 1.910 | 1.91x |
+    | 16 | 1.019 | 0.937 | 1.864 | 2.111 | 2.086 | **1.99x** |
 
     Three things worth keeping:
 
-    - **The advantage does not cross over.** It shrinks from 1.98x at concurrency 1 to 1.63x at
-      16 and is still 1.63x there. It shrinks faster than "queueing catches up" would explain,
-      and the reason is that it is the *cold* arm that starts queueing first: php-fpm has 12
-      children and each is busy for 1.2 ms of real work, so its 12 slots saturate at ~10,000
-      rps, while stokehold's warm worker does 0.6 ms of work per request and reaches ~20,000.
-      Past 12 the cold arm is queueing and the warm arm is not, so the gap should *widen*; it
-      narrows only because the client cannot push enough load — see the caveat.
+    - **The advantage does not cross over.** It is ~2.0x at concurrency 1 and still ~2.0x at
+      concurrency 16, dipping to ~1.9x in between and returning. So on this application and
+      this host there is no concurrency at which the cold model catches up, and the "crossover"
+      is better described as flat. That is the opposite of the intuition that a per-request boot
+      must eventually be hidden by concurrency, and the reason is in hazard 32: the cold arm
+      saturates its CPU budget at ~8,500 rps while the warm arm reaches ~16,000, so the cold arm
+      is *already* the one queuing and the gap has no reason to close.
     - **The two transports are the same**, now that hazard 30 is fixed: T and U agree to 3% at
-      every concurrency. That is the clean answer to hazard 23's original question.
+      every concurrency, and this is the clean answer to hazard 23's original question.
     - **P and R agree to 10%**, two independent servers on the same model, which is what makes
       the warm half of the table credible.
+
+    The same pass on `/` gives a flat ~1.5x (P/F) and ~1.64x (R/F) at every concurrency. Note
+    that the *absolute* cold-arm penalty is much larger on `/items` (0.58 ms) than on `/`
+    (0.18 ms), which is more than a constant boot would explain: the cold arm appears to pay
+    in proportion to what the request touches, plausibly because autoloading and lazy class
+    resolution follow the code path. That is an inference from the numbers, not a measurement,
+    and it is recorded as such.
 
     **Caveat, stated rather than hidden:** past concurrency 12 the *client* is the limit. All N
     client processes share the same 12 cores as the servers, and every measured latency rises

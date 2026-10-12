@@ -1050,10 +1050,13 @@ against the specification and secondary implementations, and are confirmed by fi
       here. The channel is half-duplex: the worker answers only once the request is complete, so
       a frame left in the buffer is a deadlock, not a latency win. Nothing had to be added; the
       flush was already there for its own reasons.
-    - **A full buffer cannot deadlock a body.** `MAX_BODY_CHUNK` is 64 KiB and the buffer is
-      8 KiB, which looks alarming until you check the order: the reader drains the worker's
-      output while the writer is still filling stdin, so the child's stdout cannot block. The
-      writer flushes when the buffer fills, so a chunk larger than the buffer is not lost.
+    - **A buffer smaller than a body chunk neither deadlocks nor loses bytes.** `MAX_BODY_CHUNK`
+      is 64 KiB and the buffer is 8 KiB, which looks alarming. It is fine for two reasons, and
+      neither is that the reader drains concurrently — the exchange thread sends and then
+      receives, sequentially: `BufWriter` flushes when the buffer fills, so every byte of a
+      64 KiB chunk is written; and the worker reads a whole request before it answers anything,
+      which the protocol and the PHP SDK both require, so its stdin is being consumed while the
+      client writes and the client never blocks.
 
     **The `BoundedChannel` name is a misnomer** and should probably be `PipedChannel` or
     `BufferedChannel`; it reads like it is about a bounded queue, which is a different thing this

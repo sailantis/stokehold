@@ -7,10 +7,15 @@
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use stokehold_core::config::{BackendConfig, Config, ExternalConfig, ServerConfig};
-use stokehold_fcgi::{build_params, Request, RequestInfo, Routing};
+use stokehold_fcgi::{
+    build_params, read_record, write_records, EndRequest, RecordType, Request, RequestInfo, Routing,
+    Stream, REQUEST_ID,
+};
 use stokehold_server::Dispatcher;
 
 mod common;
@@ -58,6 +63,74 @@ impl Drop for ExternalServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// A FastCGI server that answers every connection at once, with nothing to
+/// serialise on.
+///
+/// The `spawn_cgi` stand-in used by the other tests is a real `php-cgi -b`, and a
+/// single Linux `php-cgi` serves its connections **one at a time** however many
+/// are open: it takes the second request on the connection it is already holding,
+/// because the client asked for keep-alive (`PHP_FCGI_CHILDREN` is read only in the
+/// Windows branch of `sapi/cgi/cgi_main.c`, so there is no child pool to distribute
+/// to). A *real* `php-fpm` is a master over a child pool and answers as many at
+/// once as `pm.max_children` allows, which is the thing `ClientPool` exists for —
+/// so an `external` backend pointed at a lone `php-cgi` is a test fixture that
+/// cannot exhibit the property under test.
+///
+/// This server can. It accepts, reads a request, sleeps, and replies, all in a
+/// thread per connection, and it deliberately does **not** honour keep-alive: one
+/// request per connection, then close. That is a stricter backend than `php-fpm`
+/// (which is happy to be reused) and it keeps the assertion about the pool rather
+/// than about the protocol.
+struct ConcurrentServer {
+    port: u16,
+}
+
+impl ConcurrentServer {
+    fn start(sleep: Duration) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
+        let port = listener.local_addr().expect("address").port();
+
+        thread::spawn(move || {
+            let mut workers = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                workers.push(thread::spawn(move || {
+                    serve_once(Stream::Tcp(stream), sleep)
+                }));
+            }
+        });
+
+        ConcurrentServer { port }
+    }
+
+    fn socket(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+}
+
+/// Read one FastCGI request and answer it, sleeping first to widen the window in
+/// which the pool's concurrency is observable.
+fn serve_once(stream: Stream, sleep: Duration) {
+    let mut stream = stream;
+
+    // BEGIN_REQUEST, PARAMS, PARAMS-terminator, STDIN, STDIN-terminator.
+    for _ in 0..5 {
+        match read_record(&mut stream) {
+            Ok(Some(_)) => {}
+            _ => return,
+        }
+    }
+
+    thread::sleep(sleep);
+
+    let body = b"Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nCONCURRENT";
+    if write_records(&mut stream, RecordType::Stdout, REQUEST_ID, body, true).is_err() {
+        return;
+    }
+    let end = EndRequest::complete();
+    let _ = write_records(&mut stream, RecordType::EndRequest, REQUEST_ID, &end.encode(), false);
 }
 
 fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
@@ -261,10 +334,6 @@ fn a_socket_that_is_not_listening_fails_the_request_not_the_startup() {
 #[test]
 fn concurrent_requests_reach_the_backend_at_the_same_time() {
     let _serial = serial();
-    let Some(binary) = find_php_cgi() else {
-        eprintln!("skipping: no php-cgi on PATH");
-        return;
-    };
 
     // The regression test for `docs/plan.md` hazard 22. The backend used to hold
     // one `Mutex<Option<Client>>` for the whole request, so a pool of any size
@@ -273,57 +342,69 @@ fn concurrent_requests_reach_the_backend_at_the_same_time() {
     // succeeds and every response is correct — so the assertion has to be about
     // *time*, not about correctness.
     //
+    // The backend is `ConcurrentServer` rather than a real `php-cgi`, which is the
+    // correction this test needed. A lone Linux `php-cgi` serves one connection at
+    // a time, so it serialises four requests no matter how good the pool is, and it
+    // blocks forever on the second request if the first connection is kept alive —
+    // on this host the test did not fail, it *hung*. Measured on the VM: one
+    // request passes in 0.3 s, two hang past 60 s, and the threads sit in `recv`
+    // inside `Stream::read` with no timeout set.
+    //
     // Four requests that each sleep 300 ms must finish in about one sleep, not
     // four. The bound is deliberately loose (1 s rather than 400 ms) because this
     // is not a benchmark: it only has to separate "at the same time" from "one
     // after another", and 1.2 s of serialisation is unambiguous.
     const REQUESTS: usize = 4;
-    const SLEEP_US: u64 = 300_000;
+    const SLEEP: Duration = Duration::from_millis(300);
 
-    let root = std::env::temp_dir().join(format!("stokehold-concurrent-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("create the document root");
-    write_script(
-        &root,
-        "index.php",
-        &format!(
-            "<?php $body = file_get_contents(\"php://input\"); usleep({SLEEP_US}); \
-             echo \"S=\"; echo $body;"
-        ),
-    );
-
-    let server = ExternalServer::start(&binary);
-    let dispatcher = dispatcher_for(&server.socket(), &root);
+    let server = ConcurrentServer::start(SLEEP);
+    let dispatcher = dispatcher_for(&server.socket(), std::env::temp_dir().as_path());
 
     let started = Instant::now();
+    let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..REQUESTS)
-            .map(|index| {
-                let dispatcher = &dispatcher;
-                let root = &root;
-                scope.spawn(move || {
-                    let marker = format!("c{index}");
-                    let response = dispatcher
-                        .dispatch(&request_for(root, &marker))
-                        .unwrap_or_else(|err| panic!("request {index} failed: {err}"));
-                    response.check_protocol().expect("completed");
-                    let stdout = String::from_utf8_lossy(&response.stdout);
-                    assert!(stdout.contains(&format!("S={marker}")), "{stdout:?}");
-                })
-            })
-            .collect();
-        for handle in handles {
-            handle.join().expect("no request thread panicked");
+        for index in 0..REQUESTS {
+            let tx = tx.clone();
+            let dispatcher = &dispatcher;
+            scope.spawn(move || {
+                let mut info = RequestInfo {
+                    method: "POST".to_string(),
+                    uri: "/".to_string(),
+                    ..RequestInfo::default()
+                };
+                let body = format!("c{index}").into_bytes();
+                info.body_len = body.len();
+                let request = Request {
+                    params: build_params(&info, &Routing::default()).expect("params build"),
+                    body,
+                    keep_conn: true,
+                };
+                let outcome = dispatcher
+                    .dispatch(&request)
+                    .map(|response| String::from_utf8_lossy(&response.stdout).to_string())
+                    .map_err(|err| err.to_string());
+                let _ = tx.send(outcome);
+            });
+        }
+        drop(tx);
+
+        // Bounded, so a regression reports rather than waits. The original version
+        // of this test hung for 17 minutes on the VM instead of failing, which is
+        // how a real defect stayed invisible.
+        for _ in 0..REQUESTS {
+            let body = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("every request was answered within 5s")
+                .expect("every request was answered");
+            assert!(body.contains("CONCURRENT"), "{body:?}");
         }
     });
-    let elapsed = started.elapsed();
+    let done = started.elapsed();
 
-    let serial = Duration::from_micros(SLEEP_US) * REQUESTS as u32;
+    let serial = SLEEP * REQUESTS as u32;
     assert!(
-        elapsed < Duration::from_secs(1),
-        "{REQUESTS} concurrent requests took {elapsed:?}, which is close to the \
+        done < Duration::from_secs(1),
+        "{REQUESTS} concurrent requests took {done:?}, which is close to the \
          {serial:?} they would take if they were serialised on one connection"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }

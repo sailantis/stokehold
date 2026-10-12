@@ -885,9 +885,24 @@ socket = "unix:/run/stokehold/cgi"
     fn a_socket_path_that_only_fits_before_the_suffix_is_rejected() {
         // 107 is the portable `sun_path` maximum; the check must account for the
         // `.<slot>.sock` the pool appends, or slot 0 binds and slot 11 fails.
-        let fits = format!("unix:{}", "a".repeat(UNIX_SOCKET_PATH_MAX - "..sock".len() - 1));
-        let too_long = format!("unix:{}", "a".repeat(UNIX_SOCKET_PATH_MAX));
+        //
+        // The paths have to be absolute, or they never reach the length check —
+        // they are rejected as relative first, and a test that exercises the
+        // length rule has to get past that. The leading `/` is part of the path
+        // like any other byte.
+        let suffix = ".".len() + 10 + ".sock".len();
+        let fits = format!("unix:/{}", "a".repeat(UNIX_SOCKET_PATH_MAX - suffix - 1));
+        let too_long = format!("unix:/{}", "a".repeat(UNIX_SOCKET_PATH_MAX));
+
         if cfg!(unix) {
+            // The boundary in both directions. `fits` is exactly the longest
+            // prefix that still leaves room for a worst-case slot suffix, so one
+            // byte more must be rejected.
+            assert_eq!(
+                fits.len() - "unix:".len() + suffix,
+                UNIX_SOCKET_PATH_MAX,
+                "the `fits` fixture must sit exactly on the boundary"
+            );
             validate_cgi_socket(&fits).expect("a path with room for the suffix is accepted");
             assert!(
                 validate_cgi_socket(&too_long).is_err(),

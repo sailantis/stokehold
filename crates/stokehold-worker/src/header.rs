@@ -267,6 +267,11 @@ impl Header {
         // the alternative on stable Rust is reading into uninitialised storage
         // through `MaybeUninit`, and the profile shows this cost is not visible
         // next to the checksum. The checksum is the one that was worth removing.
+        //
+        // [`Header::read_into`] avoids the `memset` without `MaybeUninit`, by
+        // reusing a buffer whose tail is already initialised — so a caller that
+        // expects more frames should prefer it. This one stays for a caller that
+        // wants one owned payload and has no buffer to lend.
         let mut payload = vec![0u8; len];
         if let Err(source) = reader.read_exact(&mut payload) {
             if source.kind() == std::io::ErrorKind::UnexpectedEof {

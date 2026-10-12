@@ -23,9 +23,15 @@
 //!
 //! # What is deliberately not here
 //!
-//! TLS, HTTP/2 over TLS (ALPN) and HTTP/3. `hyper` handles HTTP/1.1 and HTTP/2
-//! over plaintext, including the prior-knowledge and `Upgrade` cases
-//! `hyper_util::server::conn::auto` negotiates. TLS is step 23, and HTTP/3 is
+//! TLS, HTTP/2 over TLS (ALPN) and HTTP/3. `hyper` handles HTTP/1.1 and,
+//! over plaintext, HTTP/2 negotiated by the **prior-knowledge** path — a client
+//! that opens with the connection preface. The **`Upgrade: h2c`** path does
+//! *not* work here, and that is a property of this crate rather than of
+//! `hyper`: upgrade-capable serving needs
+//! `hyper_util::server::conn::auto::Builder::serve_connection_with_upgrades`,
+//! and [`listener`] calls plain `serve_connection`, so a client that offers
+//! `Upgrade: h2c` is answered in HTTP/1.1 with no `101`. Verified by hand;
+//! the crate doc used to claim both paths. TLS is step 24, and HTTP/3 is
 //! `quinn` plus `h3`, not `hyper`.
 
 pub mod error;

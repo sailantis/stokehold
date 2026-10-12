@@ -1448,8 +1448,16 @@ Phase 5 — worker pool
     correlation, drain/shutdown, recycle on RSS threshold.
 
 Phase 6 — front-ends
-18. `fastcgi-frontend` — accept FastCGI from nginx, translate to the selected backend, re-frame
-    the response, pass-through fast path.
+18. `fastcgi-frontend` — **done**, in `crates/stokehold-server/src/frontend/`. Accepts FastCGI
+    from nginx, translates it into the same `Dispatcher` the HTTP front-end calls, and re-frames
+    the response, with a pass-through fast path for a record it can forward unchanged. It is
+    wired in `stokehold-cli`'s `serve` alongside the HTTP listener: the FastCGI listener owns the
+    calling thread while HTTP runs on its own, so both are served concurrently, and `serve` binds
+    FastCGI first because binding is synchronous while the HTTP listener is not. `server.fastcgi`
+    unset means disabled. `tests/frontend.rs` drives a real request through the whole chain and
+    asserts the bytes come back intact, alongside the several-in-a-row, 502-on-backend-failure,
+    real-socket codec and build-from-parser cases. **This step was implemented but the plan never
+    said so** — it read as unbuilt until this line was corrected.
 19. `http-frontend` — **done**, in `crates/stokehold-http`: a `hyper` listener speaking HTTP/1.1
     and HTTP/2 over the same dispatcher as the FastCGI front-end, with route → backend selection
     and the 404/403/413/502/503/504 mappings. This is the project's only async code, and the
@@ -1552,6 +1560,26 @@ these repositories. Nothing in it was lost — the two things it knew that no re
 the name research and the open steps below — but it cannot be re-read, so this section replaces
 it.
 
+**Everything in this section is committed and pushed, so this file is the whole answer to "where
+do I read the state of the work from the other machine".** Nothing important lives in a session
+folder, and nothing here needs the chat to interpret. The four places to look, in order:
+
+1. **This section** — the current build, the open decisions, and the list of what is built.
+2. **The step list above** (Phase 0–7) — which steps are done; steps 18, 19, 20 and 21 carry a
+   **done** marker and the rest say what is still open. Step 18 was implemented long before the
+   plan said so; that marker is now corrected.
+3. **"What actually works today"** below — the same question asked of a running binary, per
+   capability, with the probe that established it. This is the section that answers "does it do
+   HTTP/2 / SSL yet" without reading code.
+4. **The hazards** — numbered findings under "Operational hazards to build in from the start"
+   and after it, each one a measured result with its controls. Hazards 45–49 are the Windows
+   transport and FastCGI work.
+
+The raw evidence for the benchmark claims is **not** here: it is committed to
+`stokehold-competition` as `results/raw-*.tsv`, alongside that repo's README, which carries the
+conclusions. Anything measured on this host that is not in one of those two files did not
+happen.
+
 ### The published benchmark predates the current build
 
 `stokehold-competition/results/report.md` names its build as **`841c963`** (14:48). The
@@ -1614,16 +1642,63 @@ Windows — is **answered** in hazard 47: yes, by platform, with a startup hint 
 shape it breaks. What remains genuinely open from that work is only the
 `stokehold-competition` lock question below.
 
-### The published Windows latency claim is not committed
+Two items were raised in that same stretch and are recorded here rather than left in a chat:
+**the crate doc's `Upgrade` claim is now corrected** (see "What actually works today"), and
+**an NTS Windows build is the outstanding experiment** (same section) — it is the only way to
+separate the ZTS confound from the platform effect in hazard 49, and it needs a host that is
+genuinely idle, so it waits for one.
+
+### What actually works today
+
+The step list above is the *design* order and it says which steps are built; this is the same
+question asked of a running binary. Probed by hand against `0.1.0` with a `spawn_cgi` backend and
+static files on, because "the front-end speaks HTTP/2" is a claim worth confirming rather than
+reading out of a crate description.
+
+| capability | state | how it was checked |
+| --- | --- | --- |
+| HTTP/1.1 | **works** | `GET`/`HEAD`/`OPTIONS` on a static file, 200 with the right `content-type` |
+| HTTP/2 cleartext, **prior knowledge** | **works** | `curl --http2-prior-knowledge` reports HTTP/2 and answers `HTTP/2 200`; a hand-built preface + empty SETTINGS gets a real SETTINGS frame back |
+| HTTP/2 cleartext, **`Upgrade: h2c`** | **does not work** | a client offering `Upgrade: h2c` is answered **HTTP/1.1 200** with no `101` |
+| TLS / HTTPS | **does not work** | a TLS handshake to the HTTP port fails; there is **no** `rustls`, `openssl` or `native-tls` dependency in any `Cargo.toml`, and no `tls`/`cert` key in the config model |
+| HTTP/3 | **does not exist** | needs `quinn` + `h3`; step 24 |
+| FastCGI front-end | **works** | `crates/stokehold-server/src/frontend/`, wired into `serve`, 5 tests in `tests/frontend.rs` |
+| `/index.php` is executed, not disclosed | **works** | the body is the script's output, not its source |
+| static: `ETag` → 304 | **works** | the `etag` header echoed back as `If-None-Match` answers 304 |
+| static: `If-Modified-Since` → 304 | **works** | 304 with the file's own `last-modified` |
+| static: `Range` → 206, unsatifiable → 416 | **works** | `bytes=0-4` gives `206` and `stati`; `bytes=99-` gives 416 |
+| static: `If-Range` | **works** | a matching validator gives 206, a stale one gives the full 200 — which is what RFC 9110 asks for |
+| static: multi-range | **works** | `bytes=0-2,4-6` answers 206 `multipart/byteranges; boundary=stokehold-boundary` |
+| static: dotfile denial, directory redirect | **works** | `/.env` → 404; `/docs` → 301 to `/docs/`, then the index |
+| static: no traversal escape | **works** | `/../secret.txt`, `/..%2fsecret.txt`, `/%2e%2e/secret.txt` and `/....//secret.txt` all fail to reach a file outside the document root — the encoded ones are treated as *names that do not exist*, not decoded into segments |
+
+**The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
+`hyper-util`'s `auto::Builder` handles the upgrade case only through
+`serve_connection_with_upgrades`; [`listener`](../crates/stokehold-http/src/listener.rs) calls
+plain `serve_connection`, so the offer is never honoured. The crate doc at
+`crates/stokehold-http/src/lib.rs` used to claim `auto` negotiates "the prior-knowledge and
+`Upgrade` cases" — the prior-knowledge half is true and measured, the `Upgrade` half is not, and
+the doc now says so. Prior knowledge is what a real reverse proxy uses for h2c, so the practical
+loss is small; a browser-facing listener would carry HTTP/2 over ALPN instead, which arrives with
+step 24.
+
+**There is no HTTP/2 test anywhere in the repository.** `stokehold version` has printed
+"HTTP/2 (cleartext)" since step 19, and the evidence for it is the probe above rather than a
+test — so a `hyper` upgrade that changed the negotiation would be caught by nothing. A test that
+sends the preface and asserts a SETTINGS frame comes back (and one asserting the upgrade offer
+*stays* HTTP/1.1, so the gap is a decision rather than an accident) is the obvious small
+addition; it is not in this session's scope.
+
+### The published Windows latency claim **is** now committed
 
 Hazard 46's 21× figure (pipe 15.24 ms against socket 0.72 ms median on `/items`, 9 runs of 1000
-requests each, ranges disjoint) survives in this plan and in the competition README, but the 18
-raw rows were deleted with the scratch directory the run used and were never committed.
-`stokehold-competition/.gitignore` whitelists `results/raw.tsv`, `results/crossover.tsv`,
-`results/latency.tsv` and `results/raw-*.tsv`; a Windows run would be the last of those,
-`results/raw-windows.tsv`. Re-running the two arms and committing the rows would make the claim
-reproducible from the repository alone, which is what every other published number in that repo
-is. Until then the figure is evidence, not an artefact.
+requests each, ranges disjoint) survives in this plan and in the competition README, and as of
+hazard 48 the raw rows behind it **are** committed — as
+`stokehold-competition/results/raw-windows-279dc35.tsv`, 70 rows (`P` = socket, `Pp` = pipe), plus
+`results/raw-windows-fcgi-279dc35.tsv` for hazard 49's 27 interleaved rows. Both match the
+`!results/raw-*.tsv` whitelist in that repo's `.gitignore`. Earlier text here predicted the
+filename would be `results/raw-windows.tsv` and called the claim uncommitted; this paragraph
+replaces it. The 21× and the 11× can be re-derived from the repository rather than taken on trust.
 
 ### What the first real Linux run found
 
@@ -1981,7 +2056,7 @@ not the page.
   across the snapshots so a contaminated row is flagged rather than believed, and the
   numbers above come from a run in which **neither arm respawned a single worker**.
 - **The raw rows are committed**, as `results/raw-windows-279dc35.tsv` in
-  `stokehold-competition` (`P` = socket, `Pp` = pipe), which is hazard 46's outstanding
+  `stokehold-competition` (`P` = socket, `Pp` = pipe), which closes hazard 46's
   "the published Windows latency claim is not committed" — the 21× and the 11× can now be
   re-derived from the repository rather than taken on trust.
 

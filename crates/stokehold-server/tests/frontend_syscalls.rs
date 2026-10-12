@@ -28,11 +28,13 @@ thread_local! {
 /// many fills a large request needs.
 const READ_BUFFER_LEN: usize = 8 * 1024;
 
-/// A one-direction transport double: writes are counted and discarded, reads come from `input`.
+/// A one-direction transport double: writes are counted and kept, reads come from `input`.
 #[derive(Default)]
 struct Counting {
     input: std::io::Cursor<Vec<u8>>,
     writes: usize,
+    /// Everything written, so a test can inspect the framing the write count no longer shows.
+    out: Vec<u8>,
 }
 
 impl Read for Counting {
@@ -46,6 +48,7 @@ impl Write for Counting {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         WRITES.with(|count| count.set(count.get() + 1));
         self.writes += 1;
+        self.out.extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -141,6 +144,7 @@ fn buffered_reads(pairs: &[(Vec<u8>, Vec<u8>)], pairs_per_record: usize) -> usiz
         Counting {
             input: std::io::Cursor::new(request_bytes(pairs, b"", pairs_per_record)),
             writes: 0,
+            out: Vec::new(),
         },
     );
     count_start();
@@ -157,6 +161,7 @@ fn unbuffered_reads(pairs: &[(Vec<u8>, Vec<u8>)], pairs_per_record: usize) -> us
     let mut transport = Counting {
         input: std::io::Cursor::new(request_bytes(pairs, b"", pairs_per_record)),
         writes: 0,
+        out: Vec::new(),
     };
     count_start();
     let next = read_next(&mut transport).expect("a readable request");
@@ -200,11 +205,12 @@ fn reading_one_request_does_not_enter_the_kernel_once_per_field() {
 
 #[test]
 fn writing_a_response_does_not_write_a_field_at_a_time() {
-    // `write_response` writes a STDOUT record, optionally a STDERR record, then END_REQUEST —
-    // each as a header, a content payload and its padding. On a socket with `TCP_NODELAY` set,
-    // which is what a front-end socket wants, every one of those becomes its own segment.
-    // `stokehold-fcgi`'s client was fixed for exactly this shape: it assembles the whole request
-    // and issues one write.
+    // `write_response` used to write STDOUT's header, its payload, END_REQUEST's header and
+    // its payload, then flush — five `write(2)`s on a socket the listener keeps unbuffered
+    // for writes (`get_mut()` past the read buffer). On a socket with `TCP_NODELAY` set, which
+    // is what a front-end socket wants, every one of those is its own segment and its own
+    // syscall. `stokehold-fcgi`'s client was fixed for exactly this shape in an earlier pass;
+    // this is the same fix on the server's side.
     let stdout = b"Status: 200 OK\r\nContent-Type: text/html\r\n\r\nhello";
     let mut transport = Counting::default();
 
@@ -213,52 +219,124 @@ fn writing_a_response_does_not_write_a_field_at_a_time() {
 
     let writes = WRITES.with(Cell::get);
     assert_eq!(
-        writes, 5,
-        "a response with no STDERR costs a header, a payload, END_REQUEST's header and payload, \
-         and a flush; assembling it first would make this two"
+        writes, 1,
+        "a response with no STDERR is one assembled buffer and one write; it was five"
+    );
+
+    // The write count alone would not notice a change to the framing, so the bytes are
+    // checked too: STDOUT with its content and terminator, then END_REQUEST's 8-byte
+    // payload.
+    let expected = {
+        let mut out = Vec::new();
+        push_record(&mut out, RecordType::Stdout, stdout);
+        push_record(&mut out, RecordType::Stdout, b"");
+        push_record(&mut out, RecordType::EndRequest, &EndRequest::complete().encode());
+        out
+    };
+    assert_eq!(
+        transport.out, expected,
+        "the assembled response must be byte-identical to the field-by-field one"
     );
 }
 
 #[test]
 fn a_large_response_body_is_written_in_records_not_in_one_call() {
-    // `write_records` flushes per record, and a record's content is capped at 65535 bytes, so a
-    // 12 KB page is already several writes and a 300 KB one is many more. This is the count that
-    // matters on the wire.
-    fn writes_for(body_len: usize) -> usize {
+    // Assembling a response into one buffer must not remove the record framing: a payload
+    // past `MAX_CONTENT_LEN` still has to be split, and each stream record still needs its
+    // zero-length terminator. The write count can no longer show that — one `write(2)` is one
+    // `write(2)` whatever the framing — so this counts **records**, by walking what was
+    // written and checking it ends exactly at a record boundary with no bytes left over.
+    fn records_for(body_len: usize) -> usize {
         let stdout = vec![b'x'; body_len];
         let mut transport = Counting::default();
         count_start();
         write_response(&mut transport, 1, &stdout, b"", true).expect("a writable response");
-        WRITES.with(Cell::get)
+
+        let mut offset = 0;
+        let mut records = 0;
+        let mut last_header = 0;
+        let mut last_type = RecordType::Stdout;
+        while offset < transport.out.len() {
+            let header = Header::decode(
+                transport.out[offset..offset + stokehold_fcgi::protocol::HEADER_LEN]
+                    .try_into()
+                    .expect("a full header"),
+            )
+            .expect("a decodable header");
+            last_header = offset;
+            last_type = header.record_type;
+            offset += header.total_len();
+            records += 1;
+        }
+        assert_eq!(
+            offset,
+            transport.out.len(),
+            "the framing must end exactly at the end of the buffer, not overrun it"
+        );
+
+        // The last record is END_REQUEST's, which is never split. Note that its header and its
+        // 8-byte payload are separate records-worth of the framing: the last 8 bytes of the
+        // output are END_REQUEST's *status*, not its header, so the header is located by the
+        // offset the walk recorded rather than by counting back from the end.
+        assert_eq!(last_type, RecordType::EndRequest);
+        let end_payload = &transport.out[last_header + stokehold_fcgi::protocol::HEADER_LEN..];
+        assert_eq!(
+            end_payload,
+            &EndRequest::complete().encode()[..],
+            "END_REQUEST must carry its status, not just its header"
+        );
+        records
     }
 
-    let small = writes_for(12 * 1024);
-    let large = writes_for(300 * 1024);
+    let small = records_for(12 * 1024);
+    let large = records_for(300 * 1024);
 
-    assert!(small >= 3, "records are still flushed as they are written");
+    // A 12 KB page is one data record plus its terminator, plus END_REQUEST.
+    assert_eq!(small, 3, "12 KB fits in one record, its terminator, and END_REQUEST");
     assert!(
         large > small,
-        "a body past MAX_CONTENT_LEN must be split, not silently truncated"
+        "a body past MAX_CONTENT_LEN must be split across records, not silently truncated: \
+         {large} records for 300 KB against {small} for 12 KB"
+    );
+
+    // Splitting into records no longer costs a syscall each: the whole framed response is
+    // assembled first, so even 300 KB leaves in one `write(2)`. That is the point of the
+    // change — `write_records` flushed after every record, which made a large page many
+    // small segments on a socket with `TCP_NODELAY` set.
+    let mut big = Counting::default();
+    count_start();
+    write_response(&mut big, 1, &vec![b'x'; 300 * 1024], b"", true)
+        .expect("a writable response");
+    assert_eq!(
+        WRITES.with(Cell::get),
+        1,
+        "{large} records must leave in one write, not one write per record"
     );
 }
 
 #[test]
 fn the_backend_response_is_relayed_without_re_parsing_it() {
     // Pinned so the relay stays a copy: `write_response` takes the backend's `stdout` verbatim,
-    // which is why the response costs a fixed number of writes rather than one per header.
-    let response = stokehold_fcgi::Response {
-        stdout: b"Status: 200 OK\r\nX-A: 1\r\nX-B: 2\r\nX-C: 3\r\n\r\nbody".to_vec(),
-        ..Default::default()
-    };
-
+    // which is why the response costs a fixed number of *records* rather than one per header.
+    // The headers are never re-serialised, so the STDOUT payload in the output is byte-equal to
+    // what the backend sent.
+    let stdout = b"Status: 200 OK\r\nX-A: 1\r\nX-B: 2\r\nX-C: 3\r\n\r\nbody";
     let mut transport = Counting::default();
-    count_start();
-    write_response(&mut transport, 1, &response.stdout, b"", true).expect("a writable response");
 
-    let writes = WRITES.with(Cell::get);
+    count_start();
+    write_response(&mut transport, 1, stdout, b"", true).expect("a writable response");
+
     assert_eq!(
-        writes, 5,
+        WRITES.with(Cell::get),
+        1,
         "three headers must not add three writes; the block is relayed whole"
+    );
+
+    // Skip the 8-byte record header: what follows is the backend's bytes, unchanged.
+    assert_eq!(
+        &transport.out[stokehold_fcgi::protocol::HEADER_LEN..stokehold_fcgi::protocol::HEADER_LEN + stdout.len()],
+        stdout,
+        "the backend's payload must reach the wire verbatim"
     );
 }
 

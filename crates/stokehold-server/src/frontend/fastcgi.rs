@@ -199,21 +199,73 @@ pub fn write_response<W: Write>(
     stderr: &[u8],
     keep_conn: bool,
 ) -> Result<()> {
-    record::write_records(writer, RecordType::Stdout, request_id, stdout, true)?;
-    if !stderr.is_empty() {
-        record::write_records(writer, RecordType::Stderr, request_id, stderr, true)?;
-    }
-
-    // The application status is 0 because the backend already reported any
-    // application-level outcome inside its response; the client sees that as the
-    // `Status:` line.
+    // Built into this thread's scratch buffer and written once, rather than record field by
+    // record field. The listener's socket is deliberately unbuffered for writes (`get_mut()`
+    // past the read buffer), so without this a response with no `STDERR` costs five `write(2)`s
+    // — STDOUT's header, its payload, END_REQUEST's header, its payload, and the flush.
+    //
+    // The bytes are identical either way: `append_records` is the tested twin of
+    // `write_records` (`append_and_write_produce_the_same_bytes`), and the END_REQUEST pair
+    // below is the same header-then-payload with the same 8-byte content and so the same zero
+    // padding.
     let end = EndRequest::complete();
-    let header = record::Header::new(RecordType::EndRequest, request_id, 8);
-    header.write(writer)?;
-    writer.write_all(&end.encode())?;
-    writer.flush()?;
+
+    write_assembled(writer, |out| {
+        record::append_records(out, RecordType::Stdout, request_id, stdout, true);
+        if !stderr.is_empty() {
+            record::append_records(out, RecordType::Stderr, request_id, stderr, true);
+        }
+        // The application status is 0 because the backend already reported any
+        // application-level outcome inside its response; the client sees that as the
+        // `Status:` line.
+        out.extend_from_slice(
+            &record::Header::new(RecordType::EndRequest, request_id, 8).encode(),
+        );
+        out.extend_from_slice(&end.encode());
+    })?;
 
     let _ = keep_conn;
+    Ok(())
+}
+
+/// Build a whole response in a reused per-thread buffer and write it once.
+///
+/// Every response writer goes through this, because the listener's socket is deliberately
+/// unbuffered for writes: it is a `BufReader` whose writes go through `get_mut()`, so each
+/// individual `write_all` on it is its own `write(2)`, and on a socket with `TCP_NODELAY`
+/// set each is its own segment too. Writing a response record field by record field cost
+/// five syscalls; assembling it costs one.
+///
+/// **The buffer is per thread, not shared.** It never outlives the closure — nothing is
+/// returned from it — so no concurrent writer can observe another's bytes, and there is no
+/// lock anywhere on the response path. A `BufWriter` around the socket would have been the
+/// other option and is the one `stokehold-fcgi`'s client takes; here the response has a known
+/// end, so assembling it whole is simpler than reasoning about where a flush must happen.
+///
+/// It is reused rather than allocated per response because a response is body-sized: a 12 KB
+/// page would otherwise be a 12 KB allocation on every request, which is the cost this is
+/// meant to avoid.
+fn write_assembled<W, F>(writer: &mut W, build: F) -> Result<()>
+where
+    W: Write,
+    F: FnOnce(&mut Vec<u8>),
+{
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    BUFFER.with(|buffer| {
+        let mut out = buffer.borrow_mut();
+        out.clear();
+        build(&mut out);
+        writer.write_all(&out)?;
+        // One flush: a `BufWriter` puts its buffer on the wire, an unwrapped socket has
+        // nothing to flush. `write_frame`/`write_records` flush for the same reason.
+        writer.flush()?;
+        Ok::<(), ServerError>(())
+    })?;
     Ok(())
 }
 
@@ -230,29 +282,24 @@ pub fn write_error<W: Write>(
     let body = format!(
         "Status: 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nstokehold: {message}\r\n"
     );
-    record::write_records(
-        writer,
-        RecordType::Stdout,
-        request_id,
-        body.as_bytes(),
-        true,
-    )?;
-    record::write_records(
-        writer,
-        RecordType::Stderr,
-        request_id,
-        message.as_bytes(),
-        true,
-    )?;
 
+    // A failed request also gets one assembled write, and its END_REQUEST carries the
+    // *reason's* protocol status rather than `RequestComplete` — that is what tells nginx
+    // this was a gateway failure. The application status stays 0 for the same reason as
+    // above: the failure is expressed in the `Status:` line of the body.
     let end = EndRequest {
         app_status: 0,
         protocol_status: reason.protocol_status(),
     };
-    let header = record::Header::new(RecordType::EndRequest, request_id, 8);
-    header.write(writer)?;
-    writer.write_all(&end.encode())?;
-    writer.flush()?;
+
+    write_assembled(writer, |out| {
+        record::append_records(out, RecordType::Stdout, request_id, body.as_bytes(), true);
+        record::append_records(out, RecordType::Stderr, request_id, message.as_bytes(), true);
+        out.extend_from_slice(
+            &record::Header::new(RecordType::EndRequest, request_id, 8).encode(),
+        );
+        out.extend_from_slice(&end.encode());
+    })?;
     Ok(())
 }
 

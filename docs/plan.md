@@ -1745,11 +1745,11 @@ so "the tests pass" was never evidence that the Linux path had been exercised.
   | a **socket** | **0.09–0.12 ms** (0.098 / 0.090 / 0.093 across 3 repeats) | — |
 
   So the transport is not merely slower, it is slower by ~100×, and the cost is *per request*
-  rather than per connection. **Caveat, stated rather than buried:** the pipe and socket figures
-  use the same function (`stream_get_contents`) on different stream types, which is as close to
-  apples-to-apples as PHP allows but is not the SDK's exact read path. The signal is far too large
-  to be an artefact of that difference, but the precise ratio should be re-taken before it is
-  published as a headline number.
+  rather than per connection.
+
+  **The ratio was then checked the other way round**, on the warm arm itself rather than on a
+  synthetic read probe, and at the full arm scale — which is what the caveat above asked for. It
+  holds, and end to end it is *larger* than the probe suggests: see the table below.
 
   **Consequence, implemented.** `transport = "socket"` on a `worker` backend: the server binds a
   loopback listener before spawning, passes the address as `STOKEHOLD_WORKER_SOCKET`, and the

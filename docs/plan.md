@@ -845,6 +845,72 @@ against the specification and secondary implementations, and are confirmed by fi
     of these four items are invisible in wall clock, and the first attempt at this gap (hazard 23)
     hypothesised a transport cost and was wrong.
 
+<br>
+
+---
+
+<br>
+
+**34. The response parser's own allocations, and the front-end routing twice.** A second
+    pass over the same code came out of a colleague's review of `parse_response` and
+    `find_header_end`, and then out of *measuring* instead of reading: an allocation-counting
+    `#[global_allocator]` in a dedicated test binary, which turns "this looks allocation-heavy"
+    into a number. Four findings, none of which wall clock or `perf` had shown.
+
+    | finding | before | after |
+    |---|---|---|
+    | `parse_response` headers | `(String, String)` — 2 allocs + 2 `memcpy` per header, ~21 total | `Vec<(&str, &str)>` borrowing `stdout` — **1** |
+    | `split_response_body` | delegated to `parse_response`, building a list it discarded — 1 alloc | its own search — **0** |
+    | `build_params` header keys | `format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"))` — 6 allocs per request header (3 intermediates + the pair's 2) | built into the pair's buffer — **2** |
+    | `has_php_extension` | `to_ascii_lowercase()` — 1 alloc **per candidate prefix**, so `n` allocs for an `n`-segment path, each proportional to its prefix | suffix compare on bytes — **0** |
+    | `to_cgi` → `build_params` | routed **twice** per request, `is_file` syscalls included | `build_params_for` takes the route the front-end already resolved — **once** |
+
+    The allocation counts are now *asserted exactly*, not bounded, in
+    `stokehold-fcgi/tests/allocations.rs` and `stokehold-worker/tests/allocations.rs`. A new
+    allocation in this code is a decision, and a test that names it is the cheapest way to notice.
+
+    **Two correctness bugs fell out of the same review**, which is the part worth remembering:
+
+    - **`parse_response` counted the status line with `enumerate()` over the raw split**, so a
+      header block that opened with a blank line — legal — made the real first line `index == 1`
+      and a `Status:` there was *silently ignored*, leaving the status at `200`. The loop now
+      skips leading empty lines before it looks for the status.
+    - **`has_php_extension` was rewritten as `path[path.len() - 5..]`**, which panics when the
+      offset lands inside a multi-byte character. Caught by a test with `/café` in the path
+      before it could ship, and fixed by comparing bytes rather than a `&str` suffix.
+
+    A third, latent: the status line compared its name *untrimmed* (`Status :` was not `Status:`)
+    while every other header was pushed *trimmed*, so one line could be read as `200` and as a
+    `Status` header at once. Now the rule is one sentence: a header name is trimmed, for the status
+    line as for any other.
+
+    **`to_cgi` calling `cgi::route` and then `build_params` calling it again** was found by
+    reading, not measuring — and it is the kind of thing `perf` will not show, because `is_file`
+    is a syscall and the routing itself is cheap. It is exactly the "two full passes over the same
+    input" shape as hazard 33's two payload scans, one layer up.
+
+<br>
+
+---
+
+<br>
+
+**35. The declared MSRV was already false.** `Cargo.toml` said `rust-version = "1.75"` and the
+    README said "Requires Rust 1.75+", but the *locked* dependency tree already required **1.85**:
+    `clap`/`clap_builder`/`clap_derive` 4.6.7, `hyper-util` 0.1.21, `indexmap` 2.14.2,
+    `hashbrown` 0.17.1 and `tokio-util` 0.7.20 all declare it, so a real 1.75 would be rejected at
+    resolve time. The declaration was aspirational, not true, and nothing verified it — there is
+    no CI config in this repo at all, which is the reason it could drift silently.
+
+    Raised to **1.85**, the true floor. `[u8]::trim_ascii` (1.80) replaced the hand-rolled
+    `position`/`rposition` pair in `client.rs`, verified equivalent first (`"  hi \r\n"` → `"hi"`,
+    `"   "` → `""`, `""` → `""`). The same raise also enabled `clippy::manual_repeat_n` (stable in
+    1.82), which flagged four `repeat(0u8).take(n)` padding writes across two crates — so the
+    dependency floor was the thing gating a lint as well as an API.
+
+    *Worth adding: an MSRV that is not checked by CI is a comment, not a guarantee. A
+    `cargo build` under the declared toolchain in CI is what would make it true.*
+
 ## 6. Phases
 
 Phase 0 — skeleton and baseline

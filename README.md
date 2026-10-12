@@ -125,7 +125,7 @@ configuration surface.
 
 ## Getting started
 
-Requires Rust 1.75+.
+Requires Rust 1.85+.
 
 ```bash
 cargo build --release

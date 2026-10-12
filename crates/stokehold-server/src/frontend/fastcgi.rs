@@ -360,7 +360,7 @@ mod tests {
         let header = record::Header::new(record_type, request_id, content.len() as u16);
         header.write(&mut out).unwrap();
         out.extend_from_slice(content);
-        out.extend(std::iter::repeat(0u8).take(header.padding_length as usize));
+        out.extend(std::iter::repeat_n(0u8, header.padding_length as usize));
         out
     }
 
@@ -477,7 +477,7 @@ mod tests {
         let header = record::Header::new(RecordType::BeginRequest, 1, 2);
         header.write(&mut wire).unwrap();
         wire.extend_from_slice(&[0, 9]);
-        wire.extend(std::iter::repeat(0u8).take(header.padding_length as usize));
+        wire.extend(std::iter::repeat_n(0u8, header.padding_length as usize));
         assert!(read_request(&mut wire.as_slice()).is_err());
     }
 

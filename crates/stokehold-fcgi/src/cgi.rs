@@ -67,25 +67,38 @@ pub enum Route {
 /// `SCRIPT_NAME = /index.php` and `PATH_INFO = /about`.
 pub fn route(path: &str, routing: &Routing) -> Route {
     let path = path.split(['?', '#']).next().unwrap_or(path);
-    let decoded = percent_decode(path);
+    let decoded = percent_decode_cow(path);
 
+    // Compared on bytes, case-insensitively, rather than through
+    // `decoded.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase())`. That expression
+    // allocated *twice* on every request — a copy of the whole path and a copy of every
+    // configured extension — to answer a question about the last few bytes. It is the same
+    // defect that `has_php_extension` below was fixed for, which this call site was missed
+    // in.
     if routing.forbidden_extensions.iter().any(|ext| {
-        decoded
-            .to_ascii_lowercase()
-            .ends_with(&ext.to_ascii_lowercase())
+        let ext = ext.as_bytes();
+        let bytes = decoded.as_bytes();
+        bytes.len() >= ext.len() && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext)
     }) {
         return Route::Forbidden;
     }
 
     let relative = decoded.trim_start_matches('/');
-    let candidate = routing.document_root.join(relative);
 
-    if candidate.is_file() && has_php_extension(relative) {
-        return Route::Script {
-            script_filename: candidate,
-            script_name: format!("/{relative}"),
-            path_info: String::new(),
-        };
+    // The extension is tested *before* the path is built and stat'ed. The two are pure
+    // predicates so the answer is the same either way, but the order is what decides
+    // whether a request pays a `stat` syscall at all: with a front controller configured,
+    // a path naming no script is the common case, and testing for `.php` first means it
+    // never reaches `is_file`.
+    if has_php_extension(relative) {
+        let candidate = routing.document_root.join(relative);
+        if candidate.is_file() {
+            return Route::Script {
+                script_filename: candidate,
+                script_name: format!("/{relative}"),
+                path_info: String::new(),
+            };
+        }
     }
 
     // A path that starts with a real script is split at the script boundary.
@@ -197,7 +210,24 @@ fn php_extension_of(bytes: &[u8]) -> bool {
 /// Invalid escapes are left as-is rather than rejected: a stray `%` in a path is
 /// a request PHP can answer, not a reason to fail the whole request.
 pub fn percent_decode(input: &str) -> String {
+    percent_decode_cow(input).into_owned()
+}
+
+/// Percent-decode a URL path, borrowing it when there is nothing to decode.
+///
+/// Most requests contain no `%` at all, and copying the whole path to discover that is an
+/// allocation per request for nothing. `Cow` makes that case free and leaves the decoding
+/// case exactly as it was.
+///
+/// The scan and the copy are separate passes on purpose: a `Vec` that is only allocated
+/// once a `%` is found means the common path never touches the allocator, rather than
+/// allocating and then throwing the buffer away.
+pub fn percent_decode_cow(input: &str) -> std::borrow::Cow<'_, str> {
     let bytes = input.as_bytes();
+    if !bytes.contains(&b'%') {
+        return std::borrow::Cow::Borrowed(input);
+    }
+
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -212,7 +242,16 @@ pub fn percent_decode(input: &str) -> String {
         out.push(bytes[index]);
         index += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+
+    // `String::from_utf8` takes the buffer by value, so a decoded path that is valid UTF-8 —
+    // every `%XX` sequence that spells a character — keeps the allocation it already made
+    // instead of copying out of it. Only a genuinely broken escape (a `%` that is not valid
+    // UTF-8 once decoded, which the spec does not really allow but this must not panic on)
+    // pays for a second pass.
+    match String::from_utf8(out) {
+        Ok(text) => std::borrow::Cow::Owned(text),
+        Err(err) => std::borrow::Cow::Owned(String::from_utf8_lossy(err.as_bytes()).into_owned()),
+    }
 }
 
 /// The parts of a request needed to build the environment.

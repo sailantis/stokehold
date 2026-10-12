@@ -31,6 +31,25 @@ use crate::message::{
 /// so a frame length stays far from the protocol's sanity limit.
 pub const MAX_BODY_CHUNK: usize = 64 * 1024;
 
+/// A borrowed `RequestHeader`, with `body_len` supplied by the caller.
+///
+/// Exists so the request frame can be serialized without cloning the header. Field
+/// names and order match [`RequestHeader`] exactly — that is a protocol requirement, not
+/// a style preference, because the PHP SDK decodes this JSON — so the two must be changed
+/// together. `the_borrowed_request_frame_is_byte_identical_to_the_owned_encoding` is what
+/// enforces it.
+#[derive(serde::Serialize)]
+struct RequestHeaderJson<'a> {
+    method: &'a str,
+    uri: &'a str,
+    protocol: &'a str,
+    headers: &'a [(String, String)],
+    remote_addr: &'a str,
+    body_len: u64,
+    script_filename: &'a str,
+    https: bool,
+}
+
 /// Which half of a request `WorkerChannel::request_staged` reached.
 ///
 /// The distinction exists for one reason: a caller that may retry a non-idempotent
@@ -158,22 +177,48 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     /// portable timeout — the pool enforces one by killing the worker, which
     /// unblocks the read on every platform.
     pub fn request(&mut self, request: &RequestHeader, body: &[u8]) -> Result<WorkerResponse> {
+        self.request_staged(request, body, |_| {})
+    }
+
+    /// Allocate a request id, reserving 0 for unsolicited frames.
+    ///
+    /// Wraps rather than overflowing; the wrap skips [`crate::UNSOLICITED`] so an id is
+    /// never spent on the value that means "not a request". Named `take_` rather than
+    /// `next_` so it does not read like the [`WorkerChannel::next_request_id`] accessor it
+    /// sits next to — this one advances, that one only looks.
+    fn take_request_id(&mut self) -> u32 {
         let request_id = self.next_request_id;
-        // Wrap rather than overflow. 0 is reserved for unsolicited frames, so
-        // the wrap skips it.
         self.next_request_id = self.next_request_id.wrapping_add(1);
         if self.next_request_id == crate::UNSOLICITED {
             self.next_request_id = crate::FIRST_REQUEST_ID;
         }
+        request_id
+    }
 
-        let head = RequestHeader {
-            body_len: body.len() as u64,
-            ..request.clone()
+    /// Write the request frame, declaring `body_len` for the body frames that follow.
+    ///
+    /// The length is stamped in here, from the bytes that are about to be framed, so the
+    /// declared length and the bytes sent cannot disagree. That used to be done with
+    /// `RequestHeader { body_len, ..request.clone() }`, which deep-cloned five `String`s and
+    /// two more per header on every request to change one integer; the borrowed view in
+    /// [`RequestHeaderJson`] serializes to byte-identical JSON without copying anything.
+    fn send_request(
+        &mut self,
+        request: &RequestHeader,
+        request_id: u32,
+        body_len: u64,
+    ) -> Result<()> {
+        let head = RequestHeaderJson {
+            method: &request.method,
+            uri: &request.uri,
+            protocol: &request.protocol,
+            headers: &request.headers,
+            remote_addr: &request.remote_addr,
+            body_len,
+            script_filename: &request.script_filename,
+            https: request.https,
         };
-        self.send_json(MessageType::Request, request_id, &head, 0)?;
-        self.send_body(request_id, body)?;
-
-        self.collect_response(request_id)
+        self.send_json(MessageType::Request, request_id, &head, 0)
     }
 
     /// The same request, with the send and receive phases kept apart.
@@ -197,22 +242,13 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         body: &[u8],
         mut on_stage: impl FnMut(RequestStage),
     ) -> Result<WorkerResponse> {
-        let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        if self.next_request_id == crate::UNSOLICITED {
-            self.next_request_id = crate::FIRST_REQUEST_ID;
-        }
-
-        let head = RequestHeader {
-            body_len: body.len() as u64,
-            ..request.clone()
-        };
+        let request_id = self.take_request_id();
 
         // Everything up to the last byte of the body is the send phase. The
         // callbacks are reported before returning, so a failure that happens
         // *during* the write is still attributed to `Sending`.
         on_stage(RequestStage::Sending);
-        self.send_json(MessageType::Request, request_id, &head, 0)?;
+        self.send_request(request, request_id, body.len() as u64)?;
         self.send_body(request_id, body)?;
 
         on_stage(RequestStage::Reading);
@@ -619,6 +655,52 @@ mod tests {
         assert_eq!(frames[0].0.request_id, 1);
         let sent: RequestHeader = Json::decode(&frames[0].1).unwrap();
         assert_eq!(sent.body_len, 10);
+    }
+
+    #[test]
+    fn the_borrowed_request_frame_is_byte_identical_to_the_owned_encoding() {
+        // `send_request` serializes a *borrowed* view of the header rather than cloning it
+        // to stamp in `body_len`, so the two encodings have to agree exactly. Field names,
+        // order and defaults are protocol — the PHP SDK decodes this JSON.
+        //
+        // Comparing bytes rather than round-tripping is the whole point: every field of
+        // `RequestHeader` except `method` and `uri` carries a serde default, so a field
+        // missing from the borrowed view would not fail `Json::decode::<RequestHeader>` at
+        // all. It would just arrive empty, which is exactly the kind of silence a
+        // round-trip test cannot catch.
+        let request = RequestHeader {
+            method: "POST".to_string(),
+            uri: "/items?page=2".to_string(),
+            protocol: "HTTP/1.1".to_string(),
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("X-Trace".to_string(), "abc".to_string()),
+            ],
+            remote_addr: "10.0.0.7".to_string(),
+            body_len: 0,
+            script_filename: "/srv/app/public/index.php".to_string(),
+            https: true,
+        };
+        let body = b"{\"a\":1}";
+        let expected = Json::encode(&RequestHeader {
+            body_len: body.len() as u64,
+            ..request.clone()
+        })
+        .unwrap();
+
+        let mut script = WorkerScript::default();
+        script
+            .head(1, 200, 0)
+            .json(MessageType::End, 1, &RequestEnd::default());
+        let mut channel = script.channel();
+
+        channel.request(&request, body).unwrap();
+
+        let frames = sent_frames(&channel.writer);
+        assert_eq!(
+            frames[0].1, expected,
+            "the borrowed frame must encode identically to the cloned one"
+        );
     }
 
     #[test]

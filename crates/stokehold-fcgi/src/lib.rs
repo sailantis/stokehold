@@ -17,7 +17,9 @@ pub mod protocol;
 pub mod record;
 pub mod transport;
 
-pub use cgi::{build_params, build_params_for, route, RequestInfo, Route, Routing};
+pub use cgi::{
+    build_params, build_params_for, percent_decode_cow, route, RequestInfo, Route, Routing,
+};
 pub use client::{
     parse_response, parse_response_headers, split_response_body, Client, ParsedHeaders, Request,
     Response, MANAGEMENT_REQUEST_ID, REQUEST_ID,

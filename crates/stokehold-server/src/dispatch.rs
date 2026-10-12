@@ -99,16 +99,19 @@ impl Dispatcher {
 
     /// Send a request to the backend its route selects.
     pub fn dispatch(&self, request: &Request) -> Result<Response> {
-        let name = self.backend_for(request).to_string();
-        self.dispatch_to(&name, request)
+        // The name is borrowed rather than cloned into a `String`. `backend_for` and
+        // `dispatch_to` both only read `self`, so the borrow it returns is still live
+        // when `dispatch_to` is called; owning the name was an allocation per request
+        // that bought nothing.
+        let name = self.backend_for(request);
+        self.dispatch_to(name, request)
     }
 
     /// Send a request to the default backend, ignoring the route table.
     ///
     /// An alias used by the listener, where "default" is the meaningful word.
     pub fn dispatch_to_default(&self, request: &Request) -> Result<Response> {
-        let name = self.default.clone();
-        self.dispatch_to(&name, request)
+        self.dispatch_to(&self.default, request)
     }
 
     /// Send a request to a named backend.

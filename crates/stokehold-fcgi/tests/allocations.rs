@@ -224,10 +224,143 @@ fn the_response_object_parses_allocating_the_same_one_time() {
 }
 
 #[test]
+fn routing_a_path_allocates_only_the_script_strings() {
+    // `route` runs on every request, in both listeners, before anything else. It used to
+    // allocate thirteen times: the percent-decoded copy of the whole path (even when it
+    // contained no `%` at all, which is nearly every request), a lowercase copy of the path
+    // and of every configured forbidden extension, and the `SCRIPT_NAME`/`PATH_INFO` strings
+    // for whichever answer it returned.
+    //
+    // What is left is the two `format!`s that become `SCRIPT_NAME` and `PATH_INFO`. Pinning
+    // the count here makes the next step a decision rather than a guess.
+    let root = std::env::temp_dir().join(format!("stokehold-route-alloc-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&root);
+    std::fs::write(root.join("index.php"), "<?php").expect("write a fixture script");
+    let routing = Routing {
+        document_root: root.clone(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+
+    let (count, bytes) = allocations(|| {
+        let route = stokehold_fcgi::route("/items", &routing);
+        match route {
+            stokehold_fcgi::Route::Script {
+                script_name,
+                path_info,
+                ..
+            } => {
+                assert_eq!(script_name, "/index.php");
+                assert_eq!(path_info, "/items");
+            }
+            other => panic!("expected the front controller, got {other:?}"),
+        }
+    });
+
+    // Measured: six allocations. The categories are the owned path `PathBuf::join` has to
+    // build, the `SCRIPT_NAME` and `PATH_INFO` strings, and the growth of `format!`'s
+    // buffer — which is `std`'s business, so the count is recorded rather than asserted
+    // exactly. The bound is what matters: it fails if routing ever goes back to copying the
+    // path to decode it or lowercasing it to match an extension.
+    println!("route(/items): {count} allocations, {bytes} bytes");
+    assert!(
+        count <= 6,
+        "routing a path should be a borrowed decode, one joined path and two format!s, \
+         not {count} allocations"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn matching_a_forbidden_extension_does_not_scale_with_the_configured_count() {
+    // The slope is the assertion that actually catches the regression. The guard used to be
+    // `decoded.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase())` inside `any`, so a
+    // deployment with *n* forbidden extensions allocated *n* copies of the extension per
+    // request, plus one copy of the whole path. Comparing bytes makes it constant.
+    fn match_cost(extension_count: usize) -> usize {
+        let root = std::env::temp_dir().join(format!(
+            "stokehold-route-ext-{extension_count}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: None,
+            // The first entry is the one that matches, so the walk cannot shortcut.
+            forbidden_extensions: (0..extension_count)
+                .map(|index| {
+                    if index == 0 {
+                        ".htaccess".to_string()
+                    } else {
+                        format!(".forbidden-{index}")
+                    }
+                })
+                .collect(),
+        };
+
+        let (count, _) = allocations(|| {
+            assert_eq!(
+                stokehold_fcgi::route("/.htAccess", &routing),
+                stokehold_fcgi::Route::Forbidden,
+                "matched case-insensitively"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        count
+    }
+
+    let one = match_cost(1);
+    let twenty = match_cost(20);
+
+    assert_eq!(
+        one,
+        0,
+        "a forbidden match needs no allocation at all: the path is not copied and neither \
+         is the extension"
+    );
+    assert_eq!(
+        twenty, one,
+        "nineteen more forbidden extensions must cost nothing per request"
+    );
+}
+
+#[test]
+fn a_path_with_no_escapes_is_not_copied_to_decode_it() {
+    // The `Cow` that makes the common case free. Nearly every request path has no `%`, and
+    // copying the whole path to discover that was an allocation per request.
+    let (count, _) = allocations(|| {
+        let decoded = stokehold_fcgi::percent_decode_cow("/items/42?page=1");
+        assert!(matches!(decoded, std::borrow::Cow::Borrowed(_)));
+    });
+    assert_eq!(count, 0);
+
+    // An escaped path still decodes exactly as before, and into a single buffer:
+    // `String::from_utf8` takes the vector by value rather than copying out of it.
+    let (count, _) = allocations(|| {
+        let decoded = stokehold_fcgi::percent_decode_cow("/caf%C3%A9");
+        assert_eq!(decoded, "/café");
+    });
+    assert_eq!(count, 1, "one buffer, reused by String::from_utf8");
+}
+
+#[test]
+fn a_forbidden_extension_is_matched_without_lowercasing_the_path() {
+    // The guard that used to allocate twice per request: a lowercase copy of the path and a
+    // lowercase copy of every configured extension. Both are gone; what remains is the
+    // matched `Route`, which carries no strings at all.
+    let routing = stokehold_fcgi::Routing::default();
+    let (count, bytes) = allocations(|| {
+        assert_eq!(
+            stokehold_fcgi::route("/.htaccess", &routing),
+            stokehold_fcgi::Route::Forbidden
+        );
+    });
+    assert_eq!(count, 0, "{bytes} bytes");
+}
+
+#[test]
 fn neither_delegating_entry_point_allocates_on_its_own() {
-    // The single-pass parser is what both older entry points delegate to. This is the
-    // count-side companion to `the_single_pass_parser_agrees_with_the_two_entry_points`
-    // in the unit tests.
     let stdout = realistic_stdout();
 
     let (body_count, _) = allocations(|| {

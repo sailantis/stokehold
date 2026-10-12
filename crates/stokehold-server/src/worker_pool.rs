@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use stokehold_core::config::WorkerConfig;
@@ -362,13 +362,15 @@ impl Drop for WorkerPool {
 /// Run one request on a worker, putting the slot back into rotation if the pipes
 /// survived.
 fn invoke(slot: &mut Slot, request: &Request) -> std::result::Result<WorkerResponse, AttemptError> {
-    let header = request_header(request);
-    // No copy of the body: the exchange thread borrows it for the duration of
-    // the call, and the slot's lock keeps nothing else from touching the worker
-    // meanwhile. The deadline costs a `recv_timeout`, not a thread and not a
-    // body.
     let result = match slot.exchange.as_mut() {
-        Some(exchange) => exchange.request(&header, &request.body, REQUEST_TIMEOUT),
+        // The header is built here and moved into the exchange, so the request path
+        // never copies it: `request_header` produces exactly one owned `RequestHeader`
+        // and the exchange shares that allocation with its thread.
+        Some(exchange) => exchange.request(
+            Arc::new(request_header(request)),
+            &request.body,
+            REQUEST_TIMEOUT,
+        ),
         // A slot is only chosen while it has an exchange, so this cannot happen;
         // it is reported rather than panicked because a panic here would take the
         // whole server down for one request.
@@ -809,8 +811,12 @@ fn handshake_with_timeout(
 /// already done by the time this thread starts.
 enum Exchange {
     /// Send one request and collect its whole response.
+    ///
+    /// The header is behind an `Arc` rather than owned outright: it is built once per
+    /// request and only read on the exchange thread, so the thread shares the value
+    /// instead of deep-cloning it into the work item.
     Request {
-        header: RequestHeader,
+        header: Arc<RequestHeader>,
         body: Vec<u8>,
     },
     /// Send one frame from an already-encoded payload.
@@ -837,6 +843,8 @@ impl Exchange {
     ) -> std::result::Result<Option<WorkerResponse>, WorkerError> {
         match self {
             Exchange::Request { header, body } => {
+                // `header` is an `Arc<RequestHeader>`; `&header` derefs to the header
+                // itself, which is what the codec borrows.
                 let result = channel.request_staged(&header, &body, &mut *on_stage);
                 result.map(Some)
             }
@@ -929,22 +937,26 @@ impl ChannelExchange {
 
     /// Run one request, giving up after `timeout`.
     ///
-    /// Still one copy of the request body per request, and it is worth being
-    /// honest about why: the work item is moved to the exchange thread, so it must
-    /// own its bytes, and a channel of borrowed data would need a lifetime the
-    /// standard library's channels cannot express. Removing that copy means
-    /// `Request::body` becoming something cheap to share (`Arc<[u8]>`), which is a
-    /// change to the FastCGI layer every backend shares — not worth it while the
-    /// cost is one `memcpy` the previous design also paid. What is gone is the
-    /// thread, which was the measured cost.
+    /// One copy of the request body per request, and it is worth being honest about why:
+    /// the work item is moved to the exchange thread, so it must own its bytes, and a
+    /// channel of borrowed data would need a lifetime the standard library's channels
+    /// cannot express. Removing that copy means `Request::body` becoming something cheap to
+    /// share (`Arc<[u8]>`), which is a change to the FastCGI layer every backend shares —
+    /// not worth it while the cost is one `memcpy` the previous design also paid. What is
+    /// gone is the thread, which was the measured cost.
+    ///
+    /// The *header* is not copied. The work item used to carry an owned `RequestHeader`,
+    /// which meant a deep clone of five `String`s and two more per header per request; it
+    /// now carries an [`Arc`] of the finished header, so the exchange thread shares the
+    /// same allocation instead of duplicating it.
     pub fn request(
         &mut self,
-        header: &RequestHeader,
+        header: Arc<RequestHeader>,
         body: &[u8],
         timeout: Duration,
     ) -> std::result::Result<WorkerResponse, (RequestStage, WorkerError)> {
         let exchange = Exchange::Request {
-            header: header.clone(),
+            header,
             body: body.to_vec(),
         };
 

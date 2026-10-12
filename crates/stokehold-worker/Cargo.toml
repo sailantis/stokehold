@@ -8,6 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# CRC-32C for the frame header checksum. This was a bit-by-bit implementation
+# written to mirror the PHP SDK, and it was the single largest cost in the whole
+# server: every response's checksum is computed over the payload on every request,
+# so a 12 KB page meant ~96,000 shift-and-mask iterations per request. Measured
+# with `perf` at 15-19% of the server process's CPU (scripts/diag-profile.sh).
+# The crate uses SSE4.2/ARM CRC32 instructions when the CPU has them and a slicing
+# implementation otherwise, and it computes the same Castagnoli polynomial, which
+# `crc32c_matches_the_standard_check_value` pins.
+crc32c.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

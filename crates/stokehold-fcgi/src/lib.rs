@@ -19,7 +19,8 @@ pub mod transport;
 
 pub use cgi::{build_params, route, RequestInfo, Route, Routing};
 pub use client::{
-    parse_response_headers, split_response_body, Client, Request, Response, MANAGEMENT_REQUEST_ID,
+    parse_response, parse_response_headers, split_response_body, Client, Request, Response,
+    MANAGEMENT_REQUEST_ID,
     REQUEST_ID,
 };
 pub use error::{FcgiError, Result};

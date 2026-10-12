@@ -714,7 +714,9 @@ against the specification and secondary implementations, and are confirmed by fi
     - **The two transports are the same**, now that hazard 30 is fixed: T and U agree to 3% at
       every concurrency, and this is the clean answer to hazard 23's original question.
     - **P and R agree to 10%**, two independent servers on the same model, which is what makes
-      the warm half of the table credible.
+      the warm half of the table credible. *(Superseded by hazard 33: the 10% was stokehold's
+      own front-end waste, it is now fixed, and P leads R — see that hazard for the CPU
+      attribution that found it.)*
 
     The same pass on `/` gives a flat ~1.5x (P/F) and ~1.64x (R/F) at every concurrency. Note
     that the *absolute* cold-arm penalty is much larger on `/items` (0.58 ms) than on `/`
@@ -773,6 +775,75 @@ against the specification and secondary implementations, and are confirmed by fi
     survives to concurrency 16 in hazard 31: the cold arm saturates its cores at ~7,500 rps while
     the warm arm reaches 15,500, so the warm arm is further from its own ceiling at every
     concurrency.
+
+33. **stokehold's HTTP front-end used to cost 1.36x RoadRunner's CPU per request, and the whole
+    of it was three avoidable scans. Fixed — stokehold is now the cheaper of the two.**
+
+    The starting observation was that the warm arm sat ~10% behind RoadRunner on every endpoint
+    (16,329 against 18,258 rps on `/items` at concurrency 32) while implementing the same model:
+    one resident PHP process per slot, one request at a time down a pipe. A 10% gap between two
+    implementations of the same design is small enough to be worth naming, and there are only
+    three places it can live — the front-end, the worker protocol, or the client. Wall clock
+    cannot separate them, because both servers report the same latency and the same rps.
+
+    **CPU can.** `scripts/diag-split.sh` snapshots `utime + stime` for every process in the arm's
+    process tree, walked up the PPID chain from the server's own pid (not matched on `comm`,
+    which truncates at 15 characters and cannot tell `php worker.php` from `php-cgi`), brackets
+    exactly the measured wrk window, and attributes the delta per `comm`:
+
+    | arm, conc 32 | rps | server CPU/req | PHP CPU/req | total |
+    |---|---|---|---|---|
+    | P stokehold (before) | 16,017 | **413 us** | 608 us | 1,021 us |
+    | R RoadRunner | 17,860 | **309 us** | 704 us | 1,013 us |
+
+    The totals agree to 1% while the server halves differ by 1.34x, so the gap is entirely
+    stokehold's front-end and nothing else — not the protocol, not the client, not PHP.
+
+    **`scripts/diag-profile.sh` then named it.** A flat `perf record` on the server process during
+    a saturated run put 15-19% of *everything* in one function, and two more above 5%:
+
+    | symbol | self time, before |
+    |---|---|
+    | `stokehold-worker::codec::Channel::read_frame` (inlined `crc32c`) | **14.81-19%** |
+    | `stokehold-fcgi::client::parse_response_headers` | 5.20% |
+    | `stokehold-fcgi::client::split_response_body` | 5.17% |
+
+    Each was a full pass over the 12 KB response payload, per request, in userspace:
+
+    - **`crc32c` was a bit-by-bit implementation** — eight shift-and-mask rounds per byte,
+      written by hand so the PHP SDK could mirror it line for line. The SDK does not need a
+      transcription; only the *value* has to agree, and the standard check value is already
+      pinned by test. A 12 KB page meant ~96,000 inner-loop iterations per request. Replaced
+      with the `crc32c` crate (SSE4.2/ARM CRC32 instructions, slicing fallback otherwise).
+      *The lesson: "keep it dependency-free so another language can mirror it" is a good
+      argument about the encode path and a bad one about the verify path.*
+    - **`parse_response_headers` began with `String::from_utf8_lossy(stdout)`** — validating
+      UTF-8 across the entire payload, body included, and copying it when invalid, all to find a
+      `\r\n\r\n` that a byte search finds for free. Rewritten to work on bytes.
+    - **`split_response_body` searched the payload a second time** for the same separator that
+      the header parser had just been through, and `find_subslice` used `windows(4).position`,
+      comparing four bytes at every offset of 12 KB, twice.
+
+    The three fixes together, measured on the same host and methodology:
+
+    | | before | after |
+    |---|---|---|
+    | server CPU per request | 413 us | **137 us** |
+    | stokehold rps @ conc 32 | 16,017 | **18,946** |
+    | RoadRunner server CPU per request | 309 us | 153 us |
+    | RoadRunner rps @ conc 32 (re-measured) | 17,860 | 18,019 |
+
+    Two of the three were correctness fixes as much as speed ones: the lossy conversion could
+    let a non-UTF-8 byte *in the body* move the located header terminator, because the offset was
+    computed on a `String` whose length differs from the slice's. `parse_response` now scans once
+    and returns status, headers and body together, with the two older entry points delegating to
+    it and a test pinning all three to each other.
+
+    **The general lesson, which is hazard 30's lesson again:** "stokehold is N% slower than
+    RoadRunner" is not a fact about a design, it is a fact about a measurement that has not been
+    decomposed. Attribute CPU before optimising anything, or the optimisation is a guess — three
+    of these four items are invisible in wall clock, and the first attempt at this gap (hazard 23)
+    hypothesised a transport cost and was wrong.
 
 ## 6. Phases
 

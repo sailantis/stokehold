@@ -24,6 +24,7 @@ stokehold-server = { path = "crates/stokehold-server" }
 stokehold-http = { path = "crates/stokehold-http" }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+crc32c = "0.6"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }

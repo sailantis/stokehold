@@ -262,6 +262,11 @@ impl Header {
             });
         }
 
+        // `vec![0u8; len]` zeroes the buffer before the read overwrites it, which
+        // is a `memset` of the whole payload. It is left in place deliberately:
+        // the alternative on stable Rust is reading into uninitialised storage
+        // through `MaybeUninit`, and the profile shows this cost is not visible
+        // next to the checksum. The checksum is the one that was worth removing.
         let mut payload = vec![0u8; len];
         if let Err(source) = reader.read_exact(&mut payload) {
             if source.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -310,21 +315,23 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize
 
 /// CRC-32C (Castagnoli), the checksum the header carries.
 ///
-/// This must produce exactly the value PHP's `hash('crc32c', ...)` does, and
-/// the test below pins it to the standard check value. Implemented directly
-/// rather than pulled in as a dependency so the PHP SDK can mirror it line for
-/// line and so there is no chance of a differing polynomial.
+/// The polynomial is the one PHP's `hash('crc32c', ...)` uses, and
+/// `crc32c_matches_the_standard_check_value` pins it to the standard check value
+/// so a swapped implementation cannot pass unnoticed.
+///
+/// This was written out by hand, eight shift-and-mask rounds per byte, because
+/// the intent was that the PHP SDK could mirror it line for line. That was a
+/// mistake about where the cost lands: the checksum is computed over every
+/// response payload on every request, so a page of 12 KB meant ~96,000
+/// iterations of the inner loop *per request*, and `perf` attributed 15-19% of
+/// the server process's CPU to it. A table-driven or hardware implementation
+/// is not an optimisation of a rare path; it is the removal of the largest
+/// single item on the hot one.
+///
+/// The SDK does not need this to be a transcription. Only the *value* has to
+/// agree, and it is pinned by test against a value PHP itself produces.
 pub fn crc32c(data: &[u8]) -> u32 {
-    const POLY: u32 = 0x82F6_3B78;
-    let mut crc: u32 = !0;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (POLY & mask);
-        }
-    }
-    !crc
+    crc32c::crc32c(data)
 }
 
 #[cfg(test)]

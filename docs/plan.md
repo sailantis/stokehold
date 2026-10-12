@@ -1923,3 +1923,87 @@ the `create()` fixture, one level up: **a default that depends on the platform i
 every call site that relies on it**, so each place that means a *specific* transport now says so
 (`pipe_config()`, `socket_config()`) and only the sites that genuinely mean "whatever the
 deployment gets" are left on `Default`.
+
+**48. The loopback socket's real Windows advantage under load is 11×, not 21× — and the
+missing 10× is PHP's CPU, not the transport.** Hazard 46 measured the socket at 0.72 ms
+median against the pipe's 15.24 ms, sequentially, which is the like-for-like per-request
+number. It is not, however, the number a saturated pool sees, and the difference is
+large enough to be worth separating: an operator sizing a Windows deployment needs the
+*ceiling*, and the two transports do not reach it the same way.
+
+Measured on the Windows host (Ryzen 5 7500F, 6 cores / 12 threads, PHP 8.3.31 ZTS,
+`GET /items`, 12 workers, both arms behind the same `stokehold` binary at `279dc35`,
+home-grown keep-alive load generator, 5 runs of 5 s per cell, marker verified and **0
+errors in all 70 runs**):
+
+| conc | socket rps | pipe rps | ratio | socket p50 | pipe p50 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1,418 | 66 | **21.5×** | 0.658 ms | 15.11 ms |
+| 4 | 5,297 | 265 | **20.0×** | 0.683 ms | 15.10 ms |
+| 8 | 8,651 | 528 | **16.4×** | 0.903 ms | 15.09 ms |
+| 12 | 8,528 | 775 | **11.0×** | 1.215 ms | 15.53 ms |
+| 16 | 8,796 | 775 | **11.3×** | 1.547 ms | 16.04 ms |
+| 24 | 8,655 | 774 | **11.2×** | 2.082 ms | 31.03 ms |
+| 32 | 8,599 | 773 | **11.1×** | 2.504 ms | 45.34 ms |
+
+Sequential per-request latency was checked with the repository's own `latency.php` in the
+same session and agrees with hazard 46: socket **0.82 ms** median against pipe **15.26 ms**
+over 9 runs of 1000 — 18.6×, and on the same route and host. Both arms served
+byte-identical 9839-byte bodies (equal SHA-256), so the comparison is the transport and
+not the page.
+
+**Why the ratio *shrinks* as load rises — two different ceilings.**
+
+- **The pipe arm cannot use more than one worker.** It scales linearly at **exactly 66
+  rps per connection** to concurrency 8 (66 / 132 / 264 / 528), then stops dead and holds
+  **772–775 rps whether 12 or 32 connections are offered** — 12 workers × 66 rps, within
+  0.4% across every cell. The ceiling *is* the 15 ms read of hazard 46/47; nothing the
+  client does moves it. Past 12 connections the extras only queue, which is why p50 climbs
+  to 31 ms and then 45 ms with throughput flat. **No amount of pool tuning recovers this**:
+  the process that would do the work is the one that is parked.
+- **The socket arm is capped by CPU, not by the pool.** At c=12 it uses **61–63% of the
+  whole 12-thread host** while the pipe arm uses **2.9–6.6%** — and at c=12 the measured
+  per-request CPU is *lower* for the socket (0.80 ms against the pipe's 1.02 ms), because
+  the pipe's workers spend their time blocked rather than working. So the socket's ~8.6k
+  is a CPU ceiling that a second client cannot lift, and the pipe's 2.9% is the signature
+  of a pool waiting.
+
+**The controls, because the load generator is ours.**
+
+- **The client is not the bottleneck.** One client at c=12 produced 9,306 rps and two
+  clients at c=6 each produced 9,209 — the same number from twice the processes at the
+  same offered concurrency, so the limit is server-side. The client's own cost is **0.06 ms
+  of CPU per request** (½ core at 8,200 rps).
+- **CPU attribution is not contaminated by respawns.** A replacement worker starts after
+  the measurement begins, so `Get-CimInstance` would charge a whole PHP *startup* to that
+  arm — 16.6 ms each, twelve times, is 199 ms, which is 10–13% of the ~1.7 s measured and
+  exactly the kind of number that gets mistaken for a result. The PID set is compared
+  across the snapshots so a contaminated row is flagged rather than believed, and the
+  numbers above come from a run in which **neither arm respawned a single worker**.
+- **The raw rows are committed**, as `results/raw-windows-279dc35.tsv` in
+  `stokehold-competition` (`P` = socket, `Pp` = pipe), which is hazard 46's outstanding
+  "the published Windows latency claim is not committed" — the 21× and the 11× can now be
+  re-derived from the repository rather than taken on trust.
+
+**Two things to read carefully, and one that is still open.**
+
+- The socket's absolute 8.6k is **not** comparable to Linux's `wrk`-derived ~19.4k for the
+  same arm: different host, different core count, different load generator. The
+  like-for-like comparison is the sequential one, where socket 0.82 ms against Linux
+  0.556 ms is the same order and pipe 15.26 ms against Linux 0.556 ms is not. This is why
+  the ceiling ratio is the claim here and the absolute throughput is not.
+- The pipe's 15 ms is not a *contention* effect — 66 rps at concurrency 1 is the same
+  per-request cost as 775 rps at 32 — so the "one worker at a time" description above is
+  deliberately narrow. What the numbers show is that the pipe arm's throughput equals
+  66 × *min*(connections, 12) and nothing more; whether the pool could in principle have
+  kept more workers busy is not what was measured, and a 15 ms stall on a read is what
+  would make it not.
+- **The one silent event.** The first socket sweep logged `a worker died; replacing it`
+  for all 12 slots during a 32-connection cell, and because the socket transport sets the
+  worker's `stdout` to `null` and worker `stderr` is logged at **`debug`** rather than
+  `warn`, nothing the dead worker said was recorded. No request failed and no throughput
+  moved, and it did not recur in any later run, but a worker dying mid-load with no
+  visible reason is worth noting rather than explaining away — the `stderr` line is the
+  only place an uncaught PHP fatal would appear, and at `info` verbosity there is nowhere
+  it can appear at all.
+

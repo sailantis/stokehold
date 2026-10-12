@@ -1862,6 +1862,44 @@ makes the child read a **bad file descriptor** (`fread(): Read of 8192 bytes fai
 so the PHP end cannot even set it up. The option is therefore closed by the platform, not by
 preference, and `connect()` is the only route.
 
+**A named pipe does not escape it either — measured.** Since stokehold already speaks FastCGI
+over a named pipe on Windows (`stokehold-fcgi/src/pipe.rs`), the obvious follow-up question was
+whether the *worker* protocol could use one: a named pipe is opened by **name**, not as the
+child's stdio, so unlike fd 0 it would not be caught by `GetFileType`'s socket-as-pipe
+coarseness, and it would still beat stdio because the server could create the pipe and hand the
+name to the worker. So it was measured directly, with all three arms driven by the same writer
+loop (so any probe overhead cancels) and PHP timing its own `fread` of one byte on a parked read:
+
+| arm | channel | median | p95 |
+| --- | --- | --- | --- |
+| `pipe` | anonymous pipe (stdio) | **15.00 ms** | 15.56 ms |
+| `named` | `\\.\pipe\name`, `fopen`'d `r+b` | **14.97 ms** | 15.56 ms |
+| `tcp` | loopback socket | **0.012 ms** | 0.028 ms |
+
+**A named pipe is the slow path, to within 0.2% of the anonymous pipe.** The control that rules
+out the probe's own writer: the same `WriteFile` on the same named-pipe handle measures
+**0.0031 ms median** — 5000× faster than the read it was paired with, and the write and read are
+one round trip on the same handle, so the 15 ms is PHP's side of the exchange. PHP also reports
+the named pipe as `stream_type=STDIO`, i.e. it places it on the same path as stdio.
+
+Three details fall out of that and are worth keeping:
+
+- **The cost is *per read*, not per setup.** A named pipe avoids the connection dial and the
+  `connect()` API entirely, and still pays the full 15 ms per frame — so a worker protocol over
+  one would be no faster than the pipe it already uses, while adding a name convention. The
+  socket is not fast because it is *not stdio*; it is fast because it is a socket.
+- **It refines the cause in the same direction as `GetFileType`.** PHP classifies the named pipe
+  as `STDIO`/`plainfile` and the TCP stream as `tcp_socket/ssl`, and the two behave exactly as
+  those classifications predict, so the ~5 Hz polling theory now has a concrete face: PHP takes
+  its **stdio/plain-file read path** on anything that is not a socket, not a path specific to fd
+  0.
+- **It confirms the `spawn_cgi` pipe finding was a different measurement.** Hazard 45 found the
+  named pipe *faster* than loopback TCP for a **request-sized** FastCGI request (~168 µs against
+  ~211 µs). That is the same conclusion as this table: TCP's advantage is per *small park-and-wake
+  round trip*, not per byte, and at ~4 KiB the per-syscall and polling costs are amortised while
+  the socket's own stack overhead is not. Both numbers are real, and they are not in conflict —
+  they are different regimes.
+
 **Tests.** `a_worker_uses_the_better_transport_for_the_platform` and
 `the_transport_can_always_be_stated_explicitly` pin the default and both overrides;
 `a_worker_still_on_create_is_told_to_call_connect` runs a real `create()` worker on the socket

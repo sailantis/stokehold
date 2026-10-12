@@ -317,6 +317,41 @@ pub struct WorkerConfig {
     /// Extra environment variables for the worker process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+
+    /// Whether the per-frame `crc32c` is verified.
+    ///
+    /// Defaults to [`ChecksumMode::Required`], which is what every stokehold release
+    /// before this option did, so a configuration that does not mention it is unchanged on
+    /// the wire. Setting `optional` lets a worker that also agrees omit the checksum; the
+    /// negotiation is in the handshake, so a worker that does not understand the offer
+    /// simply keeps checksumming — see [`ChecksumMode`].
+    #[serde(default)]
+    pub checksum: ChecksumMode,
+}
+
+/// How strictly the worker protocol's per-frame `crc32c` is enforced.
+///
+/// A configuration-level mirror of the protocol's `Checksum` policy. It lives here
+/// rather than importing the worker crate's enum so that the configuration model stays
+/// free of the protocol crate, which is what lets `stokehold-core` be the leaf that every
+/// other crate depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksumMode {
+    /// Every frame must carry a verified checksum, and one that claims otherwise is
+    /// refused. The default, and the only mode an older worker can be driven in.
+    #[default]
+    Required,
+    /// The handshake may agree to omit the checksum. A frame that still carries one is
+    /// verified; only a frame that declares it has none is read without hashing it.
+    Optional,
+}
+
+impl ChecksumMode {
+    /// True when the checksum is enforced, for logging and tests.
+    pub fn is_required(self) -> bool {
+        matches!(self, ChecksumMode::Required)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -745,8 +780,67 @@ bind_host = "0.0.0.0"
     }
 
     #[test]
-    fn parses_a_spawn_cgi_unix_socket() {
+    fn the_checksum_is_required_unless_the_configuration_says_otherwise() {
+        // The default matters more than the option: a configuration written before this
+        // setting existed must keep the old wire behaviour, which is `required`.
         let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        match &config.backends["app"] {
+            BackendConfig::Worker(w) => assert_eq!(w.checksum, ChecksumMode::Required),
+            other => panic!("expected worker, got {other:?}"),
+        }
+
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+checksum = "optional"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        match &config.backends["app"] {
+            BackendConfig::Worker(w) => {
+                assert_eq!(w.checksum, ChecksumMode::Optional);
+                assert!(!w.checksum.is_required());
+            }
+            other => panic!("expected worker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_checksum_mode_is_refused_rather_than_defaulted() {
+        // The setting decides whether integrity is checked, so a typo — `checksum = "opt"`,
+        // say, or the `none` a reader might guess at — must not silently mean `required`.
+        // Guessing either way is wrong, so the field is denied rather than defaulted.
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+checksum = "none"
+"#;
+        let err = Config::from_toml(text).expect_err("must not be accepted");
+        let message = err.to_string();
+        assert!(message.contains("unknown variant `none`"), "{message}");
+        assert!(
+            message.contains("expected `required` or `optional`"),
+            "the error must name the two valid modes: {message}"
+        );
+    }
+
+    #[test]
+    fn parses_a_spawn_cgi_unix_socket() {        let text = r#"
 default_backend = "cgi"
 [server]
 http = "127.0.0.1:8080"

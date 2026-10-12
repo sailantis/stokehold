@@ -1307,6 +1307,59 @@ against the specification and secondary implementations, and are confirmed by fi
     `String`s per header pair), which a caller receives and keeps — a pool cannot recycle what
     the caller takes ownership of, which is why the header-buffer idea does not work.
 
+**41. The frame checksum is now optional, negotiated, and worth about 0.26%.** Hazard 40's last
+    paragraph was "the checksum is the one cost left on the framing path". It was, and it is now a
+    setting — but the measurement that justifies the work is not the one that was expected.
+
+    Measured, by encoding a whole response (head + 12 KB body + `END`) with the real SDK in a
+    loop, 50,000 iterations, four runs:
+
+    | | checked | unchecked | saved |
+    |---|---|---|---|
+    | 12 KB `BODY` frame alone | 1.63–1.77 µs | 0.73–1.01 µs | ~0.9–1.0 µs (55–57%) |
+    | whole response | 3.54–3.81 µs | 1.96–2.12 µs | ~1.5–1.7 µs |
+
+    Against the 617 µs `GET /items` on the worker arm that is **0.26%**. The PHP side is the one
+    that mattered, because the worker writes the response and the server merely reads it; the
+    Rust side hashes the same bytes once.
+
+    So this is a knob, not a win, and the honest framing is the one hazard 40 used for the read
+    path: the evidence is about the framing path, and no throughput number is claimed. It is
+    worth having because it is the *last* per-byte cost in the protocol and because turning it off
+    is now a one-line configuration change on either side of a measurement, not because 0.26%
+    needed a feature.
+
+    Three decisions that are protocol, not implementation:
+
+    - **A flag, not a zero sentinel.** `crc32c("") == 0` is a *valid* checksum, carried by every
+      empty-payload frame — the protocol document's own `HELLO` fixture shows it. A value-based
+      sentinel would make a correctly-checksummed `HELLO` or `END` indistinguishable from an
+      unchecked one, and would let corruption of the checksum field — the one field whose value
+      must never decide whether it is verified — turn the check off. Bit `0x0010` instead.
+    - **Zero means the status quo.** `NO_CHECKSUM` is opt-in, so an old peer ignores the bit and
+      keeps verifying, and a mismatch fails loudly. The reverse polarity — a `CHECKSUM` bit whose
+      absence means "unchecked" — would silently downgrade every frame a current release writes,
+      because they all carry `flags = 0`. The existing flags already follow this convention
+      (`COMPRESSED`, `ERROR`).
+    - **The offer is checksummed even when the agreement is to stop.** The handshake carries the
+      agreement, so a corrupt `HELLO_ACK` must not be able to claim agreement that was never
+      given. Both ends hash `HELLO` and `HELLO_ACK` and switch only afterwards.
+
+    Two corrections found while doing it, both worth recording because they were latent:
+
+    - **`Header::read_frame` and `read_into` had a second copy of the payload check.** Adding the
+      policy meant the strict reader refused a frame the lenient one accepted *from the same
+      bytes* — a differential test caught it immediately. `read_frame` now delegates to
+      `read_frame_with(.., Checksum::Required)`, so the rule lives in one place again.
+    - **The `HELLO` payload byte fixtures were unpinned.** `wire_format.rs` pinned 16-byte headers
+      and the reference `HELLO` was the empty-payload zero fixture, so the day `HELLO` stopped
+      being an empty frame — which it did when it moved from a reused `RequestHeader` to a real
+      two-field payload — nothing failed. There are now golden bytes for both the offered and
+      the plain `HELLO`, computed independently, and for the specification's `REQUEST` layout.
+
+    Not claimed: any throughput change. The VM has not been synced and no benchmark has been run
+    for this or for hazard 40.
+
 
 
 Phase 0 — skeleton and baseline

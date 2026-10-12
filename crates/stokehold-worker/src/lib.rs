@@ -41,10 +41,11 @@ pub use codec::{
 };
 pub use error::{Result, WorkerError};
 pub use header::{
-    crc32c, flags, write_frame, Header, MessageType, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_VERSION,
+    crc32c, flags, write_frame, Checksum, Header, MessageType, HEADER_LEN, MAX_PAYLOAD_LEN,
+    PROTOCOL_VERSION,
 };
 pub use message::{
-    Codec, Control, ErrorReport, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
+    Codec, Control, ErrorReport, Hello, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
     RequestHeader, ResponseHead,
 };
 

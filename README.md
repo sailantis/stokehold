@@ -94,6 +94,16 @@ wait has a deadline, enforced by killing the worker — the process *is* the can
 because a pipe read has no portable timeout. A failed request is deliberately **not** retried,
 unlike the FastCGI backends: a worker failure can happen after the application ran.
 
+`checksum = "optional"` turns off the protocol's per-frame CRC-32C. The default is `"required"`,
+which is what every earlier release did, so omitting the line changes nothing. When it is
+`"optional"` the server *offers* the option in its `HELLO`, and only stops verifying if the worker
+answers in its `HELLO_ACK` that it agrees — an SDK that predates the field omits it, which decodes
+as "no", and the pair stays checked. The handshake itself is always checksummed, in both
+directions, because it is the exchange that carries the agreement. Setting it is worth about what
+one `memcpy` of the page costs per frame, which on a request that spends its time inside the
+application is close to nothing; it is a knob to measure with, not a promised speed-up. See
+[`docs/worker-protocol.md`](docs/worker-protocol.md) for the wire details and the flag.
+
 ```toml
 default_backend = "app"
 
@@ -105,6 +115,7 @@ fastcgi = "unix:/run/stokehold.sock"
 kind = "worker"
 command = "php worker.php"
 memory_limit_mb = 256
+checksum = "optional"
 
 [backends.fpm]
 kind = "external"

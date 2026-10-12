@@ -13,6 +13,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The server's opening frame: the protocol version, and the policies it wants used.
+///
+/// A dedicated struct rather than the `RequestHeader` this used to reuse. Two reasons: a
+/// `RequestHeader` travels on *every* request, so a policy field there would add bytes to
+/// the hot path, and a `HELLO` carrying request-shaped JSON read as though a request were
+/// being described. The field names are part of the protocol, because the PHP SDK decodes
+/// the same JSON.
+///
+/// `no_checksum` defaults to `false`, which is the fail-safe direction: a peer that does not
+/// know the field keeps verifying checksums, and a server that says nothing means "required".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hello {
+    /// The protocol version the server speaks.
+    ///
+    /// Previously absent, because the reused `RequestHeader` had no such field and the SDK
+    /// defaulted it to its own. Stating it makes a mismatched pair visible at the first frame.
+    pub protocol_version: u8,
+    /// Whether the worker may omit the per-frame checksum.
+    #[serde(default)]
+    pub no_checksum: bool,
+}
+
 /// The PHP and stokehold versions a worker reports at handshake.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloAck {
@@ -31,6 +53,13 @@ pub struct HelloAck {
     /// What the worker's bootstrap reported, free-form and for logs only.
     #[serde(default)]
     pub runtime: String,
+    /// Whether the worker agreed to omit the per-frame checksum.
+    ///
+    /// The worker's *answer*, not its preference: a server that requires checksums will not
+    /// have offered, so an absent or `false` value means the worker is checksumming. Recorded
+    /// so the pool can see what a worker actually agreed to rather than assuming it followed.
+    #[serde(default)]
+    pub no_checksum: bool,
 }
 
 /// What the server tells a worker when asking it to serve a request.

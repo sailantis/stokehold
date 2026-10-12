@@ -11,9 +11,9 @@
 //! implementation, so they are not merely "whatever the code currently does".
 
 use stokehold_worker::codec::write_hello_ack;
-use stokehold_worker::header::{crc32c, flags, write_frame, HEADER_LEN, PROTOCOL_VERSION};
+use stokehold_worker::header::{crc32c, flags, write_frame, Checksum, HEADER_LEN, PROTOCOL_VERSION};
 use stokehold_worker::{
-    Codec, Header, HelloAck, Json, MessageType, RequestEnd, ResponseHead, MAX_BODY_CHUNK,
+    Codec, Header, Hello, HelloAck, Json, MessageType, RequestEnd, ResponseHead, MAX_BODY_CHUNK,
     MAX_PAYLOAD_LEN, UNSOLICITED,
 };
 
@@ -23,11 +23,42 @@ fn hex(data: &[u8]) -> String {
 
 /// A frame as the writer would emit it: header, then payload.
 fn wire(message_type: MessageType, request_id: u32, payload: &[u8], extra_flags: u16) -> Vec<u8> {
-    let mut header = Header::new(message_type, request_id, payload).expect("a small payload");
+    wire_with(
+        message_type,
+        request_id,
+        payload,
+        extra_flags,
+        Checksum::Required,
+    )
+}
+
+/// The same, written under a checksum policy.
+fn wire_with(
+    message_type: MessageType,
+    request_id: u32,
+    payload: &[u8],
+    extra_flags: u16,
+    policy: Checksum,
+) -> Vec<u8> {
+    let mut header =
+        Header::with_checksum(message_type, request_id, payload, policy).expect("a small payload");
     header.flags |= extra_flags;
     let mut out = Vec::new();
     write_frame(&mut out, &header, payload).expect("writing to a Vec cannot fail");
     out
+}
+
+#[test]
+fn the_request_fixture_in_the_specification_matches_the_writer() {
+    // `docs/worker-protocol.md` shows this frame byte for byte as the reference layout, so it
+    // is a contract with a reader, not an illustration. The payload is deliberately the
+    // smallest one with a non-zero checksum, because a zero checksum here could not tell a
+    // working hash from a missing one.
+    let expected = concat!(
+        "02000000", "01", "03", "0000", "01000000", "aad07b29", "7b7d",
+    );
+    assert_eq!(hex(&wire(MessageType::Request, 1, b"{}", 0)), expected);
+    assert_eq!(crc32c(b"{}"), 0x297B_D0AA);
 }
 
 #[test]
@@ -224,6 +255,7 @@ fn the_handshake_helper_writes_what_the_channel_expects() {
         sapi: "cli".to_string(),
         pid: 4242,
         runtime: String::new(),
+        no_checksum: false,
     };
 
     let mut bytes = Vec::new();
@@ -235,4 +267,83 @@ fn the_handshake_helper_writes_what_the_channel_expects() {
     assert_eq!(header.request_id, UNSOLICITED);
     let decoded: HelloAck = Json::decode(&payload).unwrap();
     assert_eq!(decoded, ack);
+}
+
+#[test]
+fn the_hello_payload_is_the_documented_fields_in_the_documented_order() {
+    // Pinned because the PHP SDK decodes this JSON and because the payload is *not* fixed
+    // length: it is the one handshake frame whose bytes changed when the checksum option
+    // arrived. The `HELLO` header fixture above cannot catch a payload change.
+    let required = Json::encode(&Hello {
+        protocol_version: PROTOCOL_VERSION,
+        no_checksum: false,
+    })
+    .unwrap();
+    assert_eq!(
+        required,
+        br#"{"protocol_version":1,"no_checksum":false}"#,
+        "the field names and order are the protocol"
+    );
+    assert_eq!(required.len(), 42);
+
+    let optional = Json::encode(&Hello {
+        protocol_version: PROTOCOL_VERSION,
+        no_checksum: true,
+    })
+    .unwrap();
+    assert_eq!(optional, br#"{"protocol_version":1,"no_checksum":true}"#);
+}
+
+#[test]
+fn a_hello_frame_matches_its_golden_bytes() {
+    // Computed independently (a throwaway Python model of the header and CRC-32C), like the
+    // other fixtures here, so a change to either side of the framing is caught.
+    let required = Json::encode(&Hello {
+        protocol_version: PROTOCOL_VERSION,
+        no_checksum: false,
+    })
+    .unwrap();
+    let expected_required = concat!(
+        // payload_len 42, version 1, HELLO (1), flags 0, request_id 0, crc32c
+        "2a000000", "01", "01", "0000", "00000000", "96d7c823",
+        "7b2270726f746f636f6c5f76657273696f6e223a312c226e6f5f636865636b73756d223a66616c73657d",
+    );
+    assert_eq!(hex(&wire(MessageType::Hello, UNSOLICITED, &required, 0)), expected_required);
+
+    // The optional form is the same frame with the `NO_CHECKSUM` flag raised and a zero
+    // checksum field: the header keeps its 16 bytes and the payload only loses the `l` of
+    // `false`.
+    let optional = Json::encode(&Hello {
+        protocol_version: PROTOCOL_VERSION,
+        no_checksum: true,
+    })
+    .unwrap();
+    let frame = wire_with(
+        MessageType::Hello,
+        UNSOLICITED,
+        &optional,
+        flags::NO_CHECKSUM,
+        Checksum::Optional,
+    );
+    assert_eq!(
+        hex(&frame),
+        concat!(
+            "29000000", "01", "01", "1000", "00000000", "00000000",
+            "7b2270726f746f636f6c5f76657273696f6e223a312c226e6f5f636865636b73756d223a747275657d",
+        )
+    );
+}
+
+#[test]
+fn the_no_checksum_flag_is_bit_four_of_the_flags_field() {
+    // The bit's value is part of the protocol for the same reason the message numbers are:
+    // the PHP SDK tests it.
+    assert_eq!(flags::NO_CHECKSUM, 0b0001_0000);
+    let frame = wire(MessageType::Request, 1, b"", flags::NO_CHECKSUM);
+    assert_eq!(&frame[6..8], &[0x10, 0x00]);
+    // And it is disjoint from every other defined bit, so raising it cannot be confused
+    // with `LAST` or `ERROR`.
+    for other in [flags::COMPRESSED, flags::CHUNKED, flags::LAST, flags::ERROR] {
+        assert_eq!(flags::NO_CHECKSUM & other, 0, "{other:#06x} overlaps");
+    }
 }

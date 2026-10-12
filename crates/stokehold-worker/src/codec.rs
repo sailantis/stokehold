@@ -19,9 +19,9 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 
 use crate::error::{Result, WorkerError};
-use crate::header::{flags, write_frame, Header, MessageType};
+use crate::header::{flags, write_frame, Checksum, Header, MessageType};
 use crate::message::{
-    Codec, Control, ErrorReport, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
+    Codec, Control, ErrorReport, Hello, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
     RequestHeader, ResponseHead,
 };
 
@@ -105,6 +105,13 @@ impl BoundedChannel {
     /// Perform the handshake: send `HELLO`, require a matching `HELLO_ACK`.
     pub fn handshake(&mut self) -> Result<HelloAck> {
         self.channel.handshake()
+    }
+
+    /// Set the checksum policy this channel offers at handshake and then uses.
+    ///
+    /// Must be called before [`BoundedChannel::handshake`], which is where the offer is made.
+    pub fn offer_no_checksum(&mut self, offer: bool) {
+        self.channel.offer_no_checksum(offer);
     }
 
     /// Send a request and collect its whole response.
@@ -313,6 +320,19 @@ pub struct WorkerChannel<W: Write, R: Read> {
     /// out of it (into the body, or decoded) before the next read, because the next read
     /// overwrites it.
     scratch: Vec<u8>,
+    /// The agreed checksum policy, in force after the handshake.
+    ///
+    /// [`Checksum::Required`] until [`WorkerChannel::handshake`] has agreed otherwise, which
+    /// is what keeps the handshake itself checksummed in both directions: the agreement is
+    /// carried *in* frames, and a frame that could turn the check off would be able to do so
+    /// before anyone had agreed to it.
+    checksum: Checksum,
+    /// Whether `HELLO` offers the worker the option of omitting the checksum.
+    ///
+    /// The *offer*, kept apart from `checksum` (the policy actually in force) so that the two
+    /// cannot be confused: offering does not change a single byte of any frame until the
+    /// worker has answered with the same offer accepted.
+    offer_no_checksum: bool,
 }
 
 impl<W: Write, R: Read> WorkerChannel<W, R> {
@@ -326,7 +346,24 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             metrics: Vec::new(),
             payload: Vec::new(),
             scratch: Vec::new(),
+            checksum: Checksum::Required,
+            offer_no_checksum: false,
         }
+    }
+
+    /// The checksum policy in force, which is [`Checksum::Required`] until the handshake.
+    pub fn checksum_policy(&self) -> Checksum {
+        self.checksum
+    }
+
+    /// Offer, in `HELLO`, to let this worker omit the per-frame checksum.
+    ///
+    /// An offer and not a decision: the policy in force does not change until the worker
+    /// answers with `no_checksum` in its `HELLO_ACK`, and it never changes at all if the
+    /// worker does not understand the field. Must be called before
+    /// [`WorkerChannel::handshake`], because that is the only frame the offer is made in.
+    pub fn offer_no_checksum(&mut self, offer: bool) {
+        self.offer_no_checksum = offer;
     }
 
     /// Push everything written so far through to the writer.
@@ -369,7 +406,10 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     /// The version check happens here, at boot, rather than on the first request
     /// — a mismatched SDK is a configuration problem and should look like one.
     pub fn handshake(&mut self) -> Result<HelloAck> {
-        let hello = RequestHeader::default();
+        let hello = Hello {
+            protocol_version: crate::PROTOCOL_VERSION,
+            no_checksum: self.offer_no_checksum,
+        };
         self.send_json(MessageType::Hello, crate::UNSOLICITED, &hello, 0)?;
 
         let (header, payload) = self.expect(MessageType::HelloAck, "handshake")?;
@@ -380,11 +420,24 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
                 expected: crate::PROTOCOL_VERSION,
             });
         }
+
+        // Adopt the policy only now, and only when it was offered: an `ack` from a worker that
+        // did not understand the field decodes as `false`, and one from a worker that refused is
+        // `false` too. Either way this end keeps verifying, which is the safe direction — a
+        // worker cannot be sent unchecked frames it never agreed to.
+        if self.offer_no_checksum && ack.no_checksum {
+            self.checksum = Checksum::Optional;
+        } else if self.offer_no_checksum {
+            tracing::debug!("worker did not accept skipping the checksum; keeping it on");
+            self.checksum = Checksum::Required;
+        }
+
         tracing::debug!(
             frame = header.message_type as u8,
             php = %ack.php_version,
             sapi = %ack.sapi,
             pid = ack.pid,
+            no_checksum = ack.no_checksum,
             "worker handshake complete"
         );
         Ok(ack)
@@ -597,7 +650,10 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             // Reuses one buffer for every frame, so a response costs no per-frame allocation
             // and no per-frame zero-fill. The bytes are consumed (copied into the body, or
             // decoded) before the next read overwrites them.
-            let Some((header, len)) = Header::read_into(&mut self.reader, frame_buffer)? else {
+            let policy = self.checksum;
+            let Some((header, len)) =
+                Header::read_into_with(&mut self.reader, frame_buffer, policy)?
+            else {
                 return Err(WorkerError::Closed(format!(
                     "the worker closed its output while answering request {request_id}"
                 )));
@@ -719,10 +775,11 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             return Ok(());
         }
 
+        let checksum = self.checksum;
         let mut chunks = body.chunks(MAX_BODY_CHUNK).peekable();
         while let Some(chunk) = chunks.next() {
             let last = chunks.peek().is_none();
-            let mut header = Header::new(MessageType::Body, request_id, chunk)?;
+            let mut header = Header::with_checksum(MessageType::Body, request_id, chunk, checksum)?;
             if last {
                 header.flags |= flags::LAST;
             }
@@ -759,14 +816,15 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         payload: &[u8],
         extra_flags: u16,
     ) -> Result<()> {
-        let mut header = Header::new(message_type, request_id, payload)?;
+        let mut header = Header::with_checksum(message_type, request_id, payload, self.checksum)?;
         header.flags |= extra_flags;
         write_frame(&mut self.writer, &header, payload)
     }
 
     /// Read one frame, tolerating nothing: a malformed frame is an error.
     pub fn read_frame(&mut self) -> Result<Option<Frame>> {
-        let Some((header, payload)) = Header::read_frame(&mut self.reader)? else {
+        let policy = self.checksum;
+        let Some((header, payload)) = Header::read_frame_with(&mut self.reader, policy)? else {
             return Ok(None);
         };
         Ok(Some(Frame { header, payload }))
@@ -883,9 +941,14 @@ mod tests {
 
     /// Decode the frames a channel wrote, so tests can assert on the request side.
     fn sent_frames(bytes: &[u8]) -> Vec<(Header, Vec<u8>)> {
+        sent_frames_with(bytes, Checksum::Required)
+    }
+
+    /// The same, for a channel that may have written frames with no checksum in them.
+    fn sent_frames_with(bytes: &[u8], policy: Checksum) -> Vec<(Header, Vec<u8>)> {
         let mut cursor = std::io::Cursor::new(bytes);
         let mut frames = Vec::new();
-        while let Some(frame) = Header::read_frame(&mut cursor).unwrap() {
+        while let Some(frame) = Header::read_frame_with(&mut cursor, policy).unwrap() {
             frames.push(frame);
         }
         frames
@@ -1328,6 +1391,7 @@ mod tests {
                 sapi: "cli".to_string(),
                 pid: 4242,
                 runtime: "php-cli".to_string(),
+                no_checksum: false,
             },
         );
         let mut channel = script.channel();
@@ -1379,6 +1443,159 @@ mod tests {
 
         let err = channel.handshake().unwrap_err();
         assert!(err.to_string().contains("HELLO_ACK"), "{err}");
+    }
+
+    /// The `HELLO` the server sent, decoded.
+    ///
+    /// Read under the lenient policy because the whole point of `HELLO` in the optional case
+    /// is that it declares itself unchecked before the agreement has been reached.
+    fn sent_hello(channel: &WorkerChannel<Vec<u8>, std::io::Cursor<Vec<u8>>>) -> Hello {
+        let frames = sent_frames_with(&channel.writer, Checksum::Optional);
+        assert_eq!(frames[0].0.message_type, MessageType::Hello);
+        Json::decode(&frames[0].1).unwrap()
+    }
+
+    /// A script that acks a handshake with the given answer and then serves one request.
+    fn handshake_then_serve(no_checksum: bool) -> WorkerScript {
+        let mut script = WorkerScript::default();
+        script.json(
+            MessageType::HelloAck,
+            crate::UNSOLICITED,
+            &HelloAck {
+                protocol_version: PROTOCOL_VERSION,
+                no_checksum,
+                ..HelloAck::default()
+            },
+        );
+        script
+            .head(1, 200, 2)
+            .body(1, b"ok", true)
+            .json(MessageType::End, 1, &RequestEnd::default());
+        script
+    }
+
+    #[test]
+    fn the_default_channel_offers_no_such_thing_as_an_unchecked_frame() {
+        // The default is what every existing deployment gets, so the `HELLO` it sends must
+        // still ask for checksums: `no_checksum: false`.
+        let script = handshake_then_serve(false);
+        let mut channel = script.channel();
+        channel.handshake().unwrap();
+
+        assert!(!sent_hello(&channel).no_checksum);
+        assert_eq!(channel.checksum_policy(), Checksum::Required);
+    }
+
+    #[test]
+    fn the_handshake_itself_is_always_checksummed() {
+        // The rule the option rests on: a frame cannot turn the check off before both ends
+        // have agreed, so the frames that carry the agreement must themselves be checked.
+        // Otherwise a corrupt `HELLO_ACK` could claim agreement that was never given.
+        let script = handshake_then_serve(true);
+        let mut channel = script.channel();
+        channel.offer_no_checksum(true);
+        channel.handshake().unwrap();
+
+        // Read *strictly*: the offer travels in the payload, so the frame that carries it
+        // carries a real checksum, and a reader that requires one still accepts it.
+        let frames = sent_frames(&channel.writer);
+        assert_eq!(frames[0].0.message_type, MessageType::Hello);
+        assert_eq!(frames[0].0.flags & flags::NO_CHECKSUM, 0);
+        assert_eq!(frames[0].0.checksum, crc32c(&frames[0].1));
+    }
+
+    #[test]
+    fn an_optional_channel_adopts_the_policy_only_when_the_worker_agrees() {
+        let script = handshake_then_serve(true);
+        let mut channel = script.channel();
+        channel.offer_no_checksum(true);
+        channel.handshake().unwrap();
+
+        assert!(sent_hello(&channel).no_checksum);
+        assert_eq!(channel.checksum_policy(), Checksum::Optional);
+    }
+
+    #[test]
+    fn a_worker_that_does_not_agree_leaves_the_channel_verifying() {
+        // The fail-safe direction: an `ack` from a worker that never heard of the field
+        // decodes as `false`, and this end keeps hashing rather than assuming agreement.
+        let script = handshake_then_serve(false);
+        let mut channel = script.channel();
+        channel.offer_no_checksum(true);
+        channel.handshake().unwrap();
+
+        assert_eq!(
+            channel.checksum_policy(),
+            Checksum::Required,
+            "a refusal must not be read as consent"
+        );
+    }
+
+    #[test]
+    fn an_optional_channel_leaves_the_checksum_field_zero_on_its_requests() {
+        let script = handshake_then_serve(true);
+        let mut channel = script.channel();
+        channel.offer_no_checksum(true);
+        channel.handshake().unwrap();
+        channel
+            .request(&RequestHeader::default(), b"")
+            .expect("the exchange must still work unchecked");
+
+        let frames = sent_frames_with(&channel.writer, Checksum::Optional);
+        // frames[0] is the HELLO, which carries the offer; frames[1] is the request, which
+        // by now is written under the agreed policy.
+        let request = &frames[1].0;
+        assert_eq!(request.message_type, MessageType::Request);
+        assert_ne!(request.flags & flags::NO_CHECKSUM, 0);
+        assert_eq!(request.checksum, 0);
+    }
+
+    #[test]
+    fn an_optional_channel_reads_an_unchecked_reply() {
+        // The reply side of the same policy: the worker, told it may omit the checksum,
+        // answers with zeroed checksum fields, and the channel accepts them.
+        let mut script = WorkerScript::default();
+        script.json(
+            MessageType::HelloAck,
+            crate::UNSOLICITED,
+            &HelloAck {
+                protocol_version: PROTOCOL_VERSION,
+                no_checksum: true,
+                ..HelloAck::default()
+            },
+        );
+        // The rest of the reply, written unchecked, which `WorkerScript` cannot do because it
+        // always writes a checksummed frame.
+        let unchecked = |message_type, request_id: u32, payload: &[u8], flags: u16| {
+            let mut header =
+                Header::with_checksum(message_type, request_id, payload, Checksum::Optional)
+                    .unwrap();
+            header.flags |= flags;
+            let mut wire = Vec::new();
+            write_frame(&mut wire, &header, payload).unwrap();
+            wire
+        };
+        let head = Json::encode(&ResponseHead {
+            status: 200,
+            headers: Vec::new(),
+            body_len: 2,
+        })
+        .unwrap();
+        script.bytes.extend(unchecked(MessageType::Response, 1, &head, 0));
+        script
+            .bytes
+            .extend(unchecked(MessageType::Body, 1, b"ok", flags::LAST));
+        let end = Json::encode(&RequestEnd::default()).unwrap();
+        script.bytes.extend(unchecked(MessageType::End, 1, &end, 0));
+
+        let mut channel = script.channel();
+        channel.offer_no_checksum(true);
+        channel.handshake().unwrap();
+
+        let response = channel
+            .request(&RequestHeader::default(), b"")
+            .expect("an unchecked but well-formed reply must be read");
+        assert_eq!(response.body, b"ok");
     }
 
     #[test]

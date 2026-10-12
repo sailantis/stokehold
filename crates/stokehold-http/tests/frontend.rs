@@ -130,6 +130,7 @@ fn worker_config(workers: u32) -> Config {
                 max_requests: None,
                 working_dir: None,
                 env: Default::default(),
+                checksum: Default::default(),
             }),
         )]
         .into_iter()

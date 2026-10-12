@@ -131,6 +131,11 @@ impl PhpWorker {
     /// expected, whereas a machine with PHP and no SDK checkout is a setup
     /// mistake that should say so rather than pass quietly.
     fn start() -> Option<Self> {
+        Self::start_with(false)
+    }
+
+    /// Start a worker, offering to skip the per-frame checksum at handshake.
+    fn start_with(offer_no_checksum: bool) -> Option<Self> {
         if let Some(reason) = skip_reason() {
             report_skip(reason);
             return None;
@@ -151,9 +156,12 @@ impl PhpWorker {
         let stdin = child.stdin.take().expect("the child's stdin");
         let stdout = child.stdout.take().expect("the child's stdout");
 
+        let mut channel = WorkerChannel::new(stdin, stdout);
+        channel.offer_no_checksum(offer_no_checksum);
+
         Some(PhpWorker {
             child,
-            channel: Some(WorkerChannel::new(stdin, stdout)),
+            channel: Some(channel),
         })
     }
 
@@ -459,6 +467,58 @@ fn closing_stdin_stops_the_worker_cleanly() {
 }
 
 #[test]
+fn the_default_handshake_does_not_offer_the_option_and_stays_checked() {
+    let mut worker = require_php!();
+
+    let ack = worker.handshake();
+
+    assert!(
+        !ack.no_checksum,
+        "a worker that was never offered the option must not claim it accepted one"
+    );
+    assert_eq!(
+        worker.channel().checksum_policy(),
+        stokehold_worker::Checksum::Required,
+        "the default policy is unchanged"
+    );
+}
+
+#[test]
+fn a_real_php_worker_agrees_to_skip_the_checksum_and_still_serves() {
+    // The end-to-end version of the negotiation: the offer travels in a real `HELLO`, the
+    // SDK answers in a real `HELLO_ACK`, and every frame after it — request and response —
+    // is written without a checksum by the PHP side and read without one by this side.
+    let mut worker = match PhpWorker::start_with(true) {
+        Some(worker) => worker,
+        None => return,
+    };
+
+    let ack = worker.handshake();
+    assert!(ack.no_checksum, "a PHP worker that understood the option accepts it");
+    assert_eq!(
+        worker.channel().checksum_policy(),
+        stokehold_worker::Checksum::Optional,
+        "the agreement is adopted once the ack says so"
+    );
+
+    let response = worker.get("/");
+    assert_eq!(response.head.status, 200, "the unchecked exchange still works");
+    assert!(
+        !response.body.is_empty(),
+        "and it still carries a body: {}",
+        body_text(&response)
+    );
+
+    // More than one request, so this covers every frame a response is made of rather than
+    // just the first. The channel's own reader is what verifies the worker really did leave
+    // the checksum field zero — an unchecked frame read under `Optional` is not hashed.
+    for uri in ["/", "/hello", "/"] {
+        let response = worker.get(uri);
+        assert_eq!(response.head.status, 200, "{uri} failed unchecked");
+    }
+}
+
+#[test]
 fn a_frame_the_php_side_did_not_write_is_not_accepted() {
     let mut worker = require_php!();
     worker.handshake();
@@ -473,6 +533,7 @@ fn a_frame_the_php_side_did_not_write_is_not_accepted() {
         sapi: "cli".to_string(),
         pid: 1234,
         runtime: String::new(),
+        no_checksum: false,
     };
     let encoded = Json::encode(&ack).expect("encode a HELLO_ACK");
     let mut wire = Vec::new();

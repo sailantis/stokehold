@@ -45,6 +45,35 @@ pub mod flags {
     pub const LAST: u16 = 0b0000_0100;
     /// The sender is reporting a failure; the payload is an `ERROR` description.
     pub const ERROR: u16 = 0b0000_1000;
+    /// The `crc32c` field is not meaningful for this frame and must not be verified.
+    ///
+    /// Set only when the checksum was turned off at handshake, and only by a reader that
+    /// allows it — see [`Checksum`]. The field is still written (as zero) to keep the
+    /// header 16 bytes.
+    ///
+    /// A **flag rather than a zero checksum**, because zero is already a real checksum:
+    /// `crc32c("") == 0`, which every empty-payload frame carries. Using zero as the
+    /// sentinel would make a correctly-checksummed `HELLO` or `END` indistinguishable
+    /// from an unchecked one, and would let corruption of the checksum field itself
+    /// disable the check — the one field whose value must never decide whether it is
+    /// verified.
+    pub const NO_CHECKSUM: u16 = 0b0001_0000;
+}
+
+/// Whether a frame's `crc32c` field must be verified.
+///
+/// The server picks this; the worker follows. Two states rather than a boolean on the
+/// read path because the difference is a *policy*, not a feature: [`Checksum::Required`]
+/// means a frame claiming [`flags::NO_CHECKSUM`] is a protocol violation, which is what
+/// stops a peer from unilaterally disabling the check on a server that wants it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Checksum {
+    /// Every frame must carry a verified checksum, and one that claims otherwise is refused.
+    #[default]
+    Required,
+    /// A frame that does not claim [`flags::NO_CHECKSUM`] is still verified; one that does
+    /// is accepted without verification.
+    Optional,
 }
 
 /// What a frame carries.
@@ -167,6 +196,21 @@ pub struct Header {
 impl Header {
     /// Build a header, defaulting the checksum to "computed by the writer".
     pub fn new(message_type: MessageType, request_id: u32, payload: &[u8]) -> Result<Self> {
+        Self::with_checksum(message_type, request_id, payload, Checksum::Required)
+    }
+
+    /// Build a header under a checksum policy.
+    ///
+    /// [`Checksum::Optional`] sets [`flags::NO_CHECKSUM`] and writes a zero checksum instead
+    /// of hashing the payload, which is where the saving is: the hash runs over every payload
+    /// byte, so skipping it is the point of the option. The flag is what tells the other end
+    /// the zero is not a checksum — the field is still written, so the header stays 16 bytes.
+    pub fn with_checksum(
+        message_type: MessageType,
+        request_id: u32,
+        payload: &[u8],
+        checksum: Checksum,
+    ) -> Result<Self> {
         if payload.len() > MAX_PAYLOAD_LEN {
             return Err(WorkerError::PayloadTooLarge {
                 size: payload.len(),
@@ -174,14 +218,38 @@ impl Header {
             });
         }
 
+        let (flags, checksum) = match checksum {
+            Checksum::Required => (0, crc32c(payload)),
+            Checksum::Optional => (flags::NO_CHECKSUM, 0),
+        };
+
         Ok(Header {
             payload_len: payload.len() as u32,
             protocol_version: PROTOCOL_VERSION,
             message_type,
-            flags: 0,
+            flags,
             request_id,
-            checksum: crc32c(payload),
+            checksum,
         })
+    }
+
+    /// Whether this header's checksum field is meaningful.
+    fn declares_no_checksum(&self) -> bool {
+        self.flags & flags::NO_CHECKSUM != 0
+    }
+
+    /// Refuse a frame that claims not to be checksummed, when the policy requires one.
+    ///
+    /// A peer must not be able to turn the check off by itself, so this is a protocol
+    /// violation rather than a quiet acceptance. Returns the error to raise, if any.
+    fn refuse_unchecked(&self, policy: Checksum) -> Option<WorkerError> {
+        if policy == Checksum::Required && self.declares_no_checksum() {
+            return Some(WorkerError::NotA {
+                expected: "a checksummed frame (this end requires one)",
+                actual: self.message_type,
+            });
+        }
+        None
     }
 
     /// Serialize to its 16-byte form.
@@ -250,9 +318,23 @@ impl Header {
 
     /// Read a whole frame: header plus payload, with the checksum verified.
     pub fn read_frame<R: Read>(reader: &mut R) -> Result<Option<(Self, Vec<u8>)>> {
+        Self::read_frame_with(reader, Checksum::Required)
+    }
+
+    /// Read a whole frame, verifying the checksum only when the policy and flags say so.
+    ///
+    /// The counterpart of [`Header::read_frame`] for a caller that has a checksum policy —
+    /// which is every reader in the protocol. See [`Checksum`].
+    pub fn read_frame_with<R: Read>(
+        reader: &mut R,
+        policy: Checksum,
+    ) -> Result<Option<(Self, Vec<u8>)>> {
         let Some(header) = Header::read(reader)? else {
             return Ok(None);
         };
+        if let Some(error) = header.refuse_unchecked(policy) {
+            return Err(error);
+        }
 
         let len = header.payload_len as usize;
         if len > MAX_PAYLOAD_LEN {
@@ -283,13 +365,15 @@ impl Header {
             return Err(WorkerError::Io(source));
         }
 
-        let computed = crc32c(&payload);
-        if computed != header.checksum {
-            return Err(WorkerError::ChecksumMismatch {
-                request_id: header.request_id,
-                expected: header.checksum,
-                computed,
-            });
+        if !header.declares_no_checksum() {
+            let computed = crc32c(&payload);
+            if computed != header.checksum {
+                return Err(WorkerError::ChecksumMismatch {
+                    request_id: header.request_id,
+                    expected: header.checksum,
+                    computed,
+                });
+            }
         }
 
         Ok(Some((header, payload)))
@@ -315,9 +399,24 @@ impl Header {
         reader: &mut R,
         buffer: &mut Vec<u8>,
     ) -> Result<Option<(Self, usize)>> {
+        Self::read_into_with(reader, buffer, Checksum::Required)
+    }
+
+    /// [`Header::read_into`] under a checksum policy.
+    ///
+    /// The policy decides two things: whether a frame claiming [`flags::NO_CHECKSUM`] is
+    /// refused outright, and whether the checksum is computed for a frame that claims one.
+    pub fn read_into_with<R: Read>(
+        reader: &mut R,
+        buffer: &mut Vec<u8>,
+        policy: Checksum,
+    ) -> Result<Option<(Self, usize)>> {
         let Some(header) = Header::read(reader)? else {
             return Ok(None);
         };
+        if let Some(error) = header.refuse_unchecked(policy) {
+            return Err(error);
+        }
 
         let len = header.payload_len as usize;
         if len > MAX_PAYLOAD_LEN {
@@ -345,16 +444,18 @@ impl Header {
             return Err(WorkerError::Io(source));
         }
 
-        let computed = crc32c(&buffer[..len]);
-        if computed != header.checksum {
-            // The buffer holds a frame that failed its checksum; clearing it keeps a caller
-            // that ignores the error from reading the bytes as if they were good.
-            buffer.clear();
-            return Err(WorkerError::ChecksumMismatch {
-                request_id: header.request_id,
-                expected: header.checksum,
-                computed,
-            });
+        if !header.declares_no_checksum() {
+            let computed = crc32c(&buffer[..len]);
+            if computed != header.checksum {
+                // The buffer holds a frame that failed its checksum; clearing it keeps a caller
+                // that ignores the error from reading the bytes as if they were good.
+                buffer.clear();
+                return Err(WorkerError::ChecksumMismatch {
+                    request_id: header.request_id,
+                    expected: header.checksum,
+                    computed,
+                });
+            }
         }
 
         Ok(Some((header, len)))
@@ -691,5 +792,114 @@ mod tests {
         let err = Header::read_into(&mut cursor, &mut buffer).unwrap_err();
         assert!(matches!(err, WorkerError::PayloadTooLarge { .. }), "{err}");
         assert_eq!(buffer.capacity(), 0, "the buffer grew before the guard ran");
+    }
+
+    /// One frame's bytes, written under a policy.
+    fn wire_of(payload: &[u8], checksum: Checksum) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let header = Header::with_checksum(MessageType::Body, 1, payload, checksum).unwrap();
+        write_frame(&mut wire, &header, payload).unwrap();
+        wire
+    }
+
+    #[test]
+    fn the_default_policy_writes_the_same_bytes_as_before_the_option_existed() {
+        // The whole point of defaulting to `Required`: an unchanged configuration must produce
+        // an unchanged wire. `Header::new` is what every existing caller uses.
+        let payload = b"a body";
+        assert_eq!(
+            wire_of(payload, Checksum::Required),
+            wire_of(payload, Checksum::default()),
+        );
+        let header = Header::new(MessageType::Body, 1, payload).unwrap();
+        assert_eq!(header.flags, 0, "the default must not raise a flag");
+        assert_eq!(header.checksum, crc32c(payload));
+    }
+
+    #[test]
+    fn an_optional_frame_declares_itself_and_carries_no_checksum() {
+        let payload = b"a body";
+        let header =
+            Header::with_checksum(MessageType::Body, 1, payload, Checksum::Optional).unwrap();
+        assert_ne!(header.flags & flags::NO_CHECKSUM, 0);
+        assert_eq!(header.checksum, 0, "the field is still written, but as zero");
+        assert_eq!(header.encode().len(), HEADER_LEN, "the header keeps its size");
+    }
+
+    #[test]
+    fn an_unchecked_frame_round_trips_when_the_policy_allows_it() {
+        let payload = b"a body that was never hashed";
+        let mut cursor = std::io::Cursor::new(wire_of(payload, Checksum::Optional));
+
+        let mut buffer = Vec::new();
+        let (header, len) =
+            Header::read_into_with(&mut cursor, &mut buffer, Checksum::Optional)
+                .unwrap()
+                .expect("a frame");
+        assert_eq!(header.message_type, MessageType::Body);
+        assert_eq!(&buffer[..len], payload);
+
+        let mut owned = std::io::Cursor::new(wire_of(payload, Checksum::Optional));
+        let (_, owned_payload) = Header::read_frame_with(&mut owned, Checksum::Optional)
+            .unwrap()
+            .expect("a frame");
+        assert_eq!(owned_payload, payload);
+    }
+
+    #[test]
+    fn corruption_in_an_unchecked_frame_is_not_detected_and_that_is_the_trade() {
+        // Stated as a test rather than left implicit: with the checksum off there is nothing
+        // to fail. This is the cost of the option, and it is why the policy is a choice.
+        let mut wire = wire_of(b"the truth", Checksum::Optional);
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff;
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let mut buffer = Vec::new();
+        let (_, len) =
+            Header::read_into_with(&mut cursor, &mut buffer, Checksum::Optional).unwrap().unwrap();
+        assert_ne!(&buffer[..len], b"the truth");
+    }
+
+    #[test]
+    fn a_required_reader_refuses_a_frame_that_declares_no_checksum() {
+        // The rule that makes the option safe: the *sender* cannot turn the check off. A peer
+        // that did not agree gets a protocol violation, loudly, rather than a silent downgrade.
+        let wire = wire_of(b"a body", Checksum::Optional);
+
+        let mut buffer = Vec::new();
+        let err = Header::read_into(&mut std::io::Cursor::new(&wire), &mut buffer).unwrap_err();
+        assert!(matches!(err, WorkerError::NotA { .. }), "{err}");
+
+        let err = Header::read_frame(&mut std::io::Cursor::new(&wire)).unwrap_err();
+        assert!(matches!(err, WorkerError::NotA { .. }), "{err}");
+    }
+
+    #[test]
+    fn an_optional_reader_still_verifies_a_frame_that_carries_one() {
+        // The policy relaxes the check only for frames that opt out. A frame that says it is
+        // checksummed is still checked, so a mixed stream is still protected where it can be.
+        let mut wire = wire_of(b"correct", Checksum::Required);
+        let payload_at = wire.len() - 7;
+        wire[payload_at] ^= 0xff;
+
+        let mut buffer = Vec::new();
+        let err =
+            Header::read_into_with(&mut std::io::Cursor::new(&wire), &mut buffer, Checksum::Optional)
+                .unwrap_err();
+        assert!(matches!(err, WorkerError::ChecksumMismatch { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_failed_checksum_does_not_leave_the_bytes_to_be_read_as_good() {
+        // `read_into` hands the bytes back through a buffer the caller owns, so a caller that
+        // ignores the error could otherwise read a corrupt frame as if it were fine.
+        let mut wire = wire_of(b"correct", Checksum::Required);
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff;
+
+        let mut buffer = vec![0u8; 4];
+        let _ = Header::read_into(&mut std::io::Cursor::new(&wire), &mut buffer);
+        assert!(buffer.is_empty(), "a corrupt frame was left in the buffer");
     }
 }

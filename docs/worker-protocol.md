@@ -54,16 +54,20 @@ All multi-byte integers are **little-endian**. Both ends are little-endian in pr
 (x86-64, arm64) and the fields are read with fixed-size loads rather than byte-by-byte
 accumulators; a big-endian host would lose a memcpy, never correctness.
 
-The reference layout, in bytes, for `Hello`, `request_id = 0`, empty payload:
+The reference frame, in bytes, for `REQUEST` with `request_id = 1`, `payload_len = 2`:
 
 ```
-00 00 00 00   payload_len = 0
+02 00 00 00   payload_len = 2
 01            protocol_version = 1
-01            message_type = HELLO
+03            message_type = REQUEST
 00 00         flags = 0
-00 00 00 00   request_id = 0
-00 00 00 00   crc32c("") = 0
+01 00 00 00   request_id = 1
+aa d0 7b 29   crc32c("{}") = 0x297BD0AA
+7b 7d         payload = "{}"
 ```
+
+`HELLO` is the one frame whose payload is not the caller's: see [Handshake](#handshake-once-at-boot)
+for the exact bytes it carries.
 
 ### Payload limits
 
@@ -140,6 +144,14 @@ work per byte on the hot path, so bytes travel as bytes.
 | `0x0002` | `CHUNKED` | The payload is one chunk of a larger logical message |
 | `0x0004` | `LAST` | This is the last chunk of a logical message |
 | `0x0008` | `ERROR` | The sender is reporting a failure |
+| `0x0010` | `NO_CHECKSUM` | The `crc32c` field is **not** a checksum and must not be verified. Only legal once the handshake has agreed to it |
+
+`NO_CHECKSUM` is a **flag rather than a zero checksum**, and the reason is that zero is already
+a real checksum: `crc32c("") == 0`, which every empty-payload frame carries. Using the value
+itself as the sentinel would make a correctly-checksummed `HELLO` or `END` indistinguishable from
+an unchecked frame, and would let corruption of the checksum field — the one field whose value
+must never decide whether it is verified — silently disable the check. The field is still
+written, as zero, so the header stays 16 bytes.
 
 ## Checksum
 
@@ -159,6 +171,40 @@ use the built-in hash rather than reimplementing the polynomial.
 
 The checksum detects truncated and garbled frames. A mismatch means framing has already
 desynchronised, so the stream is unrecoverable and the worker must be discarded.
+
+### Turning it off
+
+The checksum walks every payload byte, so on a 12 KB page it costs about as much as 12 KB of
+`memcpy` — which is to say, on a request that spends most of its time inside the application, not
+much. It is nevertheless the largest single item on the *framing* path, and it is the one part of
+the protocol that is pure overhead when the transport is a pipe between two processes on one
+machine. So it is optional, and negotiated:
+
+- The server may set `no_checksum: true` in its `HELLO`, which is an **offer**. If it does not,
+  nothing changes: the worker keeps checksumming and the server keeps verifying.
+- The worker **answers** with `no_checksum` in its `HELLO_ACK`, `true` only if it understood the
+  field and agrees to the offer. An SDK that predates the field omits it, which decodes as
+  `false`, and the pair stays checked.
+- Only when both said `true` does either end stop hashing — the server after reading the ack, the
+  worker after sending it. Every frame from then on carries `NO_CHECKSUM` and a zero checksum
+  field.
+
+Three properties are deliberate:
+
+1. **The handshake is always checksummed.** The agreement is carried *in* frames, so the frames
+   that carry it must themselves be verified; otherwise a corrupt `HELLO_ACK` could claim
+   agreement that was never given. The `HELLO` and `HELLO_ACK` are therefore written with real
+   checksums even when both ends are about to stop computing them.
+2. **A sender cannot turn the check off by itself.** A frame claiming `NO_CHECKSUM` on an end
+   that never agreed is a protocol violation, not a quiet acceptance, and is refused as such. The
+   flag is the writer's claim; believing it is the reader's decision.
+3. **A frame that says it is checksummed still is.** The policy relaxes the check only for frames
+   that opt out, so a mixed stream is verified wherever it can be.
+
+What is lost is exactly what the checksum detects on unchecked frames: a bit-flip in the payload
+of a frame that declared no checksum is not detected, and the corrupt bytes are passed to the
+application or the client. On a pipe between two processes on one machine that is a remote
+possibility — and a deliberate trade, not an oversight.
 
 ## Exchange sequences
 

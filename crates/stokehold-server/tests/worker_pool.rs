@@ -129,6 +129,7 @@ fn config(workers: u32) -> WorkerConfig {
         max_requests: None,
         working_dir: None,
         env: Default::default(),
+        checksum: Default::default(),
     }
 }
 
@@ -641,6 +642,7 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         max_requests: None,
         working_dir: None,
         env: Default::default(),
+        checksum: Default::default(),
     };
     let pool = WorkerPool::start("test", &config).expect("pool starts");
 
@@ -702,6 +704,7 @@ fn a_worker_that_cannot_boot_is_refused_at_startup() {
         max_requests: None,
         working_dir: None,
         env: Default::default(),
+        checksum: Default::default(),
     };
 
     let err = WorkerPool::start("test", &config).unwrap_err();

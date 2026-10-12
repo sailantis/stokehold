@@ -59,14 +59,14 @@ use std::borrow::Cow;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use stokehold_core::config::WorkerConfig;
+use stokehold_core::config::{ChecksumMode, WorkerConfig};
 use stokehold_fcgi::protocol::ProtocolStatus;
 use stokehold_fcgi::{EndRequest, NameValuePairs, Request, Response};
 use stokehold_worker::codec::RequestStage;
 use stokehold_worker::codec::WorkerResponse;
 use stokehold_worker::{
-    BoundedChannel, BorrowedHeaders, Codec, Control, HelloAck, Json, LogRecord, MessageType,
-    RequestHeader, RequestHeaderJson, WorkerError, UNSOLICITED,
+    BoundedChannel, BorrowedHeaders, Checksum, Codec, Control, HelloAck, Json, LogRecord,
+    MessageType, RequestHeader, RequestHeaderJson, WorkerError, UNSOLICITED,
 };
 
 use crate::error::{Result, ServerError};
@@ -634,6 +634,13 @@ struct Spec {
     args: Vec<String>,
     working_dir: Option<PathBuf>,
     env: BTreeMap<String, String>,
+    /// The checksum policy to offer at handshake.
+    ///
+    /// On the spec rather than passed to `boot` because a *replaced* worker must be
+    /// handshaken on the same terms as the one it replaces: a pool that negotiated
+    /// `optional` at startup and then respawned a worker under `required` would have one
+    /// worker verifying and the rest not, which is a difference nothing would report.
+    checksum: Checksum,
 }
 
 impl Spec {
@@ -675,6 +682,10 @@ impl Spec {
             args,
             working_dir: config.working_dir.clone(),
             env: config.env.clone(),
+            checksum: match config.checksum {
+                ChecksumMode::Required => Checksum::Required,
+                ChecksumMode::Optional => Checksum::Optional,
+            },
         })
     }
 }
@@ -730,7 +741,7 @@ fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
     }
 
     let channel = BoundedChannel::new(stdin, stdout);
-    match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT) {
+    match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT, spec.checksum) {
         Ok((channel, ack)) => {
             tracing::debug!(
                 backend = %name,
@@ -795,9 +806,14 @@ enum HandshakeFailure {
 fn handshake_with_timeout(
     mut channel: Channel,
     timeout: Duration,
+    policy: Checksum,
 ) -> std::result::Result<(Channel, HelloAck), HandshakeFailure> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
+        // The offer is recorded *before* the handshake because that is the frame it travels in:
+        // `false` means no `HELLO` is ever sent offering an unchecked frame, `true` means one is
+        // sent and the option is adopted only if the worker answers with it accepted.
+        channel.offer_no_checksum(policy == Checksum::Optional);
         let result = channel.handshake();
         // Hand the channel back so the winner can keep using it. A send failure
         // means the receiver gave up, and then the channel is dropped with this
@@ -2047,6 +2063,7 @@ mod tests {
             max_requests: None,
             working_dir: None,
             env: Default::default(),
+            checksum: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
         assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");
@@ -2065,6 +2082,7 @@ mod tests {
             max_requests: None,
             working_dir: Some(binary),
             env: Default::default(),
+            checksum: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
         assert!(err.to_string().contains("is not a directory"), "{err}");
@@ -2079,6 +2097,7 @@ mod tests {
             max_requests: None,
             working_dir: None,
             env: Default::default(),
+            checksum: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");

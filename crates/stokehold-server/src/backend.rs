@@ -365,6 +365,7 @@ mod tests {
                 max_requests: None,
                 working_dir: None,
                 env: Default::default(),
+                checksum: Default::default(),
             }),
         )
         .unwrap_err();

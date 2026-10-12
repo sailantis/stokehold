@@ -911,6 +911,37 @@ against the specification and secondary implementations, and are confirmed by fi
     *Worth adding: an MSRV that is not checked by CI is a comment, not a guarantee. A
     `cargo build` under the declared toolchain in CI is what would make it true.*
 
+<br>
+
+---
+
+<br>
+
+**36. Left deliberately on the table.** Recorded so the next pass does not rediscover them as
+    findings, and so a later decision has the reasoning rather than just the code.
+
+    - **`request_header` in `worker_pool.rs` allocates an owned `String` per CGI parameter** (about
+      seven) and two per header, via `text_param` and `headers_from_params`. The worker protocol
+      carries a JSON `RequestHeader`, which owns its strings, so this is inherent to the protocol
+      rather than to the translation — removing it means a borrowed or `Cow` header threaded through
+      the worker crate. Not done: it is an invasive change across crates, no measurement says it
+      matters, and the front-end already costs less than RoadRunner's. If the worker arm is ever
+      behind again, this is the first place to look after `perf`.
+    - **`text_param` scans the whole parameter list for each of the seven names it looks up** —
+      about 210 `eq_ignore_ascii_case` comparisons per request over a typical environment. Each is
+      a length check first, so this is genuinely trivial; a name-to-index map would cost more to
+      build than it saves.
+    - **`Header::read_frame` still `memset`s the whole payload** before reading over it
+      (`vec![0u8; len]`), which the comment there already explains: the alternative on stable Rust
+      is `MaybeUninit`, and profiling does not show it next to anything else on the path. The
+      allocation tests now state its size — one allocation, exactly the payload — so if it is ever
+      worth removing, the number that has to improve is on record.
+    - **`read_record` in `stokehold-fcgi` is the allocating reader** and is still what every call
+      site uses, including the client's per-request `receive`. A buffer-reusing `read_record_into`
+      was written and then removed rather than added speculatively, since nothing measured it and
+      it would have been public API with no caller. The allocation counts above are what would
+      justify revisiting it.
+
 ## 6. Phases
 
 Phase 0 — skeleton and baseline

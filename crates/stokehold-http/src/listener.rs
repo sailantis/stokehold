@@ -532,7 +532,12 @@ async fn read_body(body: Incoming, limit: usize) -> Result<Vec<u8>> {
 /// The request is expressed as the CGI environment plus a body, which is what
 /// every backend in the configuration already speaks. Doing it here rather than
 /// teaching each front-end its own dialect is what makes `dispatch` one path.
-fn to_cgi(
+///
+/// Public, with `Parts` in the signature, so that the allocation cost of translating one
+/// request can be measured in a test binary of its own — a `#[global_allocator]` is
+/// per-binary, and this is the only place the translation can be driven from outside.
+#[doc(hidden)]
+pub fn to_cgi(
     parts: &hyper::http::request::Parts,
     body: Vec<u8>,
     routing: &Routing,

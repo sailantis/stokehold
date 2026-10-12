@@ -1218,11 +1218,11 @@ against the specification and secondary implementations, and are confirmed by fi
 
     Three things this leaves, deliberately:
 
-    - **`to_cgi` still owns nine `String`s** to build `RequestInfo`, which is measured and
-      unchanged at 30 fixed + 2 per header. It is a smaller prize than it looked: the environment
-      is handed to a `CgiPool`/`WorkerPool` as a `Request`, and an `Arc<NameValuePairs>` shared
-      into the exchange is the shape that would remove it — a larger change across both pools,
-      recorded here rather than attempted.
+    - **`to_cgi` still owns nine `String`s** to build `RequestInfo`. The figure once attributed to
+      it here — "30 fixed + 2 per header" — was the *worker request frame*, a different layer, and
+      was wrong for this path. Measured now (hazard 42): 64 fixed + 4.07 per request header, of
+      which `RequestInfo` is a third and the whole translation under 1% of a request. **Not worth
+      doing**, and the measurement is what says so rather than the shape of the code.
     - **`BoundedChannel` is still a misnomer** and should be `PipedChannel` or `BufferedChannel`
       (hazard 38).
     - The **`render_logs` per-record `String`** and the **`static_files.rs` stats** stand as
@@ -1359,6 +1359,43 @@ against the specification and secondary implementations, and are confirmed by fi
 
     Not claimed: any throughput change. The VM has not been synced and no benchmark has been run
     for this or for hazard 40.
+
+**42. Borrowing `RequestInfo` is worth about 0.1%, so it is not being done.** Hazard 39's closing
+    note named `to_cgi`'s nine owned `String`s as "the natural next target". It was never
+    measured — the figure quoted for it, "30 fixed + 2 per header", was actually the *worker
+    request frame* from `stokehold-server/tests/request_header_allocations.rs`, a different layer
+    that the FastCGI path never pays. So the first thing was to measure `to_cgi` itself, and the
+    measurement says stop.
+
+    `crates/stokehold-http/tests/to_cgi_allocations.rs`, release build, 200,000 iterations, across
+    runs:
+
+    | request headers | `RequestInfo` | environment build | `to_cgi` total |
+    |---|---|---|---|
+    | 5 | 647–714 ns | 2,126–2,342 ns | 2,900–3,900 ns |
+    | 15 | 1,297–1,561 ns | 2,331–2,977 ns | 4,200–5,400 ns |
+
+    `RequestInfo` is **19–34%** of the translation and grows by **~63–91 ns per request header**
+    (four allocations at roughly 16 ns). The environment build is flat and three to four times
+    larger — and *it* is where the other two allocations per header go, so a `RequestInfo` that
+    borrowed would not even leave the header cost behind.
+
+    Against `GET /items` at 617 µs on the worker arm and ~362 µs on the FastCGI arms, the whole
+    translation is about **1%** of a request and the borrow work would recover about **0.1%**. That
+    is for a change that makes `RequestInfo` generic over a lifetime, rewrites `build_params` and
+    `build_params_for`, and threads that lifetime through every caller of both.
+
+    Recorded rather than done, in hazard 41's shape: the evidence is about the translation path and
+    no throughput number is claimed. The allocation counts are real and honestly four per header;
+    the *time* is not there, and four allocations at 16 ns is not where a 617 µs request goes.
+
+    What the file does instead is pin the **ratio** — `RequestInfo` under half the translation —
+    so if the environment build ever gets cheaper, or `to_cgi` ever gets more expensive, a test
+    says that the reasoning has changed and the borrow work has become the obvious next step.
+
+    One correction carried forward: the earlier "30 fixed + 2 per header" was wrong for this path
+    and should not be quoted. `to_cgi` is **64 allocations fixed, 4.07 per request header**, and
+    its wall-clock translation is a few microseconds, not a large part of anything.
 
 
 

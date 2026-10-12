@@ -289,6 +289,71 @@ impl Header {
 
         Ok(Some((header, payload)))
     }
+
+    /// Read a whole frame into a caller-owned buffer, reusing its capacity.
+    ///
+    /// The counterpart of [`Header::read_frame`] for a reader that expects more frames, which
+    /// is every loop in the protocol. It returns the payload's *length* rather than the payload
+    /// because the bytes stay in `buffer`, where the caller can read them without the borrow
+    /// conflict that returning a slice of a field would cause.
+    ///
+    /// Two costs disappear that `read_frame` has to pay on every frame:
+    ///
+    /// - the allocation, because the buffer outlives the frame; and
+    /// - the zero-fill, because only the bytes past what is already initialised need zeroing —
+    ///   a buffer already long enough is truncated instead of re-zeroed, so a steady stream of
+    ///   64 KiB body frames stops writing 64 KiB of zeros per frame.
+    ///
+    /// The buffer is left holding the payload afterwards, so a caller that keeps the bytes must
+    /// copy them before the next read.
+    pub fn read_into<R: Read>(
+        reader: &mut R,
+        buffer: &mut Vec<u8>,
+    ) -> Result<Option<(Self, usize)>> {
+        let Some(header) = Header::read(reader)? else {
+            return Ok(None);
+        };
+
+        let len = header.payload_len as usize;
+        if len > MAX_PAYLOAD_LEN {
+            return Err(WorkerError::PayloadTooLarge {
+                size: len,
+                max: MAX_PAYLOAD_LEN,
+            });
+        }
+
+        // `resize` zero-fills only the new tail; `truncate` grows nothing back. Either way the
+        // bytes that `read_exact` is about to overwrite are the only ones touched.
+        if buffer.len() < len {
+            buffer.resize(len, 0);
+        } else {
+            buffer.truncate(len);
+        }
+
+        if let Err(source) = reader.read_exact(&mut buffer[..len]) {
+            if source.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Err(WorkerError::TruncatedFrame {
+                    offset: 0,
+                    needed: len,
+                });
+            }
+            return Err(WorkerError::Io(source));
+        }
+
+        let computed = crc32c(&buffer[..len]);
+        if computed != header.checksum {
+            // The buffer holds a frame that failed its checksum; clearing it keeps a caller
+            // that ignores the error from reading the bytes as if they were good.
+            buffer.clear();
+            return Err(WorkerError::ChecksumMismatch {
+                request_id: header.request_id,
+                expected: header.checksum,
+                computed,
+            });
+        }
+
+        Ok(Some((header, len)))
+    }
 }
 
 /// Write a frame whose payload is already serialized.
@@ -517,5 +582,109 @@ mod tests {
         write_frame(&mut wire, &header, b"aaaa").unwrap();
         let mut cursor = std::io::Cursor::new(wire);
         assert!(Header::read_frame(&mut cursor).is_err());
+    }
+
+    /// Frames of assorted shapes, for the two readers to be compared over.
+    fn assorted_frames() -> Vec<(MessageType, u32, Vec<u8>)> {
+        vec![
+            (MessageType::End, 1, Vec::new()),
+            (MessageType::Body, 2, b"x".to_vec()),
+            (MessageType::Response, 3, vec![b'{'; 300]),
+            (MessageType::Body, 4, vec![b'y'; crate::codec::MAX_BODY_CHUNK]),
+            (MessageType::Log, 5, b"{\"level\":\"info\"}".to_vec()),
+        ]
+    }
+
+    #[test]
+    fn read_into_agrees_with_read_frame_over_a_whole_stream() {
+        // `read_into` exists to remove the per-frame allocation and zero-fill that
+        // `read_frame` pays. It is a second implementation of the same reading rule, so the
+        // thing worth pinning is that it reads the same stream the same way — same headers,
+        // same payloads, same stopping point, same errors. A difference in any of those would
+        // be a protocol bug that only shows up on the pooled path.
+        let mut wire = Vec::new();
+        for (message_type, request_id, payload) in assorted_frames() {
+            let header = Header::new(message_type, request_id, &payload).unwrap();
+            write_frame(&mut wire, &header, &payload).unwrap();
+        }
+
+        let mut owned_cursor = std::io::Cursor::new(&wire);
+        let mut reused_cursor = std::io::Cursor::new(&wire);
+        let mut buffer: Vec<u8> = Vec::new();
+
+        loop {
+            let owned = Header::read_frame(&mut owned_cursor).unwrap();
+            let reused = Header::read_into(&mut reused_cursor, &mut buffer).unwrap();
+
+            match (owned, reused) {
+                (None, None) => break,
+                (Some((owned_header, owned_payload)), Some((reused_header, len))) => {
+                    assert_eq!(owned_header, reused_header, "the headers disagree");
+                    assert_eq!(
+                        owned_payload,
+                        buffer[..len],
+                        "the payloads disagree for {reused_header:?}"
+                    );
+                }
+                (owned, reused) => panic!(
+                    "the two readers disagree on whether a frame was there: owned {:?}, \
+                     reused {:?}",
+                    owned.map(|(header, _)| header),
+                    reused.map(|(header, _)| header)
+                ),
+            }
+        }
+
+        // Both must stop at the same place: a reader that consumed one frame too few would
+        // break the *next* request on the channel rather than this one.
+        assert_eq!(owned_cursor.position(), reused_cursor.position());
+        assert_eq!(reused_cursor.position(), wire.len() as u64);
+    }
+
+    #[test]
+    fn read_into_reuses_the_buffer_without_growing_it() {
+        // The point of `read_into` is that the buffer's capacity is kept across frames: a
+        // stream of body frames must not make the buffer grow each time, and a frame smaller
+        // than the buffer must not shrink it either.
+        let big = vec![b'z'; 4096];
+        let small = b"tiny".to_vec();
+        let mut wire = Vec::new();
+        for (message_type, request_id, payload) in [
+            (MessageType::Body, 1, &big),
+            (MessageType::Body, 2, &small),
+            (MessageType::Body, 3, &big),
+        ] {
+            let header = Header::new(message_type, request_id, payload).unwrap();
+            write_frame(&mut wire, &header, payload).unwrap();
+        }
+
+        let mut cursor = std::io::Cursor::new(&wire);
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut capacity = 0usize;
+
+        while let Some((_, len)) = Header::read_into(&mut cursor, &mut buffer).unwrap() {
+            assert!(len <= buffer.len());
+            capacity = capacity.max(buffer.capacity());
+        }
+
+        assert!(
+            buffer.capacity() == capacity,
+            "the buffer's capacity changed across frames: {capacity} then {}",
+            buffer.capacity()
+        );
+    }
+
+    #[test]
+    fn read_into_refuses_an_absurd_payload_length_before_growing() {
+        // The guard must run before the buffer is resized, or a corrupt length would make the
+        // reader allocate 4 GiB and only then report the error.
+        let mut bytes = Header::new(MessageType::Body, 1, b"").unwrap().encode();
+        bytes[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut cursor = std::io::Cursor::new(bytes.to_vec());
+        let mut buffer: Vec<u8> = Vec::new();
+
+        let err = Header::read_into(&mut cursor, &mut buffer).unwrap_err();
+        assert!(matches!(err, WorkerError::PayloadTooLarge { .. }), "{err}");
+        assert_eq!(buffer.capacity(), 0, "the buffer grew before the guard ran");
     }
 }

@@ -40,6 +40,16 @@ pub const MAX_BODY_CHUNK: usize = 64 * 1024;
 /// not remove a syscall, because a frame larger than it still takes several.
 const BUFFER_CAPACITY: usize = 8 * 1024;
 
+/// The largest response body that will be reserved up front from the head's declaration.
+///
+/// A response head arrives before its body and declares the body's length, so the body can be
+/// sized once instead of regrowing. The reservation is capped because the declaration is the
+/// worker's to make: without a cap, a worker claiming a gigabyte would make the server commit
+/// it before sending a byte, which turns a bad length into memory pressure rather than an
+/// error. Past the cap the body still grows to whatever actually arrives — this only decides
+/// whether the growth is paid up front.
+const BODY_RESERVE_LIMIT: usize = 1024 * 1024;
+
 /// The writer half of a [`BoundedChannel`]: a buffered pipe that flushes per frame.
 pub type BufferedWriter = BufWriter<Box<dyn Write + Send>>;
 
@@ -296,6 +306,13 @@ pub struct WorkerChannel<W: Write, R: Read> {
     /// costs one allocation for the head rather than a `Vec` per request. Cleared, never shrunk,
     /// so the capacity that made the last request free is kept.
     payload: Vec<u8>,
+    /// Where each reply frame is read, so the reader reuses one buffer instead of allocating —
+    /// and zeroing — a `Vec` per frame.
+    ///
+    /// Belongs to the channel for the same reason `payload` does. A frame's payload is copied
+    /// out of it (into the body, or decoded) before the next read, because the next read
+    /// overwrites it.
+    scratch: Vec<u8>,
 }
 
 impl<W: Write, R: Read> WorkerChannel<W, R> {
@@ -308,6 +325,7 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             logs: Vec::new(),
             metrics: Vec::new(),
             payload: Vec::new(),
+            scratch: Vec::new(),
         }
     }
 
@@ -546,7 +564,24 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
     }
 
     /// Read frames until the request is finished.
+    ///
+    /// The frame buffer is taken out of `self` for the duration, as `send_request` takes the
+    /// payload buffer and for the same reason: the loop needs `&mut self` (for `absorb_log`)
+    /// while the bytes it is reading live in a buffer owned by `self`. It goes home on every
+    /// path, so a request that fails does not cost the next one its capacity.
     fn collect_response(&mut self, request_id: u32) -> Result<WorkerResponse> {
+        let mut frame_buffer = std::mem::take(&mut self.scratch);
+        let outcome = self.read_response(request_id, &mut frame_buffer);
+        self.scratch = frame_buffer;
+        outcome
+    }
+
+    /// The read loop of [`WorkerChannel::collect_response`].
+    fn read_response(
+        &mut self,
+        request_id: u32,
+        frame_buffer: &mut Vec<u8>,
+    ) -> Result<WorkerResponse> {
         let mut response = WorkerResponse::default();
         let mut have_head = false;
         let mut body = Vec::new();
@@ -559,18 +594,22 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         let metric_mark = self.metrics.len();
 
         loop {
-            let Some(frame) = self.read_frame()? else {
+            // Reuses one buffer for every frame, so a response costs no per-frame allocation
+            // and no per-frame zero-fill. The bytes are consumed (copied into the body, or
+            // decoded) before the next read overwrites them.
+            let Some((header, len)) = Header::read_into(&mut self.reader, frame_buffer)? else {
                 return Err(WorkerError::Closed(format!(
                     "the worker closed its output while answering request {request_id}"
                 )));
             };
+            let payload = &frame_buffer[..len];
 
-            match frame.header.message_type {
+            match header.message_type {
                 MessageType::Response => {
-                    if frame.header.request_id != request_id {
+                    if header.request_id != request_id {
                         return Err(WorkerError::WrongRequestId {
                             expected: request_id,
-                            actual: frame.header.request_id,
+                            actual: header.request_id,
                         });
                     }
                     if have_head {
@@ -578,16 +617,24 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
                             message: format!("request {request_id} was answered twice"),
                         });
                     }
-                    let head: ResponseHead = Json::decode(&frame.payload)?;
+                    let head: ResponseHead = Json::decode(payload)?;
+                    // The head arrives before the body, so the body can be sized once instead
+                    // of regrowing frame by frame. The declaration is checked against what
+                    // actually arrives below, and the reservation is capped, so a worker that
+                    // declares a length it does not send cannot make this allocate it.
+                    let declared = usize::try_from(head.body_len).unwrap_or(usize::MAX);
+                    if declared <= BODY_RESERVE_LIMIT {
+                        body.reserve(declared);
+                    }
                     expected_body = head.body_len;
                     response.head = head;
                     have_head = true;
                 }
                 MessageType::Body => {
-                    if frame.header.request_id != request_id {
+                    if header.request_id != request_id {
                         return Err(WorkerError::WrongRequestId {
                             expected: request_id,
-                            actual: frame.header.request_id,
+                            actual: header.request_id,
                         });
                     }
                     if !have_head {
@@ -595,28 +642,28 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
                             message: format!("request {request_id} sent a body before its head"),
                         });
                     }
-                    body.extend_from_slice(&frame.payload);
-                    if frame.header.flags & flags::LAST != 0 {
+                    body.extend_from_slice(payload);
+                    if header.flags & flags::LAST != 0 {
                         seen_last_body = true;
                     }
                 }
                 MessageType::End => {
-                    if frame.header.request_id != request_id {
+                    if header.request_id != request_id {
                         return Err(WorkerError::WrongRequestId {
                             expected: request_id,
-                            actual: frame.header.request_id,
+                            actual: header.request_id,
                         });
                     }
-                    response.end = Json::decode(&frame.payload)?;
+                    response.end = Json::decode(payload)?;
                     break;
                 }
-                MessageType::Log => self.absorb_log(&frame.payload),
-                MessageType::Metric => self.absorb_metric(&frame.payload),
+                MessageType::Log => self.absorb_log(payload),
+                MessageType::Metric => self.absorb_metric(payload),
                 MessageType::Event => {
-                    tracing::trace!(request_id = frame.header.request_id, "worker sent an event");
+                    tracing::trace!(request_id = header.request_id, "worker sent an event");
                 }
                 MessageType::Error => {
-                    let report: ErrorReport = Json::decode(&frame.payload)?;
+                    let report: ErrorReport = Json::decode(payload)?;
                     if report.recoverable {
                         tracing::warn!(%report.message, "worker reported a recoverable error");
                     } else {

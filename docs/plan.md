@@ -1228,6 +1228,85 @@ against the specification and secondary implementations, and are confirmed by fi
     - The **`render_logs` per-record `String`** and the **`static_files.rs` stats** stand as
       recorded in hazard 38.
 
+**40. The reply-read path allocated a buffer per frame, and zeroed it.** Hazard 39 asked whether
+    the worker *write* path could stop rebuilding the request, and answered it. The obvious
+    follow-up — asked as "would a pool of buffers for reading request headers help?" — turned out
+    to be the wrong shape for the right problem, and the measurement is the finding.
+
+    First, a scoping correction: on the Rust side there is **no request-header read path**. Rust
+    writes requests and reads responses; the PHP SDK does the reverse. The read side here is the
+    **response** path: a `ResponseHead` JSON frame, then the body in `Body` frames.
+
+    What it cost, measured by driving the real `WorkerChannel::request_encoded` over a `Cursor`
+    with a canned reply:
+
+    | reply body | frames | before | after |
+    |---|---|---|---|
+    | 11 B | 1 | 8 allocs / 392 B | 7 / 293 B |
+    | 2 KB | 1 | 8 / 4,468 | 7 / 2,332 |
+    | 50 KB | 1 | 8 / 102,773 | 7 / 51,485 |
+    | 200 KB | 4 | 13 / 663,926 | 7 / 205,086 |
+    | 1 MB | 16 | 27 / 3,080,567 | 7 / 1,048,863 |
+
+    Two costs, both per frame:
+
+    - **The allocation.** `Header::read_frame` did `vec![0u8; len]` once per frame, so a body in
+      `MAX_BODY_CHUNK` (64 KiB) frames cost one allocation per frame — 27 for a 1 MB response.
+    - **The zero-fill.** That `vec![0u8; len]` is a `memset` of the whole payload that the
+      following `read_exact` immediately overwrites. The comment in `read_frame` had already
+      flagged this as a known cost deliberately left, because the alternative on stable Rust is
+      `MaybeUninit`.
+
+    **A pool is the wrong shape.** `collect_response` runs on the exchange thread and serves one
+    request at a time, so there is no concurrency to pool for: what is wanted is a single buffer
+    the channel keeps, exactly like `self.payload` on the send side. That asymmetry was the real
+    finding — the *write* side already did `std::mem::take(&mut self.payload)` and reused it; the
+    read side was never given the same treatment.
+
+    So: `Header::read_into(reader, &mut Vec<u8>) -> Result<Option<(Header, usize)>>`, the
+    counterpart of `read_frame` for a caller that expects more frames. It returns the payload's
+    **length**, not the payload, because the bytes stay in the caller's buffer — returning a
+    slice of a field would borrow-conflict with the `&mut self` the loop needs. It resizes only
+    when the buffer is too short (`resize` zero-fills just the new tail) and truncates otherwise,
+    so a steady stream of 64 KiB frames stops writing 64 KiB of zeros each time.
+
+    The buffer lives on `WorkerChannel` as `scratch` and is taken out for the duration of
+    `collect_response`, which now delegates to `read_response(request_id, &mut frame_buffer)` for
+    the same borrow reason `send_request` takes the payload buffer. It goes home on every path,
+    including a failure.
+
+    Three more details worth keeping:
+
+    - **The body is reserved from its declaration.** The head arrives before the body and declares
+      `body_len`, so the body is sized once instead of regrowing frame by frame — most of the
+      3.08 MB → 1.05 MB drop on a 1 MB response, and why the count is now flat in the body size.
+      The reservation is **capped** (`BODY_RESERVE_LIMIT`, 1 MiB) because the declaration is the
+      worker's to make: uncapped, a worker claiming a gigabyte would make the server commit it
+      before sending a byte. Past the cap the body still grows to whatever arrives, so the cap
+      decides whether growth is prepaid, not whether it happens. The declaration was already
+      validated against the bytes that actually arrive, so a false one is still an error.
+    - **A checksum failure clears the buffer** before returning, so a caller that ignores the
+      error cannot read the failed bytes as if they were good.
+    - **The steady state is 5 allocations.** A *warm* channel costs 5 for any body size — the
+      `ResponseHead`, its two `String`s for a header pair, the body buffer, and the `End`. The
+      body is the one that cannot go: it is handed to the caller inside `WorkerResponse`, so its
+      allocation moves rather than disappears. Only the first request on a channel pays the frame
+      buffer (7), and it grows in two steps because the head frame and the body frame are
+      different sizes.
+
+    Pinned `read_into` against `read_frame` with a **differential test over the same stream** —
+    same headers, same payloads, same stopping point, same `PayloadTooLarge` before any growth —
+    because it is a second implementation of one reading rule, which is the shape that silently
+    diverges.
+
+    Not claimed: throughput. The worker arm is CPU-bound on PHP, and hazard 38's write-path fix
+    measured **no** throughput gain through nginx. Seven allocations and a third of the bytes
+    allocated is solid evidence about allocations; a throughput claim needs a VM run of the P arm.
+
+    Left, unchanged: the `ResponseHead` decode's own four allocations (one struct plus two
+    `String`s per header pair), which a caller receives and keeps — a pool cannot recycle what
+    the caller takes ownership of, which is why the header-buffer idea does not work.
+
 
 
 Phase 0 — skeleton and baseline

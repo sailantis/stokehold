@@ -1119,6 +1119,35 @@ against the specification and secondary implementations, and are confirmed by fi
     MSRV commit, so part of the gain is those. The direction and the magnitude are trustworthy;
     the attribution to one commit is not.
 
+    **The write side of the same hazard, finished.** Hazard 38 fixed every read side and every
+    write side *except* one, and left that one by argument rather than measurement — "the
+    response is written once per request and the reads were the expensive half". The argument
+    was wrong, and wrong for a reason created by the fix in the same pass: the listener wraps
+    its socket in a `BufReader` and writes through `get_mut()`, so its **write half is
+    unbuffered**. `write_response` was therefore writing STDOUT's header, its payload,
+    END_REQUEST's header, its payload and a flush as five separate `write(2)`s on a socket with
+    `TCP_NODELAY` set — five syscalls and five segments per response. `write_error` and
+    `write_get_values` had the same shape.
+
+    All three now build the framed response in a reused per-thread buffer and write once. The
+    per-thread buffer is the point rather than an implementation detail: a response is
+    body-sized, so a `Vec::with_capacity` per request would be a 12 KB allocation per request on
+    a 12 KB page, which is the cost being removed. It never outlives the closure, so no
+    concurrent writer can observe another's bytes and nothing is locked. A `BufWriter` around the
+    socket was the alternative and is what `stokehold-fcgi`'s client does; here the response has
+    a known end, so assembling it whole is simpler than reasoning about where a flush must land.
+
+    Pinned at **five writes → one**, and the bytes asserted equal to the record-by-record
+    framing via the existing `append_records` twin. The old test that counted writes to prove a
+    large body was still split was rewritten to walk the framing **by bytes**, because a write
+    count can no longer distinguish "one write, five records" from "one write, one record" — and
+    the new count asserts a 300 KB body leaves in one write rather than one per record.
+
+    Verified end to end against **real nginx** (this front-end's actual peer, which the unit
+    tests cannot stand in for): `GET /` and `GET /items` both 200 through nginx →
+    stokehold FastCGI → php-cgi, 30/30 requests over keep-alive, correct HTML, and an empty
+    nginx error log.
+
 
 
 Phase 0 — skeleton and baseline

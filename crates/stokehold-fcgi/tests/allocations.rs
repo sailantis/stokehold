@@ -22,8 +22,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use stokehold_fcgi::{
-    build_params, parse_response, parse_response_headers, split_response_body, RequestInfo,
-    Response, Routing,
+    build_params, build_params_for, parse_response, parse_response_headers, split_response_body,
+    RequestInfo, Response, Route, Routing,
 };
 
 thread_local! {
@@ -422,6 +422,80 @@ fn building_the_environment_allocates_about_twice_per_pair() {
         many <= few + expected_growth + 4,
         "environment cost grew by {} for 38 more headers, expected about {expected_growth}",
         many - few
+    );
+}
+
+/// The request path's own cost, with the router held out of it.
+///
+/// This is the other half of `to_cgi`: the HTTP front-end builds a `RequestInfo`, routes
+/// once, and hands both here. Measured through `build_params_for` with a pre-resolved
+/// `Route::Script` so the count is the *environment* only — the router's `is_file` traffic
+/// is a filesystem question, not an allocation one, and folding the two together would
+/// make this number depend on the document root.
+///
+/// `build_params` exists beside it and routes again, which is exactly why the front-end does
+/// not call it; the difference between the two is pinned separately, above.
+fn request_path_allocations(header_count: usize) -> usize {
+    let info = RequestInfo {
+        method: "GET".to_string(),
+        uri: "/items".to_string(),
+        query_string: String::new(),
+        protocol: "HTTP/1.1".to_string(),
+        headers: (0..header_count)
+            .map(|index| (format!("X-Header-{index}"), format!("value-{index}")))
+            .collect(),
+        remote_addr: "127.0.0.1".to_string(),
+        server_name: "localhost".to_string(),
+        server_port: 80,
+        body_len: 0,
+        https: false,
+    };
+    let routing = Routing {
+        document_root: std::env::temp_dir(),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let route = Route::Script {
+        script_filename: std::env::temp_dir().join("index.php"),
+        script_name: "/index.php".to_string(),
+        path_info: String::new(),
+    };
+
+    let (count, _) = allocations(|| {
+        let params = build_params_for(&info, &routing, &route).expect("params build");
+        assert!(!params.is_empty());
+    });
+    count
+}
+
+#[test]
+fn building_the_environment_costs_two_allocation_per_pair_and_no_intermediates() {
+    // The measured shape of the request path. `push_http_header` already builds the CGI
+    // name straight into the pair's buffer, which removed three intermediate `String`s
+    // per request header; what is left is the pair's own two heap vectors.
+    let small = request_path_allocations(0);
+    let large = request_path_allocations(20);
+
+    // Measured: 30 with no request headers, 71 with twenty. So the shape is
+    // **two allocations per header — the pair's own name and value — plus thirty
+    // fixed**, and the fixed thirty is the part worth naming: thirteen CGI variables
+    // whose names and values are compile-time constants still pay two heap vectors
+    // each, and three more (`SERVER_PORT`, `DOCUMENT_ROOT`, `SCRIPT_FILENAME`) pay a
+    // `String` for the formatted value before its bytes are copied again.
+    //
+    // The growth is exact and the fixed cost is bounded generously, deliberately: a
+    // new CGI variable is a normal thing to add and should not fail this test, while a
+    // *third* allocation per header is a regression and will.
+    let growth = large - small;
+    assert_eq!(
+        growth, 41,
+        "twenty more headers cost {growth} allocations, expected 41 - two per header \
+         plus one for the pair vector doubling"
+    );
+    assert!(
+        small <= 36,
+        "the fixed environment costs {small} allocations; it was 30, and this is a \
+         decision not a drift"
     );
 }
 

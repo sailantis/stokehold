@@ -1062,14 +1062,20 @@ against the specification and secondary implementations, and are confirmed by fi
     `BufferedChannel`; it reads like it is about a bounded queue, which is a different thing this
     project does not have.
 
-    One thing this pass did **not** settle: `read_next` decodes each `PARAMS` record
-    independently, so an environment split **mid-pair** would fail with a truncated pair. nginx
-    appears to split at pair boundaries (its module emits one `PARAMS` record per request), but
-    that is inherited belief rather than something verified here — I could not confirm it from
-    nginx's source within a reasonable budget. Hazard 34's lesson was that a `to_ascii_lowercase`
-    lived in two places and only one was fixed; this is the same shape of doubt and deserves the
-    same treatment. `frontend_syscalls.rs` models the split at pair boundaries and says so rather
-    than asserting it.
+    **Settled afterwards, from nginx's own source.** `read_next` decodes each `PARAMS` record
+    independently, so an environment split **mid-pair** fails with a truncated pair. That is safe
+    with nginx, and now as a fact rather than a belief: `ngx_http_fastcgi_create_request`
+    (`ngx_http_fastcgi_module.c`, nginx 1.30.5) sums `params_len` over *every* pair, allocates one
+    buffer for `NGX_HTTP_FASTCGI_PARAMS + len + padding`, writes the header once with that total,
+    and then appends a zero-length `PARAMS` record and an empty `STDIN`. The whole CGI environment
+    therefore travels in a single record, and a pair can never straddle two of them — which is
+    what `frontend_syscalls.rs` models.
+
+    The limit is still there, and worth stating plainly rather than closing: the mid-pair case is
+    *unhandled*, so a FastCGI client that split at the 65535-byte record boundary would get a 502
+    for a request nginx would have served. Nothing in the protocol requires nginx's behaviour, and
+    reassembling the `PARAMS` stream before decoding would make the question moot. Latent
+    interoperability limit, not a bug with a known trigger.
 
     What is still unbuffered, deliberately recorded rather than fixed: the **HTTP front end**
     (`stokehold-http`) uses hyper's own buffered IO and is not affected; the **static file**

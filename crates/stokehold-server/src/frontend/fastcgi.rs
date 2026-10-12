@@ -431,8 +431,12 @@ mod tests {
     #[test]
     fn reads_a_request_split_across_several_params_records() {
         let mut wire = begin(false);
-        // Two PARAMS records carrying one pair each, then the terminator: nginx
-        // does this when the environment exceeds a record.
+        // Two PARAMS records carrying one pair each, then the terminator.
+        //
+        // nginx does *not* do this: `ngx_http_fastcgi_create_request` sums every pair and emits
+        // the whole environment as one record (verified in nginx 1.30.5). This shape is what the
+        // front-end tolerates, not what it receives, and the split is at a *pair* boundary
+        // because a pair straddling two records is not reassembled — see hazard 38.
         let first = nvpair::encode_pairs([(&b"REQUEST_METHOD"[..], &b"GET"[..])]);
         let second = nvpair::encode_pairs([(&b"QUERY_STRING"[..], &b"x=1"[..])]);
         wire.extend(framed(RecordType::Params, 1, &first));

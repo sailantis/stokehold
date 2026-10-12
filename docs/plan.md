@@ -1084,6 +1084,41 @@ against the specification and secondary implementations, and are confirmed by fi
     `STDERR` — assembling it first would make it two, but the response is written once per
     request and the reads were the expensive half.
 
+    **The wall-clock answer, measured afterwards.** Re-running the three stokehold arms on the
+    competition VM against a binary built from the commit *before* these three fixes and one
+    built from them, same harness, same load, three repeats, medians:
+
+    | arm | endpoint | conc | before | after | |
+    |---|---|---|---|---|---|
+    | P worker (pipe) | `/` | 32 | 36,986 | **38,141** | +3.1% |
+    | P worker (pipe) | `/` | 8 | 23,800 | 24,320 | +2.2% |
+    | T spawn_cgi (TCP) | `/` | 32 | 15,901 | **16,868** | **+6.1%** |
+    | U spawn_cgi (unix) | `/` | 32 | 16,506 | 16,900 | +2.4% |
+    | T spawn_cgi (TCP) | `/items` | 32 | 8,006 | 8,009 | 0% |
+    | U spawn_cgi (unix) | `/items` | 32 | 8,353 | 8,254 | −1.2% |
+    | P worker (pipe) | `/items` | 32 | 18,739 | 19,438 | +3.7% |
+    | P worker (pipe) | `/` | 1 | 3,289 | 3,393 | +3.2% |
+
+    So the answer is **yes, but modestly** — about 2-6% on the arms where the request and
+    response are small and the syscalls are a real share of the work, and **nothing where the
+    request already spends its time elsewhere**: `/items` runs an ORM query and renders a
+    template, so ~6 saved syscalls per request on each side disappear into the noise, and the
+    per-repeat spread within one binary is larger than the difference between them (T's
+    `/items` conc-32 repeats were 8,006 / 8,275 / 8,448).
+
+    This is worth stating as the lesson rather than the ratio: **a syscall cut is a fixed cost
+    removed, not a proportional one.** It pays most where the request is otherwise cheap — which
+    is exactly the `/` arm a deployment comparison leads with, and exactly why the earlier
+    passes' allocation and parse work showed up as CPU-percent and this shows up as a few
+    percent of throughput. The 40-read front-end request in the table above was the largest
+    number in the pass and buys the least throughput, because nginx's request arrives as *one*
+    record in practice (see above), not twelve.
+
+    One thing the A/B was *not*: it is not a clean isolation of the buffering commit. The
+    pre-buffering binary is `54b8a91`, which also predates hazard 37's request-path fix and the
+    MSRV commit, so part of the gain is those. The direction and the magnitude are trustworthy;
+    the attribution to one commit is not.
+
 
 
 Phase 0 — skeleton and baseline

@@ -1998,12 +1998,29 @@ not the page.
   66 × *min*(connections, 12) and nothing more; whether the pool could in principle have
   kept more workers busy is not what was measured, and a 15 ms stall on a read is what
   would make it not.
-- **The one silent event.** The first socket sweep logged `a worker died; replacing it`
-  for all 12 slots during a 32-connection cell, and because the socket transport sets the
-  worker's `stdout` to `null` and worker `stderr` is logged at **`debug`** rather than
-  `warn`, nothing the dead worker said was recorded. No request failed and no throughput
-  moved, and it did not recur in any later run, but a worker dying mid-load with no
-  visible reason is worth noting rather than explaining away — the `stderr` line is the
-  only place an uncaught PHP fatal would appear, and at `info` verbosity there is nowhere
-  it can appear at all.
+- **The one silent event, and a failed attempt to reproduce it.** The first socket sweep
+  logged `a worker died; replacing it` for **all 12 slots at once** during a 32-connection
+  cell, and because the socket transport sets the worker's `stdout` to `null` and worker
+  `stderr` is logged at **`debug`** rather than `warn`, nothing the dead workers said was
+  recorded. No request failed and no throughput moved, and it did not recur in any later
+  run. An all-at-once death is the signature of an external kill rather than twelve
+  independent crashes, so the ordinary candidates were tested against a reproduction build
+  at `stokehold=debug` (a fresh socket pool, 12 workers, **~94,700 requests** across three
+  load shapes):
+
+  | hypothesis | how it was driven | result |
+  | --- | --- | --- |
+  | connection teardown | 32 and 48 concurrent connections against 12 workers, headers read and the body *not* read before closing | 0 deaths |
+  | mid-response abort | peer RST (`SO_LINGER` 0) after the header block, 1,280 aborts | 0 deaths |
+  | a resource ceiling | 72,000 requests on one 12-connection pool | **working set flat at 35.3 MB** (min 35.3, max 35.6), private bytes constant at 14.1 MB, against a 128 MB `memory_limit` |
+  | the pool's own recycling | `max_requests = 0`, so it is disabled by construction | 0 `recycling a worker` lines |
+
+  The whole session produced **12 `worker ready` lines — the initial spawns only — and no
+  `worker died`, no `worker stderr`, no error of any kind.** So it is not reproduced here
+  and no cause is claimed. Two things are worth keeping anyway: the socket transport did
+  not leak per request over 72k requests, and, more usefully, the event is a **silent**
+  one by construction — at `info` verbosity there is nowhere a worker's dying words can
+  appear, because `drain_stderr` logs at `debug` and a socket worker's `stdout` is null.
+  The one thing it was not is a consequence of load: the deaths at 22:07 and 22:10
+  happened while the *pipe* arm was the one under test and the socket arm was idle.
 

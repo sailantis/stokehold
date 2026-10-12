@@ -70,7 +70,7 @@ use stokehold_worker::{
     MessageType, RequestHeader, RequestHeaderJson, WorkerError, UNSOLICITED,
 };
 
-use crate::error::{Result, ServerError};
+use crate::error::{Hint, Result, ServerError, SOCKET_WORKER_HINT};
 use crate::lifecycle::{configure_command, LifecycleGuard};
 use crate::pool::worker_count;
 
@@ -165,6 +165,10 @@ impl WorkerPool {
             backend = %pool.name,
             workers = pool.slots.len(),
             command = %config.command,
+            // Logged because the transport is invisible on the wire: a pool that ended up on
+            // the wrong one answers every request with a 200, only slower, and on Windows the
+            // difference is 21× — so this is the only place the choice is ever visible.
+            transport = %pool.spec.transport,
             "worker pool started"
         );
         Ok(pool)
@@ -743,9 +747,10 @@ impl Spec {
 /// server that hangs at startup instead of one that says what is wrong, which is the same
 /// failure the named-pipe transport had to solve for reads (plan hazard 43).
 ///
-/// The listener is polled rather than put in non-blocking mode for the duration: this runs
-/// once per worker at startup, so the 2 ms granularity is not on any request path, and it
-/// keeps the accepted stream blocking, which is what the exchange thread wants.
+/// The listener is made non-blocking and polled, rather than blocking in `accept` with the
+/// deadline enforced elsewhere: there is no portable `accept` timeout, and this runs once
+/// per worker at startup, so the 2 ms granularity is not on any request path. The accepted
+/// stream is put back to blocking, which is what the exchange thread wants.
 fn accept_with_deadline(
     listener: &TcpListener,
     spec: &Spec,
@@ -775,6 +780,7 @@ fn accept_with_deadline(
                     return Err(ServerError::StartupExited {
                         binary: spec.binary.clone(),
                         status: status.to_string(),
+                        hint: Hint(Some(SOCKET_WORKER_HINT)),
                     });
                 }
                 if Instant::now() >= deadline {
@@ -785,6 +791,7 @@ fn accept_with_deadline(
                             .map(|found| found.to_string())
                             .unwrap_or_else(|_| "the worker socket".to_string()),
                         timeout,
+                        hint: Hint(Some(SOCKET_WORKER_HINT)),
                     });
                 }
                 std::thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -796,6 +803,20 @@ fn accept_with_deadline(
                 })
             }
         }
+    }
+}
+
+/// The hint for a startup failure, given how the worker was going to be reached.
+///
+/// A pipe-transport worker that exits during its handshake is an ordinary application failure
+/// — a syntax error, a missing extension, a bad path — and `StartupExited` already says
+/// everything useful about it. A socket-transport worker has one far more likely explanation
+/// that the status alone cannot express, which is the whole reason the hint exists.
+fn transport_hint(spec: &Spec) -> Option<&'static str> {
+    if spec.transport.is_pipe() {
+        None
+    } else {
+        Some(SOCKET_WORKER_HINT)
     }
 }
 
@@ -873,6 +894,7 @@ fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
             Ok(Some(status)) => ServerError::StartupExited {
                 binary: spec.binary.clone(),
                 status: status.to_string(),
+                hint: Hint(transport_hint(spec)),
             },
             _ => ServerError::Spawn {
                 binary: spec.binary.clone(),
@@ -921,6 +943,7 @@ fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
                 pid = child.id(),
                 php = %ack.php_version,
                 sapi = %ack.sapi,
+                transport = %spec.transport,
                 "worker ready"
             );
             Ok(Ready {
@@ -949,6 +972,7 @@ fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
                 Some(status) => ServerError::StartupExited {
                     binary: spec.binary.clone(),
                     status: status.to_string(),
+                    hint: Hint(transport_hint(spec)),
                 },
                 None => ServerError::WorkerProtocol {
                     backend: name.to_string(),

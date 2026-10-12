@@ -110,11 +110,20 @@ It exists for one measured reason, and it is a large one: **on Windows, PHP take
 ~0.09 ms.** A Rust process reading the identical pipe returns in 0.010 ms, and RoadRunner measured
 the same 15 ms on the same host, so this is PHP's Windows stream layer rather than anything
 stokehold does — but it is per request, not per connection, so it decides which deployment model
-wins. On Linux the pipe is fine and remains the default; on Windows, set this. The worker opts in
-with `Stokehold\Worker::connect()` (an SDK at or after the release that added it) and needs no
-other change, because the protocol does not know which transport it is on. See
-[`docs/plan.md`](docs/plan.md) hazard 46 for the measurements and the alternatives that were ruled
-out.
+wins: on the whole `/items` route it was **21×** (0.72 ms against 15.24 ms median).
+
+**The default is therefore a socket on Windows and a pipe everywhere else.** A configuration that
+never mentions the setting gets the one its platform is fast on, and the choice is logged at
+startup (`worker pool started … transport=socket`) because the transport is invisible on the wire
+— a pool on the wrong one answers every request with a `200`, only slower. Set `transport = "pipe"`
+explicitly to opt out.
+
+The worker opts in with `Stokehold\Worker::connect()` (an SDK at or after the release that added
+it) and needs no other change, because the protocol does not know which transport it is on. A
+worker that still calls `Worker::create()` cannot read the socket, so it is refused at startup
+with a message naming the fix — the failure is a startup error rather than a mystery on the first
+request. See [`docs/plan.md`](docs/plan.md) hazard 46 for the measurements and the alternatives
+that were ruled out.
 
 ```toml
 default_backend = "app"
@@ -128,8 +137,8 @@ kind = "worker"
 command = "php worker.php"
 memory_limit_mb = 256
 checksum = "optional"
-# Windows only; the pipe is faster on Linux.
-# transport = "socket"
+# Defaults to "socket" on Windows, "pipe" elsewhere. Set "pipe" to opt out.
+# transport = "pipe"
 
 [backends.fpm]
 kind = "external"

@@ -683,7 +683,10 @@ require '{autoload}';
 use Stokehold\Request;
 use Stokehold\Response;
 use Stokehold\Worker;
-$worker = Worker::create();
+// `connect()`, not `create()`: this fixture is started through the same `WorkerConfig` as
+// everything else, and on the platform where the socket is the default, `create()` would read
+// the end-of-file stdin that the socket transport leaves behind and die during the handshake.
+$worker = Worker::connect();
 $worker->run(static function (Request $request, Worker $worker): Response|null {{
     $path = (string) parse_url($request->uri, PHP_URL_PATH);
     if ($path === '/slow') {{
@@ -826,6 +829,108 @@ fn a_worker_that_cannot_boot_is_refused_at_startup() {
     assert!(
         message.contains("exited during startup") || message.contains("closed"),
         "unexpected error: {message}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A worker still written against the older API fails *fast* and says what to do.
+///
+/// This is the blast radius of making the socket the default on Windows: the transport is set
+/// by the *server*, and a worker written before it exists — the shipped SDK's own README used
+/// to teach `Worker::create()` — reads stdin, which the socket transport has set to
+/// end-of-file, and exits during its handshake. The failure is therefore correct and does not
+/// need to be prevented; what it must not be is *unexplained*, because "exit code 255" sends
+/// the reader to PHP, where nothing is wrong.
+///
+/// The socket transport is requested explicitly rather than taken from the default, so this
+/// asserts the same thing on every platform.
+#[test]
+fn a_worker_still_on_create_is_told_to_call_connect() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("stokehold-old-worker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("old-style-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Stokehold\Response;
+use Stokehold\Worker;
+// Deliberately the old API: this is what a worker written before the option did.
+$worker = Worker::create();
+$worker->run(static function ($request, Worker $worker): Response {{
+    return Response::text('ok');
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let mut config = config(1);
+    config.transport = stokehold_core::config::WorkerTransport::Socket;
+    // The fixture, not the example worker: `config()` points at the SDK's example, which
+    // calls `connect()` and would therefore connect perfectly well.
+    config.command = format!("php \"{}\"", script.display());
+
+    let started = std::time::Instant::now();
+    let err = WorkerPool::start("test", &config).unwrap_err();
+    let elapsed = started.elapsed();
+    let message = err.to_string();
+
+    // Fast, because the worker is known to be gone rather than waited out.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a worker that exits must be reported promptly, not waited out: took {elapsed:?}"
+    );
+    // And it names both ways out: the compatible fix, and the setting that restores the old
+    // behaviour. A hint that named only one of them would leave half the readers stuck.
+    assert!(
+        message.contains("connect()"),
+        "the message must name the fix the SDK ships: {message}"
+    );
+    assert!(
+        message.contains("transport = \"pipe\""),
+        "and the setting that keeps the worker as it is: {message}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The hint is specific to the transport, so a pipe worker does not get it.
+///
+/// A worker that dies during its handshake on the pipe is an ordinary application failure, and
+/// appending advice about `connect()` to every one of them would be noise that teaches readers
+/// to ignore the hint.
+#[test]
+fn a_pipe_worker_that_dies_is_not_told_about_the_socket() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("stokehold-dying-pipe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("dying-worker.php");
+    std::fs::write(&script, "<?php exit(3);\n").expect("write the script");
+
+    let mut config = config(1);
+    config.transport = stokehold_core::config::WorkerTransport::Pipe;
+    config.command = format!("php \"{}\"", script.display());
+
+    let err = WorkerPool::start("test", &config).unwrap_err();
+    let message = err.to_string();
+    // Either the exit was observed or the pipe ended first — both are startup failures, and
+    // which one wins is a race that is not what this test is about.
+    assert!(
+        message.contains("exited during startup") || message.contains("closed"),
+        "the failure is still a startup one: {message}"
+    );
+    assert!(
+        !message.contains("connect()"),
+        "a pipe failure must not be explained as a socket one: {message}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

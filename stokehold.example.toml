@@ -53,10 +53,12 @@ workers = 0               # 0 = one per logical CPU
 memory_limit_mb = 256     # recycle a worker above this RSS
 max_requests = 1000       # and after this many requests
 working_dir = "."
-# transport = "socket"    # Windows only; on Linux the pipe is faster. PHP's stream
-                          # layer reads a pipe ~100x slower than a socket there, so a
-                          # Windows deployment should set this. The worker opts in with
-                          # `Stokehold\Worker::connect()`. See plan hazard 46.
+# transport = "pipe"      # Defaults to "socket" on Windows and "pipe" elsewhere,
+                          # which is the measured winner on each: PHP's stream layer
+                          # reads a Windows pipe ~100x slower than a socket, and that
+                          # was 21x on the whole route. Set it only to override - and
+                          # note a worker must call `Stokehold\Worker::connect()`, not
+                          # `create()`, to read a socket. See plan hazard 46.
 
 # ---------------------------------------------------------------------------
 # System php-fpm: the normal Linux/macOS deployment. stokehold does not manage

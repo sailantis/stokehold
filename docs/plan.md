@@ -1609,6 +1609,22 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
 4. **The rename** — a product decision, above.
 5. **The re-run** — the five arms against current `main`, above.
 
+Hazard 46's open product decision — whether the worker transport should default to `socket` on
+Windows — is **answered** in hazard 47: yes, by platform, with a startup hint for the one worker
+shape it breaks. What remains genuinely open from that work is only the
+`stokehold-competition` lock question below.
+
+### The published Windows latency claim is not committed
+
+Hazard 46's 21× figure (pipe 15.24 ms against socket 0.72 ms median on `/items`, 9 runs of 1000
+requests each, ranges disjoint) survives in this plan and in the competition README, but the 18
+raw rows were deleted with the scratch directory the run used and were never committed.
+`stokehold-competition/.gitignore` whitelists `results/raw.tsv`, `results/crossover.tsv`,
+`results/latency.tsv` and `results/raw-*.tsv`; a Windows run would be the last of those,
+`results/raw-windows.tsv`. Re-running the two arms and committing the rows would make the claim
+reproducible from the repository alone, which is what every other published number in that repo
+is. Until then the figure is evidence, not an artefact.
+
 ### What the first real Linux run found
 
 `STOKEHOLD_E2E=1 cargo test --workspace` had never been run on Linux with a real PHP
@@ -1793,3 +1809,68 @@ so "the tests pass" was never evidence that the Linux path had been exercised.
   it the Windows *default* would be the right call on the evidence, but it is a behaviour change
   for existing deployments and belongs with the other open decisions rather than in a transport
   patch.
+
+**47. The worker transport now defaults by platform, and the reason it needed a hint.** Hazard
+46 measured the Windows pipe read at ~8 ms median against ~0.09 ms for a socket — 21× on the
+whole `/items` route, with disjoint ranges over 9 runs of 1000 requests — and left "should
+`socket` be the Windows default" as a product decision. It is now **yes**: `WorkerTransport`
+has a hand-written `Default` returning `Socket` under `cfg!(windows)` and `Pipe` elsewhere, so
+a configuration that never mentions `transport` gets the transport its platform is fast on. The
+setting is overridable both ways, and the choice is now logged (`worker pool started …
+transport=socket`) because the transport is invisible on the wire: a pool on the wrong one
+answers every request with a `200`, only slower.
+
+**The trap, and why it is not a reason to keep `Pipe` as the default.** The transport is chosen
+by the *server* and announced to the worker in `STOKEHOLD_WORKER_SOCKET`. A worker written
+before the option exists — including anything following the SDK README as it stood, which
+taught `Worker::create()` — reads `php://stdin`, which the socket transport has set to
+end-of-file, and therefore exits during its handshake. The first full-suite run after the
+default changed failed on exactly that: an *integration fixture* of ours, three files away from
+the config, still calling `create()`. So the blast radius is real and it is not only third-party
+code.
+
+It is still the right default, because the failure is a **startup** failure, not a wrong-answer
+one, and it is prompt: the worker exits in milliseconds rather than blocking, and `boot` already
+reports a worker that died before connecting as soon as `try_wait` sees it. Measured: with the
+default on, a `create()` worker is refused in under a second with exit status 1, not after the
+30 s handshake budget. What that failure *was* missing is an explanation. "exited during startup
+with exit code 1" sends a reader into PHP, where nothing is wrong, so `ServerError::StartupExited`
+and `StartupTimeout` gained a `hint: Hint` field carrying `SOCKET_WORKER_HINT`: call
+`connect()`, or set `transport = "pipe"`. The hint is attached only on the socket transport, so a
+pipe worker's ordinary application failure is not given advice about a socket.
+
+The hint is worded as a **condition** ("if the worker calls `create()`…"), not a diagnosis, and
+that matters: the server's `accept` loop knows only that no connection arrived and the child has
+exited, which is what a missing file, a syntax error and a `create()` worker all look like from
+there. The first draft asserted the cause outright and was immediately wrong — an acceptance run
+against a fixture with a *relative* path produced a file-not-found (PHP exits 1 for that) and the
+message explained it as a `create()` worker. The wording now names the check and both ways out,
+and points at the worker's own stderr, which `drain_stderr` logs above it.
+
+**The alternative that would have avoided the trap entirely, and why it is impossible.** A worker
+needs no change at all if the *server* hands it a socket as its stdin and stdout, because then
+`php://stdin` *is* the socket. That works in Rust — `Command::stdin(unsafe {
+Stdio::from_raw_handle(sock.into_raw_socket() as _) })` — and `into_raw_socket` means the handle
+has exactly one owner, so there is no double free. It fails on PHP's side, and the reason is a
+single fact worth recording: **Windows `GetFileType` reports a socket as `FILE_TYPE_PIPE` (3),
+the same as a pipe.** Verified directly (`GetFileType` on a socket handle → 3, on `NUL` → 2, on a
+file → 1), and it is documented behaviour: `GetFileType` is only a coarse classification, and a
+socket handle is *also* a file handle that `GetFileType` calls `FILE_TYPE_PIPE`. PHP's stream
+layer branches on exactly that, so a socket on fd 0 takes PHP's slow pipe read path anyway — the
+8 ms stays. PHP's own `proc_open` cannot do it either: passing a stream resource as a descriptor
+makes the child read a **bad file descriptor** (`fread(): Read of 8192 bytes failed with errno=9`),
+so the PHP end cannot even set it up. The option is therefore closed by the platform, not by
+preference, and `connect()` is the only route.
+
+**Tests.** `a_worker_uses_the_better_transport_for_the_platform` and
+`the_transport_can_always_be_stated_explicitly` pin the default and both overrides;
+`a_worker_still_on_create_is_told_to_call_connect` runs a real `create()` worker on the socket
+transport and asserts the message names `connect()` *and* `transport = "pipe"`;
+`a_pipe_worker_that_dies_is_not_told_about_the_socket` pins the other side, that the hint is
+transport-specific. That last one asserts only "a startup failure and no socket advice", not
+which of the two startup messages it is: whether the exit status or the closed pipe is seen first
+is a race, and it is not what the test is about.
+
+The `accept_with_deadline` doc comment was also wrong — it claimed the listener was polled
+*rather than* put in non-blocking mode, when the code does set it non-blocking and only restores
+blocking on the *accepted* stream. Corrected.

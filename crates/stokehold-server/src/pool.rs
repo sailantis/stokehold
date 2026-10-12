@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use stokehold_core::config::SpawnCgiConfig;
 use stokehold_fcgi::{Client, Endpoint, Request, Response};
 
-use crate::error::{Result, ServerError};
+use crate::error::{Hint, Result, ServerError};
 use crate::lifecycle::{configure_command, LifecycleGuard};
 
 /// How long to wait for a slot to start accepting connections.
@@ -575,6 +575,7 @@ fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Re
                 return Err(ServerError::StartupExited {
                     binary: binary.to_path_buf(),
                     status: status.to_string(),
+                    hint: Hint::default(),
                 })
             }
             Ok(None) => {}
@@ -589,6 +590,7 @@ fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Re
         binary: binary.to_path_buf(),
         address: slot.endpoint.to_string(),
         timeout,
+        hint: Hint::default(),
     })
 }
 

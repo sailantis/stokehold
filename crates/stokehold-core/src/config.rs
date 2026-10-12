@@ -330,25 +330,26 @@ pub struct WorkerConfig {
 
     /// How the server and a worker are connected.
     ///
-    /// Defaults to [`WorkerTransport::Pipe`], which is what every stokehold release before
-    /// this option did. `socket` exists because of a measured Windows problem: PHP's stream
-    /// layer takes **~8 ms median (15 ms p95)** to return from a blocking read on a pipe
-    /// there, while the same read on a **socket** returns in **~0.09 ms**. A Rust process
-    /// reading the identical pipe returns in 0.010 ms, and RoadRunner — a different server
-    /// with a different protocol — measured the same 15 ms, so the cost is PHP-on-Windows
-    /// rather than anything stokehold does. On Linux a pipe is fine, which is why the
-    /// default does not change. See `docs/plan.md` hazard 46.
+    /// Defaults to the platform's better transport: [`WorkerTransport::Socket`] on Windows
+    /// and [`WorkerTransport::Pipe`] everywhere else. The split is measured rather than
+    /// assumed. PHP's stream layer takes **~8 ms median (15 ms p95)** to return from a
+    /// blocking read on a Windows pipe, against **~0.09 ms** for the same read on a socket;
+    /// on a request path that was **21× on the whole `/items` route** (15.24 ms vs 0.72 ms
+    /// median, 9 runs of 1000 requests each). A Rust process reading the identical pipe
+    /// returns in 0.010 ms, and RoadRunner — a different server with a different protocol —
+    /// measured the same 15 ms, so the cost is PHP's pipe read on Windows rather than
+    /// anything stokehold does. On Linux the ordering is the other way round and much
+    /// smaller, so the pipe stays the default there. See `docs/plan.md` hazard 46.
     #[serde(default)]
     pub transport: WorkerTransport,
 }
 
 /// How a worker process is connected to the server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerTransport {
     /// The worker's own `stdin`/`stdout`. Portable, needs nothing from the worker, and
     /// the fastest option on Linux and macOS.
-    #[default]
     Pipe,
     /// A loopback TCP socket, for Windows, where PHP's pipe reads are slow. The server
     /// listens on an ephemeral loopback port and passes it to the worker as
@@ -357,10 +358,45 @@ pub enum WorkerTransport {
     Socket,
 }
 
+impl Default for WorkerTransport {
+    /// Windows gets a socket, everything else gets a pipe.
+    ///
+    /// A hand-written `Default` rather than `#[default]` on a variant, because the better
+    /// transport is a property of the platform and not of the enum. Getting this wrong is
+    /// expensive in the quiet way: a Windows deployment that leaves the setting out used to
+    /// pay 15 ms of scheduler latency per request and look healthy doing it — every request
+    /// answered, every status 200, no log line anywhere.
+    fn default() -> Self {
+        if cfg!(windows) {
+            WorkerTransport::Socket
+        } else {
+            WorkerTransport::Pipe
+        }
+    }
+}
+
 impl WorkerTransport {
     /// True when the transport is the worker's own stdio.
     pub fn is_pipe(self) -> bool {
         matches!(self, WorkerTransport::Pipe)
+    }
+
+    /// The name as it is written in configuration, for logs and diagnostics.
+    ///
+    /// Worth logging even though it is usually the default: the transport is invisible in
+    /// the protocol, so a deployment that ends up on the wrong one behaves identically
+    /// except for how fast it is.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkerTransport::Pipe => "pipe",
+            WorkerTransport::Socket => "socket",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -889,6 +925,63 @@ checksum = "optional"
             }
             other => panic!("expected worker, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_worker_uses_the_better_transport_for_the_platform() {
+        // The default is the whole point of the option: a deployment that never mentions
+        // `transport` must still get the transport that platform is fast on. On Windows that
+        // is the socket — PHP reads a pipe there in ~8 ms median against ~0.09 ms on a
+        // socket, which was 21× on the whole route. The assertion is platform-conditional
+        // rather than a fixed value because the correct answer is.
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let expected = if cfg!(windows) {
+            WorkerTransport::Socket
+        } else {
+            WorkerTransport::Pipe
+        };
+        match &config.backends["app"] {
+            BackendConfig::Worker(w) => {
+                assert_eq!(w.transport, expected);
+                assert_eq!(w.transport.is_pipe(), !cfg!(windows));
+            }
+            other => panic!("expected worker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_transport_can_always_be_stated_explicitly() {
+        // The platform default has to be overridable in both directions, or the setting is
+        // only half a setting: a Windows deployment may want the pipe, and a Linux one may
+        // want the socket to compare the two on its own hardware.
+        for (written, expected) in [("pipe", WorkerTransport::Pipe), ("socket", WorkerTransport::Socket)] {
+            let text = format!(
+                r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+transport = "{written}"
+"#
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            match &config.backends["app"] {
+                BackendConfig::Worker(w) => assert_eq!(w.transport, expected, "{written}"),
+                other => panic!("expected worker, got {other:?}"),
+            }
+        }
+        assert_eq!(WorkerTransport::Pipe.to_string(), "pipe");
+        assert_eq!(WorkerTransport::Socket.to_string(), "socket");
     }
 
     #[test]

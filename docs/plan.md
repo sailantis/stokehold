@@ -1649,14 +1649,14 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
    three options and the reason a half-reload is worse than none.
 4. **The rename** — a product decision, above.
 5. **The re-run** — the five arms against current `main`, above.
-6. **The worker pool's tail** — hazard 52. Throughput is fine and ahead; p99 on `/items` grows
-   from 1.7 ms at c=12 to 19.0 ms at c=32 while RoadRunner's stays at ~2.7 ms. **The cause is no
-   longer a hypothesis.** The pool measures its own slot waits (`4dd402a`, `a6df392`), and the
-   figure is unambiguous: the wait accumulates from concurrency 13 rather than stepping, its
-   p99 is 1–16 ms against a p50 of 2–19 µs, and the pool's `p99 − p50` accounts for 84–105% of the
-   client's excess over its own median. At c=32 a request spends 0.91 ms of its 1.69 ms waiting
-   for a busy worker. What is open is now only **which fix** — `try_lock` in the scan so a
-   request skips a busy slot, or a real fair queue — and neither has been built or compared.
+6. **The worker pool's tail** — hazard 52, **fixed and measured** (`e2b031e`). The cause was
+   measured rather than inferred: slot waits accumulated from concurrency 13, with a p99 of
+   1–16 ms against a p50 of 2–19 µs. A fair queue replaced the scan, and on the idle host p99 fell
+   60–81% (18.98 → 3.68 ms at c=32) with throughput *up* 13–21% and no refusals — checked against
+   `wrk`'s non-2xx line rather than assumed. The median at c=32 is 16% worse, which is the
+   deliberate cost: the request that would have been served on contact now waits its turn. Open
+   now only as a separate question — whether the remaining ~625 µs of *mean* queueing at c=32 is
+   worth attacking, which is not a fairness problem.
 
 Hazard 46's open product decision — whether the worker transport should default to `socket` on
 Windows — is **answered** in hazard 47: yes, by platform, with a startup hint for the one worker
@@ -2465,11 +2465,48 @@ Three things follow, and the first is a correction to my own reasoning earlier i
 
 **What is still open is which fix.** The measurement identifies the defect, its mechanism and
 its magnitude: ~0.9 ms of mean latency and a 16 ms p99 at c=32, in `pick_slot`. It does not
-compare candidates. `try_lock` in the scan so a request skips a busy slot rather than queueing
-behind it, and a real fair queue, are both consistent with this data and both would have to be
-built and re-measured. What has changed is that the measurement which was said to be missing now
-exists, and it is unambiguous — so the design change it was held back for is no longer being
-made on a hypothesis.
+compare candidates.
+
+*Both were weighed, one was built, and it holds.* The fair queue was chosen over `try_lock` in the
+scan for a reason worth recording, because it is the part that generalises: **the mean wait is
+structural.** 32 clients against 12 workers at ~600 µs each is ~20 requests in flight beyond the
+workers, and no scheduling change removes that time — it is Little's law. What a fix can change is
+*who* is charged it. `try_lock` scanning for a free slot is a race rather than a fairness
+mechanism, and at c=32, where the damage is, all twelve slots are usually busy, so there is little
+free to skip to; it would have helped the case that was not broken.
+
+`pick_slot`, the cursor and the healthy-not-free test are gone, replaced by a lease taken from a
+free list (`e2b031e`). Same sweeps, same host, three repeats per level:
+
+    conc   rps before -> after    client p99        pool mean wait    pool p99 wait
+      12   15,686 -> 16,342  +4.2%   1.68 -> 1.41 ms    34 ->   0 us     1.02 -> 0.008 ms
+      16   17,548 -> 19,884 +13.3%   3.94 -> 1.57 ms   157 ->  30 us     2.05 -> 0.51  ms
+      20   18,581 -> 22,114 +19.0%   7.68 -> 1.78 ms   325 -> 123 us     8.19 -> 1.02  ms
+      24   18,799 -> 22,787 +21.2%  10.74 -> 2.24 ms   509 -> 271 us     8.19 -> 2.05  ms
+      32   18,982 -> 22,360 +17.8%  18.98 -> 3.68 ms   906 -> 625 us    16.4  -> 4.10  ms
+
+Three of those were not predicted, and one of them is the one to distrust first:
+
+- **Nothing was shed to achieve it.** A bounded queue that refuses under load produces exactly
+  this shape while converting throughput into `503`s, so it was checked directly: `wrk` prints
+  non-2xx responses as an explicit line and printed **none** at c=16, 24 or 32, and the server
+  logged no refusal. Every response counted was a success.
+- **Throughput rose 13–21%, which was not the goal.** The mechanism explains it — the old scan
+  locked each candidate and called `try_wait` on each, and at c=32 walked the whole array before
+  blocking on one slot, all of it per request on 12 cores at 19,000 rps — but it was not predicted,
+  and an unpredicted win is the kind that deserves re-measuring rather than celebrating.
+- **The median cost much less than expected.** The estimate was p50 rising to ~1.5–1.7 ms at c=32
+  as the mean got shared out; it went to 1.35 ms. Direction right, size wrong.
+
+The trade that *was* predicted did happen: at c=32 the **median is 16% worse** while the p99 is 81%
+better. That is the fairness working as designed — the request that would have been served on
+contact now shares the queue — and it is confined to the range where there is something to share,
+because at c=12 the median is slightly better. Against RoadRunner's c=24 dense-sweep figures
+(2.70 ms p99, 1.23 ms p50) the fair queue is now better on both, which this project could not say
+before.
+
+What remains genuinely open is whether the *mean* queueing is worth attacking — a different design
+question from fairness, and the ~625 µs at c=32 is where it would show.
 
 Two things still worth keeping separate. This is **not** a throughput defect and fixing it would
 move no number in the competition report — measured throughput at c=24 is already 4% *ahead*.

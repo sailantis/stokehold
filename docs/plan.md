@@ -1580,24 +1580,30 @@ The raw evidence for the benchmark claims is **not** here: it is committed to
 conclusions. Anything measured on this host that is not in one of those two files did not
 happen.
 
-### The published benchmark predates the current build
+### The published benchmark and the current build
 
-`stokehold-competition/results/report.md` names its build as **`841c963`** (14:48). The
-five-arm run behind it was taken at **15:28**, and `main` is now at **`553c4a1`** (18:55). Four
-commits between them carry **code**, not docs or tests:
+`stokehold-competition/results/report.md` now names its build as **`91cc7b6`**, and every
+throughput, sequential-latency and crossover table in it comes from that sweep. The four commits
+that used to be the gap are measured rather than pending:
 
-| commit | what it changes |
-| --- | --- |
-| `9308ac4` | assemble a FastCGI response into a single write |
-| `270d20d` | stop rebuilding the request the pool already had *(request path)* |
-| `26e4f11` | reuse the reply frame buffer and size the body once |
-| `2549eb1` | the per-frame checksum becomes optional and negotiated |
+| commit | what it changes | throughput |
+| --- | --- | --- |
+| `9308ac4` | assemble a FastCGI response into a single write | 2–6% on `/`, nothing on `/items` (A/B, two binaries) |
+| `270d20d` | stop rebuilding the request the pool already had | not claimed (hazard 39) |
+| `26e4f11` | reuse the reply frame buffer, size the body once | not claimed (hazard 40) |
+| `2549eb1` | the per-frame checksum becomes optional | ~0.26% of one request (hazard 41) |
 
-The report already says its two CPU-attribution tables are carried over from the previous
-build. It does **not** say the throughput tables predate these four — so a re-run of the five
-arms is the one measurement that is genuinely outstanding, and the `checksum = "optional"` knob
-is the only one of the four with a plausible throughput effect (hazard 41: ~0.26% of one
-request, unclaimed until measured). Hazards 40 and 42 claim no throughput at all.
+Two things were established about them, both in hazard 50. The sweep at `841c963` that
+followed them read 1–3% slower in *every* cell, which looked like a regression and was not:
+every arm fell except the one the commits touched, and against a control the lead *grew* (P/R
++5.3% on `/`). And the `worker_pool.rs` split at `91cc7b6` was A/B'd against `ddaada7` on the
+same idle host — median **−0.00%**, every cell inside the repeat spread — so the current sweep
+is comparable to the one before it.
+
+What is still not measured on this build: the two CPU-attribution tables ("Where the warm arm's
+10% went", "The cold model's real cost is CPU"), which are carried over from the previous build.
+Their conclusions — a duty cycle, not headroom — do not depend on the few percent that moved,
+but the report says so rather than implying they are current.
 
 ### The rename, if it is ever made
 
@@ -2120,7 +2126,7 @@ respawns in all 27 runs**):
 | 32 | 1,728 rps | 1,693 rps | 7,716 rps | 4.46× | 4.56× | 1.021 |
 
 **FastCGI's ceiling is ~1,730 rps against the resident worker's ~9,700 — about 5.6×, where the
-Linux arms on the same route give 8,385 against 19,504, or 2.3×.** That is a *bigger* warm-over-
+Linux arms on the same route give 8,179 against 18,655, or 2.3×.** That is a *bigger* warm-over-
 cold margin on Windows, not a smaller one, and it is the opposite of the direction hazard 46
 suggested. The like-for-like cross-platform number is the sequential one, because absolute
 throughput here is not comparable (half the cores, SMT, ZTS rather than NTS, a home-grown load
@@ -2128,10 +2134,10 @@ generator, and 20–30% of the host in use throughout):
 
 | metric (`GET /items`) | Linux, 12 cores, idle | Windows, 6c/12t, 20–30% busy | Windows/Linux |
 | --- | --- | --- | --- |
-| resident worker, sequential p50 | 0.556 ms | 0.82 ms | 1.5× |
+| resident worker, sequential p50 | 0.585 ms | 0.82 ms | 1.4× |
 | FastCGI, sequential p50 | 1.52 ms | 4.6 ms | **3.0×** |
-| peak throughput, resident worker | 19,504 rps (c=32) | 9,717 rps (c=12) | 0.50× |
-| peak throughput, FastCGI | 8,385 rps (c=32) | 1,728 rps (c=32) | **0.21×** |
+| peak throughput, resident worker | 18,655 rps (c=32) | 9,717 rps (c=12) | 0.52× |
+| peak throughput, FastCGI | 8,179 rps (c=32) | 1,728 rps (c=32) | **0.21×** |
 | warm-over-cold, sequential | 2.7× | **5.6×** | — |
 
 **Windows is slower for both models, but the *cold* one pays much more of the penalty** — ~1.5×
@@ -2194,5 +2200,71 @@ there is no ini confound here and no wrapper was used. (`opcache.jit=tracing` is
 processes were confirmed to consume **exactly 0 CPU** over a 5 s idle sample, so leaving the
 FCGI pools running does not pollute another arm's measurement — they are blocked, like hazard
 48's pipe workers.
+
+**50. The leak guard could not see the arms it guarded, and "not a regression" needed a
+measurement rather than an argument.** Two findings from re-running the competition's five arms
+at `91cc7b6`, both about evidence rather than about stokehold's code. Neither is a defect in the
+server; both are defects in the *instrument*, which is why they are recorded here.
+
+*The guard.* `bench.sh` reported "8 stray php-cgi pools after teardown" and the report explained
+them away. The pattern was `pgrep -f 'php-cgi -b'`, but arms T and U spawn PHP through the
+`php-cgi-bench` wrapper, whose argv inserts its `-d` flags **before** `-b`:
+
+```
+/usr/bin/php-cgi -d opcache.enable_cli=1 -d opcache.validate_timestamps=0 \
+    -d xdebug.mode=off -d memory_limit=512M -b 127.0.0.1:19300
+```
+
+So the literal string never appears. Measured on the bench host: `pgrep -f 'php-cgi -b'`
+returned **0 while 12 of arm T's own children were alive**, and still **0 after a `kill -9` of
+the server left all twelve orphaned**. The guard was therefore not merely imprecise — it was
+blind to the arms under measurement, and would have reported clean through any leak the wrapper
+produced. The "8 strays" it did catch were leftovers from older configs that invoked
+`/usr/bin/php-cgi` directly, which is exactly why the number looked plausible enough to explain
+away. The fix matches `-b` as its own word via `ps -eww` (the `-ww` is load-bearing: without it
+a long wrapper command line is truncated and loses the flag) and runs after **every** arm,
+refusing to continue if a leak cannot be cleared. `pgrep -x php-cgi` would also have worked and
+would have been the wrong fix — it matches php-fpm's children on a host that serves its own
+sites, and the first version of the reap that used it killed 21 of the host's `www`-pool
+children. The lesson generalises past this harness: **a process-name pattern is a guess about
+argv, and a guard that cannot observe the thing it guards reports success, not failure.**
+
+*The reading.* The competition's first re-run of all five arms read 1–3% slower than the sweep
+before it in every cell, and the note in the report dismissed it as drift, citing a
+"clean re-run of R and F" that was **never committed** — a sentence, not data. Re-deriving it
+from the two committed TSVs shows the pattern that note missed: every arm fell **except the two
+the four intervening commits touched**.
+
+| arm | what it is | median change | cells that fell |
+| --- | --- | --- | --- |
+| P | stokehold worker — **the arm the commits changed** | **+0.35%** | 2/10 |
+| T | stokehold `spawn_cgi` | −1.54% | 8/10 |
+| U | stokehold `spawn_cgi` unix | −1.77% | 8/10 |
+| R | RoadRunner — untouched | −2.79% | **10/10** |
+| F | nginx + php-fpm — untouched | −1.63% | 7/10 |
+
+Cancelling the common mode against a control makes it unambiguous: **P/R moved +5.3% on `/`
+(lead grew in 5/5 cells) and +1.35% on `/items` (5/5)**. So the four commits did not cost
+anything, and the absolute rps column is not comparable between sweeps — which the report now
+says explicitly. This is hazard 28's shape one level up: there, a difference of *ini* was
+mistaken for a difference of server; here a difference of *host condition* was mistaken for a
+difference of server, and the control arms are what separate them.
+
+*And the refactor was measured, not argued.* P read ~3.3% below the previous sweep at `91cc7b6`,
+above every control arm, and the only code change since `ddaada7` is the `worker_pool.rs` split —
+a pure move, which by construction cannot cost throughput. That reasoning is exactly what this
+project has been wrong about before, so two binaries were built and alternated `A,B,B,A` on the
+idle host, 5 s × 3 repeats per cell: median **−0.00%**, 5/10 cells each way, every delta inside
+the 3.3% within-cell repeat spread. The refactor is free, and the ~3.3% was drift. The `A,B,B,A`
+layout is deliberate — a block layout charges linear host drift to whichever binary ran second,
+which is how a 22% "effect" appeared and reversed sign in hazard 49's own measurements.
+
+*One process hazard, for the next run.* **Stopping the SSH client does not stop the remote
+harness.** `stop_powershell` kills the `ssh.exe` locally; the remote `bash` survives, and because
+its `EXIT` trap never fires, `bench.sh` keeps serving and the next run contends with it. That
+happened here — two sweeps ran concurrently against the same 12 cores (load 4.33, two `wrk`
+clients, two server pools) and produced a P column ~25% low before it was caught. Cleanup is
+explicit: `pkill` the launcher, then `pkill -f 'stokehold serve'` and let each server's `Drop`
+take its own children, then reap any `php-cgi -b` that ignored SIGTERM.
 
 

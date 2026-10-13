@@ -1649,6 +1649,12 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
    three options and the reason a half-reload is worse than none.
 4. **The rename** — a product decision, above.
 5. **The re-run** — the five arms against current `main`, above.
+6. **The worker pool's tail** — hazard 52. Throughput is fine and ahead; p99 on `/items` grows
+   from 1.6 ms at c=12 to 10.4 ms at c=24 while RoadRunner's stays at 2.7 ms, and the suspected
+   cause is that `pick_slot` locks candidate slots until it finds a *healthy* one rather than a
+   *free* one, holding the mutex across the whole request with no queue between them. Proving
+   that needs a per-slot wait-time histogram, which does not exist yet; the design change it
+   would justify is not worth making on a hypothesis.
 
 Hazard 46's open product decision — whether the worker transport should default to `socket` on
 Windows — is **answered** in hazard 47: yes, by platform, with a startup hint for the one worker
@@ -2368,6 +2374,58 @@ stdout, stokehold reads the first byte `a` (97) as a protocol version, and the p
 only the SDK pin and that one call differ, and on Linux both resolve to the pipe — so the published
 numbers are not invalidated, but they are not reproducible byte-for-byte from the repository
 either, and the fix is the tree refresh plus `composer install` rather than the tree refresh alone.
+
+**52. The one cell RoadRunner wins is noise, but the tail is not — and it points at `pick_slot`.**
+Hazard 51's interleaved A/B has a single cell where RoadRunner leads: `/items` at c=16, −1.7%.
+The obvious reading is a crossover, because the pool has 12 slots and 16 is the first concurrency
+above it, so the cell was chased with a denser sweep — the same two variants at c=12, 14, 16, 18,
+20 and 24, eight rounds, a balanced two-variant rotation, 96 cells and none failed.
+
+    c=12  +1.3%    c=14  +1.1%    c=16  −1.1%
+    c=18  −1.3%    c=20  −0.4%    c=24  +3.0%
+
+**There is no crossover.** The deficit is ~1% (about 200 rps in 18,000), it sits in a band from 16
+to 20 rather than at a threshold, the per-round spread crosses 1.00 at four of the six levels, and
+the sequence is not monotonic. Per-request CPU agrees: stokehold's server cost is **flat at
+121–126 µs across c=8..32** and RoadRunner's moves 9 µs, so if 16 were a threshold stokehold's
+column would bend there and nothing bends. Attributing that cell to slot exhaustion would have
+been a story the data does not support, and the lesson generalises — at ~1% a single concurrency
+level is not a meaningful unit of evidence.
+
+*What the denser sweep did find is a tail divergence with no counterpart in throughput.* Median
+p99 on `/items`, RoadRunner against stokehold:
+
+    c=12  1,760 µs  vs  1,640 µs   (0.93×)
+    c=14  1,930 µs  vs  2,195 µs   (1.14×)
+    c=16  2,105 µs  vs  3,470 µs   (1.65×)
+    c=18  2,275 µs  vs  5,255 µs   (2.31×)
+    c=20  2,415 µs  vs  6,770 µs   (2.80×)
+    c=24  2,690 µs  vs 10,425 µs   (3.88×)
+
+RoadRunner's tail is **flat** above its slot count, which is what a pool that holds a queue looks
+like. Stokehold's grows without bound, and its p50 is *better* than RoadRunner's at every one of
+those levels. A p99 that grows with offered load while the median improves is the signature of
+queueing with no bound on the queue: the requests are not served slower, they wait longer before
+they are served. That is also why the throughput number never showed it — a bounded queue costs
+latency, not throughput, and every pass in this project until now reported a median.
+
+*The mechanism is a hypothesis, and is recorded as one.* `pick_slot` (`worker_pool/mod.rs:355`)
+takes `cursor.fetch_add(1)` and then locks each candidate slot in turn until one reports
+`is_available()`, which (`mod.rs:587`) is `exchange.is_some() && matches!(child.try_wait(), Ok(None))`
+— **the worker is healthy, not the slot is free**. The mutex is then held for the whole request, so
+at c=32 thirty-two connection threads contend for twelve slot mutexes with no queue and no
+backpressure. That would produce exactly this shape. Proving it needs a per-slot wait-time
+histogram, or an experiment that gives the pool a queue and re-measures the tail, and neither has
+been run. It is left open deliberately rather than "fixed": the fix is a design change to how
+slots are assigned, and the measurement that would justify it is the one that has not been made.
+
+Two things follow that are worth keeping separate. This is **not** a throughput defect and fixing
+it would move no number in the competition report — measured throughput at c=24 is already 4%
+*ahead*. And it is a user-visible property in a way a 1% throughput deficit is not: a service whose
+p99 is 10 ms under 24 concurrent connections is a different proposition from one that is merely
+faster on average. A resident-worker server that wins the mean and loses the tail is a case this
+project had not previously been able to see, because every pass it owns reported a median.
+
 
 
 

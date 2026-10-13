@@ -13,7 +13,7 @@ pub mod listener;
 pub mod pool;
 pub mod worker_pool;
 
-pub use backend::Backend;
+pub use backend::{Backend, Contention};
 pub use build::{MINIMUM_PHP_VERSION, WORKER_PROTOCOL_VERSION};
 pub use dispatch::Dispatcher;
 pub use error::{Result, ServerError};

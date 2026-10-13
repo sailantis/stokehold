@@ -125,6 +125,25 @@ impl ClientPool {
     }
 }
 
+/// Slot contention in a worker pool, gathered for the shutdown report.
+///
+/// Every worker pool accumulates what its slot mutexes cost, but a library has no
+/// business deciding where that goes, so it is surfaced here and the *program*
+/// prints it. A server that logs its own diagnostics is a server whose embedder
+/// cannot; the CLI has one place to say it and this is the data for that place.
+#[derive(Debug, Clone)]
+pub struct Contention {
+    pub backend: String,
+    pub workers: usize,
+    /// Requests this pool served. A request replayed on a second slot counts twice.
+    pub served: u64,
+    /// Mean time a request waited for a slot, in microseconds.
+    pub mean_us: u64,
+    /// The slot that took the most wait, and how much.
+    pub busiest: usize,
+    pub busiest_us: u64,
+}
+
 /// A backend, ready to serve requests.
 #[derive(Debug)]
 pub enum Backend {
@@ -273,6 +292,23 @@ impl Backend {
                 request_id: stokehold_fcgi::REQUEST_ID,
                 complete: false,
             },
+        })
+    }
+
+    /// Whether this backend is a worker pool whose slot contention should be
+    /// reported when the server stops. `None` for every other shape.
+    pub fn worker_contention(&self) -> Option<Contention> {
+        let Backend::Worker { name, pool } = self else {
+            return None;
+        };
+        let (busiest, busiest_us) = pool.busiest_slot_wait_us();
+        Some(Contention {
+            backend: name.clone(),
+            workers: pool.len(),
+            served: pool.requests_served(),
+            mean_us: pool.mean_slot_wait_us(),
+            busiest,
+            busiest_us,
         })
     }
 

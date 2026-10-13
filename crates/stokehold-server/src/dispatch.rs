@@ -125,6 +125,18 @@ impl Dispatcher {
         backend.request(request)
     }
 
+    /// Slot contention in every worker pool, for the caller to report.
+    ///
+    /// `&self`, so it is readable at any time. The CLI reads it once, after the
+    /// listeners have stopped, so a load test's numbers are in the log next to the
+    /// arm they belong to.
+    pub fn contention(&self) -> Vec<crate::backend::Contention> {
+        self.backends
+            .values()
+            .filter_map(Backend::worker_contention)
+            .collect()
+    }
+
     /// Stop every backend.
     ///
     /// `&mut self`, and only reachable by the owner: `Drop` is what reaps the

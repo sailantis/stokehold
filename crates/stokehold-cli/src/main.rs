@@ -11,7 +11,7 @@ use stokehold_core::config::Config;
 use stokehold_core::php;
 use stokehold_fcgi::cgi::Routing;
 use stokehold_http::{HttpLimits, RunningHttp, StaticState};
-use stokehold_server::{Dispatcher, FastCgiListener, Limits, ServerError};
+use stokehold_server::{Contention, Dispatcher, FastCgiListener, Limits, ServerError};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -262,6 +262,11 @@ fn serve(
         }
     }
 
+    // A report on shutdown needs numbers that only exist at shutdown, so the
+    // dispatcher stays reachable instead of being dropped with `Arc`'s last
+    // strong count below.
+    let reporting = Arc::clone(&dispatcher);
+
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
     // before the runtime is built.
@@ -330,8 +335,31 @@ fn serve(
         println!("http: {requests} request(s), {failed} failed");
     }
 
+    // Printed rather than traced: a load test wants this line in the same log as
+    // the run it describes, and a filter that could silence it is the last thing a
+    // diagnostic should depend on.
+    for contention in reporting.contention() {
+        println!("{}", contention_line(&contention));
+    }
+
     println!("stopped");
     Ok(())
+}
+
+/// The one line of slot-contention report, as a string.
+///
+/// Its own function because it is a format, not a side effect: the numbers are what a
+/// measurement is read from, so the text they land in is worth a test that does not need
+/// a server, a signal or a terminal.
+fn contention_line(contention: &Contention) -> String {
+    format!(
+        "slots: {} worker(s), {} request(s), mean wait {} us, busiest slot {} at {} us",
+        contention.workers,
+        contention.served,
+        contention.mean_us,
+        contention.busiest,
+        contention.busiest_us,
+    )
 }
 
 /// Wait until the shutdown flag is set.
@@ -543,6 +571,26 @@ fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_contention_line_carries_every_number_it_is_given() {
+        let reported = Contention {
+            backend: "app".to_string(),
+            workers: 12,
+            served: 40_000,
+            mean_us: 812,
+            busiest: 7,
+            busiest_us: 41_233,
+        };
+        let line = contention_line(&reported);
+        // Whitespace-collapsed comparison: the format is what matters, not the width of
+        // the separators, and a test that pins the spacing fails on a harmless edit.
+        let flat: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            flat,
+            "slots: 12 worker(s), 40000 request(s), mean wait 812 us, busiest slot 7 at 41233 us"
+        );
+    }
 
     #[test]
     fn routing_uses_a_front_controller_by_default() {

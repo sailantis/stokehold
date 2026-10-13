@@ -69,7 +69,7 @@ pub use request::borrowed_request;
 pub use request::request_header;
 
 use std::process::{Child};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use stokehold_core::config::{WorkerConfig};
@@ -116,6 +116,21 @@ pub struct WorkerPool {
     slots: Vec<Mutex<Slot>>,
     /// Round-robin position, so work and therefore memory are spread evenly.
     cursor: AtomicUsize,
+    /// What waiting for each slot has cost, in microseconds, summed over the requests
+    /// that had to wait.
+    ///
+    /// Per slot rather than one pool-wide total, because the question is never "is
+    /// the pool contended" but "is one slot being fought over". A single total could
+    /// not tell that apart from a cost spread evenly over the pool, and the shape is
+    /// the whole answer to whether the slot assignment is what a slow tail is made of.
+    ///
+    /// `Relaxed` throughout: these are counters for a human to read, nothing in the
+    /// program branches on them, and ordering them would put a fence on the request
+    /// path to make a diagnostic look tidier.
+    wait_us: Vec<AtomicU64>,
+    /// Requests served, so a total can be read as a mean. Counts *attempts*, so a
+    /// request the pool replayed on a second slot counts twice.
+    served: AtomicU64,
     /// `memory_limit_mb` in bytes, worked out once.
     memory_limit_bytes: Option<u64>,
     max_requests: Option<u64>,
@@ -152,6 +167,8 @@ impl WorkerPool {
             spec,
             slots,
             cursor: AtomicUsize::new(0),
+            wait_us: (0..count as usize).map(|_| AtomicU64::new(0)).collect(),
+            served: AtomicU64::new(0),
             memory_limit_bytes: config
                 .memory_limit_mb
                 .map(|mb| mb.saturating_mul(1024 * 1024)),
@@ -175,6 +192,57 @@ impl WorkerPool {
     /// Number of workers in the pool, which does not change.
     pub fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    /// The mean time a request waited for a slot, in microseconds.
+    ///
+    /// The request path times each request from the moment it asks for a slot to the
+    /// moment it holds one, and adds that up here; the mean is over the requests this
+    /// backend served, not over the slots, so it is comparable with the client-side
+    /// figures a load generator reports. It is the queueing half of a request's latency:
+    /// a slot is held for the whole request, so this is time spent behind another
+    /// request rather than any time the worker spent working.
+    ///
+    /// Its floor is not zero: the measurement spans the scan as well as the serving
+    /// lock, because a request can wait in either, so every request contributes the cost
+    /// of a lock taken and released to ask a question - microseconds, against the
+    /// milliseconds a real queue is made of.
+    ///
+    /// Read at shutdown and reported in the log. Near zero on a pool whose workers were
+    /// never contended for, which is the answer that matters: it is what says a slow
+    /// tail belongs to the front-end or the load generator rather than to the pool.
+    ///
+    /// Its floor is not zero. The measurement spans the scan as well as the serving
+    /// lock, because a request can wait in either, so every request contributes the cost
+    /// of a lock taken and released to ask a question — microseconds, against the
+    /// milliseconds a real queue is made of. A figure of a few microseconds on an idle
+    /// pool is that cost, not contention.
+    pub fn mean_slot_wait_us(&self) -> u64 {
+        let total: u64 = self
+            .wait_us
+            .iter()
+            .map(|us| us.load(Ordering::Relaxed))
+            .sum();
+        let served = self.served.load(Ordering::Relaxed);
+        total.checked_div(served).unwrap_or(0)
+    }
+
+    /// Requests this pool attempted, which is the denominator of the means above.
+    pub fn requests_served(&self) -> u64 {
+        self.served.load(Ordering::Relaxed)
+    }
+
+    /// The slot with the most wait attributed to it, and that wait in microseconds.
+    ///
+    /// The counterpart of [`WorkerPool::mean_slot_wait_us`]: a mean hides the shape
+    /// this exists to detect, where one slot takes the queueing and the rest are idle.
+    pub fn busiest_slot_wait_us(&self) -> (usize, u64) {
+        self.wait_us
+            .iter()
+            .enumerate()
+            .map(|(index, us)| (index, us.load(Ordering::Relaxed)))
+            .max_by_key(|(_, us)| *us)
+            .unwrap_or((0, 0))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -267,6 +335,15 @@ impl WorkerPool {
     /// One try at a request, with the slot chosen here so a retry can pick a
     /// different one.
     fn attempt(&self, request: &Request) -> std::result::Result<Response, FailedAttempt> {
+        // Timed across *both* acquisitions — the scan in `pick_slot` and the lock taken
+        // to serve — because that is where a request actually waits. It is not obvious
+        // which of the two does the waiting: a thread that arrives while a slot is
+        // mid-request blocks in the scan, for the remainder of that request, and by the
+        // time it gets past the scan the serving lock is free again. So the honest
+        // figure is the time from asking for a slot to holding one, not the time spent
+        // on either lock alone. Measured on a pool under eight-way load with two
+        // workers, the wait appears here and nowhere if only the second lock is timed.
+        let queued_at = Instant::now();
         let index = self.pick_slot().map_err(|source| FailedAttempt {
             source,
             // Nothing was sent, so nothing can be repeated: a missing worker is a
@@ -276,6 +353,11 @@ impl WorkerPool {
         let mut slot = self.slots[index]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let waited_us = queued_at.elapsed().as_micros() as u64;
+        if let Some(counter) = self.wait_us.get(index) {
+            counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
 
         let response = match invoke(&mut slot, request) {
@@ -350,8 +432,25 @@ impl WorkerPool {
     /// replaced in place so the pool keeps its size; the alternative is a pool
     /// that silently shrinks under repeated crashes.
     ///
-    /// A slot is only ever *reserved* here, not held: the index is returned and
-    /// the caller takes the lock, so the search never blocks on a busy worker.
+    /// **The scan locks each candidate while it looks at it**, so `is_available` is
+    /// only ever asked with the slot's mutex held, and a thread arriving while a slot
+    /// is mid-request *blocks in the scan* for the remainder of that request rather
+    /// than moving on to the next slot. The index the scan returns is not a
+    /// reservation: the caller locks the same slot again to serve on it
+    /// ([`WorkerPool::attempt`]), and in the window between the two locks another
+    /// thread may take it.
+    ///
+    /// Two things follow, and they are why [`WorkerPool::mean_slot_wait_us`] exists
+    /// rather than being reasoned about. The scan is a *round-robin with blocking*, so
+    /// a request queues behind whichever worker the cursor happened to point at
+    /// instead of being offered the next free one; and the lock the request held in the
+    /// scan is dropped again before the serving lock is taken, so two threads can be
+    /// told the same slot is free and then race for it. Which of the two dominates is a
+    /// measurement, not an argument.
+    ///
+    /// Note also what [`Slot::is_available`] answers, because it is not "this slot is
+    /// free": it is "this worker is alive". Being free is only ever learned by
+    /// blocking on the mutex.
     fn pick_slot(&self) -> Result<usize> {
         let count = self.slots.len();
         if count == 0 {

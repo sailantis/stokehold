@@ -948,3 +948,118 @@ fn a_pipe_worker_that_dies_is_not_told_about_the_socket() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// The pool's own account of how long requests waited for a slot.
+///
+/// The counter exists to tell a queueing tail apart from a slow server, so the test is
+/// that it counts in both directions: more requests than workers must make it report
+/// waiting, and one request at a time on an idle pool must make it report none. The
+/// second half is the one that matters. A counter wired to something that always
+/// reports a number would pass the first half and be worse than useless, because the
+/// whole point of reading it is to be told the pool is innocent.
+#[test]
+fn the_pool_reports_the_time_requests_spent_waiting_for_a_slot() {
+    let _serial = serial();
+    require_sdk!();
+
+    // A pool of two, so eight simultaneous requests have to queue three deep. The
+    // handler sleeps rather than returning at once, because the wait being measured is
+    // the time spent behind another *request*, and a handler that could not be caught
+    // mid-request would leave nothing to wait behind.
+    let dir = std::env::temp_dir().join(format!("stokehold-wait-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("slow-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Stokehold\Request;
+use Stokehold\Response;
+use Stokehold\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    usleep(50000);
+    return Response::json(['pid' => getmypid()]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let workers = 2;
+    let config = WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers,
+        memory_limit_mb: None,
+        max_requests: None,
+        working_dir: None,
+        env: Default::default(),
+        checksum: Default::default(),
+        transport: Default::default(),
+    };
+    let pool = WorkerPool::start("test", &config).expect("pool starts");
+
+    // Idle: one request against two workers has nothing to wait for, so the pool must say
+    // so. Not *zero*: the figure includes the scan's own lock-and-release, which every
+    // request pays and which is microseconds. So the assertion is a floor rather than an
+    // equality, and the floor is set far below anything a queue for a request could be.
+    // `requests_served` is read alongside it, because a mean of zero and a mean of
+    // nothing-measured are the same number otherwise.
+    let single = pool.request(&get("/")).expect("the first request answers");
+    assert_eq!(single.parse_status_headers().0, 200);
+    assert_eq!(pool.requests_served(), 1);
+    let idle = pool.mean_slot_wait_us();
+    assert!(
+        idle < 1_000,
+        "one request against two idle workers waits for nothing but the scan: {idle} us"
+    );
+
+    // Contended: eight requests for two workers. The later batches each wait for a whole
+    // 50 ms request to finish, so the pool's mean is at least tens of milliseconds.
+    let requests: usize = 8;
+    let contended_at = std::time::Instant::now();
+    let answers: Vec<u16> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..requests)
+            .map(|_| scope.spawn(|| pool.request(&get("/")).map(|r| r.parse_status_headers().0)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("no thread panics")
+                    .expect("every request answers")
+            })
+            .collect()
+    });
+    let contended_for = contended_at.elapsed();
+    assert!(answers.iter().all(|status| *status == 200));
+
+    assert_eq!(pool.requests_served(), 1 + requests as u64);
+    let (busiest, busiest_us) = pool.busiest_slot_wait_us();
+    let mean = pool.mean_slot_wait_us();
+    // The wall clock comes first because it says whether there was anything to queue for.
+    // Eight 50 ms requests on two workers is four batches, so anything near eight batches
+    // means they never overlapped and a wait of zero would be the truth rather than a bug.
+    assert!(
+        contended_for >= Duration::from_millis(150),
+        "eight 50 ms requests on two workers take at least four batches: {contended_for:?}"
+    );
+    assert!(
+        mean >= 20_000,
+        "eight requests on two 50 ms workers queue for tens of milliseconds each, not {mean} us \
+         (busiest slot {busiest} at {busiest_us} us, {contended_for:?} wall clock)"
+    );
+
+    // And the wait lands on the slots rather than on the pool as a whole: a request waits
+    // for the slot it was pointed at, so the busiest slot holds on the order of 8 x 50 ms
+    // / 2, and is never a slot with nothing attributed to it.
+    assert!(busiest < workers as usize);
+    assert!(
+        busiest_us >= mean,
+        "the busiest slot is at least the mean: {busiest_us} us vs {mean} us"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

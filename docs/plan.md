@@ -1314,6 +1314,13 @@ against the specification and secondary implementations, and are confirmed by fi
     paragraph was "the checksum is the one cost left on the framing path". It was, and it is now a
     setting — but the measurement that justifies the work is not the one that was expected.
 
+    > **Superseded in scope by hazard 51.** The 0.26% below times only the *Rust-side frame
+    > encoding*, and the checksum is hashed **twice** per response — once by the PHP worker that
+    > writes the frame and once by the server that reads it. Measured end to end the cost is
+    > ~6 µs of CPU per request (~1.5%), and the throughput saving is +2.0% to +3.0%, with a
+    > spread that crosses 1.00. The knob is worth more than this hazard claims, and hazard 51 has
+    > the per-process attribution that shows where it goes. The decisions below are unaffected.
+
     Measured, by encoding a whole response (head + 12 KB body + `END`) with the real SDK in a
     loop, 50,000 iterations, four runs:
 
@@ -2266,5 +2273,101 @@ happened here — two sweeps ran concurrently against the same 12 cores (load 4.
 clients, two server pools) and produced a P column ~25% low before it was caught. Cleanup is
 explicit: `pkill` the launcher, then `pkill -f 'stokehold serve'` and let each server's `Drop`
 take its own children, then reap any `php-cgi -b` that ignored SIGTERM.
+
+**51. The crc32c fix is worth 10–16%, and hazard 41 measured the checksum against half its own
+    cost.** The question that started this was the right one to ask and was asked for the right
+    reason: the lead over RoadRunner *looked* lost again in the latest sweep. An interleaved A/B
+    settles it, and the answer is that the effect is not merely still there — it accounts for the
+    whole lead. Two corrections fall out of it, one about a number this document already
+    published and one about the host the benchmark was measured on.
+
+*Method, because the previous attempt at this question was a trend and a trend cannot answer it.*
+Five committed sweeps were compared cell by cell and could not separate a real movement from the
+host's own drift: in the one sweep that looked like a regression, every arm fell — including
+`RoadRunner` and `nginx + php-fpm`, which none of the intervening commits touch. So this is a
+different instrument. Four variants, every one measured **inside the same round**, and the
+starting order rotated by round so that a drift of any shape charges every variant equally:
+
+| variant | what it is |
+| --- | --- |
+| `new-req` | current `main`, `checksum = "required"` — what every published number used |
+| `new-opt` | current `main`, `checksum = "optional"` — the knob hazard 41 added |
+| `old-req` | current `main` with **only** `crc32c` reverted to the hand-written loop |
+| `rr` | RoadRunner, resident worker — shares no code with any of the others |
+
+`rr` is the control and the reason the result is legible: a round in which every stokehold variant
+moved but `rr` did not is a round in which stokehold moved. Seven rounds × 2 endpoints × 3
+concurrencies = **168 measured cells, 0 failed**, and the guard from hazard 50 reports clean after
+every variant. The estimator is a ratio computed *within* a round, so its spread across the seven
+rounds is the error bar — which is what a blocked layout throws away.
+
+*The revert is targeted, and that matters.* Building `07fea44^` would have been simpler and would
+have isolated nothing: it is twenty commits back and bundles the FastCGI parser de-allocation
+(5.2%), the single-pass `parse_response` (5.2%) and the request-path copies along with the
+checksum. So only `header::crc32c` was restored to the bit-by-bit loop it replaced, in a second
+checkout, and the two binaries were confirmed to differ in behaviour not at all: both return
+**byte-identical** bodies for both endpoints, and the pinned `crc32c_matches_the_standard_check_value`
+test still passes on the reverted tree. The value is what has to match, not the implementation —
+which is the point the original commit made and this confirms from the other side.
+
+| ratio, median over 7 rounds | `/` c=8 | `/` c=16 | `/` c=32 | `/items` c=8 | `/items` c=16 | `/items` c=32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `crc32c` fix (`new-req`/`old-req`) | **+11.8%** | **+11.4%** | **+16.3%** | **+10.2%** | **+12.1%** | **+13.7%** |
+| checksum option (`new-opt`/`new-req`) | +2.0% | +2.9% | +2.5% | +3.0% | +2.7% | +2.8% |
+| lead over `rr` (`new-req`/`rr`) | +18.0% | +4.6% | +4.2% | +3.3% | **−1.7%** | +7.0% |
+| **pre-fix vs `rr` (`old-req`/`rr`)** | **+5.3%** | **−6.5%** | **−9.1%** | **−5.8%** | **−12.9%** | **−6.2%** |
+
+The crc32c row is positive in **all 42 paired cells** and the pre-fix row is negative in all six
+cells of every round. That is the answer: **the pre-fix build is behind RoadRunner everywhere**,
+by 5.8–12.9%, so the crc32c fix is not one optimization among several — it is the one that turned
+a consistent deficit into a consistent lead.
+
+*The mechanism agrees, and in the column it predicted.* A ratio says the cost exists; CPU
+attribution says whose it is. Per request at c=32 on `/items`, median of three rounds:
+
+| | server µs | PHP µs | total µs | rps |
+| --- | --- | --- | --- | --- |
+| `old-req` (bit-by-bit loop) | **184** | 287 | 471 | 16,957 |
+| `new-req` (crate, hardware CRC32) | **125** | 283 | 408 | 19,428 |
+| `new-opt` (crate + checksum off) | **121** | **281** | 402 | 19,414 |
+
+The fix removes **59 µs of server CPU per request (184 → 125, −32%)** and leaves the PHP column
+where it was (287 → 283), which is exactly what it should do: the server hashes every response
+once, and the PHP worker was already using `hash('crc32c', …)`, which is hardware-accelerated.
+The same figure at c=16 is 181 → 122. So the 10–16% in throughput is a ~13% cut in total CPU per
+request, and the two independent instruments land on the same number. The warm arm at 19,400 rps
+is using 7.8 of the 12 cores, so it is not CPU-saturated at this load — which is why the
+throughput gain is a little smaller than the CPU gain, and why the gain is not uniform across
+concurrency.
+
+*Correction to hazard 41, which is the reason this pass was worth running.* Hazard 41 concluded
+that the optional checksum was "worth about 0.26%", from a microbenchmark that encoded a whole
+response with the SDK 50,000 times. That measurement is not wrong, it is **incomplete**, and the
+omission is systematic: it timed the *Rust-side frame encoding*, but the checksum is hashed
+**twice** per response — once by the PHP worker that writes the `BODY` frame and once by the server
+that reads it. The PHP hash is the one that dominates, precisely because the worker's hash is the
+SDK's and the benchmark had never isolated it. Measured end to end the cost is **~6 µs of CPU per
+request (1.5%)**, not 1.7 µs, and the throughput medians are **+2.0% to +3.0%**.
+
+Even so, the throughput evidence for this one is weaker than the table makes it look, and the
+difference between the two rows above is the lesson: **the crc32c row's seven-round spread never
+crosses 1.00, while the checksum row's does, in four of the six cells** (`/` c=8 `[0.987..1.034]`,
+`/items` c=16 `[0.997..1.045]`). A median that is positive while its own spread straddles 1.00 is
+a cost that exists reported through a noise floor that is larger than it. The CPU columns settle
+it — the option removes a real 3–4 µs on each side — and it should be read as a small, real,
+now-measured saving rather than as the 0.26% hazard 41 implied.
+
+*And the benchmark host was not measuring what the repository pins.* Setting this experiment up
+found that the VM's application tree is **not a git checkout** and had drifted: all 31 apparently
+differing files were CRLF in a tree that is LF in the repository, but two real differences were
+underneath — `worker.php` still called `Worker::create()` where `main` calls `Worker::connect()`,
+and the vendored SDK was `5ede306` where `composer.json` pins `475bfd2b`. That is the exact failure
+commit `134a7bc` documents: `connect()` on an SDK that predates it makes PHP write its error to
+stdout, stokehold reads the first byte `a` (97) as a protocol version, and the pool dies with
+"unsupported protocol version 97". The published sweep's *application* source does match the repo;
+only the SDK pin and that one call differ, and on Linux both resolve to the pipe — so the published
+numbers are not invalidated, but they are not reproducible byte-for-byte from the repository
+either, and the fix is the tree refresh plus `composer install` rather than the tree refresh alone.
+
 
 

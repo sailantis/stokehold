@@ -99,6 +99,36 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a worker has to exit after being told to, before it is killed.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How many buckets a slot wait is counted into, for reading a percentile out of it.
+///
+/// Twenty covers 1 microsecond to a second in powers of two, which is the whole range a
+/// slot wait can occupy: below a microsecond it is measurement noise, and above a second
+/// the request has hit `REQUEST_TIMEOUT` and been replaced. Powers of two rather than
+/// even steps because the question is "is a tail of milliseconds real", and a bucket
+/// width of a millisecond cannot resolve the microseconds a healthy wait lives at.
+const WAIT_BUCKETS: usize = 20;
+
+/// The bucket a wait of `micros` belongs in.
+///
+/// Never negative and never zero-valued, so the index is `floor(log2)` of the wait.
+/// `micros == 0` is counted in bucket 0 with the sub-microsecond waits rather than
+/// discarded: a request that waited nothing is data too, and dropping it would make every
+/// percentile a percentile of the waits that happened to be long enough.
+fn wait_bucket(micros: u64) -> usize {
+    let value = micros.max(1);
+    let floor_log2 = 63 - value.leading_zeros() as usize;
+    floor_log2.min(WAIT_BUCKETS - 1)
+}
+
+/// The largest wait a bucket can hold, in microseconds.
+///
+/// A bucket's upper edge is what is reported, and reading a percentile from a histogram
+/// always means choosing an edge: this one never understates the bucket, which is the
+/// direction that matters when the number is being used to decide whether a tail is real.
+fn bucket_upper_edge(index: usize) -> u64 {
+    1u64 << (index + 1)
+}
+
 /// A pool of persistent PHP workers.
 #[derive(Debug)]
 pub struct WorkerPool {
@@ -128,6 +158,19 @@ pub struct WorkerPool {
     /// program branches on them, and ordering them would put a fence on the request
     /// path to make a diagnostic look tidier.
     wait_us: Vec<AtomicU64>,
+    /// Every slot wait, counted into powers of two, so a percentile can be read without
+    /// keeping a sample per request.
+    ///
+    /// A mean alone cannot answer the question this exists for. Two pools with the same
+    /// mean wait are not the same pool: one may give every request a fair share, and the
+    /// other may serve most requests quickly and starve a few, and only the second has a
+    /// tail. The shape is the finding.
+    ///
+    /// Boxed for size rather than for speed. Twenty counters inline make the pool large
+    /// enough that `Backend::Worker` would dominate its own enum - a lint, and a real one:
+    /// the enum is moved around on the startup path, not per request. One allocation, once
+    /// per pool, in exchange for not paying for the counters on every move.
+    wait_buckets: Box<[AtomicU64]>,
     /// Requests served, so a total can be read as a mean. Counts *attempts*, so a
     /// request the pool replayed on a second slot counts twice.
     served: AtomicU64,
@@ -168,6 +211,7 @@ impl WorkerPool {
             slots,
             cursor: AtomicUsize::new(0),
             wait_us: (0..count as usize).map(|_| AtomicU64::new(0)).collect(),
+            wait_buckets: (0..WAIT_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
             served: AtomicU64::new(0),
             memory_limit_bytes: config
                 .memory_limit_mb
@@ -225,6 +269,32 @@ impl WorkerPool {
             .sum();
         let served = self.served.load(Ordering::Relaxed);
         total.checked_div(served).unwrap_or(0)
+    }
+
+    /// The largest wait that at most `fraction` of requests exceeded, in microseconds.
+    ///
+    /// The pool's own p99, or p50, or whatever fraction is asked for - the counterpart of
+    /// the client's figure, measured inside the pool so the two can be compared without a
+    /// load generator in between. A histogram edge rather than an exact sample, so the
+    /// answer is never smaller than the truth; see [`bucket_upper_edge`].
+    pub fn slot_wait_percentile_us(&self, fraction: f64) -> u64 {
+        let served = self.served.load(Ordering::Relaxed);
+        if served == 0 {
+            return 0;
+        }
+        let counts: Vec<u64> = self
+            .wait_buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        let mut cumulative = 0u64;
+        for (index, count) in counts.iter().enumerate() {
+            cumulative += count;
+            if cumulative as f64 >= fraction * served as f64 {
+                return bucket_upper_edge(index);
+            }
+        }
+        bucket_upper_edge(WAIT_BUCKETS - 1)
     }
 
     /// Requests this pool attempted, which is the denominator of the means above.
@@ -356,6 +426,9 @@ impl WorkerPool {
         let waited_us = queued_at.elapsed().as_micros() as u64;
         if let Some(counter) = self.wait_us.get(index) {
             counter.fetch_add(waited_us, Ordering::Relaxed);
+        }
+        if let Some(bucket) = self.wait_buckets.get(wait_bucket(waited_us)) {
+            bucket.fetch_add(1, Ordering::Relaxed);
         }
         self.served.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
@@ -818,5 +891,34 @@ fn a_pool_can_be_reached_from_several_threads_at_once() {
     }
 
     let _ = reach_shared;
+}
+
+/// The histogram's bucket edges, which is where a percentile can go wrong quietly.
+#[test]
+fn wait_buckets_are_monotonic_and_cover_the_range_a_wait_can_occupy() {
+    // Every bucket is reachable, so a wait of zero and a wait of a whole request are never
+    // counted together: below a microsecond is measurement noise and belongs in the first
+    // bucket, not in a discard the percentiles would then be computed without.
+    assert_eq!(wait_bucket(0), 0);
+    assert_eq!(wait_bucket(1), 0);
+    assert_eq!(wait_bucket(2), 1);
+    assert_eq!(wait_bucket(3), 1);
+    assert_eq!(wait_bucket(1_000), 9);
+    assert_ne!(wait_bucket(1_000), wait_bucket(2_000));
+
+    // Monotonic, so the cumulative walk in `slot_wait_percentile_us` cannot see a larger
+    // wait sorted into an earlier bucket and report a percentile that is too small.
+    let mut previous = 0;
+    for micros in 0..200_000u64 {
+        let bucket = wait_bucket(micros);
+        assert!(bucket >= previous, "{micros} us went backwards");
+        previous = bucket;
+    }
+
+    // A wait past the last edge must saturate rather than index out of the array, and the
+    // last edge is beyond the point at which the request timeout replaces the worker.
+    assert_eq!(wait_bucket(1_000_000), WAIT_BUCKETS - 1);
+    assert_eq!(wait_bucket(u64::MAX), WAIT_BUCKETS - 1);
+    assert!(bucket_upper_edge(WAIT_BUCKETS - 1) > 1_000_000);
 }
 }

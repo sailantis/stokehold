@@ -1061,5 +1061,20 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
         "the busiest slot is at least the mean: {busiest_us} us vs {mean} us"
     );
 
+    // The distribution, not just the mean: the histogram has to put the median below the
+    // tail and the tail above the median, or the two figures are not measuring a spread.
+    // A mean alone cannot tell contention that is spread evenly from contention that
+    // starves a few, and the second kind is the one that makes a latency tail.
+    let p50 = pool.slot_wait_percentile_us(0.50);
+    let p99 = pool.slot_wait_percentile_us(0.99);
+    assert!(
+        p50 <= p99,
+        "the median wait cannot exceed the tail: p50 {p50} us, p99 {p99} us"
+    );
+    assert!(
+        p99 >= 20_000,
+        "one queueing wait in a hundred is a whole 50 ms request: p99 is {p99} us"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

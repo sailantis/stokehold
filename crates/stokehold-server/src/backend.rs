@@ -139,6 +139,14 @@ pub struct Contention {
     pub served: u64,
     /// Mean time a request waited for a slot, in microseconds.
     pub mean_us: u64,
+    /// The wait only one request in a hundred exceeded, and the median, in microseconds.
+    ///
+    /// The pair is the point: a mean says how much waiting there was, and these say how it
+    /// was spread. A pool whose p99 is far above its p50 is queueing unfairly - most
+    /// requests are served at once and a few wait for whole requests - which a mean cannot
+    /// show and which is exactly the shape of a latency tail.
+    pub p50_us: u64,
+    pub p99_us: u64,
     /// The slot that took the most wait, and how much.
     pub busiest: usize,
     pub busiest_us: u64,
@@ -307,6 +315,8 @@ impl Backend {
             workers: pool.len(),
             served: pool.requests_served(),
             mean_us: pool.mean_slot_wait_us(),
+            p50_us: pool.slot_wait_percentile_us(0.50),
+            p99_us: pool.slot_wait_percentile_us(0.99),
             busiest,
             busiest_us,
         })

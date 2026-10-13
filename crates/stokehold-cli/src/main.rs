@@ -353,10 +353,13 @@ fn serve(
 /// a server, a signal or a terminal.
 fn contention_line(contention: &Contention) -> String {
     format!(
-        "slots: {} worker(s), {} request(s), mean wait {} us, busiest slot {} at {} us",
+        "slots: {} worker(s), {} request(s), wait mean {} us, wait p50 {} us, wait p99 {} us, \
+         busiest slot {} at {} us",
         contention.workers,
         contention.served,
         contention.mean_us,
+        contention.p50_us,
+        contention.p99_us,
         contention.busiest,
         contention.busiest_us,
     )
@@ -579,6 +582,8 @@ mod tests {
             workers: 12,
             served: 40_000,
             mean_us: 812,
+            p50_us: 1,
+            p99_us: 16_384,
             busiest: 7,
             busiest_us: 41_233,
         };
@@ -588,7 +593,8 @@ mod tests {
         let flat: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
             flat,
-            "slots: 12 worker(s), 40000 request(s), mean wait 812 us, busiest slot 7 at 41233 us"
+            "slots: 12 worker(s), 40000 request(s), wait mean 812 us, wait p50 1 us, \
+             wait p99 16384 us, busiest slot 7 at 41233 us"
         );
     }
 

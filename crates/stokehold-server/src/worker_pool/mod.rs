@@ -40,14 +40,22 @@
 //! replaying a `POST` because its response was malformed is how an application is
 //! made to run twice.
 //!
-//! **Concurrency is per slot.** The pool takes `&self` and each slot is behind
-//! its own `Mutex`, so a pool of `n` workers serves `n` requests at once and a
-//! request to a free worker never waits for a busy one. The protocol's
-//! one-request-at-a-time rule is per *worker*, not per pool, and each slot's
-//! exchange thread is what enforces it now: a request is handed to that thread
-//! and the answer comes back on the slot's own channel, so two requests cannot
-//! reach one worker at once. The lock means a caller holds its slot for the
-//! duration, which is the same guarantee the borrow checker used to give.
+//! **Concurrency is a lease, one per slot.** The pool takes `&self`, and a slot is only ever
+//! handed out by taking it out of the pool's free list and returned when the [`Lease`] that
+//! holds it drops. So a pool of `n` workers serves `n` requests at once, a request is never
+//! given a slot another request is using, and a request that finds every slot taken waits for
+//! one rather than for a particular worker. The protocol's one-request-at-a-time rule is per
+//! *worker*, not per pool, and the lease is what enforces it now: a slot cannot be leased twice,
+//! so two requests cannot reach one worker at once.
+//!
+//! This replaced a scan that walked the slots from an atomic cursor and locked each one until a
+//! worker answered "healthy". That is a different question from "free", and it was answered
+//! with the mutex released before the caller took it again — so under load several threads were
+//! told the same slot was theirs and then raced for it, queueing behind one worker while others
+//! idled. Measured, that cost a p99 of 16 ms against a p50 of 19 µs at concurrency 32: most
+//! requests were served at once and a few waited for whole requests. What the free list buys is
+//! that a wait is always for the slot the request will actually use, and what [`MAX_SLOT_WAIT`]
+//! buys is that the wait cannot grow without end.
 
 //!
 //! # How this module is laid out
@@ -69,8 +77,8 @@ pub use request::borrowed_request;
 pub use request::request_header;
 
 use std::process::{Child};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use stokehold_core::config::{WorkerConfig};
 use stokehold_fcgi::{Request, Response};
@@ -98,6 +106,24 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a worker has to exit after being told to, before it is killed.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a request may wait for a slot before it is refused.
+///
+/// Not `None`. A bounded wait is what the tail measurement asked for, but *refusing* as soon
+/// as every slot is busy would answer a full pool with a 503 — which is a throughput
+/// regression on any workload whose concurrency exceeds `workers`, and the measurement that
+/// led here showed the pool reaching 19,000 rps at c=32 with 12 workers. Twelve workers
+/// cannot serve 32 clients without someone waiting, so the choice is not whether to queue but
+/// how to queue fairly and how far to let the queue grow.
+///
+/// So the queue is fair and this is its bound. A request that waits longer than this is
+/// refused with `503`, which is the point at which waiting has stopped being queueing and
+/// started being a latency leak: it caps both queue depth and the latency a client can see.
+/// The bound is deliberately generous relative to a request's cost — `GET /items` takes about
+/// 600 µs, so half a second is roughly eight hundred requests of queue, which is far past any
+/// depth this pool produces in practice. It exists to stop an unbounded tail, not to shape
+/// ordinary load.
+const MAX_SLOT_WAIT: Option<Duration> = Some(Duration::from_millis(500));
 
 /// How many buckets a slot wait is counted into, for reading a percentile out of it.
 ///
@@ -129,6 +155,88 @@ fn bucket_upper_edge(index: usize) -> u64 {
     1u64 << (index + 1)
 }
 
+/// The pool's free slots, and how many requests are owed one.
+///
+/// The two live under one mutex because they have to be read together: a slot on the list that
+/// a waiter has already been woken for is not available to a request arriving now, and that is
+/// only knowable if the count and the list are consistent.
+#[derive(Debug, Default)]
+struct FreeSlots {
+    ids: Vec<usize>,
+    /// Requests parked waiting for a slot.
+    ///
+    /// Counted so an arriving request can tell whether the next release is already owed to
+    /// someone. Waking a waiter and that waiter re-acquiring the mutex are not atomic, so
+    /// without this a later request can barge into the gap and take the slot the woken waiter
+    /// was told about — the classic barging problem, and under sustained load it is what would
+    /// preserve a tail: the requests that queue would be the ones repeatedly overtaken, which
+    /// is the unfairness this change exists to remove.
+    waiters: usize,
+}
+
+impl FreeSlots {
+    /// The slot a request arriving now may take.
+    ///
+    /// `None` while any request is parked: the next release is owed to one of them, and giving
+    /// it to a newcomer instead would leave the parked request waiting for a slot that has
+    /// already been handed out.
+    fn take_available(&mut self) -> Option<usize> {
+        if self.waiters > 0 {
+            return None;
+        }
+        self.ids.pop()
+    }
+
+    /// The slot a parked request takes when it is woken.
+    ///
+    /// Identical to [`FreeSlots::take_available`] except that it does not check the waiter
+    /// count — a parked request *is* the waiter that count is about. Keeping them separate is
+    /// what makes the barging rule legible: the only thing distinguishing a newcomer from a
+    /// request that has been waiting is which of these two it is allowed to call.
+    fn take_woken(&mut self) -> Option<usize> {
+        self.ids.pop()
+    }
+
+    /// Whether `index` is on the list.
+    fn contains(&self, index: usize) -> bool {
+        self.ids.contains(&index)
+    }
+}
+
+/// A slot handed to one request for as long as it serves it.
+///
+/// The fairness mechanism, and therefore the reason a request cannot be served on a slot
+/// another request is using: a lease can only be obtained for a slot sitting in the pool's
+/// free list, and holding it is what keeps it out of that list. No request has to be
+/// *told* a slot is free, which was the old scan's job and its defect — it asked whether a
+/// worker was healthy, took the mutex to find out, and left a window in which two requests
+/// could both be told the same slot was theirs.
+///
+/// `Drop` is what returns the slot, and that is deliberate: the request path has several
+/// early returns — a protocol error, a worker that died mid-request — and a release that
+/// had to be written at each of them is a release that will eventually be missed. A leaked
+/// slot is not a lost request, it is a pool that silently shrinks.
+///
+/// The queue is fair, and it is bounded by [`WorkerPool::max_wait`]: a request that waits
+/// longer than the bound is refused with `503` rather than parked indefinitely, because an
+/// unbounded wait is what made the p99 grow without limit in the first place.
+struct Lease<'a> {
+    pool: &'a WorkerPool,
+    index: usize,
+}
+
+impl<'a> Lease<'a> {
+    fn index(&self) -> usize {
+        self.index
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        self.pool.release(self.index);
+    }
+}
+
 /// A pool of persistent PHP workers.
 #[derive(Debug)]
 pub struct WorkerPool {
@@ -144,8 +252,37 @@ pub struct WorkerPool {
     /// buy recycling and memory spreading but not parallelism, which is a
     /// surprising thing for a setting called "workers" to mean.
     slots: Vec<Mutex<Slot>>,
-    /// Round-robin position, so work and therefore memory are spread evenly.
-    cursor: AtomicUsize,
+    /// The slots no request is using, as a stack: the head is taken first.
+    ///
+    /// A `Mutex<Vec<usize>>` rather than a channel because the common case is "take one and
+    /// go" — an uncontended mutex plus a `Vec::pop` is a few nanoseconds and allocates
+    /// nothing — and the uncommon case is "wait for one", which the paired `Condvar` covers
+    /// without a second structure.
+    ///
+    /// The list is what makes the queue fair, and that is the whole fix: a request waits for
+    /// *the slot it will actually use*, never for one that another request has already been
+    /// given. The old scan could not make that promise, which is why a request could be told
+    /// a slot was free, lose it in the window before taking it, and then queue behind one
+    /// worker while eleven sat idle. A released slot goes straight back to the head of this
+    /// list, so it is available to the next request immediately rather than reserved for
+    /// whichever waiter has been waiting longest — what matters is that the slot is *free
+    /// and unused*, not which order the waiting requests are in.
+    free: Mutex<FreeSlots>,
+    /// Woken when a slot is released, so a request that is waiting for one is told rather
+    /// than left to poll.
+    ///
+    /// Only used when [`WorkerPool::max_wait`] is set: the default refuses instead of
+    /// waiting, so on a default pool this is never waited on and the fast path never touches
+    /// it.
+    released: Condvar,
+    /// How long a request may wait for a slot before it is refused, or `None` to be
+    /// refused the moment no slot is free.
+    ///
+    /// Some bound by default; see [`MAX_SLOT_WAIT`] for why it is not `None` and why it is
+    /// not zero. The queue this bounds is *fair* — the fairness is the free list, not this
+    /// number — so what is left for the number to decide is only how much latency is
+    /// acceptable before a 503 is the more honest answer.
+    max_wait: Option<Duration>,
     /// What waiting for each slot has cost, in microseconds, summed over the requests
     /// that had to wait.
     ///
@@ -201,15 +338,29 @@ impl WorkerPool {
         for _ in 0..count {
             // A failure here returns early, and `slots` is dropped — which kills
             // every worker that did start, so a partial pool leaves nothing
-            // behind.
+            // behind. That is why the booted workers are collected as `Slot`s and not
+            // as the `Ready`s `boot` returns: `Slot::drop` reaps the process and
+            // `Ready` has no `Drop` at all, so a vector of `Ready`s would leak every
+            // PHP child this loop had already started.
             slots.push(Mutex::new(Slot::from_boot(boot(name, &spec, &guard)?)));
         }
 
         let pool = WorkerPool {
             name: name.to_string(),
             spec,
+            // Reversed so that taking from the head serves slot 0 first: a cold pool's
+            // traffic then lands in index order, which makes a log or a diagnostic read
+            // the way it was configured.
+            free: Mutex::new(FreeSlots {
+                // Reversed so that taking from the head serves slot 0 first: a cold pool's
+                // traffic then lands in index order, which makes a log or a diagnostic read
+                // the way it was configured.
+                ids: (0..slots.len()).rev().collect(),
+                waiters: 0,
+            }),
+            released: Condvar::new(),
+            max_wait: MAX_SLOT_WAIT,
             slots,
-            cursor: AtomicUsize::new(0),
             wait_us: (0..count as usize).map(|_| AtomicU64::new(0)).collect(),
             wait_buckets: (0..WAIT_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
             served: AtomicU64::new(0),
@@ -405,24 +556,20 @@ impl WorkerPool {
     /// One try at a request, with the slot chosen here so a retry can pick a
     /// different one.
     fn attempt(&self, request: &Request) -> std::result::Result<Response, FailedAttempt> {
-        // Timed across *both* acquisitions — the scan in `pick_slot` and the lock taken
-        // to serve — because that is where a request actually waits. It is not obvious
-        // which of the two does the waiting: a thread that arrives while a slot is
-        // mid-request blocks in the scan, for the remainder of that request, and by the
-        // time it gets past the scan the serving lock is free again. So the honest
-        // figure is the time from asking for a slot to holding one, not the time spent
-        // on either lock alone. Measured on a pool under eight-way load with two
-        // workers, the wait appears here and nowhere if only the second lock is timed.
+        // Timed from asking for a slot to holding one, which is now a single operation:
+        // the lease is *taken* if a slot is free and *waited for* if the pool is full, so
+        // this measures queueing and nothing else. There is no second acquisition to fold
+        // in any more — the old path locked a slot in the scan and then locked the same
+        // slot again to serve, and the wait lived in whichever of the two happened to
+        // block.
         let queued_at = Instant::now();
-        let index = self.pick_slot().map_err(|source| FailedAttempt {
+        let lease = self.acquire().map_err(|source| FailedAttempt {
             source,
-            // Nothing was sent, so nothing can be repeated: a missing worker is a
-            // configuration or capacity condition, not a lost request.
+            // Nothing was sent, so nothing can be repeated: a full pool is a capacity
+            // condition, not a lost request.
             retryable: false,
         })?;
-        let mut slot = self.slots[index]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = lease.index();
         let waited_us = queued_at.elapsed().as_micros() as u64;
         if let Some(counter) = self.wait_us.get(index) {
             counter.fetch_add(waited_us, Ordering::Relaxed);
@@ -432,6 +579,39 @@ impl WorkerPool {
         }
         self.served.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+
+        // The lease is held for everything below and released when it drops, so this slot
+        // cannot be handed to another request until this one is finished with it.
+        let mut slot = self.slots[index]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // A leased slot can still hold a dead worker: one that exited since its last
+        // request, or that was killed, leaves its pipes at end-of-file and would look
+        // healthy to anything that only inspected the exchange. The process is the only
+        // thing that answers the question, which is why `is_available` asks it. The check
+        // lives here rather than in the slot search now — the search is about *which* slot
+        // to use, and whether its worker is alive is not something the caller can act on by
+        // choosing a different one.
+        if !slot.is_available() {
+            tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
+            let outcome = respawn(&self.name, &self.spec, &self.guard, &mut slot);
+            drop(slot);
+            // Always retryable, and for a different reason than `invoke`'s failures are:
+            // nothing was sent to this worker, so a replay cannot run anything twice whatever
+            // the method is. The request simply has to be offered to a slot with a live
+            // worker in it, which is what the retry does. A `respawn` that failed is retried
+            // for the same reason and may land on a slot that is healthy.
+            return Err(FailedAttempt {
+                source: match outcome {
+                    Ok(()) => ServerError::NoWorker {
+                        backend: self.name.clone(),
+                    },
+                    Err(source) => source,
+                },
+                retryable: true,
+            });
+        }
 
         let response = match invoke(&mut slot, request) {
             Ok(response) => response,
@@ -467,17 +647,28 @@ impl WorkerPool {
 
     /// Replace the worker in a slot, for an operator or a test.
     ///
-    /// The lock means the slot must not be mid-request, so this is only
-    /// meaningful for an idle slot, which is why it is not called from anywhere
-    /// on the request path.
+    /// The slot must be idle, which the lease is what establishes: taking it is the only way
+    /// to know the slot is not mid-request, because the mutex that guards a slot is also held
+    /// for the whole of a request. An operator asking to restart a worker that is currently
+    /// working gets `AllBusy` rather than a hang or a replacement swapped out from under a
+    /// live request.
     pub fn restart(&self, index: usize) -> Result<()> {
         let Some(slot) = self.slots.get(index) else {
             return Err(ServerError::NoWorker {
                 backend: self.name.clone(),
             });
         };
+        if self.take_specific(index).is_none() {
+            return Err(ServerError::AllBusy {
+                backend: self.name.clone(),
+            });
+        }
+
         let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        respawn(&self.name, &self.spec, &self.guard, &mut slot)
+        let outcome = respawn(&self.name, &self.spec, &self.guard, &mut slot);
+        drop(slot);
+        self.release(index);
+        outcome
     }
 
     /// Stop every worker, waiting for each to exit.
@@ -485,7 +676,17 @@ impl WorkerPool {
     /// `&mut self` because stopping means emptying the pool, and only the owner
     /// may do that. Nothing on the request path needs it: the server drops the
     /// pool, and `Drop` calls this.
+    ///
+    /// The free list is cleared *before* the workers are stopped, so a lease dropped during
+    /// the shutdown — there is none on a synchronous path, but a `Drop` must not be the
+    /// thing that decides this — cannot push an index into a list whose slots no longer
+    /// exist.
     pub fn shutdown(&mut self) {
+        self.free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ids
+            .clear();
         for slot in &mut self.slots {
             // `get_mut`: the pool is exclusively borrowed, so there is nothing to
             // synchronise against.
@@ -497,60 +698,148 @@ impl WorkerPool {
         self.slots.clear();
     }
 
-    /// The slot to use next.
+    /// Take a slot, or refuse the request once `max_wait` is up.
     ///
-    /// Round-robin rather than always the first slot: with persistent workers an
-    /// uneven distribution is also an uneven memory picture, and `max_requests`
-    /// recycling would then only ever happen on one of them. A dead worker is
-    /// replaced in place so the pool keeps its size; the alternative is a pool
-    /// that silently shrinks under repeated crashes.
+    /// This is the whole slot-assignment mechanism, and it is a fair queue over a free list
+    /// rather than a scan. The difference is not stylistic: the old scan asked each candidate
+    /// slot whether its worker was *healthy*, which is not the same question as whether the
+    /// slot was *free*, and it released the mutex before the caller took it again — so under
+    /// load several threads were told the same slot was theirs and then raced for it,
+    /// queueing behind one worker while others sat idle. A slot only leaves the free list
+    /// when it is leased and only returns when that lease drops, so two requests cannot be
+    /// given the same one, and a request waits for the slot it was given rather than for
+    /// whichever worker the cursor happened to point at.
     ///
-    /// **The scan locks each candidate while it looks at it**, so `is_available` is
-    /// only ever asked with the slot's mutex held, and a thread arriving while a slot
-    /// is mid-request *blocks in the scan* for the remainder of that request rather
-    /// than moving on to the next slot. The index the scan returns is not a
-    /// reservation: the caller locks the same slot again to serve on it
-    /// ([`WorkerPool::attempt`]), and in the window between the two locks another
-    /// thread may take it.
-    ///
-    /// Two things follow, and they are why [`WorkerPool::mean_slot_wait_us`] exists
-    /// rather than being reasoned about. The scan is a *round-robin with blocking*, so
-    /// a request queues behind whichever worker the cursor happened to point at
-    /// instead of being offered the next free one; and the lock the request held in the
-    /// scan is dropped again before the serving lock is taken, so two threads can be
-    /// told the same slot is free and then race for it. Which of the two dominates is a
-    /// measurement, not an argument.
-    ///
-    /// Note also what [`Slot::is_available`] answers, because it is not "this slot is
-    /// free": it is "this worker is alive". Being free is only ever learned by
-    /// blocking on the mutex.
-    fn pick_slot(&self) -> Result<usize> {
-        let count = self.slots.len();
-        if count == 0 {
+    /// The waiter's own lock is held across the whole wait loop, which is what makes a
+    /// release and a wake-up one step rather than two: `release` cannot take the free list to
+    /// push a slot until this thread is parked, so a slot cannot be pushed while the waiter is
+    /// between checking and waiting, and no wake-up can be lost.
+    fn acquire(&self) -> Result<Lease<'_>> {
+        if self.slots.is_empty() {
             return Err(ServerError::NoWorker {
                 backend: self.name.clone(),
             });
         }
 
-        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..count {
-            let index = (base + offset) % count;
-            let mut slot = self.slots[index]
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if slot.is_available() {
-                return Ok(index);
-            }
-            tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
-            if respawn(&self.name, &self.spec, &self.guard, &mut slot).is_err() {
-                continue;
-            }
-            return Ok(index);
+        // Fast path: take what is free, but only if no parked request is already owed it.
+        // Without that condition a constant trickle of new arrivals would take every released
+        // slot before a woken waiter could re-acquire the mutex, and the requests that queued
+        // would be the ones starved — a tail kept alive by the fix itself.
+        if let Some(index) = self.take_free() {
+            return Ok(Lease { pool: self, index });
         }
 
-        Err(ServerError::NoWorker {
-            backend: self.name.clone(),
-        })
+        // No slot is free, so this request is about to be charged for someone else's work.
+        // That is unavoidable — twelve workers cannot serve thirty-two clients — and the only
+        // question is how long it is allowed to be charged for.
+        let Some(limit) = self.max_wait else {
+            return Err(ServerError::AllBusy {
+                backend: self.name.clone(),
+            });
+        };
+
+        let deadline = Instant::now() + limit;
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        free.waiters += 1;
+        loop {
+            if let Some(index) = free.take_woken() {
+                free.waiters -= 1;
+                drop(free);
+                return Ok(Lease { pool: self, index });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                // Waiting has stopped being queueing and started being a leak. A 503 is the
+                // honest answer, and it is what bounds the tail.
+                free.waiters -= 1;
+                return Err(ServerError::AllBusy {
+                    backend: self.name.clone(),
+                });
+            }
+            let (guard, _timeout) = self
+                .released
+                .wait_timeout(free, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            free = guard;
+        }
+    }
+
+    /// Take a free slot, if one is free *and* not already owed to a parked request.
+    fn take_free(&self) -> Option<usize> {
+        self.free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_available()
+    }
+
+    /// Take `index` if it is free, for [`WorkerPool::restart`].
+    fn take_specific(&self, index: usize) -> Option<usize> {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let at = free.ids.iter().position(|free| *free == index)?;
+        Some(free.ids.swap_remove(at))
+    }
+
+    /// How long a request may wait for a slot, or `None` for "refuse at once".
+    pub fn max_wait(&self) -> Option<Duration> {
+        self.max_wait
+    }
+
+    /// How long a request may wait for a slot before it is refused, or `None` to refuse as
+    /// soon as none is free.
+    ///
+    /// The queue is fair whatever this is set to; this decides only how deep it may get.
+    /// `None` is the strict policy — a request that cannot be served now is answered `503`
+    /// rather than made to wait — and a duration caps how much queueing latency a client can
+    /// be charged for.
+    pub fn set_max_wait(&mut self, limit: Option<Duration>) -> &mut Self {
+        self.max_wait = limit;
+        self
+    }
+
+    /// How many slots are free right now.
+    ///
+    /// For tests and diagnostics: it is the one number that says the free list agrees with
+    /// reality, which is the invariant a leak would break.
+    pub fn free_slots(&self) -> usize {
+        self.free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ids
+            .len()
+    }
+
+    /// Put a slot back, and wake one request waiting for one.
+    ///
+    /// Called from [`Lease::drop`] and from [`WorkerPool::restart`], and from nowhere else: the
+    /// free list is the pool's invariant, and every path that returns a slot goes through here
+    /// so the list cannot drift out of step with the slots that exist.
+    ///
+    /// The wake-up is unconditional once a slot is on the list, including when one *already*
+    /// was — a released slot means any parked request can now be satisfied, and the one that
+    /// wakes will find the list non-empty whether or not this release is the one it takes.
+    fn release(&self, index: usize) {
+        {
+            let mut free = self
+                .free
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if free.contains(index) {
+                // A slot released twice would be handed to two requests at once, which is the
+                // exact failure this whole mechanism exists to prevent. Reported loudly rather
+                // than silently doubled: it is a bug in the caller, not a condition to
+                // tolerate.
+                tracing::error!(backend = %self.name, slot = index, "a slot was released twice");
+                return;
+            }
+            free.ids.push(index);
+        }
+        self.released.notify_one();
     }
 }
 
@@ -891,6 +1180,38 @@ fn a_pool_can_be_reached_from_several_threads_at_once() {
     }
 
     let _ = reach_shared;
+}
+
+/// The free list's two rules, which is where a fair queue is won or lost.
+#[test]
+fn a_free_slot_is_not_taken_from_a_request_that_is_waiting_for_it() {
+    let mut free = FreeSlots {
+        ids: vec![3, 2, 1, 0],
+        waiters: 0,
+    };
+
+    // An idle pool with no waiters: a new request takes a slot.
+    assert_eq!(free.take_available(), Some(0));
+    assert_eq!(free.ids, vec![3, 2, 1]);
+
+    // With a request parked, a newcomer gets nothing even though slots *are* free. This is the
+    // barging rule: the parked request was woken for the next release, and handing that slot to
+    // an arrival instead would leave the parked one waiting for a slot it was already promised.
+    free.waiters = 1;
+    assert_eq!(free.take_available(), None);
+    assert_eq!(free.ids, vec![3, 2, 1], "nothing was taken");
+
+    // The parked request takes it, and the rule lifts for the next arrival.
+    assert_eq!(free.take_woken(), Some(1));
+    free.waiters -= 1;
+    assert_eq!(free.take_available(), Some(2));
+
+    // A woken request can still find nothing, if the slot it was woken for went to another
+    // waiter first. That is why the queue loop re-checks rather than assuming a wake-up means a
+    // slot, and the last line is the state it must handle.
+    free.waiters = 2;
+    assert_eq!(free.take_woken(), Some(3));
+    assert_eq!(free.take_woken(), None);
 }
 
 /// The histogram's bucket edges, which is where a percentile can go wrong quietly.

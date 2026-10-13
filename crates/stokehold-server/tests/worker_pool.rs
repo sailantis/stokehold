@@ -637,8 +637,8 @@ fn a_request_landing_on_a_killed_worker_is_answered_by_the_replacement() {
     // No sleep: the request is meant to arrive while the pool's view of the worker
     // is still "alive but about to be found dead", which is exactly the window a
     // real recycle opens. If the kill has not been reaped yet the pool finds the
-    // pipes closed and retries; if it already has, `pick_slot` replaces first. Both
-    // are the recovery under test.
+    // pipes closed and retries; if it already has, the liveness check on the leased
+    // slot replaces the worker first. Both are the recovery under test.
     let response = pool
         .request(&get("/health"))
         .expect("the replacement answered the request");
@@ -1077,4 +1077,187 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+/// A worker whose handler sleeps, so a slot is observably occupied.
+///
+/// Written to a temp directory per test rather than shared, because the tests that need it
+/// run concurrently and each wants its own pool.
+fn slow_worker(tag: &str, micros: u64) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("stokehold-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("slow-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Stokehold\Request;
+use Stokehold\Response;
+use Stokehold\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    usleep({micros});
+    return Response::json(['pid' => getmypid(), 'uri' => $request->uri]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+    script
+}
+
+/// A pool of `workers` slow workers, with the wait policy set explicitly.
+fn slow_pool(tag: &str, workers: u32, micros: u64, max_wait: Option<Duration>) -> WorkerPool {
+    let script = slow_worker(tag, micros);
+    let config = WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers,
+        memory_limit_mb: None,
+        max_requests: None,
+        working_dir: None,
+        env: Default::default(),
+        checksum: Default::default(),
+        transport: Default::default(),
+    };
+    let mut pool = WorkerPool::start("test", &config).expect("pool starts");
+    pool.set_max_wait(max_wait);
+    pool
+}
+
+/// A slot leaves the free list when a request takes it and returns when that request ends.
+///
+/// This is the invariant the old scan could not state, let alone keep: it asked whether a
+/// worker was *healthy*, which is true of a worker that is busy, so the number of slots
+/// actually available was never something it knew. Here it is a number, and an idle pool must
+/// have all of them.
+#[test]
+fn the_free_list_accounts_for_every_slot_exactly_once() {
+    let _serial = serial();
+    require_sdk!();
+
+    let workers = 3;
+    let pool = slow_pool("freelist", workers, 100_000, Some(Duration::from_secs(30)));
+    assert_eq!(
+        pool.free_slots(),
+        workers as usize,
+        "an idle pool offers every slot"
+    );
+
+    // Take them all at once and hold them: the handler sleeps, so the slots stay leased for
+    // the duration. One extra request goes beyond the pool and must queue for a slot, which is
+    // the other half of the policy.
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers as usize)
+            .map(|_| {
+                scope.spawn(|| {
+                    let response = pool.request(&get("/")).expect("every slot is leased");
+                    assert_eq!(response.parse_status_headers().0, 200);
+                })
+            })
+            .collect();
+        let queued = scope.spawn(|| {
+            pool.request(&get("/"))
+                .expect("a request beyond the pool waits and is then served")
+                .parse_status_headers()
+                .0
+        });
+        for handle in handles {
+            handle.join().expect("no thread panics");
+        }
+        assert_eq!(queued.join().expect("no thread panics"), 200);
+    });
+
+    assert_eq!(
+        pool.free_slots(),
+        workers as usize,
+        "every slot came back, so nothing leaked"
+    );
+    assert_eq!(pool.requests_served(), workers as u64 + 1);
+}
+
+/// A full pool refuses once the wait is up, rather than growing a queue without end.
+///
+/// The policy that bounds the tail. `None` is the strictest form - refuse as soon as no slot
+/// is free - and the test is that the second request comes back *quickly* and as busy, rather
+/// than being made to wait for the first one's whole duration.
+#[test]
+fn a_full_pool_refuses_rather_than_queueing_when_the_wait_is_none() {
+    let _serial = serial();
+    require_sdk!();
+
+    let hold = 400_000;
+    let pool = slow_pool("refuse", 1, hold, None);
+    assert_eq!(pool.free_slots(), 1);
+
+    std::thread::scope(|scope| {
+        // Hold the only slot.
+        let holder = scope.spawn(|| {
+            pool.request(&get("/")).expect("the first request has a slot");
+        });
+
+        // Wait until the slot is actually taken before asking for it, so this cannot pass by
+        // racing the holder to it.
+        let mut waited = Duration::ZERO;
+        while pool.free_slots() != 0 && waited < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+            waited += Duration::from_millis(5);
+        }
+        assert_eq!(pool.free_slots(), 0, "the holder took the only slot");
+
+        let refused_at = std::time::Instant::now();
+        let outcome = pool.request(&get("/"));
+        let refused_in = refused_at.elapsed();
+        holder.join().expect("no thread panics");
+
+        let err = outcome.expect_err("a full pool with no wait refuses");
+        assert!(
+            err.is_busy(),
+            "a refused request is a capacity condition, not a failure: {err}"
+        );
+        assert!(
+            refused_in < Duration::from_millis(200),
+            "it was refused at once rather than made to wait {} ms for the holder",
+            hold / 1000
+        );
+    });
+
+    assert_eq!(pool.free_slots(), 1, "the holder's slot came back");
+}
+
+/// A slot comes back even when the request on it fails.
+///
+/// The leak this guards against is the quiet kind: every early return on the request path is
+/// a place a release could be forgotten, and a pool that loses one slot per failure shrinks
+/// without ever reporting an error. The release is a `Drop` for exactly this reason, and this
+/// is the test that says so.
+#[test]
+fn a_slot_comes_back_after_a_failed_request() {
+    let _serial = serial();
+    require_sdk!();
+
+    let workers = 2;
+    let pool = slow_pool("afterfail", workers, 10_000, Some(Duration::from_secs(5)));
+    assert_eq!(
+        pool.request(&get("/"))
+            .expect("warm-up")
+            .parse_status_headers()
+            .0,
+        200
+    );
+    assert_eq!(pool.free_slots(), workers as usize);
+
+    // Kill the workers and make requests land on them. However that fails and however many
+    // attempts it takes, the accounting must end up whole.
+    for pid in pool.pids() {
+        kill(pid);
+    }
+    for _ in 0..3 {
+        let _ = pool.request(&get("/"));
+        assert_eq!(
+            pool.free_slots(),
+            workers as usize,
+            "no slot was lost to the failures"
+        );
+    }
 }

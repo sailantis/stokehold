@@ -1650,11 +1650,13 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
 4. **The rename** — a product decision, above.
 5. **The re-run** — the five arms against current `main`, above.
 6. **The worker pool's tail** — hazard 52. Throughput is fine and ahead; p99 on `/items` grows
-   from 1.6 ms at c=12 to 10.4 ms at c=24 while RoadRunner's stays at 2.7 ms, and the suspected
-   cause is that `pick_slot` locks candidate slots until it finds a *healthy* one rather than a
-   *free* one, holding the mutex across the whole request with no queue between them. Proving
-   that needs a per-slot wait-time histogram, which does not exist yet; the design change it
-   would justify is not worth making on a hypothesis.
+   from 1.7 ms at c=12 to 19.0 ms at c=32 while RoadRunner's stays at ~2.7 ms. **The cause is no
+   longer a hypothesis.** The pool measures its own slot waits (`4dd402a`, `a6df392`), and the
+   figure is unambiguous: the wait accumulates from concurrency 13 rather than stepping, its
+   p99 is 1–16 ms against a p50 of 2–19 µs, and the pool's `p99 − p50` accounts for 84–105% of the
+   client's excess over its own median. At c=32 a request spends 0.91 ms of its 1.69 ms waiting
+   for a busy worker. What is open is now only **which fix** — `try_lock` in the scan so a
+   request skips a busy slot, or a real fair queue — and neither has been built or compared.
 
 Hazard 46's open product decision — whether the worker transport should default to `socket` on
 Windows — is **answered** in hazard 47: yes, by platform, with a startup hint for the one worker
@@ -2409,22 +2411,72 @@ queueing with no bound on the queue: the requests are not served slower, they wa
 they are served. That is also why the throughput number never showed it — a bounded queue costs
 latency, not throughput, and every pass in this project until now reported a median.
 
-*The mechanism is a hypothesis, and is recorded as one.* `pick_slot` (`worker_pool/mod.rs:355`)
-takes `cursor.fetch_add(1)` and then locks each candidate slot in turn until one reports
-`is_available()`, which (`mod.rs:587`) is `exchange.is_some() && matches!(child.try_wait(), Ok(None))`
-— **the worker is healthy, not the slot is free**. The mutex is then held for the whole request, so
-at c=32 thirty-two connection threads contend for twelve slot mutexes with no queue and no
-backpressure. That would produce exactly this shape. Proving it needs a per-slot wait-time
-histogram, or an experiment that gives the pool a queue and re-measures the tail, and neither has
-been run. It is left open deliberately rather than "fixed": the fix is a design change to how
-slots are assigned, and the measurement that would justify it is the one that has not been made.
+*The mechanism was a hypothesis. It has now been measured, and it is confirmed — with a
+correction, and with a number attached.* The pool reports, at shutdown, the mean and the p50/p99
+of the time each request spent between asking for a slot and holding one: per-slot totals plus a
+powers-of-two histogram, all accumulated inside the server by `WorkerPool::attempt`, surfaced
+through `Contention`, and printed by the CLI (`4dd402a`, `a6df392`). Because it is
+measured in-process it cannot include anything a load generator did, which is the property that
+makes it evidence rather than another correlation.
 
-Two things follow that are worth keeping separate. This is **not** a throughput defect and fixing
-it would move no number in the competition report — measured throughput at c=24 is already 4%
-*ahead*. And it is a user-visible property in a way a 1% throughput deficit is not: a service whose
-p99 is 10 ms under 24 concurrent connections is a different proposition from one that is merely
-faster on average. A resident-worker server that wins the mean and loses the tail is a case this
-project had not previously been able to see, because every pass it owns reported a median.
+Two experiments on the benchmark host, `/items`, 8 s per run, three repeats per level,
+`scripts/diag-slots.sh`.
+
+**The client is exonerated.** The harness drives `wrk` as `-t$c -c$c`, so at c=32 the load
+generator owns 32 threads on a 12-core box, and I suspected *that* was the tail. Holding
+concurrency at 32 and varying only the thread count changes nothing server-side:
+
+    threads   2: client p99 17.80 ms   pool mean 895 µs   pool p99 16.4 ms
+    threads  32: client p99 18.33 ms   pool mean 898 µs   pool p99 16.4 ms
+
+3% apart, and the pool's own columns do not move at all. This was my hypothesis, it was
+plausible, and the measurement refutes it.
+
+**The queue, at concurrency equal to threads:**
+
+    conc  excess   client p50   client p99   pool mean   pool p50   pool p99   pool share of time in system
+      12       0      0.71 ms      1.68 ms       34 µs       2 µs     1.02 ms      4%
+      16       4      0.79 ms      3.94 ms      157 µs       3 µs     2.05 ms     17%
+      20       8      0.88 ms      7.68 ms      325 µs       4 µs     8.19 ms     30%
+      24      12      0.97 ms     10.74 ms      509 µs       4 µs     8.19 ms     40%
+      32      20      1.16 ms     18.98 ms      906 µs      19 µs    16.4  ms     54%
+
+Three things follow, and the first is a correction to my own reasoning earlier in this item.
+
+- **It grows from concurrency 13, it is not a step.** I had reasoned that because the winner is
+  chosen by cursor and then locked again, a request is served the moment the cursor lands on a
+  free slot, so the wait would be a step at `workers + 1` and flat after. That is wrong. A step
+  shape would mean waiting for the one request already in front; 34 → 157 → 325 → 509 → 906 µs
+  across 0 → 4 → 8 → 12 → 20 excess clients is a queue *accumulating*, each new arrival waiting
+  for everything ahead of it. The old docstring's "the search never blocks on a busy worker" did
+  not describe this code.
+- **It is unfairness, and the arithmetic ties it to the client's tail.** The pool's median wait
+  is 2–19 µs while its p99 is 1–16 ms: most requests take an uncontended mutex and a few wait for
+  whole requests. The pool's own `p99 − p50` tracks the client's `p99 − p50` at every level —
+  1.02 vs 0.97 ms, 2.05 vs 3.15, 8.19 vs 6.80, 8.19 vs 9.77, 16.37 vs 17.82 — so the tail *is* the
+  pool's, and it accounts for 84–105% of the client's excess over its own median.
+- **The mean is real too, and it is a cost, not only a tail.** The pool's mean wait is a growing
+  share of a request's mean time in system: 4% at c=12, **54% at c=32**, where 0.91 ms of a
+  1.69 ms request is spent waiting for a busy worker. That is worth separating from the tail. A
+  fair queue would not delete that time — a slot is still held for a whole request — it would
+  spread it evenly instead of concentrating it, so it is a latency-*variance* fix. Removing the
+  time itself is a different design question, and the throughput plateau at ~19k is that
+  question seen from the other side.
+
+**What is still open is which fix.** The measurement identifies the defect, its mechanism and
+its magnitude: ~0.9 ms of mean latency and a 16 ms p99 at c=32, in `pick_slot`. It does not
+compare candidates. `try_lock` in the scan so a request skips a busy slot rather than queueing
+behind it, and a real fair queue, are both consistent with this data and both would have to be
+built and re-measured. What has changed is that the measurement which was said to be missing now
+exists, and it is unambiguous — so the design change it was held back for is no longer being
+made on a hypothesis.
+
+Two things still worth keeping separate. This is **not** a throughput defect and fixing it would
+move no number in the competition report — measured throughput at c=24 is already 4% *ahead*.
+And it is a user-visible property in a way a 1% throughput deficit is not: a service whose p99 is
+19 ms under 32 concurrent connections is a different proposition from one that is merely faster
+on average. A resident-worker server that wins the mean and loses the tail is a case this project
+had not previously been able to see, because every pass it owns reported a median.
 
 
 

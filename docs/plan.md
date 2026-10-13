@@ -1653,10 +1653,15 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
    measured rather than inferred: slot waits accumulated from concurrency 13, with a p99 of
    1–16 ms against a p50 of 2–19 µs. A fair queue replaced the scan, and on the idle host p99 fell
    60–81% (18.98 → 3.68 ms at c=32) with throughput *up* 13–21% and no refusals — checked against
-   `wrk`'s non-2xx line rather than assumed. The median at c=32 is 16% worse, which is the
-   deliberate cost: the request that would have been served on contact now waits its turn. Open
-   now only as a separate question — whether the remaining ~625 µs of *mean* queueing at c=32 is
-   worth attacking, which is not a fairness problem.
+   `wrk`'s non-2xx line rather than assumed. The gain was then re-measured **interleaved** (two
+   builds in rotating order inside one round, RoadRunner as a control, 42 cells, 0 discarded)
+   because a blocked layout cannot settle a number of that size on a host that drifts: it reads
+   **+24.5% at c=24 and +22.9% at c=32**, spread clear of 1.00 in all 14 paired comparisons, with
+   the pre-fix binary still landing exactly where hazard 51 left it (+3.0%/+5.7% over RoadRunner).
+   The median at c=32 is 16% worse, which is the deliberate cost: the request that would have been
+   served on contact now waits its turn (p50 8 → 256 µs at c=24) instead of one request waiting
+   10 ms. Open now only as a separate question — whether the remaining ~587 µs of *mean* queueing
+   at c=32 is worth attacking, which is not a fairness problem.
 
 Hazard 46's open product decision — whether the worker transport should default to `socket` on
 Windows — is **answered** in hazard 47: yes, by platform, with a startup hint for the one worker
@@ -2507,6 +2512,44 @@ before.
 
 What remains genuinely open is whether the *mean* queueing is worth attacking — a different design
 question from fairness, and the ~625 µs at c=32 is where it would show.
+
+*And the one number in that table that deserved distrust has now been re-measured the way this
+project measures things, and it is larger than the blocked layout said.* The +13–21% was
+before-vs-after, and this repository has already published a 22% "effect" that reversed sign the
+moment two binaries were interleaved instead of blocked (hazard 49). So the same two binaries were
+measured again inside a single round, in rotating order, with RoadRunner as a control that shares no
+code with either — `diag-slots.sh` gains an A/B mode for it, and `scripts/slots-report.py` reads it.
+7 rounds x 3 variants x 2 concurrency levels, a discarded warm-up pass per round so the first
+variant of round 1 pays for the cold binary and cold fs cache only in a row that is thrown away.
+42 measured cells, 0 discarded.
+
+    conc   new / pre-fair        spread over 7 rounds   new / rr      pre-fair / rr
+      24   1.245x  (+24.5%)      1.223 .. 1.271          1.272x        1.030x
+      32   1.229x  (+22.9%)      1.197 .. 1.244          1.302x        1.057x
+
+The spread never crosses 1.00 at either level and all 14 paired comparisons point the same way. The
+control is what makes it legible: **the pre-fair binary measured +3.0% and +5.7% over RoadRunner,
+which is the same figure hazard 51's interleaved A/B established for it (+3.3% … +7.0%)** — it still
+lands exactly where it always did — while the current build sits at +27% and +30%. So the blocked
+layout *understated* the gain, and this is the second largest single effect measured in this
+project, behind only the crc32c fix.
+
+The pool's own columns move with it rather than against it, median over the seven rounds:
+
+    conc   build      mean wait   wait p50   wait p99   client p50   client p99
+      24   pre-fair     522 us       8 us     8,192 us     1.00 ms      10.92 ms
+      24   fair         263 us     256 us     2,048 us     0.98 ms       2.19 ms
+      32   pre-fair     887 us      64 us    16,384 us     1.21 ms      17.44 ms
+      32   fair         587 us   1,024 us     4,096 us     1.28 ms       3.47 ms
+
+The p99 halves twice over *while* the mean wait falls (522 -> 263 us); the p50 rises, which is the
+fairness made visible (the request served on contact now shares the queue, so the unlucky one no
+longer waits 10 ms); and the cost at c=32 is 0.07 ms of median against 14 ms of tail. Nothing was
+shed: three 8-second runs at c=24 printed `wrk`'s full summary and showed **no `Non-2xx` line and no
+`Socket errors` line** in any of them, 232,751 / 233,591 / 235,206 successful requests, with the
+pool's 500 ms slot-wait ceiling never reached. `run_measurement` now checks for those lines on every
+cell and prints them if they appear, so the claim is enforced by the harness rather than by memory.
+Raw rows are committed beside the earlier ones (`slot-waits-fair-ab-c24.tsv`, `-c32.tsv`).
 
 Two things still worth keeping separate. This is **not** a throughput defect and fixing it would
 move no number in the competition report — measured throughput at c=24 is already 4% *ahead*.

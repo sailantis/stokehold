@@ -2531,8 +2531,11 @@ The spread never crosses 1.00 at either level and all 14 paired comparisons poin
 control is what makes it legible: **the pre-fair binary measured +3.0% and +5.7% over RoadRunner,
 which is the same figure hazard 51's interleaved A/B established for it (+3.3% … +7.0%)** — it still
 lands exactly where it always did — while the current build sits at +27% and +30%. So the blocked
-layout *understated* the gain, and this is the second largest single effect measured in this
-project, behind only the crc32c fix.
+layout *understated* the gain, and this is the largest throughput effect this project's own code
+has produced — larger than the `crc32c` fix's +10–16%, which was called "the whole lead" over
+RoadRunner (the fix put stokehold 4–7% ahead; this puts it 27–30% ahead). Only two effects
+measured here are larger, and neither is stokehold's code: removing xdebug from the host's CLI
+PHP doubled the warm arms, which was a configuration bug in one arm.
 
 The pool's own columns move with it rather than against it, median over the seven rounds:
 

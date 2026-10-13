@@ -1662,6 +1662,17 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
    served on contact now waits its turn (p50 8 → 256 µs at c=24) instead of one request waiting
    10 ms. Open now only as a separate question — whether the remaining ~587 µs of *mean* queueing
    at c=32 is worth attacking, which is not a fairness problem.
+7. **Why the embedded runtime stops scaling** — hazard 53, **measured, not explained**. The sixth
+   arm in `stokehold-competition` is FrankenPHP, and it is indistinguishable from stokehold at
+   concurrency 1 (1.018x, spread spanning 1.00) and 32% behind at 32 (0.677x). CPU accounting rules
+   out the easy answer: at concurrency 16 it consumes 7.17 of 12 cores while serving *fewer*
+   requests per second than stokehold, which uses 8.10 — so it is not CPU-bound, and its ceiling is
+   in dispatch
+   or queueing rather than in what its interpreter costs per request. Worth knowing because it is
+   the shape a "PHP embedded in a Rust server" design would land in if the embedding were done
+   naively; it is not a defect this project has to fix, and the arm exists to price a decision
+   stokehold already made on other grounds (isolation, a rebuild per PHP version) rather than to be
+   beaten. Carries two stated confounds: the bundled PHP is 8.5.11 against this host's 8.3.35.
 
 Hazard 46's open product decision — whether the worker transport should default to `socket` on
 Windows — is **answered** in hazard 47: yes, by platform, with a startup hint for the one worker
@@ -2561,6 +2572,83 @@ And it is a user-visible property in a way a 1% throughput deficit is not: a ser
 19 ms under 32 concurrent connections is a different proposition from one that is merely faster
 on average. A resident-worker server that wins the mean and loses the tail is a case this project
 had not previously been able to see, because every pass it owns reported a median.
+
+### Hazard 53 — the embedded runtime, measured against the two that spawn
+
+`stokehold-competition` gained a sixth arm, and it is the only one that can test the project's
+**first** constraint rather than its tuning. That constraint is *no PHP embedding, no FFI —
+`php`/`php-cgi`/`php-fpm` are always spawned as external processes*. FrankenPHP is the
+counter-proposal: a Caddy server with a ZTS PHP built into the binary, twelve worker threads in
+one process, framework booted once. Same `BenchApp`, same page, same worker count,
+`max_requests`/`max_jobs`/`pm.max_requests` all 0, and the same ini reached through `php_ini`.
+
+Interleaved, 7 rounds, order rotated, `/items`, 12 workers (`scripts/ab-perf.sh`):
+
+    conc   FrankenPHP   stokehold   RoadRunner     franken/rr    franken/stokehold
+      1      2,441        2,388        1,773         1.381x        1.018x  [0.969..1.054]
+      8     14,337       15,538       11,131         1.288x        0.921x
+     16     15,140       19,984       17,554         0.876x        0.759x
+     32     15,823       23,250       18,164         0.867x        0.677x
+
+Every ratio held the same way in all 7 rounds except the one at concurrency 1, whose spread
+spans 1.00 — so **FrankenPHP and stokehold are indistinguishable when one request is in
+flight, and FrankenPHP is the slower of the three from concurrency 8 upward.** What survives
+is the *shape*: the arm with the interpreter inside its process does not convert concurrency
+into throughput, gaining 10.4% from 8 to 32 where stokehold gains 49.6%. On this page, in the
+range a server is actually for, the no-embedding rule was a cost rather than a saving — which
+is worth stating plainly, because the constraint was argued on other grounds (isolation, a
+rebuild per PHP version) and this is not evidence against those.
+
+It is **not** that the embedded interpreter costs more per request. Twelve seconds at
+concurrency 16, `utime + stime` summed over each whole process tree out of `/proc/<pid>/stat`
+— the integral across the window, not a `top` snapshot:
+
+    server      pids   server CPU-s   cores used   rps
+    FrankenPHP     2       85.99         7.17       15,262
+    RoadRunner    13      105.90         8.83       17,794
+    stokehold     13       97.18         8.10       20,204
+
+FrankenPHP serves the fewest requests per second **and** leaves the most cores idle: 7.17 of
+12, against stokehold's 8.10 at 33% higher throughput. Capacity is sitting unused while its
+throughput is capped, which is the signature of dispatch or queueing rather than of compute.
+That is as far as the evidence goes; the reason is open decision 7 below.
+
+Two confounds, stated rather than corrected, and both belong with any number quoted from this
+arm: the release binary bundles **PHP 8.5.11** against this host's **8.3.35** and there is no 8.3
+build (so some of the c=1 lead may be 8.5 rather than embedding, and some of the c=32 deficit may
+be a runtime this new), and it reports **2 pids** where the other two report 13, because its
+workers are threads and not children — which is the architecture under measurement rather than an
+artefact of it.
+
+**One harness lesson, and it generalises well past this arm.** `php_server` runs a `worker` only
+where `match` says so, and its default is "requests for a `.php` file". Everything else goes to the
+ordinary per-request PHP handler. Same binary, same worker script, same thread count, two
+Caddyfiles differing by one directive, `GET /items` at concurrency 32:
+
+    worker { match /* }       15,856 rps
+    no `match` (the default)     662 rps
+
+A 24x error that no HTTP response can reveal — both return 200, both contain the page marker, both
+serve byte-identical bodies. A 662 rps arm would have been read as "embedding is much slower",
+not as "this arm is cold". So the arm proves its own model: the worker script logs the first time
+its loop is actually asked to serve something, and the harness refuses to measure the arm if that
+line is missing. Two weaker checks were built first and **discarded with their numbers** — a
+timing floor (1.26 ms warm against 2.61 ms cold medians, with the best-case cold at 1.96 ms
+overlapping the worst-case warm at 1.35 ms, so any threshold between them is a coin flip) and a
+worker-thread count read out of the log (both configurations start all twelve threads and both
+log all twelve reaching their loop; the worker is real in both cases and is simply never asked to
+serve anything). A check that cannot fail is not a check — hazard 28's lesson with a new
+instrument.
+
+Two more traps specific to this arm, each of which produced a broken arm before it produced a
+number. The release binary loads **no php.ini whatsoever** (`php_ini_loaded_file()` comes back
+empty), so absent the Caddyfile's `php_ini` the arm would have run `memory_limit` 128M and
+`opcache.validate_timestamps` **on** while every other arm ran 512M and off — the values are
+therefore read back from inside a worker thread into the arm's own log, twelve lines, one per
+thread. And **`STDERR` does not exist in this SAPI**: a worker's output *is* the HTTP response, so
+the first version of the worker died on `Undefined constant "STDERR"` before reaching its request
+loop, which the server reports only as `worker ... has not reached
+frankenphp_handle_request()`.
 
 
 

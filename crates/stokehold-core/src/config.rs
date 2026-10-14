@@ -383,6 +383,78 @@ pub fn host_matches(pattern: &str, host: Option<&str>) -> bool {
     }
 }
 
+/// Pick a backend from a route table, or `None` when nothing matches.
+///
+/// Free rather than a method on [`Config`] because a site carries its own table, and
+/// the two must be selected by the same rule — a site whose routes were matched even
+/// slightly differently from the server's would be a bug nobody could reproduce from
+/// reading either table alone.
+pub fn select_backend<'a>(
+    routes: &'a [RouteConfig],
+    host: Option<&str>,
+    path: &str,
+) -> Option<&'a str> {
+    select_route(routes, host, path).map(|route| route.backend.as_str())
+}
+
+/// [`select_backend`], keeping the route so its other properties are available.
+pub fn select_route<'a>(
+    routes: &'a [RouteConfig],
+    host: Option<&str>,
+    path: &str,
+) -> Option<&'a RouteConfig> {
+    routes
+        .iter()
+        .filter(|route| route.matches(host, path))
+        .max_by_key(|route| (route.specificity(), route.has_exact_host()))
+}
+
+/// Whether a route proves its path names a script, so the caller need not `stat` it.
+///
+/// `php-cgi` checks that a script exists and answers `No input file specified` when it
+/// does not, so *existence* is genuinely its business. What it does **not** do is check
+/// that the file is PHP: handed `config.json` it emits it verbatim with a 200, which is
+/// hazard 19. So the `stat` in the router is doing two jobs, and only one of them is
+/// removable.
+///
+/// The removable one is removable exactly when the pattern already pins a script
+/// extension: then the file can only be PHP, and its absence is PHP's own 404. That is a
+/// static property of the configuration, so it is decided once at startup rather than
+/// per request — and never written by hand, because the decision belongs with the code
+/// that knows why it is safe.
+pub fn skip_stat(route: &RouteConfig, backend_is_worker: bool) -> bool {
+    // A worker never interprets the path: it reads `script_filename` as metadata and
+    // routes on `REQUEST_URI`, so there is no file for the stat to protect.
+    if backend_is_worker {
+        return true;
+    }
+    // A suffix that pins a script extension, e.g. `.php`. Compared with the same
+    // case-insensitive rule `has_php_extension` uses, so the two cannot disagree about
+    // `/upload.PHP`.
+    route
+        .path_suffix
+        .as_deref()
+        .is_some_and(is_script_extension)
+}
+
+/// Whether a `path_suffix` names a script extension, and nothing but one.
+///
+/// `".php"` and `"/entry.php"` do; `".json"` and `".css"` do not. A prefix says nothing
+/// about the extension at all, which is why only a suffix can make this claim.
+fn is_script_extension(suffix: &str) -> bool {
+    // The last `.`-separated part of the suffix is the extension it pins, so a suffix
+    // carrying a path (`/api/entry.php`) is judged by its end rather than rejected.
+    match suffix.rsplit_once('.') {
+        Some((_, extension)) => {
+            const SCRIPT_EXTENSIONS: [&str; 3] = ["php", "php3", "phtml"];
+            SCRIPT_EXTENSIONS
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        }
+        None => false,
+    }
+}
+
 /// A `Host` header without its `:port`, handling a bracketed IPv6 literal.
 fn strip_port(host: &str) -> &str {
     let host = host.trim();
@@ -415,11 +487,7 @@ impl Config {
     ///    request.
     /// 3. Anything still tied is settled by declaration order.
     pub fn route_backend(&self, host: Option<&str>, path: &str) -> Option<&str> {
-        self.routes
-            .iter()
-            .filter(|route| route.matches(host, path))
-            .max_by_key(|route| (route.specificity(), route.has_exact_host()))
-            .map(|route| route.backend.as_str())
+        select_backend(&self.routes, host, path)
     }
 }
 

@@ -91,6 +91,16 @@ impl Dispatcher {
         &self.default
     }
 
+    /// Whether the named backend is a worker pool.
+    ///
+    /// A worker reads `script_filename` as metadata and routes on `REQUEST_URI`, so a
+    /// path naming no script is not a file the router needs to resolve for it — which is
+    /// what lets a route to a worker skip the `stat` entirely. An unknown name is not a
+    /// worker: a name that selects nothing cannot vouch for the safety of anything.
+    pub fn is_worker(&self, backend: &str) -> bool {
+        self.backends.get(backend).is_some_and(Backend::is_worker)
+    }
+
     /// Names of every backend, for diagnostics.
     pub fn backend_names(&self) -> Vec<&str> {
         self.backends.values().map(Backend::name).collect()

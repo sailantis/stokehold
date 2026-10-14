@@ -242,6 +242,64 @@ pub fn climbs_out(path: &str) -> bool {
     false
 }
 
+/// Resolve a path for a backend that will be reached regardless of the outcome.
+///
+/// [`route`] answers `NotFound` when a path names no script and no front controller is
+/// configured, which is the right answer to "should this reach PHP at all". It is the
+/// wrong answer when a route has *already* said it must: the backend is chosen from the
+/// route table, so the request is going to PHP either way, and refusing to build an
+/// environment for it means the route can never fire for a path that names no file.
+///
+/// The fallback is deliberately narrow, because building `SCRIPT_FILENAME` from a path
+/// that names an existing non-script file is how the document root becomes a file server
+/// — `php-cgi` will happily emit `config.json` verbatim with a 200, which is hazard 19.
+/// So:
+///
+/// - With a **front controller**, the request is that script's, exactly as [`route`]
+///   would have decided.
+/// - With a path the router itself recognises as a **script** (`has_php_extension`), the
+///   path is handed over and `php-cgi`'s own check answers `No input file specified` when
+///   it is absent. Nothing but a script can be reached this way.
+/// - Anything else is left as `NotFound`. A route matching `path_suffix = ".json"` does
+///   not turn the document root into a file server; the path is application *input* and
+///   belongs to whichever script the front controller names.
+pub fn route_or_dispatch(path: &str, routing: &Routing) -> Route {
+    match route(path, routing) {
+        Route::NotFound => dispatch_fallback(path, routing),
+        decided => decided,
+    }
+}
+
+/// What to do with a path no script resolved.
+fn dispatch_fallback(path: &str, routing: &Routing) -> Route {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let decoded = percent_decode_cow(path);
+    let relative = decoded.trim_start_matches('/');
+
+    if let Some(front) = &routing.front_controller {
+        // A dotfile must not be handled by the application either: handed `/.env` as
+        // its `PATH_INFO`, PHP emits the file's contents as the response body.
+        if relative.split('/').any(|part| part.starts_with('.')) {
+            return Route::NotFound;
+        }
+        return Route::Script {
+            script_filename: routing.document_root.join(front),
+            script_name: format!("/{front}"),
+            path_info: format!("/{relative}"),
+        };
+    }
+
+    if has_php_extension(relative) {
+        return Route::Script {
+            script_filename: routing.document_root.join(relative),
+            script_name: format!("/{relative}"),
+            path_info: String::new(),
+        };
+    }
+
+    Route::NotFound
+}
+
 /// PHP extensions this server will execute, as ASCII bytes for a case-insensitive
 /// suffix comparison.
 const PHP_EXTENSIONS: [&[u8]; 3] = [b".php", b".php3", b".phtml"];

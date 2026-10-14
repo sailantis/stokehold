@@ -72,11 +72,26 @@ impl Sites {
     /// absolutises it and a site must not be resolved against a relative path. A
     /// site always states its own root, so this is only the default site's.
     pub fn from_config(config: &Config, document_root: &Path) -> Self {
+        Self::from_config_with(config, document_root, None)
+    }
+
+    /// [`Sites::from_config`], with the front controller the command line resolved.
+    ///
+    /// The flag describes the *default* site, so it is applied to that one and to sites
+    /// that inherit: a site stating its own controller keeps it, which is what "a site
+    /// states its own" means.
+    pub fn from_config_with(
+        config: &Config,
+        document_root: &Path,
+        front_controller_override: Option<&str>,
+    ) -> Self {
         // Through `resolve_front_controller`, so the default (`index.php`) is applied
         // here rather than left to the CLI. Otherwise a site that omits the key would
         // get no controller while the single-site path got `index.php` — the same
         // deployment behaving two ways depending on which front-end read it.
-        let default_front = config.server.resolve_front_controller(None);
+        let default_front = config
+            .server
+            .resolve_front_controller(front_controller_override);
         let default_statics = config.server.statics();
 
         let default = ResolvedSite {

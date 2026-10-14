@@ -9,8 +9,9 @@ use clap::{Parser, Subcommand};
 
 use stokehold_core::config::Config;
 use stokehold_core::php;
+use stokehold_core::sites::Sites;
 use stokehold_fcgi::cgi::Routing;
-use stokehold_http::{HttpLimits, RunningHttp, StaticState};
+use stokehold_http::{HttpLimits, RunningHttp};
 use stokehold_server::{Contention, Dispatcher, FastCgiListener, Limits, ServerError};
 
 #[derive(Parser, Debug)]
@@ -216,8 +217,38 @@ fn serve(
     let front_controller = config
         .server
         .resolve_front_controller(front_controller_flag);
-    let routing = routing_for(&document_root, front_controller.as_deref());
-    let static_state = config.server.statics();
+
+    // The command line describes the *default* site. A site states its own root, so a
+    // flag that named one would silently mean "the default site only" — the kind of
+    // setting this file already refuses to give two meanings (see the empty-string rule
+    // on `front_controller`).
+    if !config.sites.is_empty() {
+        if document_root_flag.is_some() {
+            return Err(ServerError::Misconfigured {
+                backend: "<cli>".to_string(),
+                reason: "--document-root cannot be combined with [sites]: each site states its \
+                         own document_root"
+                    .to_string(),
+            });
+        }
+        if front_controller_flag.is_some() {
+            return Err(ServerError::Misconfigured {
+                backend: "<cli>".to_string(),
+                reason: "--front-controller cannot be combined with [sites]: each site states its \
+                         own front_controller"
+                    .to_string(),
+            });
+        }
+    }
+
+    // One routing, derived once, from the same table the sites are. The command line's
+    // controller is folded in here rather than afterwards so the default site is
+    // described in one place.
+    let sites = Arc::new(Sites::from_config_with(
+        &config,
+        &document_root,
+        front_controller.as_deref(),
+    ));
     let http_address = config.server.http.clone();
     let fastcgi_address = config.server.fastcgi.clone();
     if http_address.is_none() && fastcgi_address.is_none() {
@@ -228,7 +259,10 @@ fn serve(
     // reported before a port is occupied. One dispatcher serves both front-ends,
     // shared without a lock because each backend slot synchronises internally —
     // so two requests to two workers run at the same time.
-    let dispatcher = Dispatcher::from_config(&config, routing.clone())?;
+    let dispatcher = Dispatcher::from_config(
+        &config,
+        routing_for(&document_root, front_controller.as_deref()),
+    )?;
     for name in dispatcher.backend_names() {
         tracing::info!(backend = %name, "backend ready");
     }
@@ -255,7 +289,13 @@ fn serve(
     if !config.routes.is_empty() {
         println!("  routes:           {}", config.routes.len());
     }
-    if static_state.enabled {
+    if !config.sites.is_empty() {
+        println!("  sites:            {}", config.sites.len());
+        for (name, site) in &config.sites {
+            println!("    {name}: {}", site.hosts.join(", "));
+        }
+    }
+    if config.server.statics().enabled {
         println!("  static files:     serving from the document root");
     }
 
@@ -300,14 +340,10 @@ fn serve(
             let running = RunningHttp::start(
                 address,
                 Arc::clone(&dispatcher),
-                routing,
+                Arc::clone(&sites),
                 HttpLimits {
                     max_connections,
                     ..HttpLimits::default()
-                },
-                StaticState {
-                    config: static_state.clone(),
-                    document_root: document_root.to_path_buf(),
                 },
             )
             .map_err(|err| ServerError::Listener {

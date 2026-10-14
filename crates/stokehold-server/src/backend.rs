@@ -217,6 +217,15 @@ impl Backend {
         }
     }
 
+    /// Whether this backend runs the application rather than interpreting a path.
+    ///
+    /// A worker is told the request's `script_filename` but does not switch file on it:
+    /// it routes on `REQUEST_URI`, and the path is metadata. That is what makes a route
+    /// to a worker able to skip resolving the path to a script at all.
+    pub fn is_worker(&self) -> bool {
+        matches!(self, Backend::Worker { .. })
+    }
+
     /// Whether PHP's own SAPI resets state between requests for this backend.
     pub fn resets_per_request(&self) -> bool {
         !matches!(self, Backend::Worker { .. })

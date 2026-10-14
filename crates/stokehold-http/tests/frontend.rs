@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use stokehold_core::config::{BackendConfig, Config, ServerConfig, WorkerConfig};
+use stokehold_core::sites::Sites;
 use stokehold_fcgi::Routing;
 use stokehold_http::{HttpLimits, HttpListener};
 use stokehold_server::Dispatcher;
@@ -195,7 +196,16 @@ impl Server {
         dispatcher: Dispatcher,
         routing: Routing,
         limits: HttpLimits,
-        statics: stokehold_http::StaticState,
+        statics: stokehold_core::config::StaticConfig,
+    ) -> Option<Server> {
+        Server::start_sites(dispatcher, Arc::new(sites_for(&routing, statics)), limits)
+    }
+
+    /// Start a listener around an explicit site table, for tests that serve more than one.
+    fn start_sites(
+        dispatcher: Dispatcher,
+        sites: Arc<Sites>,
+        limits: HttpLimits,
     ) -> Option<Server> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -206,9 +216,8 @@ impl Server {
         let listener = runtime.block_on(HttpListener::bind(
             "127.0.0.1:0",
             Arc::new(dispatcher),
-            routing,
+            sites,
             limits,
-            statics,
         ));
         let listener = match listener {
             Ok(listener) => listener,
@@ -292,6 +301,12 @@ fn exchange(address: &str, request: &[u8]) -> Exchange {
 /// A `GET` on a fresh connection.
 fn get(address: &str, path: &str) -> Exchange {
     let request = format!("GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n");
+    exchange(address, request.as_bytes())
+}
+
+/// A `GET` naming the host, so a test can drive two sites through one listener.
+fn get_as(address: &str, host: &str, path: &str) -> Exchange {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     exchange(address, request.as_bytes())
 }
 
@@ -667,15 +682,45 @@ fn static_server(root: &Path, config: stokehold_core::config::StaticConfig) -> O
     let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
         .expect("a dispatcher that starts no process");
 
-    Server::start(
-        dispatcher,
-        routing,
-        HttpLimits::default(),
-        stokehold_http::StaticState {
-            config,
-            document_root: root.to_path_buf(),
-        },
-    )
+    Server::start(dispatcher, routing, HttpLimits::default(), config)
+}
+
+/// The single default site a test's routing and static settings describe.
+///
+/// The listener takes a [`Sites`] table because that is what `serve` builds, and a test
+/// exercising the same path should build one the same way rather than through a side door.
+fn sites_for(routing: &Routing, statics: stokehold_core::config::StaticConfig) -> Sites {
+    let config = stokehold_core::config::Config::from_toml(&toml_for(routing, &statics))
+        .expect("the test's own configuration parses");
+    Sites::from_config(&config, &routing.document_root)
+}
+
+fn toml_for(routing: &Routing, statics: &stokehold_core::config::StaticConfig) -> String {
+    let root = routing.document_root.to_string_lossy();
+    // Everything lives on `[server]` — the default site — except "files only", which the
+    // global `front_controller` cannot spell: it reserves the empty value, because TOML
+    // cannot tell `""` from an absent key. A site may say `false`, so the one case that
+    // needs it is expressed as a site naming the host these tests send.
+    let files_only = match routing.front_controller.as_deref() {
+        Some(path) => format!("front_controller = {path:?}\n"),
+        None => String::new(),
+    };
+    let site = match routing.front_controller {
+        Some(_) => String::new(),
+        None => format!(
+            "\n[sites.test]\nhosts = [\"example.test\", \"localhost\"]\n\
+             document_root = {root:?}\nfront_controller = false\n"
+        ),
+    };
+    let text = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {root:?}\n{files_only}\
+         static_files = {{ enabled = {enabled}, precompressed = {precompressed}, \
+         directory_index = {directory_index} }}\n{site}",
+        enabled = statics.enabled,
+        precompressed = statics.precompressed,
+        directory_index = statics.directory_index,
+    );
+    text
 }
 
 /// The static configuration a test wants, with serving switched on.
@@ -1054,4 +1099,82 @@ fn a_php_script_with_path_info_still_reaches_the_backend() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Two sites in one process: the same path answers differently per `Host`.
+///
+/// This is the whole feature, and it is asserted with static content because that is what
+/// makes the difference visible without a backend: the document root is chosen by the
+/// `Host` header before anything else is decided, so `/whoami.txt` cannot be the same file
+/// for two hosts.
+#[test]
+fn two_sites_in_one_process_serve_different_roots() {
+    let base = std::env::temp_dir().join(format!("stokehold-sites-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for (name, body) in [
+        ("a", "site-a"),
+        ("b", "site-b"),
+        ("default", "site-default"),
+    ] {
+        std::fs::create_dir_all(base.join(name)).expect("create a site root");
+        std::fs::write(base.join(name).join("whoami.txt"), body).expect("write the marker");
+    }
+
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {default:?}
+static_files = {{ enabled = true }}
+
+[sites.a]
+hosts = ["a.test", "*.a.test"]
+document_root = {a:?}
+static_files = {{ enabled = true }}
+
+[sites.b]
+hosts = ["b.test"]
+document_root = {b:?}
+static_files = {{ enabled = true }}
+"#,
+        default = base.join("default").to_string_lossy(),
+        a = base.join("a").to_string_lossy(),
+        b = base.join("b").to_string_lossy(),
+    );
+    let config = stokehold_core::config::Config::from_toml(&text).expect("config parses");
+    let sites = Arc::new(Sites::from_config(&config, &base.join("default")));
+    let routing = Routing {
+        document_root: base.join("default"),
+        front_controller: Some("index.php".to_string()),
+        ..Routing::default()
+    };
+    let dispatcher =
+        Dispatcher::from_config(&unreachable_config(), routing).expect("no process is started");
+
+    let Some(server) = Server::start_sites(dispatcher, sites, HttpLimits::default()) else {
+        return;
+    };
+    let address = server.address.clone();
+
+    let answer = |host: &str| {
+        let response = get_as(&address, host, "/whoami.txt");
+        assert_eq!(response.status, 200, "{host}: {response:?}");
+        response.text()
+    };
+
+    assert_eq!(answer("a.test"), "site-a");
+    assert_eq!(answer("b.test"), "site-b");
+    // The wildcard belongs to `a`, and is matched without regard to case or port.
+    assert_eq!(answer("x.a.test"), "site-a");
+    assert_eq!(answer("A.TEST:8080"), "site-a");
+    // An unlisted host is the default site's.
+    assert_eq!(answer("elsewhere.test"), "site-default");
+
+    // A path naming no file belongs to the matching site's front controller, which is
+    // unreachable here — 502 rather than a 404 or another site's content.
+    let missing = get_as(&address, "b.test", "/no-such-file");
+    assert_eq!(missing.status, 502, "{missing:?}");
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&base);
 }

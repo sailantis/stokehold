@@ -24,6 +24,7 @@
 //! done here either — the bytes go to PHP, which owns `$_FILES` and
 //! `is_uploaded_file()`.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -39,6 +40,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
+use stokehold_core::sites::{ResolvedSite, Sites};
 use stokehold_fcgi::{cgi, RequestInfo, Route, Routing};
 use stokehold_server::{Dispatcher, ServerError};
 
@@ -143,27 +145,52 @@ struct FrontEnd {
     /// synchronise internally, per backend slot, so requests to different
     /// workers genuinely run at the same time.
     dispatcher: Arc<Dispatcher>,
-    routing: Routing,
+    /// One prebuilt routing per site, by site name, plus the default under
+    /// `"<default>"`.
+    ///
+    /// Prebuilt, not derived per request: a `Routing` is a document root and a front
+    /// controller, and rebuilding one for every request would put a `PathBuf` clone on
+    /// the hot path to answer a question the configuration already answered at startup.
+    routings: Arc<BTreeMap<String, Routing>>,
+    /// The static layer per site, for the same reason.
+    statics: Arc<BTreeMap<String, StaticFiles>>,
+    /// The site table, to turn a `Host` header into one of the entries above.
+    sites: Arc<Sites>,
     limits: HttpLimits,
     stats: Arc<HttpStats>,
     shutdown: Arc<AtomicBool>,
     /// The port this listener is bound to, for `SERVER_PORT` when the client
     /// sends no `Host`.
     server_port: u16,
-    /// Serving files from the document root. Consulted before the body is read,
-    /// and inert until `enabled` is set.
-    statics: StaticFiles,
 }
 
-/// What the static layer needs, as the caller spells it.
-///
-/// Separate from [`StaticFiles`] because only the listener knows its own bound
-/// port, which the layer needs for a redirect.
-#[derive(Debug, Clone, Default)]
-pub struct StaticState {
-    pub config: stokehold_core::config::StaticConfig,
-    pub document_root: std::path::PathBuf,
+impl FrontEnd {
+    /// The routing and static layer for one site.
+    ///
+    /// A site resolved by [`Sites`] is always in both maps — they are built from the
+    /// same table in the same pass — so a missing entry would mean the two had
+    /// diverged, and falling back to the default is the safe direction: it serves the
+    /// deployment's own root rather than an empty path.
+    fn for_site(&self, site: &ResolvedSite) -> (&Routing, &StaticFiles) {
+        let routing = self
+            .routings
+            .get(&site.name)
+            .or_else(|| self.routings.get(DEFAULT_SITE_KEY))
+            .expect("the default site is always built");
+        let statics = self
+            .statics
+            .get(&site.name)
+            .or_else(|| self.statics.get(DEFAULT_SITE_KEY))
+            .expect("the default site is always built");
+        (routing, statics)
+    }
 }
+
+/// The key the default site's routing is stored under.
+///
+/// A name that cannot collide with a site's own, because a site name comes from a TOML
+/// table key and `<>` is not valid in a bare TOML key.
+pub const DEFAULT_SITE_KEY: &str = "<default>";
 
 /// A running HTTP listener.
 pub struct HttpListener {
@@ -197,18 +224,15 @@ impl RunningHttp {
     pub fn start(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        routing: Routing,
+        sites: Arc<Sites>,
         limits: HttpLimits,
-        statics: StaticState,
     ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(HttpError::Runtime)?;
 
-        let listener = runtime.block_on(HttpListener::bind(
-            address, dispatcher, routing, limits, statics,
-        ))?;
+        let listener = runtime.block_on(HttpListener::bind(address, dispatcher, sites, limits))?;
         let bound = listener.local_addr()?;
         let shutdown = listener.shutdown_handle();
         let stats = listener.stats();
@@ -272,9 +296,8 @@ impl HttpListener {
     pub async fn bind(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        routing: Routing,
+        sites: Arc<Sites>,
         limits: HttpLimits,
-        statics: StaticState,
     ) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -287,21 +310,45 @@ impl HttpListener {
             source,
         })?;
 
+        // The bound port, which matters when port 0 was requested. The port is needed
+        // here rather than by the caller because only the listener knows what it got.
+        let port = bound.port();
+        let mut routings = BTreeMap::new();
+        let mut statics = BTreeMap::new();
+        for site in sites
+            .named()
+            .values()
+            .chain(std::iter::once(sites.default_site()))
+        {
+            routings.insert(
+                site.name.clone(),
+                Routing {
+                    document_root: site.document_root.clone(),
+                    front_controller: site.front_controller.clone(),
+                    ..Routing::default()
+                },
+            );
+            statics.insert(
+                site.name.clone(),
+                StaticFiles {
+                    config: site.static_files.clone(),
+                    document_root: site.document_root.clone(),
+                    server_port: port,
+                },
+            );
+        }
+
         Ok(HttpListener {
             listener,
             front_end: Arc::new(FrontEnd {
                 dispatcher,
-                routing,
+                routings: Arc::new(routings),
+                statics: Arc::new(statics),
+                sites,
                 limits,
                 stats: Arc::new(HttpStats::default()),
                 shutdown: Arc::new(AtomicBool::new(false)),
-                server_port: bound.port(),
-                statics: StaticFiles {
-                    config: statics.config,
-                    document_root: statics.document_root,
-                    // The bound port, which matters when port 0 was requested.
-                    server_port: bound.port(),
-                },
+                server_port: port,
             }),
         })
     }
@@ -451,38 +498,68 @@ async fn prepare(
 ) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
 
+    // The site is resolved first, because everything after this is per site: which
+    // document root a path resolves under, which front controller serves it, and which
+    // static layer answers it. A map probe on the runtime thread, not work.
+    let host = parts
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok());
+    let site = front_end.sites.resolve(host);
+    let (routing, statics) = front_end.for_site(site);
+
     // Static content is decided before the body is read: a `GET` for a file has
     // no body worth buffering, and refusing to buffer one it will never use is
     // the point of a limit.
-    {
+    //
+    // `serve_only` decides whether this happens at all. A site that serves only a
+    // backend skips it, which is the difference between "static files first" and "no
+    // static layer": the first still stats on every request to discover there is no
+    // file, and for an application host there never is one.
+    if site.serve_only.serves_files() {
         let static_request = static_files::Request {
             method: &parts.method,
             path: parts.uri.path(),
             headers: &parts.headers,
-            host: parts
-                .headers
-                .get(HOST)
-                .and_then(|value| value.to_str().ok()),
+            host,
         };
-        if let Some(answer) = static_files::respond(static_request, &front_end.statics).await {
+        if let Some(answer) = static_files::respond(static_request, statics).await {
             return answer;
         }
     }
 
+    // A site that serves only files has no backend to fall through to, and the honest
+    // answer for a path naming no file is then 404 — not a dispatch, and not a 500 from
+    // a backend the deployment never configured.
+    if !site.serve_only.serves_backend() {
+        return Err(HttpError::NotFound(parts.uri.path().to_string()));
+    }
+
     let body = read_body(body, front_end.limits.max_body_bytes).await?;
+
+    // A route that proves its pattern names a script may skip the router's own `stat`:
+    // `php-cgi` checks existence itself, and the extension guard is already satisfied by
+    // the pattern. See `RouteConfig::skip_stat` for why that is a static property of the
+    // configuration rather than something to decide per request.
+    let route = {
+        let path = parts.uri.path();
+        stokehold_core::config::select_route(&site.routes, host, path)
+    };
+    let skips_stat = route.is_some_and(|route| {
+        stokehold_core::config::skip_stat(route, front_end.dispatcher.is_worker(&route.backend))
+    });
 
     // Everything from here on blocks: routing stats the filesystem to resolve
     // SCRIPT_FILENAME, and the backend reads and writes pipes. Both must happen
     // off the runtime's threads.
     let front_end = Arc::clone(front_end);
+    let routing = routing.clone();
     let blocking = tokio::task::spawn_blocking(move || {
-        let cgi_request = to_cgi(
-            &parts,
-            body,
-            &front_end.routing,
-            front_end.server_port,
-            &remote_addr,
-        )?;
+        let cgi_request = if skips_stat {
+            to_cgi_routed(&parts, body, &routing, front_end.server_port, &remote_addr)?
+        } else {
+            to_cgi(&parts, body, &routing, front_end.server_port, &remote_addr)?
+        };
         front_end
             .dispatcher
             .dispatch(&cgi_request)
@@ -544,6 +621,34 @@ pub fn to_cgi(
     server_port: u16,
     remote_addr: &str,
 ) -> Result<stokehold_fcgi::Request> {
+    to_cgi_with(parts, body, routing, server_port, remote_addr, false)
+}
+
+/// Build the CGI request for a path a route has already claimed.
+///
+/// Identical to [`to_cgi`] except that a path naming no script is handed to the backend
+/// rather than answered 404 here — see [`cgi::route_or_dispatch`] for why that is safe.
+/// Called only when a route's `skip_stat` says so, because skipping the check
+/// unconditionally would send every unmatched path to a backend.
+#[doc(hidden)]
+pub fn to_cgi_routed(
+    parts: &hyper::http::request::Parts,
+    body: Vec<u8>,
+    routing: &Routing,
+    server_port: u16,
+    remote_addr: &str,
+) -> Result<stokehold_fcgi::Request> {
+    to_cgi_with(parts, body, routing, server_port, remote_addr, true)
+}
+
+fn to_cgi_with(
+    parts: &hyper::http::request::Parts,
+    body: Vec<u8>,
+    routing: &Routing,
+    server_port: u16,
+    remote_addr: &str,
+    allow_no_script: bool,
+) -> Result<stokehold_fcgi::Request> {
     let path = parts.uri.path();
     let target = parts
         .uri
@@ -560,7 +665,11 @@ pub fn to_cgi(
     // The answer is then handed to `build_params_for`, which does not route again. Doing
     // it twice walked the path and called `is_file` on its candidates a second time on
     // every request, for a result already in hand.
-    let route = match cgi::route(path, routing) {
+    let route = match if allow_no_script {
+        cgi::route_or_dispatch(path, routing)
+    } else {
+        cgi::route(path, routing)
+    } {
         Route::NotFound => return Err(HttpError::NotFound(path.to_string())),
         Route::Forbidden => return Err(HttpError::Forbidden(path.to_string())),
         resolved => resolved,

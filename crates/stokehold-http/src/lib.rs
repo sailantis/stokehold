@@ -39,4 +39,6 @@ pub mod listener;
 pub mod static_files;
 
 pub use error::HttpError;
-pub use listener::{to_cgi, HttpLimits, HttpListener, HttpShutdown, HttpStats, RunningHttp, StaticState};
+pub use listener::{
+    to_cgi, to_cgi_routed, HttpLimits, HttpListener, HttpShutdown, HttpStats, RunningHttp,
+};

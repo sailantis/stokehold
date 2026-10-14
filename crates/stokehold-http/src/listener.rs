@@ -149,11 +149,24 @@ pub struct TlsSettings<'a> {
     pub config: &'a stokehold_core::config::Config,
     /// Where a relative `certificate`/`key` resolves.
     pub config_dir: &'a std::path::Path,
+}
+
+/// How one listener is set up: whether *it* speaks TLS, and whether it redirects.
+///
+/// The two are deliberately separate, because they come apart in the shape a real deployment
+/// uses. With `http` on :80 and `https` on :443, the plaintext listener has **no TLS of its
+/// own** — it must not build an acceptor — and still carries the redirect. Deriving the
+/// redirect from the presence of a certificate would have made that listener a TLS port, which
+/// is a mistake that only shows up as a client that cannot connect at all.
+#[derive(Clone, Copy, Default)]
+pub struct ListenerSettings<'a> {
+    /// TLS for this listener, or `None` for a plaintext one.
+    pub tls: Option<TlsSettings<'a>>,
     /// Answer cleartext requests with a `301` to the `https://` equivalent.
     ///
     /// Per listener rather than per configuration, because only the listener that serves
-    /// cleartext may redirect: with a separate `https` port the plaintext listener redirects,
-    /// and with TLS sharing the port only the cleartext half of it does.
+    /// cleartext may redirect: with a separate `https` port the plaintext listener carries it,
+    /// and with TLS sharing the port only the cleartext half of that listener does.
     pub redirect_to_https: bool,
     /// The port a redirect should name, when it is not this listener's own.
     pub https_port: Option<u16>,
@@ -279,16 +292,16 @@ impl RunningHttp {
         sites: Arc<Sites>,
         limits: HttpLimits,
     ) -> Result<Self> {
-        Self::start_with_tls(address, dispatcher, sites, limits, None)
+        Self::start_with_tls(address, dispatcher, sites, limits, ListenerSettings::default())
     }
 
-    /// [`RunningHttp::start`], with TLS.
+    /// [`RunningHttp::start`], with TLS and/or a redirect.
     pub fn start_with_tls(
         address: &str,
         dispatcher: Arc<Dispatcher>,
         sites: Arc<Sites>,
         limits: HttpLimits,
-        tls: Option<TlsSettings<'_>>,
+        settings: ListenerSettings<'_>,
     ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -296,7 +309,7 @@ impl RunningHttp {
             .map_err(HttpError::Runtime)?;
 
         let listener = runtime.block_on(HttpListener::bind_with_tls(
-            address, dispatcher, sites, limits, tls,
+            address, dispatcher, sites, limits, settings,
         ))?;
         let bound = listener.local_addr()?;
         let shutdown = listener.shutdown_handle();
@@ -364,7 +377,7 @@ impl HttpListener {
         sites: Arc<Sites>,
         limits: HttpLimits,
     ) -> Result<Self> {
-        Self::bind_with_tls(address, dispatcher, sites, limits, None).await
+        Self::bind_with_tls(address, dispatcher, sites, limits, ListenerSettings::default()).await
     }
 
     /// [`HttpListener::bind`], with the TLS settings and the directory certificate paths
@@ -378,7 +391,7 @@ impl HttpListener {
         dispatcher: Arc<Dispatcher>,
         sites: Arc<Sites>,
         limits: HttpLimits,
-        tls: Option<TlsSettings<'_>>,
+        settings: ListenerSettings<'_>,
     ) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -392,13 +405,14 @@ impl HttpListener {
         })?;
 
         // The redirect settings come from the listener's own settings, so a plaintext listener in
-        // a split :80/:443 deployment can carry them with no TLS of its own.
-        let redirect_to_https = tls.map(|s| s.redirect_to_https).unwrap_or(false);
-        let requested_https_port = tls.and_then(|s| s.https_port);
+        // a split :80/:443 deployment can carry them with no TLS of its own — which is exactly
+        // why they are separate from `tls` rather than derived from it.
+        let redirect_to_https = settings.redirect_to_https;
+        let requested_https_port = settings.https_port;
 
         // The acceptor is built before anything is served, and its failure is reported as a
         // configuration error: a certificate that cannot be read must not become a listener.
-        let (acceptor, accept_plain) = match tls {
+        let (acceptor, accept_plain) = match settings.tls {
             Some(settings) => {
                 let resolver = Arc::new(
                     crate::tls::SniResolver::from_config(settings.config, settings.config_dir)
@@ -421,7 +435,6 @@ impl HttpListener {
                         .collect::<Vec<_>>(),
                     plaintext_accepted = settings.config.server.tls.as_ref()
                         .is_some_and(|t| t.plain),
-                    redirect_to_https = settings.redirect_to_https,
                     "TLS enabled"
                 );
                 (

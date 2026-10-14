@@ -402,9 +402,7 @@ fn serve(
     // half of that one listener. Validation has already ensured some plaintext listener exists.
     //
     // Only a TCP listener has a port. A unix socket cannot be reached over a redirect at all,
-    // so it yields `None` and the redirect falls back to the listener's own port — which is
-    // then only used to build a URL nobody can follow. `validate` requires `https` to parse, so
-    // the `None` case here is a unix socket rather than a malformed address.
+    // so it yields `None` and the redirect falls back to the listener's own port.
     let https_port = match &https_address {
         Some(address) => match stokehold_core::config::parse_listener(address) {
             Ok(stokehold_core::config::Listener::Tcp(addr)) => Some(addr.port()),
@@ -413,28 +411,20 @@ fn serve(
         None => None,
     };
 
-    let http_tls = if tls_on_http {
-        Some(stokehold_http::TlsSettings {
-            config: &config,
-            config_dir,
-            redirect_to_https: wants_redirect && config
-                .server
-                .tls
-                .as_ref()
-                .is_some_and(|t| t.plain),
-            https_port: None,
-        })
-    } else if wants_redirect && tls_active {
-        // The plaintext listener beside a separate `https`: it carries the redirect without any
-        // TLS of its own, which is why the settings exist independently of the acceptor.
-        Some(stokehold_http::TlsSettings {
-            config: &config,
-            config_dir,
-            redirect_to_https: true,
-            https_port,
-        })
-    } else {
-        None
+    // `tls` and the redirect are separate settings on purpose: the plaintext listener in a
+    // split deployment carries the redirect with *no* acceptor, and giving it one would turn it
+    // into a TLS port that no cleartext client could reach.
+    let http_settings = stokehold_http::ListenerSettings {
+        tls: if tls_on_http {
+            Some(stokehold_http::TlsSettings {
+                config: &config,
+                config_dir,
+            })
+        } else {
+            None
+        },
+        redirect_to_https: wants_redirect && config.server.has_plaintext_listener(),
+        https_port,
     };
 
     let http = match &http_address {
@@ -447,7 +437,7 @@ fn serve(
                     max_connections,
                     ..HttpLimits::default()
                 },
-                http_tls,
+                http_settings,
             )
             .map_err(|err| ServerError::Listener {
                 reason: err.to_string(),
@@ -475,12 +465,16 @@ fn serve(
                     max_connections,
                     ..HttpLimits::default()
                 },
-                Some(stokehold_http::TlsSettings {
-                    config: &config,
-                    config_dir,
+                // TLS only: this listener is already the https endpoint, so a redirect here
+                // would send a client to where it came from.
+                stokehold_http::ListenerSettings {
+                    tls: Some(stokehold_http::TlsSettings {
+                        config: &config,
+                        config_dir,
+                    }),
                     redirect_to_https: false,
                     https_port,
-                }),
+                },
             )
             .map_err(|err| ServerError::Listener {
                 reason: err.to_string(),

@@ -41,7 +41,7 @@ pub mod tls;
 
 pub use error::HttpError;
 pub use listener::{
-    to_cgi, to_cgi_routed, HttpLimits, HttpListener, HttpShutdown, HttpStats, RunningHttp,
-    TlsSettings,
+    to_cgi, to_cgi_routed, HttpLimits, HttpListener, HttpShutdown, HttpStats, ListenerSettings,
+    RunningHttp, TlsSettings,
 };
 pub use tls::{SniResolver, TlsError};

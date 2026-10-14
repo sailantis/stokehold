@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use stokehold_core::config::Config;
 use stokehold_core::sites::Sites;
-use stokehold_http::{HttpLimits, HttpListener, TlsSettings};
+use stokehold_http::{HttpLimits, HttpListener, ListenerSettings, TlsSettings};
 use stokehold_server::Dispatcher;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -117,12 +117,11 @@ async fn start(config: Config, config_dir: &Path) -> SocketAddr {
         dispatcher,
         sites,
         HttpLimits::default(),
-        Some(TlsSettings {
-            config: &config,
-            config_dir,
+        ListenerSettings {
+            tls: Some(TlsSettings { config: &config, config_dir }),
             redirect_to_https: false,
             https_port: None,
-        }),
+        },
     )
     .await
     .expect("bind with TLS");
@@ -412,6 +411,26 @@ async fn a_1_3_floor_still_serves_a_1_3_client() {
 }
 
 #[tokio::test]
+async fn a_redirect_does_not_turn_a_plaintext_listener_into_a_tls_port() {
+    // The bug this pins, found by running the split :80/:443 shape rather than by reading it:
+    // the redirect was originally derived from the presence of TLS settings, so the plaintext
+    // listener built an acceptor and stopped answering cleartext at all. A client would have
+    // seen a connection that accepted and then hung or failed, with nothing in the log.
+    let cert = Cert::new("noregress", "example.test");
+    let config = write_config(&cert, "");
+    let addr = start_plaintext_redirecting(config, cert.dir(), Some(443)).await;
+
+    let response = fetch_cleartext_with_host(addr, "example.test")
+        .await
+        .expect("a plaintext listener with a redirect must still answer cleartext");
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 301"),
+        "and it must answer with the redirect, not a TLS alert: {text}"
+    );
+}
+
+#[tokio::test]
 async fn redirect_to_https_answers_cleartext_with_a_301() {
     // The redirect must name the https port, not the port the request arrived on — otherwise it
     // sends the client back to the plaintext port it just used, which is a loop.
@@ -457,7 +476,7 @@ async fn redirect_on_the_default_port_leaves_it_out_of_the_location() {
     // also the shape a split :80/:443 deployment uses, where `https_port` is what matters.
     let cert = Cert::new("redirect443", "example.test");
     let config = write_config(&cert, "plain = true");
-    let addr = start_redirecting_to(config, cert.dir(), Some(443)).await;
+    let addr = start_plaintext_redirecting(config, cert.dir(), Some(443)).await;
 
     let response = fetch_cleartext_with_host(addr, "example.test")
         .await
@@ -496,16 +515,32 @@ async fn a_redirect_keeps_the_path_and_query() {
     );
 }
 
-/// Start a listener with the redirect turned on, which `write_config` does not set.
+/// Start a listener that serves TLS **and** redirects cleartext on the same port.
+///
+/// The `plain = true` shape: one socket carries both protocols, and only the cleartext half is
+/// redirected.
 async fn start_redirecting(config: Config, config_dir: &Path) -> SocketAddr {
-    start_redirecting_to(config, config_dir, None).await
+    start_redirecting_to(config, config_dir, None, true).await
 }
 
-/// [`start_redirecting`], naming the https port a redirect should reach.
+/// Start a plaintext-only listener that redirects, which is the split `:80`/`:443` shape.
+///
+/// No acceptor, deliberately: this listener must answer cleartext, and giving it TLS settings
+/// would have made it a TLS port that no cleartext client could reach. That is the bug this
+/// separate constructor exists to keep out of the tests.
+async fn start_plaintext_redirecting(
+    config: Config,
+    config_dir: &Path,
+    https_port: Option<u16>,
+) -> SocketAddr {
+    start_redirecting_to(config, config_dir, https_port, false).await
+}
+
 async fn start_redirecting_to(
     config: Config,
     config_dir: &Path,
     https_port: Option<u16>,
+    with_tls: bool,
 ) -> SocketAddr {
     let sites = Arc::new(Sites::from_config(&config, config_dir));
     let dispatcher = Arc::new(
@@ -517,12 +552,14 @@ async fn start_redirecting_to(
         dispatcher,
         sites,
         HttpLimits::default(),
-        Some(TlsSettings {
-            config: &config,
-            config_dir,
+        ListenerSettings {
+            tls: with_tls.then_some(TlsSettings {
+                config: &config,
+                config_dir,
+            }),
             redirect_to_https: true,
             https_port,
-        }),
+        },
     )
     .await
     .expect("bind with redirect");
@@ -563,3 +600,6 @@ fn base64_decode(input: &str) -> Vec<u8> {
     }
     out
 }
+
+
+

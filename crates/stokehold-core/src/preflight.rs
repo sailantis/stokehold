@@ -158,19 +158,6 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                     ));
                 }
             }
-            BackendConfig::SpawnFpm(fpm) => {
-                // `serve` refuses `spawn_fpm` outright, so the file check is not
-                // the whole story for this backend. Saying so here is what keeps
-                // `check` and `serve` from disagreeing about a configuration that
-                // is unbuildable for a reason other than a missing file.
-                warnings.push(Warning::with_hint(
-                    format!(
-                        "backends.{name}: spawn_fpm is not implemented; {} will not be started",
-                        fpm.binary.display()
-                    ),
-                    "point at a running php-fpm with `kind = \"external\"` instead",
-                ));
-            }
             BackendConfig::External(external) => {
                 // Nothing to look for on disk: the socket belongs to another
                 // process, and whether it is there yet is not a configuration
@@ -322,40 +309,27 @@ binary = "C:/definitely/not/php-cgi.exe"
         );
     }
 
-    /// `serve` refuses `spawn_fpm` outright, so a file that asks for it must be
-    /// reported as unbuildable even though its `binary` is present. Without this
-    /// the warning would be conditional on the file check and `check` would call
-    /// a configuration OK that `serve` cannot start.
+    /// The `spawn_fpm` key is gone, and a file that still carries it must be rejected
+    /// by name rather than parsed into something else.
+    ///
+    /// It used to be accepted and then refused at startup, with `check` warning that it
+    /// would not be started — a key that looked supported and could not work. `deny_unknown_fields`
+    /// on the backend table is what turns that into an error at the point the file is
+    /// read, which is where a removed setting should be noticed.
     #[test]
-    fn the_unimplemented_spawn_fpm_backend_is_reported() {
-        let root = Fixture::new("spawn-fpm");
-        root.write("index.php");
-        let exe = std::env::current_exe().expect("the test binary path");
-        let text = format!(
-            r#"
+    fn the_removed_spawn_fpm_backend_is_rejected_by_name() {
+        let text = r#"
 default_backend = "fpm"
 [server]
 http = "127.0.0.1:8080"
 [backends.fpm]
 kind = "spawn_fpm"
-binary = "{}"
-"#,
-            exe.display().to_string().replace('\\', "\\\\")
-        );
-        let config = Config::from_toml(&text).expect("config parses");
-        let warnings = inspect(&config, root.path());
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+binary = "/usr/sbin/php-fpm"
+"#;
+        let err = Config::from_toml(text).expect_err("the key must be rejected");
         assert!(
-            warnings[0].message.contains("not implemented"),
-            "{warnings:?}"
-        );
-        assert!(
-            warnings[0]
-                .hint
-                .as_deref()
-                .unwrap_or_default()
-                .contains("external"),
-            "the hint must say what to use instead: {warnings:?}"
+            err.to_string().contains("spawn_fpm"),
+            "the message must name the key that was removed: {err}"
         );
     }
 

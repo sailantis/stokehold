@@ -198,14 +198,6 @@ impl Backend {
                 name: name.to_string(),
                 pool: WorkerPool::start(name, worker)?,
             }),
-            BackendConfig::SpawnFpm(fpm) => Err(ServerError::Misconfigured {
-                backend: name.to_string(),
-                reason: format!(
-                    "spawn_fpm is not implemented yet (binary {}); point at a running php-fpm with \
-                     kind = \"external\" instead",
-                    fpm.binary.display()
-                ),
-            }),
         }
     }
 
@@ -421,16 +413,22 @@ mod tests {
     }
 
     #[test]
-    fn spawn_fpm_explains_what_to_do_instead() {
-        let err = Backend::from_config(
-            "own",
-            &BackendConfig::SpawnFpm(stokehold_core::config::SpawnFpmConfig {
-                binary: std::path::PathBuf::from("/usr/sbin/php-fpm"),
-                config: None,
-                socket: None,
-            }),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("external"), "{err}");
+    fn spawn_fpm_is_no_longer_a_backend_shape() {
+        // It was accepted by the parser and then refused by `Backend::from_config`, so the
+        // failure arrived at startup rather than where the file was read. Now that the
+        // variant is gone the file cannot be written at all, which is the point of a
+        // removed key: it should be noticed by whoever wrote it.
+        let text = r#"
+default_backend = "own"
+[server]
+http = "127.0.0.1:8080"
+[backends.own]
+kind = "spawn_fpm"
+binary = "/usr/sbin/php-fpm"
+"#;
+        assert!(
+            stokehold_core::config::Config::from_toml(text).is_err(),
+            "spawn_fpm must not parse"
+        );
     }
 }

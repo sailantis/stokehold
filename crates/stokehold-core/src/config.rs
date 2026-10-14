@@ -586,7 +586,14 @@ fn default_max_multirange() -> u64 {
     1024 * 1024
 }
 
-/// A backend is one of four shapes, tagged by `kind` in TOML.
+/// A backend is one of three shapes, tagged by `kind` in TOML.
+///
+/// There was a fourth, `spawn_fpm`, which stokehold would have started itself. It was
+/// never implemented — `Dispatcher` refused it — while `stokehold version` advertised it
+/// and the preflight check warned that it would not start, so the key looked supported
+/// and could not work. It is gone rather than built: `docs/plan.md` §9 says not to
+/// reimplement what php-fpm already does, and `external` attaches to the php-fpm that
+/// systemd already supervises, which is the better version of the same feature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendConfig {
@@ -594,8 +601,6 @@ pub enum BackendConfig {
     Worker(WorkerConfig),
     /// An already-running php-fpm (systemd-managed). Linux/macOS default.
     External(ExternalConfig),
-    /// stokehold starts php-fpm itself; php-fpm still manages its own children.
-    SpawnFpm(SpawnFpmConfig),
     /// N `php-cgi` processes on N ports. The only option on Windows.
     SpawnCgi(SpawnCgiConfig),
 }
@@ -605,7 +610,6 @@ impl BackendConfig {
         match self {
             BackendConfig::Worker(_) => "worker",
             BackendConfig::External(_) => "external",
-            BackendConfig::SpawnFpm(_) => "spawn_fpm",
             BackendConfig::SpawnCgi(_) => "spawn_cgi",
         }
     }
@@ -768,21 +772,6 @@ impl ChecksumMode {
 pub struct ExternalConfig {
     /// php-fpm listener: `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`.
     pub socket: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SpawnFpmConfig {
-    /// php-fpm binary.
-    pub binary: PathBuf,
-
-    /// php-fpm configuration file to pass with `--fpm-config`.
-    #[serde(default)]
-    pub config: Option<PathBuf>,
-
-    /// Listener php-fpm will bind, used by stokehold to reach it.
-    #[serde(default)]
-    pub socket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1065,12 +1054,6 @@ impl Config {
             BackendConfig::External(e) => {
                 parse_listener(&e.socket)
                     .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
-            }
-            BackendConfig::SpawnFpm(f) => {
-                if let Some(socket) = &f.socket {
-                    parse_listener(socket)
-                        .map_err(|err| Error::Config(format!("backends.{name}.socket: {err}")))?;
-                }
             }
             BackendConfig::SpawnCgi(c) => {
                 if let Some(socket) = &c.socket {

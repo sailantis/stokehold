@@ -132,7 +132,7 @@ fn version() {
         "  php floor:        {}",
         stokehold_server::MINIMUM_PHP_VERSION
     );
-    println!("  backends:         worker, external fpm, spawn_fpm, spawn_cgi");
+    println!("  backends:         worker, external fpm, spawn_cgi");
 }
 
 fn init_tracing(verbosity: u8) {

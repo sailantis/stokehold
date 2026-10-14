@@ -7,10 +7,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
-use stokehold_core::config::Config;
+use stokehold_core::config::{Config, MinTlsVersion};
 use stokehold_core::php;
-use stokehold_core::sites::Sites;
-use stokehold_fcgi::cgi::Routing;
+use stokehold_core::sites::Sites;use stokehold_fcgi::cgi::Routing;
 use stokehold_http::{HttpLimits, RunningHttp};
 use stokehold_server::{Contention, Dispatcher, FastCgiListener, Limits, ServerError};
 
@@ -199,6 +198,59 @@ fn absolute_document_root(root: &Path) -> PathBuf {
         .unwrap_or_else(|_| root.to_path_buf())
 }
 
+/// Resolve a TLS path against the directory holding the config file.
+///
+/// Deliberately **not** the document-root rule, which is relative to the process's working
+/// directory. A certificate beside `stokehold.toml` is the common case, and resolving it
+/// against wherever the process happened to start is a footgun with a security consequence:
+/// the server would start with whatever certificate it found, or fail to start at all, for a
+/// reason invisible in the file. An absolute path is used as written.
+fn resolve_tls_path(path: &Path, config_path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match config_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(path),
+        // A bare filename such as `stokehold.toml` has an empty parent, which means the
+        // working directory — the same answer `Path::parent` gives and the one a reader
+        // expects.
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Absolute certificate and key for the server's own TLS settings.
+fn resolved_server_tls(config: &Config, config_path: &Path) -> Option<TlsPaths> {
+    let tls = config.server.tls.as_ref()?;
+    Some(TlsPaths {
+        certificate: resolve_tls_path(&tls.certificate, config_path),
+        key: resolve_tls_path(&tls.key, config_path),
+    })
+}
+
+/// Resolved certificate and key paths.
+struct TlsPaths {
+    certificate: PathBuf,
+    key: PathBuf,
+}
+
+/// Every `(site name, paths)` that states its own certificate, resolved.
+fn resolved_site_tls(config: &Config, config_path: &Path) -> Vec<(String, TlsPaths)> {
+    config
+        .sites
+        .iter()
+        .filter_map(|(name, site)| {
+            let tls = site.tls.as_ref()?;
+            Some((
+                name.clone(),
+                TlsPaths {
+                    certificate: resolve_tls_path(&tls.certificate, config_path),
+                    key: resolve_tls_path(&tls.key, config_path),
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Run the configured listeners until interrupted.
 ///
 /// Both front-ends share one dispatcher, so a request gets the same backend
@@ -304,7 +356,7 @@ fn serve(
     // front controller PHP will not run, and noticing it in the log is worth
     // more than the process refusing to start. Only in the log, so a deployment
     // that creates the root during startup still works.
-    for warning in stokehold_core::preflight::inspect(&config, &document_root) {
+    for warning in stokehold_core::preflight::inspect_with(&config, &document_root, Some(path)) {
         tracing::warn!("{}", warning.message);
         if let Some(hint) = &warning.hint {
             tracing::warn!("  {hint}");
@@ -486,9 +538,52 @@ fn check(
         Some(http) => println!("    http:    {http}"),
         None => println!("    http:    (disabled)"),
     }
+    match &config.server.https {
+        Some(https) => println!("    https:   {https}"),
+        None => println!("    https:   (disabled)"),
+    }
     match &config.server.fastcgi {
         Some(fcgi) => println!("    fastcgi: {fcgi}"),
         None => println!("    fastcgi: (disabled)"),
+    }
+
+    // TLS, and which paths were actually resolved. The resolution is printed rather than
+    // assumed because a certificate path is the one setting whose *file* the reader cannot
+    // see from the config: `certs/a.crt` is relative to this file, not to wherever the
+    // process started.
+    match resolved_server_tls(&config, path) {
+        Some(server_tls) => {
+            let tls = config.server.tls.as_ref().expect("resolved implies present");
+            println!("  tls:");
+            println!("    certificate:      {}", server_tls.certificate.display());
+            println!("    key:              {}", server_tls.key.display());
+            println!(
+                "    min version:      {}",
+                match tls.min_version {
+                    MinTlsVersion::V1_2 => "1.2",
+                    MinTlsVersion::V1_3 => "1.3",
+                }
+            );
+            println!("    alpn:             {}", tls.alpn.join(", "));
+            if tls.plain {
+                println!(
+                    "    plain:            true (cleartext and TLS share the http port — \
+                     accept it knowingly)"
+                );
+            } else {
+                println!("    plain:            false");
+            }
+            if config.server.redirect_to_https {
+                println!("    redirect_to_https: true");
+            }
+        }
+        None => println!("  tls:              (disabled)"),
+    }
+    // A site's certificate is printed only when the site states one, for the same reason the
+    // site table prints only stated keys: listing the inherited value per site would read as
+    // though every site had been configured with it.
+    for (name, site_tls) in resolved_site_tls(&config, path) {
+        println!("    site {name}:        {}", site_tls.certificate.display());
     }
 
     println!("  document root: {}", document_root.display());
@@ -654,7 +749,7 @@ fn check(
     // Warnings, not errors: every one of these is a normal intermediate state on
     // the way to a working deployment, and refusing to report anything else
     // because the root is not there yet would be the wrong trade.
-    let warnings = stokehold_core::preflight::inspect(&config, &document_root);
+    let warnings = stokehold_core::preflight::inspect_with(&config, &document_root, Some(path));
     if !warnings.is_empty() {
         println!("  warnings:");
         for warning in &warnings {

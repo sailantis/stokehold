@@ -93,6 +93,14 @@ pub struct SiteConfig {
     /// `ServeOnly::All`.
     #[serde(default)]
     pub serve_only: Option<ServeOnly>,
+
+    /// This site's own certificate, presented by SNI for the site's hosts.
+    ///
+    /// Absent inherits `[server.tls]`. This is the only per-site TLS setting, because it is
+    /// the only one that is a statement about the site rather than about the socket; see
+    /// [`SiteTlsConfig`].
+    #[serde(default)]
+    pub tls: Option<SiteTlsConfig>,
 }
 
 /// What a deployment serves.
@@ -534,8 +542,26 @@ impl Config {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// HTTP listener, e.g. `127.0.0.1:8080`.
+    ///
+    /// With no `[server.tls]` this listener is plaintext. With `[server.tls]` present and
+    /// no `https`, TLS wraps *this* listener, and `[server.tls].plain` decides whether it
+    /// also answers cleartext on the same port.
     #[serde(default)]
     pub http: Option<String>,
+
+    /// HTTPS listener, e.g. `0.0.0.0:443`.
+    ///
+    /// A second, independently bound listener that speaks TLS only. Setting it frees
+    /// `http` to stay plaintext, which is what an `:80` and `:443` deployment needs — and
+    /// what ACME's HTTP-01 challenge and an `:80` → `:443` redirect need, because those
+    /// are the only parts of TLS that genuinely require a particular port.
+    ///
+    /// Requires `[server.tls]`: a TLS listener with no certificate is an error, not a
+    /// listener that fails every handshake. Setting it together with `[server.tls].plain`
+    /// is also an error — the port is already dedicated, so the same-port sniff would have
+    /// nothing to decide.
+    #[serde(default)]
+    pub https: Option<String>,
 
     /// FastCGI listener, e.g. `127.0.0.1:9000` or `unix:/run/stokehold.sock`.
     #[serde(default)]
@@ -576,10 +602,36 @@ pub struct ServerConfig {
     /// What this deployment serves; see [`ServeOnly`]. Defaults to everything.
     #[serde(default)]
     pub serve_only: ServeOnly,
+
+    /// TLS settings. **Presence of this table is what turns TLS on.**
+    ///
+    /// No separate `enabled` boolean, deliberately: a flag and a certificate are two
+    /// statements about one thing, and they can disagree. A table without both a
+    /// certificate and a key is rejected instead.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+
+    /// Answer cleartext requests on `http` with a `301` to the `https://` equivalent.
+    ///
+    /// Off by default: it changes what an existing cleartext deployment does, and a
+    /// redirect is a deployment's decision rather than a server's. Only meaningful when
+    /// there is a plaintext listener to redirect *from* — with TLS on `http` and
+    /// `plain = false`, that listener only ever answers TLS, so setting this is an error
+    /// rather than a silently inert key.
+    #[serde(default)]
+    pub redirect_to_https: bool,
 }
 
 /// The front controller used when neither the config nor the command line says.
 pub const DEFAULT_FRONT_CONTROLLER: &str = "index.php";
+
+/// ALPN protocol names this server understands.
+///
+/// Checked by name rather than passed through, because an unknown identifier is accepted by
+/// rustls and then never selected by anyone: the listener would look configured and answer
+/// only whatever a client happened to offer. `h2` and `http/1.1` are the two it can actually
+/// serve.
+pub const KNOWN_ALPN: [&str; 2] = ["h2", "http/1.1"];
 
 impl ServerConfig {
     /// The effective front controller, or `None` for "serve only real files".
@@ -610,6 +662,107 @@ impl ServerConfig {
             ..StaticConfig::default()
         })
     }
+
+    /// Whether a plaintext listener exists to redirect *from*.
+    ///
+    /// Two shapes have one: `http` + `https`, and TLS on `http` with `plain = true`. With
+    /// TLS on `http` alone, that socket never answers cleartext, so `redirect_to_https` has
+    /// nothing to act on.
+    pub fn has_plaintext_listener(&self) -> bool {
+        let Some(tls) = &self.tls else {
+            return false;
+        };
+        if self.https.is_some() {
+            return self.http.is_some();
+        }
+        tls.plain
+    }
+}
+
+/// TLS settings.
+///
+/// **The presence of this table is what turns TLS on.** There is deliberately no `enabled`
+/// key: a flag and a certificate are two statements about the same thing, and two statements
+/// can disagree — so a table without a usable certificate is an error instead.
+///
+/// A relative `certificate`/`key` is resolved against **the directory holding the config
+/// file**, which is a deliberate exception to `document_root`'s rule (that one is relative to
+/// the process's working directory). A certificate beside `stokehold.toml` is the common
+/// case, and resolving it against wherever the process happened to start would be a footgun
+/// with a security consequence. `stokehold check` prints the path it resolved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain, leaf first.
+    pub certificate: PathBuf,
+
+    /// PEM private key (PKCS#8, PKCS#1 or SEC1).
+    pub key: PathBuf,
+
+    /// Lowest protocol version accepted: `"1.2"` (the default) or `"1.3"`.
+    ///
+    /// Stated as a string rather than a number because `1.2` and `1.3` are names of
+    /// protocol versions, not decimals, and `1.10` must never be expressible.
+    #[serde(default)]
+    pub min_version: MinTlsVersion,
+
+    /// ALPN protocols to advertise, in preference order.
+    ///
+    /// `http/1.1` must not be dropped: a client that cannot do `h2` must still connect, and
+    /// a listener that advertises only `h2` fails that handshake rather than downgrading.
+    #[serde(default = "default_alpn")]
+    pub alpn: Vec<String>,
+
+    /// Also answer cleartext HTTP on the same port as TLS.
+    ///
+    /// Off by default, and it should stay off unless something needs it. It exists for a
+    /// deployment behind an upstream proxy that forwards cleartext to `:443`, and for a
+    /// migration period — not as a convenience. Accepting cleartext on a port that clients
+    /// believe is encrypted is a security decision, so it is explicit, it is logged loudly at
+    /// startup, and it is an error beside `https` (that port is already dedicated, so the
+    /// sniff would have nothing to decide).
+    ///
+    /// A **detection, not a downgrade**: the first byte picks which of two paths a connection
+    /// takes (a TLS record always begins `0x16`; a plaintext request begins an ASCII method
+    /// letter). A client that offers TLS and fails the handshake still fails — there is no
+    /// fallback to cleartext on a handshake error.
+    #[serde(default)]
+    pub plain: bool,
+}
+
+/// The `[sites.<name>.tls]` override.
+///
+/// Only the certificate and key can differ per site, because SNI is the whole reason a
+/// per-site table exists: the name is claimed before any request is read, so a per-site
+/// setting here can only be about *which certificate is presented*. `min_version`, `alpn`
+/// and `plain` are properties of the socket the connection arrived on, so a per-site value
+/// would describe something the socket does not do — setting one is an error rather than a
+/// silently ignored key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteTlsConfig {
+    /// PEM certificate chain for this site's hosts, leaf first.
+    pub certificate: PathBuf,
+
+    /// PEM private key for this site's hosts.
+    pub key: PathBuf,
+}
+
+/// The lowest TLS protocol version accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MinTlsVersion {
+    /// TLS 1.2 — the default. TLS 1.3 clients still negotiate 1.3; this is a floor.
+    #[default]
+    #[serde(rename = "1.2")]
+    V1_2,
+    /// TLS 1.3 only.
+    #[serde(rename = "1.3")]
+    V1_3,
+}
+
+/// ALPN default: HTTP/2 preferred, HTTP/1.1 always offered.
+fn default_alpn() -> Vec<String> {
+    vec!["h2".to_string(), "http/1.1".to_string()]
 }
 
 /// How files under the document root are served.
@@ -952,9 +1105,11 @@ impl Config {
 
     /// Reject configurations that cannot work, with actionable messages.
     pub fn validate(&self) -> Result<()> {
-        if self.server.http.is_none() && self.server.fastcgi.is_none() {
+        if self.server.http.is_none() && self.server.fastcgi.is_none() && self.server.https.is_none()
+        {
             return Err(Error::Config(
-                "no listener configured: set server.http and/or server.fastcgi".to_string(),
+                "no listener configured: set server.http, server.https and/or server.fastcgi"
+                    .to_string(),
             ));
         }
 
@@ -964,6 +1119,11 @@ impl Config {
         if let Some(fastcgi) = &self.server.fastcgi {
             parse_listener(fastcgi).map_err(|e| Error::Config(format!("server.fastcgi: {e}")))?;
         }
+        if let Some(https) = &self.server.https {
+            parse_listener(https).map_err(|e| Error::Config(format!("server.https: {e}")))?;
+        }
+
+        self.validate_tls()?;
 
         for (name, backend) in &self.backends {
             self.validate_backend(name, backend)?;
@@ -1075,6 +1235,138 @@ impl Config {
         }
 
         self.validate_sites()?;
+
+        Ok(())
+    }
+
+    /// Validate the TLS settings, and the listener arrangements they have to agree with.
+    ///
+    /// Every rule here exists because the alternative is a configuration that parses, reports
+    /// nothing, and then does something the file does not say — a listener that accepts and
+    /// fails every handshake, or a per-site key that silently has no effect.
+    fn validate_tls(&self) -> Result<()> {
+        let Some(tls) = &self.server.tls else {
+            // No `[server.tls]`: TLS is not configured, so a listener that needs it is the
+            // mistake to report. Saying so by name is the difference between "why does my
+            // https listener fail every handshake" and a config error.
+            if self.server.https.is_some() {
+                return Err(Error::Config(
+                    "server.https is set but [server.tls] is not; an HTTPS listener needs a \
+                     certificate, so add [server.tls] with a certificate and key"
+                        .to_string(),
+                ));
+            }
+            if self.sites.values().any(|site| site.tls.is_some()) {
+                let name = self
+                    .sites
+                    .iter()
+                    .find(|(_, site)| site.tls.is_some())
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_default();
+                return Err(Error::Config(format!(
+                    "sites.{name}.tls is set but [server.tls] is not; a per-site certificate \
+                     overrides the server's, so the server needs one first"
+                )));
+            }
+            if self.server.redirect_to_https {
+                return Err(Error::Config(
+                    "server.redirect_to_https is set but [server.tls] is not, so there is no \
+                     HTTPS endpoint to redirect to"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        };
+
+        if tls.certificate.as_os_str().is_empty() {
+            return Err(Error::Config(
+                "server.tls.certificate is empty; name the PEM file".to_string(),
+            ));
+        }
+        if tls.key.as_os_str().is_empty() {
+            return Err(Error::Config(
+                "server.tls.key is empty; name the PEM file".to_string(),
+            ));
+        }
+
+        for protocol in &tls.alpn {
+            if protocol.is_empty() {
+                return Err(Error::Config(
+                    "server.tls.alpn contains an empty protocol; name one, or remove the key to \
+                     get the default"
+                        .to_string(),
+                ));
+            }
+            if !KNOWN_ALPN.contains(&protocol.as_str()) {
+                return Err(Error::Config(format!(
+                    "server.tls.alpn {protocol:?} is not a known protocol; expected one of \
+                     {KNOWN_ALPN:?}"
+                )));
+            }
+        }
+        if tls.alpn.iter().any(|p| p == "h2") && !tls.alpn.iter().any(|p| p == "http/1.1") {
+            // Not fatal — a deployment may genuinely want h2 only — but it is nearly always a
+            // mistake with an invisible cost: a client that cannot do h2 fails the handshake
+            // rather than being served HTTP/1.1.
+            tracing::warn!(
+                "server.tls.alpn offers \"h2\" without \"http/1.1\"; a client that cannot do \
+                 HTTP/2 will fail the handshake rather than being served HTTP/1.1"
+            );
+        }
+
+        match (&self.server.http, &self.server.https) {
+            (None, None) => {
+                return Err(Error::Config(
+                    "[server.tls] is set but no listener carries it: set server.http (TLS on \
+                     that port) and/or server.https"
+                        .to_string(),
+                ));
+            }
+            (Some(http), Some(https)) if http == https => {
+                return Err(Error::Config(format!(
+                    "server.http and server.https are both {http:?}; they are two listeners, so \
+                     they need two addresses"
+                )));
+            }
+            (Some(_), Some(_)) if tls.plain => {
+                return Err(Error::Config(
+                    "[server.tls].plain is set together with server.https; the plaintext \
+                     listener is already server.http, so the sniff has nothing to decide \
+                     — remove one of them"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+        // A site's own table may only change which certificate is presented, because the name
+        // is claimed before any request exists. Anything else here would describe something the
+        // socket does not do, so it is refused rather than ignored.
+        for (name, site) in &self.sites {
+            let Some(site_tls) = &site.tls else { continue };
+            if site_tls.certificate.as_os_str().is_empty() {
+                return Err(Error::Config(format!(
+                    "sites.{name}.tls.certificate is empty; name the PEM file, or remove the \
+                     table to inherit [server.tls]"
+                )));
+            }
+            if site_tls.key.as_os_str().is_empty() {
+                return Err(Error::Config(format!(
+                    "sites.{name}.tls.key is empty; name the PEM file, or remove the table to \
+                     inherit [server.tls]"
+                )));
+            }
+        }
+
+        // A redirect needs a plaintext listener to redirect *from*. With TLS on `http` and
+        // `plain` off, that socket never answers cleartext, so the key could never fire.
+        if self.server.redirect_to_https && !self.server.has_plaintext_listener() {
+            return Err(Error::Config(
+                "server.redirect_to_https is set but nothing serves cleartext: with TLS on \
+                 server.http, set [server.tls].plain = true, or add a server.https listener \
+                 so server.http stays plaintext"
+                    .to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -2493,5 +2785,325 @@ front_controller = true
         let config = Config::from_toml(text).expect("parses");
         let err = config.validate().expect_err("must fail");
         assert!(err.to_string().contains("front_controller"), "{err}");
+    }
+
+    // ---- TLS -------------------------------------------------------------------------
+
+    /// A config with TLS on `http`, so a test can vary one key at a time.
+    fn tls_config(extra: &str) -> String {
+        format!(
+            r#"
+[server]
+http = "127.0.0.1:443"
+
+[server.tls]
+certificate = "certs/default.crt"
+key = "certs/default.key"
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn a_tls_table_with_both_paths_is_accepted() {
+        let config = Config::from_toml(&tls_config("")).expect("parses");
+        config.validate().expect("a certificate and key are enough");
+
+        let tls = config.server.tls.as_ref().expect("tls present");
+        assert_eq!(tls.min_version, MinTlsVersion::V1_2, "1.2 is the floor by default");
+        assert_eq!(tls.alpn, ["h2", "http/1.1"], "http/1.1 must not be dropped");
+        assert!(!tls.plain, "accepting cleartext on a TLS port is opt-in");
+        assert!(!config.server.redirect_to_https, "a redirect is a deployment's decision");
+    }
+
+    #[test]
+    fn a_tls_table_missing_a_key_is_refused_rather_than_defaulted() {
+        // `deny_unknown_fields` plus a required field means the *absence* of `key` is
+        // caught by serde, before any of `validate_tls` runs. That is the right layer —
+        // a table that says "TLS on" but names no key cannot be given a sensible default.
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+
+[server.tls]
+certificate = "certs/default.crt"
+"#;
+        let err = Config::from_toml(text).expect_err("a key is required");
+        assert!(err.to_string().contains("key"), "{err}");
+    }
+
+    #[test]
+    fn https_without_a_tls_table_is_refused_by_name() {
+        let text = r#"
+[server]
+http = "127.0.0.1:80"
+https = "127.0.0.1:443"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("server.https"), "{err}");
+        assert!(err.to_string().contains("[server.tls]"), "{err}");
+    }
+
+    #[test]
+    fn a_tls_table_with_no_listener_carrying_it_is_refused() {
+        let text = r#"
+[server]
+fastcgi = "127.0.0.1:9000"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("no listener carries it"), "{err}");
+    }
+
+    #[test]
+    fn plain_and_https_together_are_refused() {
+        // With a dedicated HTTPS port, cleartext already has a home: the `http` listener.
+        // The sniff would have nothing to decide, so this is a contradiction rather than a
+        // harmless redundancy.
+        let text = r#"
+[server]
+http = "127.0.0.1:80"
+https = "127.0.0.1:443"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+plain = true
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("plain"), "{err}");
+        assert!(err.to_string().contains("server.https"), "{err}");
+    }
+
+    #[test]
+    fn http_and_https_on_the_same_address_are_refused() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+https = "127.0.0.1:443"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("two listeners"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_alpn_protocol_is_refused_by_name() {
+        // Accepted by rustls and then never selected by anyone, which would leave a
+        // listener that looks configured and answers only what a client offered.
+        let config = Config::from_toml(&tls_config(r#"alpn = ["h2", "spdy/3"]"#)).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("spdy/3"), "{err}");
+    }
+
+    #[test]
+    fn h2_without_http11_is_allowed_but_warned_about() {
+        // Not fatal: a deployment may deliberately serve only HTTP/2. It is nearly always
+        // a mistake though, because a client that cannot do h2 fails the handshake rather
+        // than being served HTTP/1.1 — so it validates and the warning is the signal.
+        let config = Config::from_toml(&tls_config(r#"alpn = ["h2"]"#)).expect("parses");
+        config.validate().expect("h2 alone is a deliberate choice, not an error");
+    }
+
+    #[test]
+    fn a_per_site_tls_table_needs_the_server_one_first() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "/srv/shop"
+
+[sites.shop.tls]
+certificate = "shop.crt"
+key = "shop.key"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("shop.tls"), "{err}");
+        assert!(err.to_string().contains("server.tls"), "{err}");
+    }
+
+    #[test]
+    fn a_per_site_certificate_overrides_the_servers() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+
+[server.tls]
+certificate = "default.crt"
+key = "default.key"
+
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "/srv/shop"
+
+[sites.shop.tls]
+certificate = "shop.crt"
+key = "shop.key"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("a per-site certificate is the SNI case");
+
+        let site = config.sites.get("shop").expect("site present");
+        assert_eq!(
+            site.tls.as_ref().map(|t| t.certificate.as_path()),
+            Some(Path::new("shop.crt")),
+            "the site states its own certificate"
+        );
+    }
+
+    #[test]
+    fn a_per_site_handshake_key_is_refused_rather_than_ignored() {
+        // `min_version` describes the socket, and SNI cannot change what the socket did
+        // before the request existed. Accepting it would let a site claim something the
+        // listener does not do.
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+
+[server.tls]
+certificate = "default.crt"
+key = "default.key"
+
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "/srv/shop"
+
+[sites.shop.tls]
+certificate = "shop.crt"
+key = "shop.key"
+min_version = "1.3"
+"#;
+        let err = Config::from_toml(text).expect_err("unknown key in the site tls table");
+        assert!(err.to_string().contains("min_version"), "{err}");
+    }
+
+    #[test]
+    fn a_redirect_needs_something_serving_cleartext() {
+        // With TLS on `http` and `plain` off, that socket never answers cleartext, so the
+        // key could never fire — refused rather than silently inert.
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+redirect_to_https = true
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("redirect_to_https"), "{err}");
+        assert!(err.to_string().contains("cleartext"), "{err}");
+    }
+
+    #[test]
+    fn a_redirect_is_accepted_when_a_plaintext_listener_exists() {
+        // Two shapes qualify: a dedicated `https` listener beside a plain `http` one, or
+        // TLS on `http` with `plain = true`.
+        let with_https = r#"
+[server]
+http = "127.0.0.1:80"
+https = "127.0.0.1:443"
+redirect_to_https = true
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+"#;
+        Config::from_toml(with_https)
+            .expect("parses")
+            .validate()
+            .expect("a dedicated https listener leaves http plaintext");
+
+        let with_plain = r#"
+[server]
+http = "127.0.0.1:443"
+redirect_to_https = true
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+plain = true
+"#;
+        Config::from_toml(with_plain)
+            .expect("parses")
+            .validate()
+            .expect("plain = true gives the redirect something to fire on");
+    }
+
+    #[test]
+    fn redirect_without_tls_at_all_is_refused() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+redirect_to_https = true
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("redirect_to_https"), "{err}");
+    }
+
+    #[test]
+    fn a_plaintext_deployment_is_unchanged_by_any_of_this() {
+        // The control: no `[server.tls]`, no `https`, no redirect — exactly the config
+        // shape that existed before TLS, and it must still validate and carry no TLS.
+        let config = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("parses");
+        config.validate().expect("valid");
+        assert!(config.server.tls.is_none());
+        assert!(config.server.https.is_none());
+        assert!(!config.server.redirect_to_https);
+    }
+
+    #[test]
+    fn has_plaintext_listener_matches_the_documented_matrix() {
+        let bare = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("parses");
+        assert!(!bare.server.has_plaintext_listener());
+
+        let tls_only = Config::from_toml(&tls_config("")).expect("parses");
+        assert!(!tls_only.server.has_plaintext_listener(), "h2-only TLS on http");
+
+        let tls_plain = Config::from_toml(&tls_config("plain = true")).expect("parses");
+        assert!(tls_plain.server.has_plaintext_listener());
+
+        let both = Config::from_toml(
+            r#"
+[server]
+http = "127.0.0.1:80"
+https = "127.0.0.1:443"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+"#,
+        )
+        .expect("parses");
+        assert!(both.server.has_plaintext_listener());
+
+        let https_only = Config::from_toml(
+            r#"
+[server]
+https = "127.0.0.1:443"
+
+[server.tls]
+certificate = "c.crt"
+key = "c.key"
+"#,
+        )
+        .expect("parses");
+        assert!(!https_only.server.has_plaintext_listener(), "TLS only");
+        https_only.validate().expect("a TLS-only deployment is valid");
     }
 }

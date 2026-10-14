@@ -27,6 +27,56 @@ fastcgi = "127.0.0.1:9080"
 # front_controller = "index.php"
 
 # ---------------------------------------------------------------------------
+# TLS. The presence of `[server.tls]` is what turns it on -- there is no
+# `enabled` flag, because a flag and a certificate are two statements about one
+# thing and two statements can disagree.
+#
+# A relative certificate/key path is resolved against the directory holding this
+# file (not the process's working directory, which is the rule document_root
+# follows). `stokehold check` prints the path it resolved.
+#
+# Three shapes, all supported:
+#
+#   1. TLS only, on `http`:
+#        [server]  http = "0.0.0.0:443"
+#        [server.tls]  ...                      (plain = false, the default)
+#
+#   2. Plain and TLS on ONE port. A TLS record always begins with the byte 0x16
+#      and a plaintext request begins an ASCII method letter, so the first byte
+#      decides which of two paths a connection takes. This is what nginx's
+#      ssl_preread does. It is NOT a downgrade: a client that offers TLS and
+#      fails the handshake still fails.
+#        [server]  http = "0.0.0.0:443"
+#        [server.tls]  plain = true
+#
+#   3. Plain on :80 and TLS on :443, the conventional pair. This is the only
+#      shape that can host ACME's HTTP-01 challenge and an :80 -> :443 redirect,
+#      because those are the two parts of TLS that need a particular port.
+#        [server]  http = "0.0.0.0:80"
+#                  https = "0.0.0.0:443"
+# ---------------------------------------------------------------------------
+# [server.tls]
+# certificate = "certs/default.crt"   # PEM chain, leaf first
+# key = "certs/default.key"           # PEM private key
+# min_version = "1.2"                 # or "1.3"; a floor, not a cap
+# alpn = ["h2", "http/1.1"]           # h2 preferred; do NOT drop http/1.1
+# plain = false                       # accept cleartext on the TLS port too
+#
+# Answer cleartext requests with a 301 to the https:// equivalent. Off by
+# default: it changes what an existing cleartext deployment does. Needs a
+# plaintext listener to act on -- either a separate `https`, or `plain = true`.
+# redirect_to_https = false
+#
+# A per-site certificate, presented by SNI for that site's hosts. Only the
+# certificate and key can be per site, because the name is claimed before any
+# request exists -- min_version/alpn/plain describe the socket, so setting one
+# here is an error rather than a key that silently does nothing.
+#
+# [sites.shop.tls]
+# certificate = "certs/shop.crt"
+# key = "certs/shop.key"
+
+# ---------------------------------------------------------------------------
 # Static files, served from the document root without waking PHP at all. This is
 # a routing layer above the backends: a path that names a real file under the
 # document root is answered from disk, and a path that names nothing still goes

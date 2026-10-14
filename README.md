@@ -462,6 +462,116 @@ hyper frames the response without chunked encoding. Zero-copy (`sendfile`) is *n
 would be a Unix-only second code path — so a large file is copied per block. See
 [the module docs](crates/stokehold-http/src/static_files.rs) for what is deliberately absent.
 
+## TLS
+
+`[server.tls]` is what turns TLS on — there is no `enabled` key, because a flag and a certificate
+are two statements about one thing and two statements can disagree. A table without both paths is
+an error rather than a defaulted half.
+
+```toml
+[server]
+http = "0.0.0.0:443"
+
+[server.tls]
+certificate = "certs/default.crt"   # PEM chain, leaf first
+key = "certs/default.key"           # PEM private key
+min_version = "1.2"                 # or "1.3"; a floor, not a cap
+alpn = ["h2", "http/1.1"]           # h2 preferred; do NOT drop http/1.1
+plain = false                       # also answer cleartext on this same port
+```
+
+A relative `certificate`/`key` resolves against **the directory holding the config file**. That is
+a deliberate exception to `document_root`'s rule, which is relative to the process's working
+directory: a certificate beside `stokehold.toml` is the usual case, and resolving it against
+wherever the process started would be a footgun with a security consequence. `stokehold check`
+prints the path it resolved.
+
+### Plain HTTP and TLS together
+
+All three shapes work. `http` always keeps its name and meaning, so no existing configuration
+changes behaviour.
+
+| Shape | Configuration |
+| --- | --- |
+| Cleartext only | `http = "...:8080"`, no `[server.tls]` — **unchanged from before** |
+| TLS only | `http = "...:443"` + `[server.tls]` |
+| **Both on one port** | `[server.tls].plain = true` |
+| Both, conventional ports | `http = "...:80"` and `https = "...:443"` |
+
+**One port carrying both** works by looking at the first byte: a TLS record always begins with
+`0x16`, and a plaintext request begins an ASCII method letter. This is what nginx's `ssl_preread`
+does, and it costs one `peek` per *connection* — never per request, because the protocol is decided
+once and then the connection is one path or the other.
+
+It is a **detection, not a downgrade**: a client that offers TLS and fails the handshake still
+fails. There is no fallback to cleartext on a handshake error. And because accepting cleartext on a
+port that clients believe is encrypted is a security decision, `plain` is off by default and is
+logged loudly at startup when on.
+
+Two mechanisms rather than one, because SMTP's analogy does not carry over: SMTP negotiates in-band
+(`STARTTLS` inside the protocol, so plaintext always comes first), while HTTP has no `STARTTLS` —
+RFC 2817 defined `Upgrade: TLS/1.0` and nothing adopted it. So HTTP only ever has what SMTP calls
+"direct SSL", where TLS begins at byte one and the server must decide the protocol before either
+side has spoken.
+
+No port is privileged either: `https://host:8443` sends the identical ClientHello. Only two things
+genuinely need a fixed port, and both are `https`'s job — **ACME HTTP-01** (the challenge server
+always contacts `:80`) and an **`:80 → :443` redirect**.
+
+```toml
+# Plain on :80, TLS on :443, and redirect the former to the latter.
+[server]
+http = "0.0.0.0:80"
+https = "0.0.0.0:443"
+redirect_to_https = true
+
+[server.tls]
+certificate = "certs/default.crt"
+key = "certs/default.key"
+```
+
+`redirect_to_https` is off by default because a redirect is a deployment's decision. It needs
+something actually serving cleartext to fire on — a separate `https`, or `plain = true` — so
+setting it with TLS on `http` alone is an error rather than a silently inert key.
+
+### Per-site certificates (SNI)
+
+```toml
+[sites.shop.tls]
+certificate = "certs/shop.crt"
+key = "certs/shop.key"
+```
+
+Only `certificate` and `key` can be per site. The name is claimed in the TLS handshake, before any
+request exists, so a per-site table can only be about *which certificate is presented* —
+`min_version`, `alpn` and `plain` describe the socket, and setting one per site is an error rather
+than a key that does nothing.
+
+Certificates are selected by **SNI**, not by the `Host` header: exact name, then the longest `*.`
+wildcard, then the server's certificate, using the same matching rule as [Sites](#sites). The two
+*should* agree but need not — a client may claim one name in the handshake and another in the
+request. That is not an error: the certificate for the claimed name is presented, and the request
+is then served by whatever site its `Host` selects.
+
+### What TLS costs when it is off
+
+Nothing. With no `[server.tls]` there is no peek, no branch, and no TLS value is constructed — the
+cleartext path is the same code it was before TLS existed.
+
+### Build prerequisites
+
+`rustls` is used rather than OpenSSL, so there is no DLL/dylib to match against a system OpenSSL.
+It is **not** dependency-free at build time, though: its default `aws-lc-rs` provider is C and
+assembly, so it needs a **C toolchain** (MSVC on Windows), **NASM**, and **CMake**. The `ring`
+provider needs only the C compiler, and is one feature line away if that ever matters:
+
+```toml
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+```
+
+Rustls 0.24 moves providers into separate crates (`rustls-aws-lc-rs`, `rustls-ring`) selected at
+runtime; those are still pre-release, so this targets 0.23 stable.
+
 ## Layout
 
 | Path | Contents |

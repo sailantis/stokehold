@@ -106,7 +106,7 @@ opt-in and only when configured.
 | --- | --- |
 | Protocol for worker pool | **Own framed protocol** (see §4) — FastCGI cannot express worker→server messages |
 | Protocol for CGI backends | **FastCGI** — mandatory for `php-cgi`/`php-fpm`; also nginx-testable |
-| TLS | **rustls**, not OpenSSL — no DLL/dylib matrix across three platforms |
+| TLS | **rustls**, not OpenSSL — no DLL/dylib matrix across three platforms. **Not** build-dependency-free though: the default `aws-lc-rs` provider needs a C toolchain, NASM and CMake (hazard 54) |
 | Worker transport | child **stdin/stdout pipes** — portable, and needs no port per worker |
 | Config format | **TOML** (`serde`) — no YAML dependency, better tooling |
 | Front-end scope | HTTP listener **in v1**; TLS/ACME/HTTP-2 as a later milestone |
@@ -1514,10 +1514,17 @@ Phase 7 — packaging
     php-cgi, to state realistic expectations rather than claims.
 
 Later milestone
-24. `tls-acme` — `rustls` + `rustls-acme`, ALPN for HTTP/2 over TLS, optional HTTP/3. HTTP/3 is
-    `quinn` + `h3` + `rustls`, not `hyper`; `quinn` runs on `tokio`, which the HTTP front-end
-    already has. The `Sites` table is the map SNI certificate selection needs, so this step no
-    longer has to grow one.
+24. `tls-acme` — **split into 24a and 24b** (hazard 54). 24a is TLS termination, which is testable
+    offline with a self-signed certificate; 24b is ACME issuance, which is a network protocol with
+    its own failure modes, and bundling them means a review cannot tell which half a bug is in.
+    24a: `rustls` + `tokio-rustls`, `aws-lc-rs` (measured to build here, hazard 54), ALPN for HTTP/2
+    over TLS, and plain and TLS on one port or on two. 24b — the ACME half. HTTP/3 is `quinn` +
+    `h3` + `rustls`, not `hyper`; `quinn` runs on `tokio`, which the HTTP front-end already has, and
+    it stays out of both.
+    **The `Sites` table is *not* the map SNI needs**, contrary to what this step used to claim:
+    `Sites`' host maps are private and `ResolvedSite` carries no `hosts`. SNI needs its own
+    host→certificate map; what is reusable is the *rule*, so it is extracted into `HostMap<V>` and
+    shared by sites, SNI and route matching (hazard 54).
 25. `prefork-optional` — Unix-only prefork to cut worker bootstrap cost, forked from a PHP boot
     parent (never the Tokio runtime).
 26. `rpc-sidechannel` — only if a v2 need appears (background jobs, websockets) that the
@@ -1591,7 +1598,44 @@ Later, and deliberately not part of Phase 8:
 40. `route-policy` — `RouteConfig` gains `policy` and `backend` becomes optional, so a route is a
     location rather than only a backend selector. §4.8 of the design notes.
 41. `compression` — on-the-fly gzip/brotli, and the ETag and negotiation-cache questions it raises.
-    Belongs with packaging (step 22), not with sites.
+
+Phase 9 — TLS termination (step 24a, split from `tls-acme` by hazard 54)
+
+The `Sites` table is a host→site map and SNI needs a host→certificate one, so the *rule* is shared
+rather than the table: exact name, then longest `*.` wildcard, then the server's certificate. Steps
+42–44 exist because that rule is currently written once and must be written once more.
+
+42. `tls-provider-setup` — **done.** NASM 3.02 and CMake 4.4.4 installed and verified; `aws-lc-rs`
+    confirmed to build and construct a real `ServerConfig` here, and the `ring` fallback confirmed
+    too (hazard 54). Rustls 0.24 is pre-release on every crate involved, so 0.23 stable is the
+    target.
+43. `tls-config` — **done.** `TlsConfig` on `ServerConfig` and `SiteTlsConfig` on `SiteConfig`;
+    `server.https` and `redirect_to_https`; validation for every combination the listener matrix
+    allows and every one it does not; `check` reports the resolved certificate paths and says per
+    site whether a certificate is its own or inherited; preflight reports a certificate that is
+    missing, unreadable, or not PEM.
+44. `host-map` — extract `HostMap<V>` and re-home `Sites` on it; the existing sites tests are the
+    control and must pass unchanged.
+45. `tls-termination` — the `Acceptor`, the SNI resolver over `HostMap<Arc<CertifiedKey>>`, the
+    wrapped accept loop, and `serve_connection` made generic over the stream so one code path
+    serves both protocols.
+46. `dual-protocol` — the first-byte sniff for plain-and-TLS on one port, the second `https`
+    listener, and the `:80` → `:443` redirect.
+47. `alpn-h2` — ALPN advertisement, confirming `auto::Builder` picks HTTP/2 from it, and the two
+    HTTP/2 tests the repository has never had.
+48. `tls-cli` — `serve` parses the certificates for real and fails before binding; `version`, whose
+    front-end line currently describes a build with no TLS.
+49. `tls-docs` — README and this file.
+50. `tls-verify` — end to end, self-signed: SNI selection, ALPN negotiation, the same-port sniff in
+    both directions, the redirect, a certificate that fails before bind, and the TLS-off benchmark
+    inside the current build's spread.
+51. `ci-build-matrix` — a build and test workflow. TLS is the workspace's first native dependency
+    (C toolchain + NASM + CMake), and there is no `.github`, no CI, no release artifact and no
+    systemd unit, so "it builds everywhere" is verified only by hand on one host. The prerequisite
+    list just grew from "Rust" to "Rust + C toolchain + NASM + CMake".
+52. `tls-acme` — **24b.** `rustls-acme`, whose default and recommended mechanism is TLS-ALPN-01 and
+    needs no second port. The plaintext listener this phase adds is what HTTP-01 would need, so
+    that option is open rather than blocked.
 
 ## 7. Testing strategy
 
@@ -1785,7 +1829,7 @@ reading out of a crate description.
 | HTTP/1.1 | **works** | `GET`/`HEAD`/`OPTIONS` on a static file, 200 with the right `content-type` |
 | HTTP/2 cleartext, **prior knowledge** | **works** | `curl --http2-prior-knowledge` reports HTTP/2 and answers `HTTP/2 200`; a hand-built preface + empty SETTINGS gets a real SETTINGS frame back |
 | HTTP/2 cleartext, **`Upgrade: h2c`** | **does not work** | a client offering `Upgrade: h2c` is answered **HTTP/1.1 200** with no `101` |
-| TLS / HTTPS | **does not work** | a TLS handshake to the HTTP port fails; there is **no** `rustls`, `openssl` or `native-tls` dependency in any `Cargo.toml`, and no `tls`/`cert` key in the config model |
+| TLS / HTTPS | **configuration and validation work; the listener does not** | `[server.tls]`, `server.https`, `redirect_to_https`, per-site `[sites.x.tls]`, all validation for the listener matrix, `check`'s resolved certificate paths and preflight's missing/unreadable/not-PEM warnings all work. The accept loop is **not yet wrapped**: no `rustls` dependency is in any `Cargo.toml`, so a TLS handshake to the HTTP port still fails. Steps 44–47 |
 | HTTP/3 | **does not exist** | needs `quinn` + `h3`; step 24 |
 | FastCGI front-end | **works** | `crates/stokehold-server/src/frontend/`, wired into `serve`, 5 tests in `tests/frontend.rs` |
 | `/index.php` is executed, not disclosed | **works** | the body is the script's output, not its source |
@@ -2737,6 +2781,58 @@ thread. And **`STDERR` does not exist in this SAPI**: a worker's output *is* the
 the first version of the worker died on `Undefined constant "STDERR"` before reaching its request
 loop, which the server reports only as `worker ... has not reached
 frankenphp_handle_request()`.
+
+### Hazard 54 — "rustls needs no system dependency" is true at runtime and false at build time
+
+The case for rustls over OpenSSL has always been stated here as *no DLL/dylib matrix* (§3, decisions
+table). That is correct and it still holds: a rustls build links no OpenSSL, so there is nothing to
+match to a system version on any of the three platforms. What the sentence does **not** cover is the
+build, and the two were being read as one thing.
+
+**Measured.** rustls 0.23's default crypto provider is `aws-lc-rs`, which is C and assembly, and
+`aws-lc-sys` invokes CMake and needs an assembler. On this host before the work started:
+
+    nasm    absent
+    cmake   absent
+    cl      installed (14.44.35207) but not on PATH
+
+so the workspace's first TLS dependency would not have compiled, and the reason would have looked
+like "rustls is hard to build" rather than "this machine is missing two tools". After
+`winget install NASM.NASM` and `winget install Kitware.CMake`:
+
+    nasm    3.02   C:\Users\christian\AppData\Local\bin\NASM\nasm.exe   ** not on PATH **
+    cmake   4.4.4  winget shim on PATH
+
+Two things were established by building rather than by reading. **First, aws-lc-rs does compile
+here** — `rustls` 0.23.46 + `tokio-rustls` 0.26.6 + `aws-lc-sys` 0.46.0 built in 39 s, and a real
+`ServerConfig` was constructed from an rcgen self-signed certificate, which is the part that would
+panic if the provider were unusable rather than merely present. The installed provider reports **9
+cipher suites**. **Second, the `ring` fallback is not a fallback any more** — with
+`default-features = false, features = ["ring", "std", "tls12"]` the same probe also built and ran,
+so if aws-lc-rs ever breaks on a target, one feature line reverts it.
+
+**The trap worth recording** is that winget installed NASM correctly and then did not put it on
+PATH, while CMake *did* get a shim. So `nasm -v` fails in a fresh shell even though the tool is
+installed, and the failure surfaces much later as a CMake error from inside `aws-lc-sys`. Nothing on
+the machine or user PATH matched `NASM`; the directory had to be added by hand. The build
+prerequisites for this project are therefore now **Rust + a C toolchain + NASM + CMake**, not
+"Rust", and that is a real change to what a fresh checkout needs. It is why `ci-build-matrix`
+(step 52) should exist before the cross-platform claim is made.
+
+**Version decision, also measured rather than assumed.** The Rustls 0.24 line moves providers out of
+the main crate into `rustls-aws-lc-rs` / `rustls-ring`, selected by an explicit runtime install
+rather than a feature. Checked on crates.io: `rustls` is at `0.24.0-dev.2`,
+`rustls-aws-lc-rs` and `rustls-ring` are both at `0.1.0-dev.1`, while `tokio-rustls` is at
+`0.26.6` and `rustls-acme` at `0.15.4`. So **0.24 is pre-release on every crate involved** and
+targeting it would mean a dev dependency in a server's TLS path. **0.23 stable is the target**;
+the provider move is a mechanical migration when 0.24 and its siblings release.
+
+**One correction to the step-24 text, which claimed the `Sites` table is "the map SNI certificate
+selection needs":** it is not. `Sites`' host maps are private, `named()` returns `ResolvedSite`, and
+`ResolvedSite` carries no `hosts` — so SNI needs its own host→certificate map. The saving is real but
+smaller than stated: the *rule* is reusable (exact name, then longest `*.` wildcard, then the server's
+certificate), and it is extracted into `HostMap<V>` so sites, SNI and route matching share one
+implementation of it rather than growing a third.
 
 
 

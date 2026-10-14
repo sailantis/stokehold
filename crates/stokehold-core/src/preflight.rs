@@ -7,7 +7,7 @@
 //! these checks buy is that a mistake is reported once, here, instead of as a
 //! puzzling 404 at the first request.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::{BackendConfig, Config};
 use crate::program::{resolve_program, split_command};
@@ -44,6 +44,15 @@ impl Warning {
 /// command line has had its say — so `check` can report the same decision `serve`
 /// would make rather than the one the file happens to contain.
 pub fn inspect(config: &Config, document_root: &Path) -> Vec<Warning> {
+    inspect_with(config, document_root, None)
+}
+
+/// [`inspect`], resolving relative TLS paths against the config file's directory.
+///
+/// `config_path` is `None` when the caller has no file (a config built in a test), in which
+/// case a relative TLS path is reported as written — the same answer `Path::parent` gives for
+/// a bare filename, and better than inventing a directory.
+pub fn inspect_with(config: &Config, document_root: &Path, config_path: Option<&Path>) -> Vec<Warning> {
     let mut warnings = Vec::new();
 
     if !document_root.exists() {
@@ -139,8 +148,100 @@ pub fn inspect(config: &Config, document_root: &Path) -> Vec<Warning> {
     }
 
     inspect_programs(config, &mut warnings);
+    inspect_tls_with(config, config_path, &mut warnings);
 
     warnings
+}
+
+/// Report TLS settings whose files are missing or unusable.
+///
+/// The paths here are as written in the configuration, so this runs against whatever the
+/// caller resolved — `check` passes the config-file-relative paths it printed, which is the
+/// point: the warning names the same file the operator sees.
+///
+/// Everything is a warning, like the rest of this module. A certificate that is not there yet
+/// is a normal thing to check before a deploy copies it in, and the failure it would otherwise
+/// cause is the worst kind: a listener that binds, reports nothing, and fails every handshake.
+pub fn inspect_tls(config: &Config, warnings: &mut Vec<Warning>) {
+    inspect_tls_with(config, None, warnings)
+}
+
+/// [`inspect_tls`], resolving relative paths against the config file's directory.
+pub fn inspect_tls_with(config: &Config, config_path: Option<&Path>, warnings: &mut Vec<Warning>) {
+    let Some(tls) = &config.server.tls else {
+        return;
+    };
+
+    let base = config_path.and_then(Path::parent);
+    let resolve = |path: &Path| -> PathBuf {
+        match base {
+            Some(dir) if !dir.as_os_str().is_empty() && path.is_relative() => dir.join(path),
+            _ => path.to_path_buf(),
+        }
+    };
+
+    let certificate = resolve(&tls.certificate);
+    let key = resolve(&tls.key);
+    check_pem(
+        &format!("server.tls.certificate {}", certificate.display()),
+        &certificate,
+        "certificate",
+        warnings,
+    );
+    check_pem(
+        &format!("server.tls.key {}", key.display()),
+        &key,
+        "private key",
+        warnings,
+    );
+
+    for (name, site) in &config.sites {
+        let Some(site_tls) = &site.tls else { continue };
+        let certificate = resolve(&site_tls.certificate);
+        let key = resolve(&site_tls.key);
+        check_pem(
+            &format!(
+                "sites.{name}.tls.certificate {}",
+                certificate.display()
+            ),
+            &certificate,
+            "certificate",
+            warnings,
+        );
+        check_pem(
+            &format!("sites.{name}.tls.key {}", key.display()),
+            &key,
+            "private key",
+            warnings,
+        );
+    }
+}
+
+/// Report one PEM file that is missing, unreadable, or not PEM.
+///
+/// "Starts with a PEM header" is deliberately all this checks. Parsing the certificate properly
+/// belongs to `serve`, which must do it anyway before it binds — and duplicating a real parser
+/// here would be a second answer to the same question, which is the drift this codebase avoids.
+/// A file that begins with `-----BEGIN` and is still corrupt is caught at startup.
+fn check_pem(label: &str, path: &Path, what: &str, warnings: &mut Vec<Warning>) {
+    if path.as_os_str().is_empty() {
+        // Empty is already an error in `validate`; reaching here means the config was not
+        // validated first, so saying nothing is better than repeating a weaker message.
+        return;
+    }
+    let Ok(contents) = std::fs::read(path) else {
+        warnings.push(Warning::with_hint(
+            format!("{label} cannot be read"),
+            format!("the {what} is missing or unreadable; TLS will fail to start"),
+        ));
+        return;
+    };
+    if !contents.windows(11).any(|w| w == b"-----BEGIN ") {
+        warnings.push(Warning::with_hint(
+            format!("{label} does not look like PEM"),
+            format!("a {what} must be a PEM file beginning with -----BEGIN"),
+        ));
+    }
 }
 
 /// Report every configured program that cannot be started.
@@ -474,6 +575,141 @@ http = "127.0.0.1:8080"
         assert!(
             warnings[1].message.contains("static_files is enabled"),
             "{warnings:?}"
+        );
+    }
+
+    // ---- TLS -------------------------------------------------------------------------
+
+    /// A config with `[server.tls]`, so the PEM checks have something to look at.
+    fn tls_config(certificate: &str, key: &str) -> Config {
+        let text = format!(
+            r#"
+[server]
+http = "127.0.0.1:443"
+
+[server.tls]
+certificate = "{certificate}"
+key = "{key}"
+"#
+        );
+        Config::from_toml(&text).expect("config parses")
+    }
+
+    /// A valid-looking PEM block. The check is deliberately shallow — it asks whether the
+    /// file starts with a PEM header, not whether the certificate parses, because parsing
+    /// belongs to `serve` and a second parser here would be a second answer.
+    const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+    /// Only the warnings this module's TLS checks produced.
+    ///
+    /// The fixture deliberately has no front controller and no backends, so `inspect_with`
+    /// also reports those — they are real findings about the fixture, not about TLS, and
+    /// counting them here would make these tests break whenever an unrelated check grows.
+    fn tls_warnings(warnings: &[Warning]) -> Vec<&Warning> {
+        warnings
+            .iter()
+            .filter(|w| w.message.contains("tls."))
+            .collect()
+    }
+
+    #[test]
+    fn a_readable_pem_pair_is_clean() {
+        let root = Fixture::new("tls-clean");
+        std::fs::write(root.path().join("c.crt"), PEM).expect("write cert");
+        std::fs::write(root.path().join("c.key"), PEM).expect("write key");
+
+        let config = tls_config("c.crt", "c.key");
+        let warnings = inspect_with(&config, root.path(), Some(&root.path().join("stokehold.toml")));
+        assert_eq!(tls_warnings(&warnings).len(), 0, "{warnings:?}");
+    }
+
+    #[test]
+    fn a_missing_certificate_is_reported_by_the_resolved_path() {
+        // The path in the message must be the resolved one, not the path as written: the
+        // reader is looking at a file, and `certs/a.crt` names two different files depending
+        // on the directory it is resolved against.
+        let root = Fixture::new("tls-missing");
+        let config = tls_config("certs/default.crt", "certs/default.key");
+        let config_path = root.path().join("stokehold.toml");
+
+        let warnings = inspect_with(&config, root.path(), Some(&config_path));
+        let tls = tls_warnings(&warnings);
+        assert_eq!(tls.len(), 2, "{warnings:?}");
+        assert!(tls[0].message.contains("cannot be read"), "{warnings:?}");
+        assert!(
+            tls[0].message.contains("server.tls.certificate"),
+            "{warnings:?}"
+        );
+        // Resolved against the config file's directory, which is the whole point of the
+        // separate rule.
+        assert!(
+            tls[0].message.contains("certs") && tls[0].message.contains("default.crt"),
+            "{warnings:?}"
+        );
+        assert!(tls[1].message.contains("server.tls.key"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_pem_is_reported() {
+        let root = Fixture::new("tls-notpem");
+        std::fs::write(root.path().join("c.crt"), "not a certificate\n").expect("write");
+        std::fs::write(root.path().join("c.key"), PEM).expect("write key");
+
+        let config = tls_config("c.crt", "c.key");
+        let warnings = inspect_with(&config, root.path(), Some(&root.path().join("stokehold.toml")));
+        let tls = tls_warnings(&warnings);
+        assert_eq!(tls.len(), 1, "{warnings:?}");
+        assert!(tls[0].message.contains("does not look like PEM"), "{warnings:?}");
+        assert!(
+            tls[0].hint.as_deref().is_some_and(|h| h.contains("-----BEGIN")),
+            "the hint should name what PEM means: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_site_certificate_is_checked_too() {
+        let root = Fixture::new("tls-site");
+        std::fs::write(root.path().join("default.crt"), PEM).expect("write");
+        std::fs::write(root.path().join("default.key"), PEM).expect("write");
+
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+
+[server.tls]
+certificate = "default.crt"
+key = "default.key"
+
+[sites.shop]
+hosts = ["shop.test"]
+document_root = "/srv/shop"
+
+[sites.shop.tls]
+certificate = "shop.crt"
+key = "shop.key"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let warnings = inspect_with(&config, root.path(), Some(&root.path().join("stokehold.toml")));
+
+        // The server's pair is present, the site's is not — so exactly the site's two are
+        // reported, and the server's absence of a warning is what proves the check is
+        // looking at the right pair rather than reporting everything.
+        let tls = tls_warnings(&warnings);
+        assert_eq!(tls.len(), 2, "{warnings:?}");
+        assert!(tls[0].message.contains("sites.shop.tls.certificate"), "{warnings:?}");
+        assert!(tls[1].message.contains("sites.shop.tls.key"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_plaintext_config_reports_nothing_about_tls() {
+        // The control: no `[server.tls]` means the TLS checks must be entirely absent, not
+        // merely quiet.
+        let root = Fixture::new("tls-none");
+        root.write("index.php");
+        let warnings = inspect(&config(), root.path());
+        assert!(
+            tls_warnings(&warnings).is_empty(),
+            "a deployment with no TLS must not be warned about TLS: {warnings:?}"
         );
     }
 }

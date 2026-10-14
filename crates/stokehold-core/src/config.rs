@@ -175,8 +175,8 @@ impl FrontController {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StaticsSetting {
-    /// A tuning table.
-    Table(StaticConfig),
+    /// A tuning table, naming only the keys it changes.
+    Table(StaticOverrides),
     /// `false` disables the layer; `true` enables it with the defaults.
     Switch(bool),
 }
@@ -184,26 +184,81 @@ pub enum StaticsSetting {
 impl Default for StaticsSetting {
     /// Absent means the layer is off, matching `StaticConfig::enabled`'s own default.
     ///
-    /// It resolves to `Switch(false)` rather than `Table(StaticConfig::default())`
-    /// so that `check` can report a deployment which *chose* to turn the layer off
-    /// apart from one which never mentioned it.
+    /// It resolves to `Switch(false)` rather than an empty table so that `check` can
+    /// report a deployment which *chose* to turn the layer off apart from one which
+    /// never mentioned it.
     fn default() -> Self {
         StaticsSetting::Switch(false)
     }
 }
 
 impl StaticsSetting {
-    /// The setting as a full table, resolving the bare boolean.
+    /// The setting applied over `base`.
     ///
-    /// `true` means "the defaults", not "inherit": a site that wants the site's own
-    /// or the server's setting simply leaves the key out.
-    pub fn resolved(&self) -> StaticConfig {
+    /// A site resolves its static layer against the server's rather than against
+    /// nothing, so a site naming one key keeps the root's other settings — an
+    /// application that overrides `precompressed` must not silently reset
+    /// `cache_control` to the default for its whole document root.
+    pub fn applied_to(&self, base: &StaticConfig) -> StaticConfig {
         match self {
-            StaticsSetting::Table(config) => config.clone(),
+            StaticsSetting::Table(overrides) => overrides.apply(base),
+            // A bare boolean says one thing about `enabled` and nothing about the
+            // rest, so the rest is inherited — which is what makes
+            // `static_files = false` a usable opt-out for a site whose root serves
+            // files with settings worth keeping.
             StaticsSetting::Switch(enabled) => StaticConfig {
                 enabled: *enabled,
-                ..StaticConfig::default()
+                ..base.clone()
             },
+        }
+    }
+
+    /// The setting applied over the defaults, which is what a deployment with no
+    /// inherited value gets.
+    pub fn resolved(&self) -> StaticConfig {
+        self.applied_to(&StaticConfig::default())
+    }
+}
+
+/// The keys a `static_files` table states, each optional.
+///
+/// `Option` per key rather than a [`StaticConfig`] with defaults, because "did not
+/// mention it" and "mentioned it and chose the default" are different answers when
+/// the table is an override. Without that distinction a site setting
+/// `precompressed = true` would also assert `enabled = false` and
+/// `cache_control = "…"` — the defaults — over whatever the server had said.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticOverrides {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub precompressed: Option<bool>,
+    #[serde(default)]
+    pub directory_index: Option<bool>,
+    #[serde(default)]
+    pub dotfiles: Option<Dotfiles>,
+    #[serde(default)]
+    pub cache_control: Option<String>,
+    #[serde(default)]
+    pub max_multirange_bytes: Option<u64>,
+}
+
+impl StaticOverrides {
+    /// The base settings with these overrides applied.
+    pub fn apply(&self, base: &StaticConfig) -> StaticConfig {
+        StaticConfig {
+            enabled: self.enabled.unwrap_or(base.enabled),
+            precompressed: self.precompressed.unwrap_or(base.precompressed),
+            directory_index: self.directory_index.unwrap_or(base.directory_index),
+            dotfiles: self.dotfiles.unwrap_or(base.dotfiles),
+            cache_control: self
+                .cache_control
+                .clone()
+                .unwrap_or_else(|| base.cache_control.clone()),
+            max_multirange_bytes: self
+                .max_multirange_bytes
+                .unwrap_or(base.max_multirange_bytes),
         }
     }
 }
@@ -214,7 +269,7 @@ impl StaticsSetting {
 /// neither is just `default_backend` written the long way, and it would make the
 /// precedence rule meaningless. Constraints within one route are **all** of
 /// ("and"), not any of.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// Match a request whose path starts with this string, e.g. `/api`.
@@ -969,7 +1024,8 @@ impl Config {
             }
 
             if let Some(statics) = &site.static_files {
-                validate_statics(&statics.resolved(), &format!("sites.{name}.static_files"))?;
+                let resolved = statics.applied_to(&self.server.statics());
+                validate_statics(&resolved, &format!("sites.{name}.static_files"))?;
             }
 
             // `static_files = false` and `serve_only = "static"` are both a way of

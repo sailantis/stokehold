@@ -1048,4 +1048,125 @@ fn version_prints_the_protocol_and_the_php_floor() {
         "the floor a build claims must be the floor it has: {text}"
     );
     assert!(text.contains("FastCGI"), "{text}");
+    assert!(
+        !text.contains("spawn_fpm"),
+        "a removed backend must not be advertised: {text}"
+    );
+}
+
+/// `check` describes the sites a deployment will serve, and where a route still
+/// checks the filesystem.
+///
+/// The route line is the point of the second half: `skip_stat` is inferred rather than
+/// written, so the only way an operator can see the saving is if `check` prints it.
+#[test]
+fn check_describes_the_sites_and_the_routes_that_skip_the_stat() {
+    let Some(binary) = stokehold_binary() else {
+        eprintln!("skipping: the stokehold binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("stokehold-check-sites-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("a")).expect("create a site root");
+    std::fs::create_dir_all(root.join("b")).expect("create a site root");
+
+    let config_path = root.join("stokehold.toml");
+    let config = format!(
+        r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+document_root = {root}
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[backends.cgi]
+kind = "spawn_cgi"
+binary = 'C:\php\php-cgi.exe'
+
+[[routes]]
+path_prefix = "/api"
+backend = "app"
+
+[[routes]]
+path_prefix = "/legacy"
+backend = "cgi"
+
+[[routes]]
+path_suffix = ".php"
+backend = "cgi"
+
+[sites.a]
+hosts = ["a.test", "*.a.test"]
+document_root = {a}
+front_controller = false
+serve_only = "static"
+
+[sites.b]
+hosts = ["b.test"]
+document_root = {b}
+default_backend = "cgi"
+"#,
+        root = toml_string(&root.display().to_string()),
+        a = toml_string(&root.join("a").display().to_string()),
+        b = toml_string(&root.join("b").display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let output = Command::new(&binary)
+        .arg("check")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("the check command runs");
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    // The site table, with each site's own settings rather than the server's.
+    assert!(text.contains("sites:"), "{text}");
+    assert!(text.contains("a: a.test, *.a.test"), "{text}");
+    assert!(text.contains("b: b.test"), "{text}");
+    assert!(
+        text.contains("serve only:       static"),
+        "a site's serve_only must be reported, not the server's: {text}"
+    );
+    assert!(
+        text.contains("front controller: (none: only real .php files are served)"),
+        "`front_controller = false` must be reported as such: {text}"
+    );
+    assert!(
+        text.contains("default backend:  cgi"),
+        "a site's own default backend must be reported: {text}"
+    );
+
+    // Three routes, two reasons to skip and one route that must not:
+    // `/api` goes to a worker, which reads the path as metadata and never interprets it;
+    // `.php` pins a script extension, so the file can only be PHP;
+    // `/legacy` goes to `php-cgi` with a prefix, which proves nothing about the
+    // extension — `/legacy/config.json` would be emitted verbatim — so the stat stays.
+    assert!(
+        text.contains("stat: skipped"),
+        "the saving must be visible: {text}"
+    );
+    assert!(
+        text.matches("stat: skipped").count() == 2,
+        "the worker and suffix routes skip, the prefix route does not: {text}"
+    );
+    let legacy = text
+        .lines()
+        .position(|line| line.contains("/legacy") && line.contains("-> cgi"))
+        .expect("the /legacy route is printed");
+    assert!(
+        !text
+            .lines()
+            .nth(legacy + 1)
+            .unwrap_or("")
+            .contains("stat: skipped"),
+        "a prefix route proves nothing about the extension and must keep the stat: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -1084,7 +1084,6 @@ impl Config {
                 let resolved = statics.applied_to(&self.server.statics());
                 validate_statics(&resolved, &format!("sites.{name}.static_files"))?;
             }
-
             // `static_files = false` and `serve_only = "static"` are both a way of
             // saying "files only", so writing them together is a contradiction and
             // writing `false` beside `"backend"` is a double negative. Rejecting is

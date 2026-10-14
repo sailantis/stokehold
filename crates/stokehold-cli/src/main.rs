@@ -532,17 +532,69 @@ fn check(
         );
     }
 
+    // A route is printed as the three matchers it can state, with `skip_stat` where it
+    // applies — the saving is real and an operator should be able to see where the
+    // router is still checking the filesystem and where it has stopped.
+    let print_route = |route: &stokehold_core::config::RouteConfig, worker: bool, indent: &str| {
+        let host = route.host.as_deref().unwrap_or("*");
+        let prefix = route.path_prefix.as_deref().unwrap_or("*");
+        let suffix = route.path_suffix.as_deref().unwrap_or("*");
+        println!("{indent}{host}{prefix}…{suffix} -> {}", route.backend);
+        if stokehold_core::config::skip_stat(route, worker) {
+            println!("{indent}  stat: skipped (the pattern proves the extension)");
+        }
+    };
+    let is_worker = |name: &str| {
+        config.backends.get(name).is_some_and(|backend| {
+            matches!(backend, stokehold_core::config::BackendConfig::Worker(_))
+        })
+    };
+
     println!("  routes:");
     if config.routes.is_empty() {
         println!("    (none: every request goes to the default backend)");
     }
     for route in &config.routes {
-        let host = route.host.as_deref().unwrap_or("*");
-        let path = route.path_prefix.as_deref().unwrap_or("*");
-        println!("    {host}{path} -> {}", route.backend);
+        print_route(route, is_worker(&route.backend), "    ");
+    }
+
+    println!("  sites:");
+    if config.sites.is_empty() {
+        println!("    (none: [server] describes the only site)");
+    }
+    // Only what a site *states* is printed here. A key it does not state is the server's,
+    // already printed above, and repeating it per site would make the table read as
+    // though every site had been configured with the same values.
+    for (name, site) in &config.sites {
+        println!("    {name}: {}", site.hosts.join(", "));
+        println!("      document root:    {}", site.document_root.display());
+        if let Some(controller) = &site.front_controller {
+            match controller.as_path() {
+                Some(path) => println!("      front controller: {path}"),
+                None => println!("      front controller: (none: only real .php files are served)"),
+            }
+        }
+        if let Some(serve_only) = site.serve_only {
+            println!("      serve only:       {serve_only}");
+        }
+        if let Some(routes) = &site.routes {
+            println!("      routes:");
+            for route in routes {
+                print_route(route, is_worker(&route.backend), "        ");
+            }
+        }
+        if let Some(backend) = &site.default_backend {
+            println!("      default backend:  {backend}");
+        }
     }
 
     println!("  static files:");
+    println!("    {}", config.server.serve_only);
+    if !config.sites.is_empty() {
+        println!(
+            "    this is the default site's setting; a site that states serve_only overrides it"
+        );
+    }
     if config.server.statics().enabled {
         println!("    enabled for the HTTP listener");
         println!(

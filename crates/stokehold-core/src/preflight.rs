@@ -92,6 +92,40 @@ pub fn inspect(config: &Config, document_root: &Path) -> Vec<Warning> {
         ));
     }
 
+    // Each site's own root and front controller, because those are what a request to that
+    // site actually uses. A site whose root is missing is not visible in the default site's
+    // checks at all, and it answers 404 or 500 for every request it receives.
+    for (name, site) in &config.sites {
+        let root = &site.document_root;
+        if !root.is_dir() {
+            warnings.push(Warning::with_hint(
+                format!(
+                    "sites.{name}: document root {} does not exist",
+                    root.display()
+                ),
+                "create it, or point this site's document_root somewhere else — every request \
+                 to this site's hosts will fail meanwhile",
+            ));
+            continue;
+        }
+        // The site's own controller, or the one it inherits. A site that says
+        // `front_controller = false` has none on purpose and is not warned about.
+        if let Some(controller) = &site.front_controller {
+            if let Some(front) = controller.as_path() {
+                if !root.join(front).is_file() {
+                    warnings.push(Warning::with_hint(
+                        format!(
+                            "sites.{name}: front controller {front} was not found under {}",
+                            root.display()
+                        ),
+                        "check the path, or write `front_controller = false` to serve only real \
+                         files",
+                    ));
+                }
+            }
+        }
+    }
+
     // A listener with no backends is a static-only deployment, which works — but
     // only for paths that name a file. A path that names nothing has nowhere to go
     // and answers 500, so it is worth saying once here rather than leaving it to be

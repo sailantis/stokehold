@@ -123,7 +123,7 @@ fn main() -> ExitCode {
 /// a per-request peak. See the README in `sailantis/stokehold-php-sdk`.
 fn version() {
     println!("stokehold {}", env!("CARGO_PKG_VERSION"));
-    println!("  front-ends:       HTTP/1.1, HTTP/2 (cleartext), FastCGI");
+    println!("  front-ends:       HTTP/1.1, HTTP/2 (cleartext), FastCGI, TLS (rustls)");
     println!(
         "  worker protocol:  {}",
         stokehold_server::WORKER_PROTOCOL_VERSION
@@ -388,9 +388,25 @@ fn serve(
         }
     };
 
+    // TLS applies to `http` unless a dedicated `https` listener was configured, in which case
+    // `http` stays plaintext and `https` carries it. Validation has already refused every
+    // combination outside that matrix, so this only picks between the two shapes.
+    let config_dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let tls_active = config.server.tls.is_some();
+    let https_address = config.server.https.clone();
+    let tls_on_http = tls_active && https_address.is_none();
+    let tls_for_http = if tls_on_http {
+        Some(stokehold_http::TlsSettings {
+            config: &config,
+            config_dir,
+        })
+    } else {
+        None
+    };
+
     let http = match &http_address {
         Some(address) => {
-            let running = RunningHttp::start(
+            let running = RunningHttp::start_with_tls(
                 address,
                 Arc::clone(&dispatcher),
                 Arc::clone(&sites),
@@ -398,15 +414,49 @@ fn serve(
                     max_connections,
                     ..HttpLimits::default()
                 },
+                tls_for_http,
             )
             .map_err(|err| ServerError::Listener {
                 reason: err.to_string(),
             })?;
-            println!("  http:             {}", running.local_addr());
+            if tls_on_http {
+                println!("  http:             {} (https)", running.local_addr());
+            } else {
+                println!("  http:             {}", running.local_addr());
+            }
             Some(running)
         }
         None => {
             println!("  http:             (disabled)");
+            None
+        }
+    };
+
+    let https = match &https_address {
+        Some(address) => {
+            let running = RunningHttp::start_with_tls(
+                address,
+                Arc::clone(&dispatcher),
+                Arc::clone(&sites),
+                HttpLimits {
+                    max_connections,
+                    ..HttpLimits::default()
+                },
+                Some(stokehold_http::TlsSettings {
+                    config: &config,
+                    config_dir,
+                }),
+            )
+            .map_err(|err| ServerError::Listener {
+                reason: err.to_string(),
+            })?;
+            println!("  https:            {} (https)", running.local_addr());
+            Some(running)
+        }
+        None => {
+            if tls_active {
+                println!("  https:            (disabled)");
+            }
             None
         }
     };
@@ -431,6 +481,14 @@ fn serve(
         http.stop();
         let (_, requests, _, failed) = stats.snapshot();
         println!("http: {requests} request(s), {failed} failed");
+        report_tls(&stats);
+    }
+    if let Some(https) = https {
+        let stats = Arc::clone(&https.stats());
+        https.stop();
+        let (_, requests, _, failed) = stats.snapshot();
+        println!("https: {requests} request(s), {failed} failed");
+        report_tls(&stats);
     }
 
     // Printed rather than traced: a load test wants this line in the same log as
@@ -442,6 +500,22 @@ fn serve(
 
     println!("stopped");
     Ok(())
+}
+
+/// Print the TLS counters, when the listener had TLS at all.
+///
+/// Printed rather than traced for the same reason the request counts are: a failed handshake is
+/// invisible from the client's side — the client sees a handshake error and never reaches this
+/// log — so the number is the only signal that a port is refusing everyone.
+fn report_tls(stats: &stokehold_http::HttpStats) {
+    let (handshakes, failures, plaintext) = stats.tls_snapshot();
+    if handshakes == 0 && failures == 0 && plaintext == 0 {
+        return;
+    }
+    println!("tls: {handshakes} handshake(s), {failures} failed");
+    if plaintext > 0 {
+        println!("tls: {plaintext} cleartext connection(s) accepted on the TLS port");
+    }
 }
 
 /// The one line of slot-contention report, as a string.

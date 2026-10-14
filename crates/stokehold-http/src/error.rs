@@ -54,6 +54,14 @@ pub enum HttpError {
     /// The `tokio` runtime could not be created.
     #[error("cannot start the async runtime: {0}")]
     Runtime(#[source] std::io::Error),
+
+    /// A certificate or key could not be loaded, or they do not pair.
+    ///
+    /// Reported before the port is bound, because a listener that starts and then fails every
+    /// handshake is worse than one that refuses to start: the failure belongs to the operator
+    /// reading the log, not to every client that connects.
+    #[error("TLS is configured but unusable: {reason}")]
+    Tls { reason: String },
 }
 
 impl HttpError {
@@ -69,7 +77,7 @@ impl HttpError {
             HttpError::GatewayTimeout(_) => 504,
             // Neither of these reaches a client: they stop the listener before it
             // accepts anything. Reported as a 500 rather than panicking.
-            HttpError::Bind { .. } | HttpError::Runtime(_) => 500,
+            HttpError::Bind { .. } | HttpError::Runtime(_) | HttpError::Tls { .. } => 500,
         }
     }
 

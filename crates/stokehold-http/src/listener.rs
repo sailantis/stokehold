@@ -106,6 +106,19 @@ pub struct HttpStats {
     pub requests: AtomicUsize,
     pub rejected: AtomicUsize,
     pub failed: AtomicUsize,
+    /// Handshakes that completed. Zero on a deployment without TLS.
+    pub handshakes: AtomicUsize,
+    /// Handshakes that failed.
+    ///
+    /// Counted rather than only logged because a TLS misconfiguration is the one failure that
+    /// is invisible from the client's side: the client sees a handshake error and never reaches
+    /// the server's logs. A non-zero count on a port that should be idle is the signal.
+    pub handshake_failures: AtomicUsize,
+    /// Cleartext connections answered on a TLS port.
+    ///
+    /// Only possible with `[server.tls].plain`, which is off by default and logged at startup.
+    /// Counted so a deployment can see it happening rather than inferring it.
+    pub plaintext_on_tls_port: AtomicUsize,
 }
 
 impl HttpStats {
@@ -118,6 +131,24 @@ impl HttpStats {
             self.failed.load(Ordering::Relaxed),
         )
     }
+
+    /// The TLS counters, for logging at shutdown.
+    pub fn tls_snapshot(&self) -> (usize, usize, usize) {
+        (
+            self.handshakes.load(Ordering::Relaxed),
+            self.handshake_failures.load(Ordering::Relaxed),
+            self.plaintext_on_tls_port.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// TLS settings for a listener, borrowed from the configuration.
+#[derive(Clone, Copy)]
+pub struct TlsSettings<'a> {
+    /// The validated configuration, read for `[server.tls]` and the per-site tables.
+    pub config: &'a stokehold_core::config::Config,
+    /// Where a relative `certificate`/`key` resolves.
+    pub config_dir: &'a std::path::Path,
 }
 
 /// Stops the listener from another thread.
@@ -196,6 +227,15 @@ pub const DEFAULT_SITE_KEY: &str = "<default>";
 pub struct HttpListener {
     listener: tokio::net::TcpListener,
     front_end: Arc<FrontEnd>,
+    /// TLS, when `[server.tls]` is configured. `None` is a plaintext listener, and that is
+    /// the whole of the cost when TLS is off: no accept wrapping, no peek, no TLS type built.
+    tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    /// Also answer cleartext on the TLS port (`[server.tls].plain`).
+    ///
+    /// Only ever true with `tls` set. The first byte decides which of the two paths a
+    /// connection takes, which is what nginx's `ssl_preread` does — a TLS record always begins
+    /// `0x16`, a plaintext request begins an ASCII method letter.
+    accept_plain: bool,
 }
 
 /// A running HTTP listener on a dedicated runtime thread.
@@ -227,12 +267,25 @@ impl RunningHttp {
         sites: Arc<Sites>,
         limits: HttpLimits,
     ) -> Result<Self> {
+        Self::start_with_tls(address, dispatcher, sites, limits, None)
+    }
+
+    /// [`RunningHttp::start`], with TLS.
+    pub fn start_with_tls(
+        address: &str,
+        dispatcher: Arc<Dispatcher>,
+        sites: Arc<Sites>,
+        limits: HttpLimits,
+        tls: Option<TlsSettings<'_>>,
+    ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(HttpError::Runtime)?;
 
-        let listener = runtime.block_on(HttpListener::bind(address, dispatcher, sites, limits))?;
+        let listener = runtime.block_on(HttpListener::bind_with_tls(
+            address, dispatcher, sites, limits, tls,
+        ))?;
         let bound = listener.local_addr()?;
         let shutdown = listener.shutdown_handle();
         let stats = listener.stats();
@@ -299,6 +352,22 @@ impl HttpListener {
         sites: Arc<Sites>,
         limits: HttpLimits,
     ) -> Result<Self> {
+        Self::bind_with_tls(address, dispatcher, sites, limits, None).await
+    }
+
+    /// [`HttpListener::bind`], with the TLS settings and the directory certificate paths
+    /// resolve against.
+    ///
+    /// The resolver is built here rather than per connection, and a certificate that cannot
+    /// load fails this call — before the port is bound — so a misconfigured deployment is
+    /// reported once rather than as a listener that accepts and then fails every handshake.
+    pub async fn bind_with_tls(
+        address: &str,
+        dispatcher: Arc<Dispatcher>,
+        sites: Arc<Sites>,
+        limits: HttpLimits,
+        tls: Option<TlsSettings<'_>>,
+    ) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .map_err(|source| HttpError::Bind {
@@ -309,6 +378,41 @@ impl HttpListener {
             address: address.to_string(),
             source,
         })?;
+
+        // The acceptor is built before anything is served, and its failure is reported as a
+        // configuration error: a certificate that cannot be read must not become a listener.
+        let (acceptor, accept_plain) = match tls {
+            Some(settings) => {
+                let resolver = Arc::new(
+                    crate::tls::SniResolver::from_config(settings.config, settings.config_dir)
+                        .map_err(|source| HttpError::Tls {
+                            reason: source.to_string(),
+                        })?,
+                );
+                let server = crate::tls::server_config(
+                    settings.config,
+                    settings.config_dir,
+                    Arc::clone(&resolver),
+                )
+                .map_err(|source| HttpError::Tls {
+                    reason: source.to_string(),
+                })?;
+                tracing::info!(
+                    named_certificates = resolver.named_certificates(),
+                    alpn = ?server.alpn_protocols.iter()
+                        .map(|p| String::from_utf8_lossy(p).into_owned())
+                        .collect::<Vec<_>>(),
+                    plaintext_accepted = settings.config.server.tls.as_ref()
+                        .is_some_and(|t| t.plain),
+                    "TLS enabled"
+                );
+                (
+                    Some(Arc::new(tokio_rustls::TlsAcceptor::from(server))),
+                    settings.config.server.tls.as_ref().is_some_and(|t| t.plain),
+                )
+            }
+            None => (None, false),
+        };
 
         // The bound port, which matters when port 0 was requested. The port is needed
         // here rather than by the caller because only the listener knows what it got.
@@ -350,6 +454,8 @@ impl HttpListener {
                 shutdown: Arc::new(AtomicBool::new(false)),
                 server_port: port,
             }),
+            tls: acceptor,
+            accept_plain,
         })
     }
 
@@ -387,6 +493,8 @@ impl HttpListener {
         let HttpListener {
             listener,
             front_end,
+            tls,
+            accept_plain,
         } = self;
 
         while !front_end.shutdown.load(Ordering::Relaxed) {
@@ -400,11 +508,14 @@ impl HttpListener {
                         continue;
                     }
 
+                    // Nagle's algorithm is disabled on the raw socket, which is the one place
+                    // it can be: the stream is wrapped by TLS from here on, and a `TlsStream`
+                    // has no `set_nodelay`.
+                    let _ = stream.set_nodelay(true);
                     let front_end = Arc::clone(&front_end);
+                    let tls = tls.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = serve_connection(stream, front_end.clone(), peer).await {
-                            tracing::debug!(%peer, %err, "http connection ended");
-                        }
+                        serve_accepted(stream, tls, accept_plain, front_end.clone(), peer).await;
                         front_end.stats.connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
@@ -432,14 +543,99 @@ impl HttpListener {
     }
 }
 
-/// Serve every request on one connection until it closes.
-async fn serve_connection(
+/// The first byte of a TLS record header: `ContentType: handshake`.
+///
+/// A plaintext HTTP request cannot begin with this byte — it begins with an ASCII method letter
+/// (`G` = `0x47`, `P` = `0x50`, …) — so one byte separates the two protocols unambiguously.
+/// This is the same test nginx's `ssl_preread` applies.
+const TLS_HANDSHAKE_BYTE: u8 = 0x16;
+
+/// Decide the protocol for one accepted connection, then serve it.
+///
+/// With no TLS configured this is `serve_connection` on the raw stream — no peek, no branch,
+/// no TLS value constructed, which is the whole of the claim that TLS costs nothing when it is
+/// off.
+///
+/// With TLS configured and `plain` off, every connection is a TLS handshake: a client that
+/// sends cleartext gets a handshake failure, which is what a TLS-only port should do.
+///
+/// With `plain` on, the first byte decides. That is a **detection, not a downgrade**: a
+/// connection goes down one path or the other, and a client that offers TLS and fails the
+/// handshake still fails. There is no retry as cleartext.
+async fn serve_accepted(
     stream: tokio::net::TcpStream,
+    tls: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    accept_plain: bool,
     front_end: Arc<FrontEnd>,
     peer: SocketAddr,
-) -> Result<()> {
-    let _ = stream.set_nodelay(true);
+) {
+    let Some(acceptor) = tls else {
+        if let Err(err) = serve_connection(stream, front_end, peer).await {
+            tracing::debug!(%peer, %err, "http connection ended");
+        }
+        return;
+    };
 
+    if accept_plain && !starts_with_tls_handshake(&stream).await {
+        front_end
+            .stats
+            .plaintext_on_tls_port
+            .fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = serve_connection(stream, front_end, peer).await {
+            tracing::debug!(%peer, %err, "http connection ended");
+        }
+        return;
+    }
+
+    match acceptor.accept(stream).await {
+        Ok(tls_stream) => {
+            front_end
+                .stats
+                .handshakes
+                .fetch_add(1, Ordering::Relaxed);
+            if let Err(err) = serve_connection(tls_stream, front_end, peer).await {
+                tracing::debug!(%peer, %err, "https connection ended");
+            }
+        }
+        // A failed handshake is not an error worth propagating: it is a client that could not
+        // negotiate, and it is counted so a port that nothing can connect to is visible rather
+        // than silent.
+        Err(err) => {
+            front_end
+                .stats
+                .handshake_failures
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%peer, %err, "tls handshake failed");
+        }
+    }
+}
+
+/// Whether a connection begins with a TLS handshake.
+///
+/// `peek` reads without consuming, so the bytes are still there for whichever path runs next.
+/// A read that fails or returns nothing is *not* a TLS handshake: there is no request to serve
+/// either way, and treating a dead connection as TLS would only turn a clean close into a
+/// handshake error.
+async fn starts_with_tls_handshake(stream: &tokio::net::TcpStream) -> bool {
+    let mut first = [0u8; 1];
+    matches!(stream.peek(&mut first).await, Ok(1) if first[0] == TLS_HANDSHAKE_BYTE)
+}
+
+/// Serve every request on one connection until it closes.
+///
+/// Generic over the stream so that one code path serves both protocols. The TLS handshake is
+/// the caller's business: by the time a stream arrives here it is already decrypted (or was
+/// never encrypted), and everything below — the request loop, dispatch, site resolution, the
+/// static layer — is identical. `hyper`'s auto-detection still picks HTTP/2 from the ALPN
+/// result, which it reads off the `TlsStream` through the `TokioIo` wrapper.
+async fn serve_connection<S>(
+    stream: S,
+    front_end: Arc<FrontEnd>,
+    peer: SocketAddr,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let remote_addr = peer.ip().to_string();
     let service = service_fn(move |request: Request<Incoming>| {
         let front_end = Arc::clone(&front_end);

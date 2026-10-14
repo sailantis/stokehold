@@ -1,4 +1,4 @@
-# stokehold — cross-platform PHP application server (Rust)
+# volucer — cross-platform PHP application server (Rust)
 
 ## 1. Problem
 
@@ -26,7 +26,7 @@ Hard constraints established in discussion:
 multipart/`$_FILES` parsing, upload temp files, `is_uploaded_file()`, request startup and
 shutdown. That is precisely the work a forked plain PHP process cannot do (it has no SAPI to
 populate `$_SERVER`/`$_GET`/`$_POST`/`$_FILES`, and FFI cannot install SAPI callbacks). So
-stokehold **never** parses multipart itself: it passes `CONTENT_TYPE`, `CONTENT_LENGTH` and the
+volucer **never** parses multipart itself: it passes `CONTENT_TYPE`, `CONTENT_LENGTH` and the
 raw body as `STDIN`, and PHP does the rest.
 
 ## 2. Recovered context
@@ -37,7 +37,7 @@ session-store database was empty for this machine. The full prior discussion was
 verified `php-cgi.exe -b` probe, the naming evaluation and the open questions. This plan
 restores and extends it.
 
-Naming is **settled**: `stokehold`. crates.io-free, low search collision. (Rejected along the
+Naming is **settled**: `volucer`. crates.io-free, low search collision. (Rejected along the
 way: `firestarter` — taken on crates.io and collides with the Linux firewall GUI; `tinderbox` —
 collides with a GPU forest-fire simulator; `php-wpm` — narrows the scope to worker pooling.)
 
@@ -53,14 +53,14 @@ collides with a GPU forest-fire simulator; `php-wpm` — narrows the scope to wo
 ```
 
 - Both front-ends are just **listeners** that produce the same CGI environment and hand off to
-  one dispatcher — so `stokehold serve` can be hit directly by a browser **and** spoken to by
+  one dispatcher — so `volucer serve` can be hit directly by a browser **and** spoken to by
   nginx. One binary, no second application.
 - The HTTP listener resolves the `Host` header **before** anything else, because that is the one
   decision the FastCGI path cannot make for itself: a `host` matcher in the route table is
   consulted after `SCRIPT_FILENAME` is resolved, so it can choose a backend but never a document
   root. `[sites.<name>]` gives each host its own root, controller, routes and static layer, and
   the routing for each is built once at startup rather than per request.
-- stokehold is a **protocol gateway, not a forward proxy**: it terminates the client protocol
+- volucer is a **protocol gateway, not a forward proxy**: it terminates the client protocol
   (HTTP or FastCGI) and originates FastCGI to the backend. It owns both ends, so it translates
   rather than relays — with one exception (pass-through below).
 - **Backend is an enum** so one dispatcher serves everything:
@@ -89,7 +89,7 @@ default_backend  = "app"
 Route → backend selection is per-site or per-route. Worker-safe hot paths go to the worker
 pool; anything needing real isolation or SAPI-specific behaviour goes to a FastCGI backend.
 
-There was a fourth backend kind, `spawn_fpm`, which stokehold would have started itself. It
+There was a fourth backend kind, `spawn_fpm`, which volucer would have started itself. It
 parsed and validated while `Backend::from_config` refused it, so `version` advertised a feature
 that could not run — see the decisions table for why it was removed rather than implemented.
 
@@ -111,7 +111,7 @@ opt-in and only when configured.
 | Config format | **TOML** (`serde`) — no YAML dependency, better tooling |
 | Front-end scope | HTTP listener **in v1**; TLS/ACME/HTTP-2 as a later milestone |
 | Prefork | **deferred**, Unix-only, forked from a PHP boot parent — never from the Tokio runtime |
-| HTTP front-end runtime | **`hyper` on `tokio`, confined to `crates/stokehold-http`** — the target is the public-facing case (static files, HTTP/2 now, HTTP/3 later), and HTTP/3 needs `quinn`, which is itself a `tokio` program. So the runtime was arriving anyway; this is that bet made earlier rather than a second one. Every backend stays blocking and is reached only through `spawn_blocking` |
+| HTTP front-end runtime | **`hyper` on `tokio`, confined to `crates/volucer-http`** — the target is the public-facing case (static files, HTTP/2 now, HTTP/3 later), and HTTP/3 needs `quinn`, which is itself a `tokio` program. So the runtime was arriving anyway; this is that bet made earlier rather than a second one. Every backend stays blocking and is reached only through `spawn_blocking` |
 | PHP floor | **8.2** — the floor is `memory_reset_peak_usage()`, which the SDK calls to make each `END` report that request's peak rather than a high-water mark that never falls. 8.1 was never verified, and azera and clarity already require 8.2+, so one floor across the stack beats three |
 | Static files | **In the HTTP front-end, above the backends, off by default** — a path naming a file is answered from disk, a path naming nothing is dispatched. Streaming through `tokio::fs` rather than zero-copy: `sendfile` is Unix-only, so it would be a second code path rather than a faster one |
 | Where the document root lives | **`server.document_root`, with the `--document-root` flag overriding it** — a deployment fact belongs in the file a systemd unit already reads, and the more specific statement (the flag) is the one that takes effect. Same rule for `front_controller`. An empty file value is **rejected** rather than given a meaning, because TOML cannot distinguish it from an absent key |
@@ -123,8 +123,8 @@ opt-in and only when configured.
 | Path traversal in the router | **Refused**, sharing one predicate with the static layer. `cgi::route` only did `trim_start_matches('/')`, so `..` was carried into `PATH_INFO`, `REQUEST_URI` and the `SCRIPT_FILENAME` built from them; nginx normalises the URI, so the two front-ends disagreed about the same request. Checked **after** percent-decoding, because `%2e%2e` is `..` by the time a path is compared, and per segment, because a URL path always begins with `/` and a backslash separates on Windows but is a filename byte on Unix |
 | Per-route static and header policy | **Designed, not built** — `policy = { cache_control, precompressed, headers }` with `backend` becoming optional, so a route is a location rather than only a backend selector. Kept out of the vhosts change because it shares no code with host resolution, and a site's own `static_files` already covers the multi-site case. There is **no** on-the-fly compression today: `precompressed` serves a file that was already built |
 | Configuration reload | **Not built** — see open decision 5. Restarting the process is the honest answer until the dispatcher can be reloaded whole rather than in part |
-| Where the PHP SDK lives | **Its own repository, `sailantis/stokehold-php-sdk`** — Packagist requires `composer.json` at the root of a repository, so a tagged `sailantis/stokehold-worker` cannot exist while the SDK sits in `sdk/php/`. The spec (`docs/worker-protocol.md`) stays here: it is the shared document both ends are tested against, and two copies of a specification are two specifications. A release of the package links back to it at a **pinned commit**, because a branch link would silently start describing a later protocol than the release implements |
-| Skipped end-to-end tests | **A skip is visible, and a failure when `STOKEHOLD_E2E=1`** — `libtest` hides a passing test's stderr, so "skipped with a printed reason" was in practice identical to "passed". The suites that need PHP or the SDK are the ones that actually prove the wire format, so CI sets `STOKEHOLD_E2E=1` and a skip fails there |
+| Where the PHP SDK lives | **Its own repository, `sailantis/volucer-php-sdk`** — Packagist requires `composer.json` at the root of a repository, so a tagged `sailantis/volucer-worker` cannot exist while the SDK sits in `sdk/php/`. The spec (`docs/worker-protocol.md`) stays here: it is the shared document both ends are tested against, and two copies of a specification are two specifications. A release of the package links back to it at a **pinned commit**, because a branch link would silently start describing a later protocol than the release implements |
+| Skipped end-to-end tests | **A skip is visible, and a failure when `VOLUCER_E2E=1`** — `libtest` hides a passing test's stderr, so "skipped with a printed reason" was in practice identical to "passed". The suites that need PHP or the SDK are the ones that actually prove the wire format, so CI sets `VOLUCER_E2E=1` and a skip fails there |
 
 ## 4. Worker protocol (own protocol)
 
@@ -181,12 +181,12 @@ Deliberately stdlib-only — no extensions, no FFI, no build step:
   figure where available) so the supervisor can recycle on a threshold — the same idea as
   RoadRunner's `max_worker_memory`.
 
-Shape of the SDK (`sailantis/stokehold-worker`, MIT, its own repository —
-[`sailantis/stokehold-php-sdk`](https://github.com/sailantis/stokehold-php-sdk) — because a
+Shape of the SDK (`sailantis/volucer-worker`, MIT, its own repository —
+[`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk) — because a
 Composer package needs `composer.json` at the root of a repository):
 
 ```php
-$worker = Stokehold\Worker::create();          // HELLO handshake
+$worker = Volucer\Worker::create();          // HELLO handshake
 while ($req = $worker->waitRequest()) {        // one frame per request
     $worker->respond(handle($req));            // writes RESPONSE (+ BODY)
 }
@@ -200,7 +200,7 @@ of lines. The SDK is a **transport, not a framework**.
 Source: the FastCGI specification
 (<https://fastcgi-archives.github.io/FastCGI_Specification.html>). Values below were verified
 against the specification and secondary implementations, and are confirmed by fixture tests in
-`crates/stokehold-fcgi`.
+`crates/volucer-fcgi`.
 
 - **Record header (8 bytes):** `version`, `type`, `requestIdB1`, `requestIdB0`,
   `contentLengthB1`, `contentLengthB0`, `paddingLength`, `reserved`. Content length is
@@ -248,7 +248,7 @@ against the specification and secondary implementations, and are confirmed by fi
    send as `STDIN` are silently dropped while the response still looks successful. The
    environment builder must always send it, derived from the body it is about to frame. This was
    found by the `php-cgi` integration test in
-   `crates/stokehold-fcgi/tests/php_cgi.rs`, which is why that test exists.
+   `crates/volucer-fcgi/tests/php_cgi.rs`, which is why that test exists.
 6. **On Windows an accepted socket inherits the listener's non-blocking mode.** A listener put
    into non-blocking mode so `accept` can be polled hands every accepted connection the same
    flag, and Rust does not reset it. Every read then returns `WSAEWOULDBLOCK` immediately and the
@@ -262,7 +262,7 @@ against the specification and secondary implementations, and are confirmed by fi
    waiting on it; the worker is then *killed*, which is what makes the pending read return so the
    thread can exit and drop the pipes. The consequence to remember is that a timed-out worker's
    pipes must not be reused — the reader may still be inside a read.
-   `crates/stokehold-server/src/worker_pool/` (`exchange.rs`).
+   `crates/volucer-server/src/worker_pool/` (`exchange.rs`).
 8. **Draining `STDERR` on the caller's thread is the same hang as not draining it.** A worker
    whose stderr pipe fills blocks for ever on its next write, which is why one reader thread per
    backend is mandatory. But reading that pipe to end-of-file *blocks until the worker exits*, so
@@ -279,14 +279,14 @@ against the specification and secondary implementations, and are confirmed by fi
     request at a time and `php-cgi` processes sequentially, so every backend blocks. Calling one
     from an async context stalls a runtime worker thread; enough stalls starve every other
     connection, and the symptom is latency, not an error. The dispatcher is therefore reached only
-    through `spawn_blocking` — `crates/stokehold-http/src/listener.rs`, and the rule is stated in
+    through `spawn_blocking` — `crates/volucer-http/src/listener.rs`, and the rule is stated in
     that crate's module docs so it is not rediscovered.
 11. **Static serving must not decode the URL path.** Percent-decoding a path before resolving it
     to a file is how a file server is walked out of its document root: `%2e%2e%2f` resolves to
     `../` in a layer that decodes and to a literal file name in a layer that does not. The static
     layer therefore refuses `..` segments outright *and* leaves the path encoded, so the two rules
     cannot disagree. PHP's router, which does decode, is reached through the front controller and
-    is a separate trust boundary — see `crates/stokehold-http/src/static_files.rs`.
+    is a separate trust boundary — see `crates/volucer-http/src/static_files.rs`.
 12. **A ranged or streamed response cannot carry a `Content-Length` hyper did not choose.** A body
     whose `size_hint` is not exact is framed as chunked, so a stream over a file must be a `Body`
     with `SizeHint::with_exact` rather than more bytes than were promised — a mismatch desynchronises
@@ -296,13 +296,13 @@ against the specification and secondary implementations, and are confirmed by fi
     `front_controller` deserialize to the same thing, so an empty value cannot be given a meaning
     distinct from the default. Rather than guessing which the operator meant, the value is
     *rejected* with a message pointing at the command-line flag that does mean "no front
-    controller" — and `stokehold check` reports the resolved controller so the effective value is
+    controller" — and `volucer check` reports the resolved controller so the effective value is
     always visible. The general rule: when a config format cannot distinguish two states, refuse
     the ambiguous input instead of picking a winner.
 14. **A preflight hint is a claim about the rest of the system, so test it against the rest of the
     system.** The first version of the missing-front-controller hint told the operator to write
     `server.front_controller = ""`, which `Config::validate` rejects — a warning whose advice fails
-    when followed. `crates/stokehold-core/src/preflight.rs` has a test asserting no hint
+    when followed. `crates/volucer-core/src/preflight.rs` has a test asserting no hint
     recommends a value validation refuses, because the two were written separately and nothing else
     connects them.
 15. **A static file server must refuse to serve a script, or it discloses source code.** The static
@@ -312,7 +312,7 @@ against the specification and secondary implementations, and are confirmed by fi
     test suite for a structural reason**: the shared fixture never wrote an `index.php`, so the
     assertion `"/index.php" → not a file` passed because the file was absent, not because the rule
     existed. A test that asserts a refusal must create the thing being refused. The rule now shares
-    `stokehold_fcgi::cgi::has_php_extension` with the routing layer, because two lists of "what is a
+    `volucer_fcgi::cgi::has_php_extension` with the routing layer, because two lists of "what is a
     script" would drift and the one that drifted would be the one serving source. It also makes
     `/index.php/foo` work, which is the `PATH_INFO` case a deployment needs.
 16. **A relative document root silently breaks a *persistent* PHP pool after the first request.**
@@ -329,12 +329,12 @@ against the specification and secondary implementations, and are confirmed by fi
     `WIN32_MAX_SPAWN_CHILDREN` (64) of them, and all of them share the single bound socket. So
     `php-cgi -b host:port` gives *one slot's worth of concurrency* rather than one process, and the
     count is read from php-cgi's own environment (`sapi/cgi/cgi_main.c`) — a host that exports
-    `PHP_FCGI_CHILDREN` for php-fpm silently hands it to stokehold too. Measured on this machine:
+    `PHP_FCGI_CHILDREN` for php-fpm silently hands it to volucer too. Measured on this machine:
     `workers = 2` produced **21 processes** (one parent plus 20 children per slot, 20 being the
     inherited value). The pool now sets `PHP_FCGI_CHILDREN=0` (`0`, not `1`: php-cgi spawns
     CHILDREN *children in addition to itself*) and `PHP_FCGI_MAX_REQUESTS=0`, because PHP's own
     check is `if (max_requests && requests == max_requests)` and its default is 500 — so without
-    the second variable a child exits and is silently replaced while stokehold's `max_requests`
+    the second variable a child exits and is silently replaced while volucer's `max_requests`
     accounting keeps counting. That made every pool test start 21 processes instead of 1, which is
     also an excellent way to make an integration suite flaky.
 18. **A test helper that waits for a specific banner field hangs on a config that does not set it.**
@@ -363,15 +363,15 @@ against the specification and secondary implementations, and are confirmed by fi
     `PATH`") therefore report the same result whether the protocol was exercised against PHP or
     not — and a green suite is exactly the shape a silently broken end-to-end test takes. Worse,
     the SDK moved to its own repository, so the two suites that drive it now depend on a checkout
-    being *found*: a wrong `STOKEHOLD_SDK_DIR` would have been indistinguishable from a pass.
-    `STOKEHOLD_E2E=1` makes a skip a failure, which is what CI should set; it is deliberately off
+    being *found*: a wrong `VOLUCER_SDK_DIR` would have been indistinguishable from a pass.
+    `VOLUCER_E2E=1` makes a skip a failure, which is what CI should set; it is deliberately off
     by default so a laptop with no PHP stays green.
 
 21. **A lock held for the length of a request makes `workers` a lie.** The dispatcher kept its
     `Dispatcher` behind one `Arc<Mutex<_>>` and the pools took `&mut self`, so *every* request in
     the whole server queued on one lock. Measured on the homepage, throughput was flat at ~65 rps
     from concurrency 1 to 16 while RoadRunner on the same site scaled linearly to ~765. The
-    per-request cost was never the difference — both did ~66 rps at concurrency 1, so stokehold was
+    per-request cost was never the difference — both did ~66 rps at concurrency 1, so volucer was
     simply never using more than one core. The protocol's one-request-at-a-time rule is *per
     worker*, not per pool, so nothing about the design wanted that serialisation: the pools now
     lock per slot and the request path takes `&self`. Two lessons worth keeping. First, a
@@ -422,7 +422,7 @@ against the specification and secondary implementations, and are confirmed by fi
     connection handling at all: with retention at one, arm D now matches arm A, static file
     serving by the same Rust front-end with no PHP in the path, so the backend is no longer what
     D is limited by. Regression test:
-    `crates/stokehold-server/tests/external.rs::concurrent_requests_reach_the_backend_at_the_same_time`
+    `crates/volucer-server/tests/external.rs::concurrent_requests_reach_the_backend_at_the_same_time`
     — four requests sleeping 300 ms each must finish in under a second, and it fails at 1.26 s
     against the single-connection version (verified by reverting).
 
@@ -450,10 +450,10 @@ against the specification and secondary implementations, and are confirmed by fi
 25. **The worker arm spent a thread per request, and removing that turned the only losing arm into
     a winning one.** On the trivial handler the piped worker used to reach 20,422 rps at concurrency
     32 while `spawn_cgi` with the *same* 12 slots reached 29,950 — and RoadRunner's piped worker,
-    speaking the same protocol shape, reached **31,525**. So stokehold *lost* the direct
+    speaking the same protocol shape, reached **31,525**. So volucer *lost* the direct
     worker-versus-worker comparison by about 54% at concurrency 32, having been level up to
     concurrency 8 (17,471 vs 16,610). The cause was `request_with_deadline`
-    (`crates/stokehold-server/src/worker_pool/exchange.rs`): a pipe read has no portable timeout, so each
+    (`crates/volucer-server/src/worker_pool/exchange.rs`): a pipe read has no portable timeout, so each
     request spawned a `std::thread` to run the exchange and took the result through an
     `mpsc::recv_timeout`, while `CgiPool::request` calls straight into the slot. Every request paid
     a thread create and a channel handoff, so the pool reached its ceiling *below* the point where
@@ -488,7 +488,7 @@ against the specification and secondary implementations, and are confirmed by fi
     | E RoadRunner piped | 3,105 | 6,131 | 11,858 | 17,126 | 22,808 | 32,733 |
     | A static (front-end ceiling) | 5,680 | 11,683 | 24,079 | 35,698 | 37,011 | 36,691 |
 
-    **Stokehold now leads RoadRunner at every concurrency** — +10% at 32, +42% at 16, +42% at 8 —
+    **Volucer now leads RoadRunner at every concurrency** — +10% at 32, +42% at 16, +42% at 8 —
     where before it trailed by 54% at 32. Three repetitions gave `B` 23.0/23.5/24.5k at concurrency 8
     against `E` 17.4/17.0/17.1k and `B` 38.7/38.5/38.3k at 32 against `E` 32.0/32.1/32.0k, so the
     margin is stable to about ±3%. Two things are worth noting alongside it: the piped worker now
@@ -508,12 +508,12 @@ against the specification and secondary implementations, and are confirmed by fi
     different feature and not what `-b 127.0.0.1:port` does there.
 
     This was originally justified by the TCP arm's cost, which hazard 30 later showed was a bug
-    on stokehold's side rather than a property of loopback TCP. With that fixed the two transports
+    on volucer's side rather than a property of loopback TCP. With that fixed the two transports
     measure the same (1.238 ms against 1.219 ms), so the option is kept on its own merits —
     convention, and a filesystem path being easier to police with permissions than a port — and
     **not** as a performance recommendation.
 
-    **Implemented** as `socket = "unix:/run/stokehold/cgi"` in a `spawn_cgi` backend
+    **Implemented** as `socket = "unix:/run/volucer/cgi"` in a `spawn_cgi` backend
     (`SpawnCgiConfig::socket`). Three things about it are deliberate rather than incidental. The
     configured value is a **path prefix**, not a finished path: slot `i` binds `<prefix>.<i>.sock`,
     because one socket per process is what lets a slot be recycled, counted and reasoned about on
@@ -572,14 +572,14 @@ against the specification and secondary implementations, and are confirmed by fi
     free, so the boot is most of the request. Against ~1.1× on the trivial handler (hazard 25), this
     is the answer to "does the worker model pay off": on an empty handler hardly at all, on a real
     framework by a multiple. `deploy/stoke/` and `scripts/fw-bench.sh` in `azera-competition` add
-    stokehold as a third server so the comparison has two independent server pairs rather than one.
+    volucer as a third server so the comparison has two independent server pairs rather than one.
 
     **What is deliberately not claimed here: my own four-arm run's cold numbers.** In that run
-    stokehold's `spawn_cgi` beat php-fpm on azera (1,115 vs 402 rps) and lost to it badly on Laravel
+    volucer's `spawn_cgi` beat php-fpm on azera (1,115 vs 402 rps) and lost to it badly on Laravel
     (21.8 vs 49.5), and neither figure reconciles with the published FPM rows above (azera should be
     ~1,274 rps, not 402). A cold-versus-cold disagreement in *both* directions means the cold arms
     are measuring something other than the deployment model, so they are not evidence for anything
-    and the published dataset is used instead. The warm-over-cold ratio measured *within* stokehold
+    and the published dataset is used instead. The warm-over-cold ratio measured *within* volucer
     (resident worker vs `spawn_cgi`, same server, same app: 2.3× azera, 30× Laravel) brackets the
     published ratios and agrees on the magnitude, which is the most that can be said for it.
 
@@ -605,7 +605,7 @@ against the specification and secondary implementations, and are confirmed by fi
 29. **`max_requests = 0` meant "recycle after every request" — the opposite of php-fpm.**
     `pm.max_requests = 0` in a php-fpm pool and `max_jobs: 0` in a RoadRunner config both mean *never
     recycle*, and a php-fpm pool config is exactly what an operator copies when configuring a Worker
-    backend. Both pools compared `served >= max` unguarded, so copying that line made stokehold boot
+    backend. Both pools compared `served >= max` unguarded, so copying that line made volucer boot
     the application once per request — the deployment model the backend exists to avoid. It was found
     while writing the framework benchmark, where it produced 11 rps where 2,569 was expected, and it
     is the most consequential configuration footgun in the project precisely because it degrades
@@ -646,10 +646,10 @@ against the specification and secondary implementations, and are confirmed by fi
 
     42.005 with a spread of 0.05 ms is the tell: that is not a throughput limit, it is a
     timer. `TcpExtDelayedACKs` was ~1 per request on T and **exactly 0** on U, and the wire
-    trace showed php-cgi's trailing 1728-byte segment leaving **10 us after** stokehold's ACK
+    trace showed php-cgi's trailing 1728-byte segment leaving **10 us after** volucer's ACK
     arrived 40.7 ms after the data — sender-side Nagle, receiver-side delayed ACK.
 
-    **The fix** is receiver-side and belongs in `stokehold-fcgi`: `TCP_QUICKACK` immediately
+    **The fix** is receiver-side and belongs in `volucer-fcgi`: `TCP_QUICKACK` immediately
     before each `read` on a TCP backend (`transport.rs`). The kernel clears the flag after
     using it and after every `recv`, so it is re-armed per read rather than set once at
     connect time. It takes effect from the next read, which is exactly the read whose ACKs
@@ -680,12 +680,12 @@ against the specification and secondary implementations, and are confirmed by fi
 
     **Wrong answer 2 — "it is delayed ACK, from php-cgi setting `TCP_NODELAY` late".** Half
     right, for entirely the wrong reason. The claim was that php-cgi sets the flag only *after*
-    `fcgi_accept_request` reads the request, so stokehold's writes fall in a Nagle-eligible
+    `fcgi_accept_request` reads the request, so volucer's writes fall in a Nagle-eligible
     window. Reading the guard at line 1088 shows the flag is never set on Linux at all, so the
     window never closes rather than closing late. The conclusion happened to be delayed ACK;
     the reasoning was refuted by source.
 
-    **Wrong answer 3 — "the 8-segment write".** `tcpdump` showed stokehold sending each request
+    **Wrong answer 3 — "the 8-segment write".** `tcpdump` showed volucer sending each request
     as 8 TCP segments, one per 8-byte record header, against nginx's 1–2. That was real and was
     fixed (`Client::send` assembles in a reused buffer and writes once), and it measured
     **1.572 -> 1.509 ms, about 4%** — genuine, and not the cause. It also produced the second
@@ -713,7 +713,7 @@ against the specification and secondary implementations, and are confirmed by fi
     running the same blocking request loop `latency.php` uses. `/items`, median of 3 runs x 500
     iterations per client, ms:
 
-    | conc | P stokehold | R RoadRunner | F php-fpm | U stokehold unix | T stokehold TCP | R/F |
+    | conc | P volucer | R RoadRunner | F php-fpm | U volucer unix | T volucer TCP | R/F |
     |---|---|---|---|---|---|---|
     | 1 | 0.645 | 0.595 | 1.240 | 1.464 | 1.490 | **2.08x** |
     | 2 | 0.646 | 0.580 | 1.177 | 1.348 | 1.381 | 2.03x |
@@ -734,7 +734,7 @@ against the specification and secondary implementations, and are confirmed by fi
     - **The two transports are the same**, now that hazard 30 is fixed: T and U agree to 3% at
       every concurrency, and this is the clean answer to hazard 23's original question.
     - **P and R agree to 10%**, two independent servers on the same model, which is what makes
-      the warm half of the table credible. *(Superseded by hazard 33: the 10% was stokehold's
+      the warm half of the table credible. *(Superseded by hazard 33: the 10% was volucer's
       own front-end waste, it is now fixed, and P leads R — see that hazard for the CPU
       attribution that found it.)*
 
@@ -796,8 +796,8 @@ against the specification and secondary implementations, and are confirmed by fi
     the warm arm reaches 15,500, so the warm arm is further from its own ceiling at every
     concurrency.
 
-33. **stokehold's HTTP front-end used to cost 1.36x RoadRunner's CPU per request, and the whole
-    of it was three avoidable scans. Fixed — stokehold is now the cheaper of the two.**
+33. **volucer's HTTP front-end used to cost 1.36x RoadRunner's CPU per request, and the whole
+    of it was three avoidable scans. Fixed — volucer is now the cheaper of the two.**
 
     The starting observation was that the warm arm sat ~10% behind RoadRunner on every endpoint
     (16,329 against 18,258 rps on `/items` at concurrency 32) while implementing the same model:
@@ -813,20 +813,20 @@ against the specification and secondary implementations, and are confirmed by fi
 
     | arm, conc 32 | rps | server CPU/req | PHP CPU/req | total |
     |---|---|---|---|---|
-    | P stokehold (before) | 16,017 | **413 us** | 608 us | 1,021 us |
+    | P volucer (before) | 16,017 | **413 us** | 608 us | 1,021 us |
     | R RoadRunner | 17,860 | **309 us** | 704 us | 1,013 us |
 
     The totals agree to 1% while the server halves differ by 1.34x, so the gap is entirely
-    stokehold's front-end and nothing else — not the protocol, not the client, not PHP.
+    volucer's front-end and nothing else — not the protocol, not the client, not PHP.
 
     **`scripts/diag-profile.sh` then named it.** A flat `perf record` on the server process during
     a saturated run put 15-19% of *everything* in one function, and two more above 5%:
 
     | symbol | self time, before |
     |---|---|
-    | `stokehold-worker::codec::Channel::read_frame` (inlined `crc32c`) | **14.81-19%** |
-    | `stokehold-fcgi::client::parse_response_headers` | 5.20% |
-    | `stokehold-fcgi::client::split_response_body` | 5.17% |
+    | `volucer-worker::codec::Channel::read_frame` (inlined `crc32c`) | **14.81-19%** |
+    | `volucer-fcgi::client::parse_response_headers` | 5.20% |
+    | `volucer-fcgi::client::split_response_body` | 5.17% |
 
     Each was a full pass over the 12 KB response payload, per request, in userspace:
 
@@ -849,7 +849,7 @@ against the specification and secondary implementations, and are confirmed by fi
     | | before | after |
     |---|---|---|
     | server CPU per request | 413 us | **137 us** |
-    | stokehold rps @ conc 32 | 16,017 | **18,946** |
+    | volucer rps @ conc 32 | 16,017 | **18,946** |
     | RoadRunner server CPU per request | 309 us | 153 us |
     | RoadRunner rps @ conc 32 (re-measured) | 17,860 | 18,019 |
 
@@ -859,7 +859,7 @@ against the specification and secondary implementations, and are confirmed by fi
     and returns status, headers and body together, with the two older entry points delegating to
     it and a test pinning all three to each other.
 
-    **The general lesson, which is hazard 30's lesson again:** "stokehold is N% slower than
+    **The general lesson, which is hazard 30's lesson again:** "volucer is N% slower than
     RoadRunner" is not a fact about a design, it is a fact about a measurement that has not been
     decomposed. Attribute CPU before optimising anything, or the optimisation is a guess — three
     of these four items are invisible in wall clock, and the first attempt at this gap (hazard 23)
@@ -886,7 +886,7 @@ against the specification and secondary implementations, and are confirmed by fi
     | `to_cgi` → `build_params` | routed **twice** per request, `is_file` syscalls included | `build_params_for` takes the route the front-end already resolved — **once** |
 
     The allocation counts are now *asserted exactly*, not bounded, in
-    `stokehold-fcgi/tests/allocations.rs` and `stokehold-worker/tests/allocations.rs`. A new
+    `volucer-fcgi/tests/allocations.rs` and `volucer-worker/tests/allocations.rs`. A new
     allocation in this code is a decision, and a test that names it is the cheapest way to notice.
 
     **Two correctness bugs fell out of the same review**, which is the part worth remembering:
@@ -956,7 +956,7 @@ against the specification and secondary implementations, and are confirmed by fi
       is `MaybeUninit`, and profiling does not show it next to anything else on the path. The
       allocation tests now state its size — one allocation, exactly the payload — so if it is ever
       worth removing, the number that has to improve is on record.
-    - **`read_record` in `stokehold-fcgi` is the allocating reader** and is still what every call
+    - **`read_record` in `volucer-fcgi` is the allocating reader** and is still what every call
       site uses, including the client's per-request `receive`. A buffer-reusing `read_record_into`
       was written and then removed rather than added speculatively, since nothing measured it and
       it would have been public API with no caller. The allocation counts above are what would
@@ -1009,9 +1009,9 @@ against the specification and secondary implementations, and are confirmed by fi
     a per-header cost immediately, and it caught two of these that reading had not. The clone in
     `request_staged` is four lines and looks harmless; it is 38 allocations.
 
-    Both halves are pinned, deliberately split by crate. `stokehold-worker`'s
+    Both halves are pinned, deliberately split by crate. `volucer-worker`'s
     `tests/request_path.rs` drives a whole round trip over the real codec, so a reintroduced
-    clone anywhere on that path fails there; `stokehold-fcgi`'s `tests/allocations.rs` holds the
+    clone anywhere on that path fails there; `volucer-fcgi`'s `tests/allocations.rs` holds the
     router. A slope test in the crate whose source changed is worth more than an exact count in
     a crate that only consumes it.
 
@@ -1020,7 +1020,7 @@ against the specification and secondary implementations, and are confirmed by fi
     from the borrowed serialization view would not fail a `Json::decode::<RequestHeader>`
     round-trip at all — it would arrive empty. The byte-equality test exists for exactly that.
 
-    **`stokehold-core` is not a target.** It was the question this pass started from, and the
+    **`volucer-core` is not a target.** It was the question this pass started from, and the
     answer is that it is cold path: configuration, PHP discovery and preflight all run once at
     startup. Its only per-request functions are `RouteConfig::matches` and `Config::route_backend`,
     and `route_backend` is **dead code** — `Dispatcher::backend_for` duplicates the filter-and-max
@@ -1031,7 +1031,7 @@ against the specification and secondary implementations, and are confirmed by fi
     where it *entered the kernel* more than it had to — and the answer was every transport in
     the project.
 
-    The rule the codebase already knew, in `stokehold-fcgi`'s client: *"assemble the whole request
+    The rule the codebase already knew, in `volucer-fcgi`'s client: *"assemble the whole request
     in `self.out` and write it once… the number of `write(2)` calls changes, from eight to one."*
     It had been applied to the client's **write** side in an earlier pass and to nothing else.
     Every **read** side was still unbuffered, and every write side of the two servers was still
@@ -1053,15 +1053,15 @@ against the specification and secondary implementations, and are confirmed by fi
 
     Three fixes, one per transport:
 
-    - **`stokehold-worker` gained `BoundedChannel`**, a `WorkerChannel` over
+    - **`volucer-worker` gained `BoundedChannel`**, a `WorkerChannel` over
       `BufWriter<Box<dyn Write + Send>>` and `BufReader<Box<dyn Read + Send>>`. It is a new type
       rather than a change to `WorkerChannel` because that type is generic over its streams on
       purpose — the tests drive it over a `Cursor` — and because the buffering is a property of
       talking to a *pipe*, not of the protocol.
-    - **`stokehold-fcgi`'s `Client` now holds `BufReader<T>`** rather than `T`. Writes go through
+    - **`volucer-fcgi`'s `Client` now holds `BufReader<T>`** rather than `T`. Writes go through
       `get_mut()`, so the one-write-per-request guarantee is untouched and `client.stream`
       became `client.stream.get_ref()` at the two test sites that inspect what was written.
-    - **`stokehold-server`'s listener wraps its accepted socket in a `BufReader`** and writes
+    - **`volucer-server`'s listener wraps its accepted socket in a `BufReader`** and writes
       through `get_mut()`.
 
     Two details that matter more than they look:
@@ -1098,13 +1098,13 @@ against the specification and secondary implementations, and are confirmed by fi
     interoperability limit, not a bug with a known trigger.
 
     What is still unbuffered, deliberately recorded rather than fixed: the **HTTP front end**
-    (`stokehold-http`) uses hyper's own buffered IO and is not affected; the **static file**
-    path is dominated by the file read itself; and `stokehold-server`'s listener still flushes
+    (`volucer-http`) uses hyper's own buffered IO and is not affected; the **static file**
+    path is dominated by the file read itself; and `volucer-server`'s listener still flushes
     the response once per record, which the tests pin at five writes for a response with no
     `STDERR` — assembling it first would make it two, but the response is written once per
     request and the reads were the expensive half.
 
-    **The wall-clock answer, measured afterwards.** Re-running the three stokehold arms on the
+    **The wall-clock answer, measured afterwards.** Re-running the three volucer arms on the
     competition VM against a binary built from the commit *before* these three fixes and one
     built from them, same harness, same load, three repeats, medians:
 
@@ -1154,7 +1154,7 @@ against the specification and secondary implementations, and are confirmed by fi
     body-sized, so a `Vec::with_capacity` per request would be a 12 KB allocation per request on
     a 12 KB page, which is the cost being removed. It never outlives the closure, so no
     concurrent writer can observe another's bytes and nothing is locked. A `BufWriter` around the
-    socket was the alternative and is what `stokehold-fcgi`'s client does; here the response has
+    socket was the alternative and is what `volucer-fcgi`'s client does; here the response has
     a known end, so assembling it whole is simpler than reasoning about where a flush must land.
 
     Pinned at **five writes → one**, and the bytes asserted equal to the record-by-record
@@ -1165,7 +1165,7 @@ against the specification and secondary implementations, and are confirmed by fi
 
     Verified end to end against **real nginx** (this front-end's actual peer, which the unit
     tests cannot stand in for): `GET /` and `GET /items` both 200 through nginx →
-    stokehold FastCGI → php-cgi, 30/30 requests over keep-alive, correct HTML, and an empty
+    volucer FastCGI → php-cgi, 30/30 requests over keep-alive, correct HTML, and an empty
     nginx error log.
 
 **39. The worker path rebuilt the whole request, for the third time.** Hazard 37 removed the
@@ -1390,11 +1390,11 @@ against the specification and secondary implementations, and are confirmed by fi
 **42. Borrowing `RequestInfo` is worth about 0.1%, so it is not being done.** Hazard 39's closing
     note named `to_cgi`'s nine owned `String`s as "the natural next target". It was never
     measured — the figure quoted for it, "30 fixed + 2 per header", was actually the *worker
-    request frame* from `stokehold-server/tests/request_header_allocations.rs`, a different layer
+    request frame* from `volucer-server/tests/request_header_allocations.rs`, a different layer
     that the FastCGI path never pays. So the first thing was to measure `to_cgi` itself, and the
     measurement says stop.
 
-    `crates/stokehold-http/tests/to_cgi_allocations.rs`, release build, 200,000 iterations, across
+    `crates/volucer-http/tests/to_cgi_allocations.rs`, release build, 200,000 iterations, across
     runs:
 
     | request headers | `RequestInfo` | environment build | `to_cgi` total |
@@ -1472,17 +1472,17 @@ Phase 5 — worker pool
     correlation, drain/shutdown, recycle on RSS threshold.
 
 Phase 6 — front-ends
-18. `fastcgi-frontend` — **done**, in `crates/stokehold-server/src/frontend/`. Accepts FastCGI
+18. `fastcgi-frontend` — **done**, in `crates/volucer-server/src/frontend/`. Accepts FastCGI
     from nginx, translates it into the same `Dispatcher` the HTTP front-end calls, and re-frames
     the response, with a pass-through fast path for a record it can forward unchanged. It is
-    wired in `stokehold-cli`'s `serve` alongside the HTTP listener: the FastCGI listener owns the
+    wired in `volucer-cli`'s `serve` alongside the HTTP listener: the FastCGI listener owns the
     calling thread while HTTP runs on its own, so both are served concurrently, and `serve` binds
     FastCGI first because binding is synchronous while the HTTP listener is not. `server.fastcgi`
     unset means disabled. `tests/frontend.rs` drives a real request through the whole chain and
     asserts the bytes come back intact, alongside the several-in-a-row, 502-on-backend-failure,
     real-socket codec and build-from-parser cases. **This step was implemented but the plan never
     said so** — it read as unbuilt until this line was corrected.
-19. `http-frontend` — **done**, in `crates/stokehold-http`: a `hyper` listener speaking HTTP/1.1
+19. `http-frontend` — **done**, in `crates/volucer-http`: a `hyper` listener speaking HTTP/1.1
     and HTTP/2 over the same dispatcher as the FastCGI front-end, with route → backend selection
     and the 404/403/413/502/503/504 mappings. This is the project's only async code, and the
     boundary is `spawn_blocking`; see the crate docs for why.
@@ -1493,9 +1493,9 @@ Phase 6 — front-ends
     nothing, and it sits *above* the backends rather than beside them: a path that names no file
     goes to PHP exactly as before, which is what keeps a front controller working. Split out of
     step 19 because it is a feature rather than a translation layer, and because it is what turns
-    "serves PHP" into "can front a site". See `crates/stokehold-http/src/static_files.rs`, and
+    "serves PHP" into "can front a site". See `crates/volucer-http/src/static_files.rs`, and
     hazards 11 and 12.
-21. `config-cli` — **done**. `stokehold serve|check|version`. The gap this closed was that the two
+21. `config-cli` — **done**. `volucer serve|check|version`. The gap this closed was that the two
     settings that describe a deployment most concretely — the document root and the front
     controller — existed only as `serve` flags, so a systemd unit or a container image had to carry
     a command line to say where the application lived. Both are now `server.document_root` and
@@ -1542,7 +1542,7 @@ the wiring.
     bare boolean. `deny_unknown_fields` was added to the backend structs, which were missing it:
     a top-level `routes` written after a `[backends.x]` header was being absorbed into the backend
     table rather than rejected, so the configuration silently had no routes at all.
-28. `sites-resolver` — **done** (`b609cf6`). `stokehold_core::sites::Sites`: exact name, then the
+28. `sites-resolver` — **done** (`b609cf6`). `volucer_core::sites::Sites`: exact name, then the
     longest `*.` wildcard, then `[server]`; ports and case are the client's spelling. It returns
     configuration rather than a `Routing`, because `Routing` lives in a crate that depends on this
     one. Two things the tests forced: the default front controller is applied here rather than
@@ -1614,14 +1614,14 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     allows and every one it does not; `check` reports the resolved certificate paths and says per
     site whether a certificate is its own or inherited; preflight reports a certificate that is
     missing, unreadable, or not PEM.
-44. `host-map` — **done.** `stokehold_core::hostmap::HostMap<V>` holds the rule (exact name, then
+44. `host-map` — **done.** `volucer_core::hostmap::HostMap<V>` holds the rule (exact name, then
     the longest `*.` wildcard, then the caller's fallback — no default is stored, because what an
     unmatched host means differs between callers and inventing one is how SNI and site selection
     would come to disagree). `Sites` is re-homed on `HostMap<String>` and the eight vhost tests pass
     **unchanged**, which is the control for the refactor. Extracting it found a real divergence
     between the two implementations, recorded as hazard 54b and now pinned by a test that runs
     every pattern against every host and requires them to agree.
-45. `tls-termination` — **done.** `crates/stokehold-http/src/tls.rs` loads the chain and key, pairs
+45. `tls-termination` — **done.** `crates/volucer-http/src/tls.rs` loads the chain and key, pairs
     them, and resolves SNI over `HostMap<Arc<CertifiedKey>>`; `serve_connection` is generic over the
     stream so one code path serves both protocols; `bind` builds the acceptor and **fails before
     binding** on a certificate it cannot load. A real bug was found by running it rather than
@@ -1682,7 +1682,7 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
 4. **Static file serving** in the HTTP front-end: minimal `static` middleware, or out of scope
    for v1? — **Answered: in scope, as its own routing layer above the backends, off by default.**
    See step 20 and the Static files section of the README.
-5. **Configuration reload.** Re-reading `stokehold.toml` on `SIGHUP` without dropping a connection
+5. **Configuration reload.** Re-reading `volucer.toml` on `SIGHUP` without dropping a connection
    is the obvious next thing an operator asks for, and it is **not** built. The reason is that
    only part of the file can be reloaded in place: listeners are bound, backends are running
    processes with live pipes, and both front-ends hold the dispatcher behind a handle. Reloading
@@ -1732,13 +1732,13 @@ folder, and nothing here needs the chat to interpret. The four places to look, i
    transport and FastCGI work.
 
 The raw evidence for the benchmark claims is **not** here: it is committed to
-`stokehold-competition` as `results/raw-*.tsv`, alongside that repo's README, which carries the
+`volucer-competition` as `results/raw-*.tsv`, alongside that repo's README, which carries the
 conclusions. Anything measured on this host that is not in one of those two files did not
 happen.
 
 ### The published benchmark and the current build
 
-`stokehold-competition/results/report.md` now names its build as **`91cc7b6`**, and every
+`volucer-competition/results/report.md` now names its build as **`91cc7b6`**, and every
 throughput, sequential-latency and crossover table in it comes from that sweep. The four commits
 that used to be the gap are measured rather than pending:
 
@@ -1764,7 +1764,7 @@ but the report says so rather than implying they are current.
 ### The rename, if it is ever made
 
 Researched against the registries that actually bind a project — crates.io, the GitHub
-namespace, npm, PyPI, Docker Hub and DNS. `stokehold` itself is **still free on crates.io**.
+namespace, npm, PyPI, Docker Hub and DNS. `volucer` itself is **still free on crates.io**.
 
 | name | crates.io | GitHub | domain |
 | --- | --- | --- | --- |
@@ -1782,7 +1782,7 @@ namespace, npm, PyPI, Docker Hub and DNS. `stokehold` itself is **still free on 
   words. It does not block a crate, a Packagist package, a Docker image or a domain, and the
   project org stays `sailantis`.
 - **Recommendation: `combustor`** — the chamber that contains and directs the burn, fitting the
-  engine metaphor `stokehold` came from, and clean on crates.io, npm and both domains.
+  engine metaphor `volucer` came from, and clean on crates.io, npm and both domains.
   `bowshock` (the shock wave ahead of a supersonic vehicle) is the better pure-speed metaphor and
   equally clean; `zephyrix`/`plasmax` are the invented-fantasy option.
 
@@ -1812,21 +1812,21 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
    10 ms. Open now only as a separate question — whether the remaining ~587 µs of *mean* queueing
    at c=32 is worth attacking, which is not a fairness problem.
 7. **Why the embedded runtime stops scaling** — hazard 53, **measured, not explained**. The sixth
-   arm in `stokehold-competition` is FrankenPHP, and it is indistinguishable from stokehold at
+   arm in `volucer-competition` is FrankenPHP, and it is indistinguishable from volucer at
    concurrency 1 (1.018x, spread spanning 1.00) and 32% behind at 32 (0.677x). CPU accounting rules
    out the easy answer: at concurrency 16 it consumes 7.17 of 12 cores while serving *fewer*
-   requests per second than stokehold, which uses 8.10 — so it is not CPU-bound, and its ceiling is
+   requests per second than volucer, which uses 8.10 — so it is not CPU-bound, and its ceiling is
    in dispatch
    or queueing rather than in what its interpreter costs per request. Worth knowing because it is
    the shape a "PHP embedded in a Rust server" design would land in if the embedding were done
    naively; it is not a defect this project has to fix, and the arm exists to price a decision
-   stokehold already made on other grounds (isolation, a rebuild per PHP version) rather than to be
+   volucer already made on other grounds (isolation, a rebuild per PHP version) rather than to be
    beaten. Carries two stated confounds: the bundled PHP is 8.5.11 against this host's 8.3.35.
 
 Hazard 46's open product decision — whether the worker transport should default to `socket` on
 Windows — is **answered** in hazard 47: yes, by platform, with a startup hint for the one worker
 shape it breaks. What remains genuinely open from that work is only the
-`stokehold-competition` lock question below.
+`volucer-competition` lock question below.
 
 Two items were raised in that same stretch and are recorded here rather than left in a chat:
 **the crate doc's `Upgrade` claim is now corrected** (see "What actually works today"), and
@@ -1849,27 +1849,27 @@ reading out of a crate description.
 | TLS / HTTPS | **works** | `[server.tls]` with `certificate`/`key`/`min_version`/`alpn`/`plain`; `server.https` for a second listener; per-site `[sites.x.tls]` certificates selected by SNI; `redirect_to_https`. Verified by hand against a running server (a real `curl`/schannel handshake, `200` over HTTPS, cleartext refused on a TLS-only port, cleartext and TLS both answering on one port) and then by six integration tests that use `rustls` as a client, including `sni_selects_a_per_site_certificate`, which compares the presented certificate byte for byte |
 | TLS / HTTP-2 over ALPN | **works** | `alpn_negotiates_http2_then_http11` — h2 wins when both are offered, and `http/1.1` when h2 is not. This is the **first HTTP/2 test** in the repository |
 | HTTP/3 | **does not exist** | needs `quinn` + `h3`; step 24 |
-| FastCGI front-end | **works** | `crates/stokehold-server/src/frontend/`, wired into `serve`, 5 tests in `tests/frontend.rs` |
+| FastCGI front-end | **works** | `crates/volucer-server/src/frontend/`, wired into `serve`, 5 tests in `tests/frontend.rs` |
 | `/index.php` is executed, not disclosed | **works** | the body is the script's output, not its source |
 | static: `ETag` → 304 | **works** | the `etag` header echoed back as `If-None-Match` answers 304 |
 | static: `If-Modified-Since` → 304 | **works** | 304 with the file's own `last-modified` |
 | static: `Range` → 206, unsatifiable → 416 | **works** | `bytes=0-4` gives `206` and `stati`; `bytes=99-` gives 416 |
 | static: `If-Range` | **works** | a matching validator gives 206, a stale one gives the full 200 — which is what RFC 9110 asks for |
-| static: multi-range | **works** | `bytes=0-2,4-6` answers 206 `multipart/byteranges; boundary=stokehold-boundary` |
+| static: multi-range | **works** | `bytes=0-2,4-6` answers 206 `multipart/byteranges; boundary=volucer-boundary` |
 | static: dotfile denial, directory redirect | **works** | `/.env` → 404; `/docs` → 301 to `/docs/`, then the index |
 | static: no traversal escape | **works** | `/../secret.txt`, `/..%2fsecret.txt`, `/%2e%2e/secret.txt` and `/....//secret.txt` all fail to reach a file outside the document root — the encoded ones are treated as *names that do not exist*, not decoded into segments |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
-`serve_connection_with_upgrades`; [`listener`](../crates/stokehold-http/src/listener.rs) calls
+`serve_connection_with_upgrades`; [`listener`](../crates/volucer-http/src/listener.rs) calls
 plain `serve_connection`, so the offer is never honoured. The crate doc at
-`crates/stokehold-http/src/lib.rs` used to claim `auto` negotiates "the prior-knowledge and
+`crates/volucer-http/src/lib.rs` used to claim `auto` negotiates "the prior-knowledge and
 `Upgrade` cases" — the prior-knowledge half is true and measured, the `Upgrade` half is not, and
 the doc now says so. Prior knowledge is what a real reverse proxy uses for h2c, so the practical
 loss is small; a browser-facing listener would carry HTTP/2 over ALPN instead, which arrives with
 step 24.
 
-**There is no HTTP/2 test anywhere in the repository.** `stokehold version` has printed
+**There is no HTTP/2 test anywhere in the repository.** `volucer version` has printed
 "HTTP/2 (cleartext)" since step 19, and the evidence for it is the probe above rather than a
 test — so a `hyper` upgrade that changed the negotiation would be caught by nothing. A test that
 sends the preface and asserts a SETTINGS frame comes back (and one asserting the upgrade offer
@@ -1881,7 +1881,7 @@ addition; it is not in this session's scope.
 Hazard 46's 21× figure (pipe 15.24 ms against socket 0.72 ms median on `/items`, 9 runs of 1000
 requests each, ranges disjoint) survives in this plan and in the competition README, and as of
 hazard 48 the raw rows behind it **are** committed — as
-`stokehold-competition/results/raw-windows-279dc35.tsv`, 70 rows (`P` = socket, `Pp` = pipe), plus
+`volucer-competition/results/raw-windows-279dc35.tsv`, 70 rows (`P` = socket, `Pp` = pipe), plus
 `results/raw-windows-fcgi-279dc35.tsv` for hazard 49's 27 interleaved rows. Both match the
 `!results/raw-*.tsv` whitelist in that repo's `.gitignore`. Earlier text here predicted the
 filename would be `results/raw-windows.tsv` and called the claim uncommitted; this paragraph
@@ -1889,7 +1889,7 @@ replaces it. The 21× and the 11× can be re-derived from the repository rather 
 
 ### What the first real Linux run found
 
-`STOKEHOLD_E2E=1 cargo test --workspace` had never been run on Linux with a real PHP
+`VOLUCER_E2E=1 cargo test --workspace` had never been run on Linux with a real PHP
 present. It found three defects that cannot exist on Windows, which is where the suite
 had been exercised:
 
@@ -1932,7 +1932,7 @@ correctly against a new server — the compatibility direction that a `CHECKSUM`
 have broken silently. That is now a measured fact rather than a design argument.
 
 Also worth recording because it is about the benchmark rather than the code: the first
-`STOKEHOLD_E2E=1` run on the *same* tree was still passing when the harness was written,
+`VOLUCER_E2E=1` run on the *same* tree was still passing when the harness was written,
 so "the tests pass" was never evidence that the Linux path had been exercised.
 
 - **45. The Windows named pipe is not just reachable, it is the faster transport — and the one
@@ -1957,7 +1957,7 @@ so "the tests pass" was never evidence that the Linux path had been exercised.
   roughly 40% of a request, that is an end-to-end effect of about **8%** — larger than the last
   four optimisations put together.
 
-  **Implemented** as `socket = '\\.\pipe\stokehold-cgi'` on a `spawn_cgi` backend, which
+  **Implemented** as `socket = '\\.\pipe\volucer-cgi'` on a `spawn_cgi` backend, which
   `validate_cgi_socket` now accepts and `cgi_socket_path` turns into one pipe per slot (the index
   is appended to the *name*, as it is to a path). The protocol layer needed no change at all:
   `Client::from_stream` already accepts any `Read + Write`, so this is purely a transport addition,
@@ -2030,7 +2030,7 @@ so "the tests pass" was never evidence that the Linux path had been exercised.
   holds, and end to end it is *larger* than the probe suggests: see the table below.
 
   **Consequence, implemented.** `transport = "socket"` on a `worker` backend: the server binds a
-  loopback listener before spawning, passes the address as `STOKEHOLD_WORKER_SOCKET`, and the
+  loopback listener before spawning, passes the address as `VOLUCER_WORKER_SOCKET`, and the
   worker dials back instead of using stdio. The PHP side is one call — `Worker::connect()` — which
   is `Worker::create()` plus the decision, so an application does not change and the protocol does
   not know which transport it is on.
@@ -2062,7 +2062,7 @@ so "the tests pass" was never evidence that the Linux path had been exercised.
     is the SDK's example, and a checkout of the SDK that predates the method dies with a fatal
     error that the server correctly reports as "unsupported protocol version 97" — 97 being `a`,
     the first byte of PHP's error text. The same thing happened on the VM, whose SDK checkout was
-    a plain checkout without the change, and again in `stokehold-competition`, whose `vendor/`
+    a plain checkout without the change, and again in `volucer-competition`, whose `vendor/`
     pins the SDK at `5ede306`. **A worker file that calls a method the pinned SDK does not have is
     a fatal error on startup, not a degraded path**, so the pin has to move with the server.
 
@@ -2083,7 +2083,7 @@ transport=socket`) because the transport is invisible on the wire: a pool on the
 answers every request with a `200`, only slower.
 
 **The trap, and why it is not a reason to keep `Pipe` as the default.** The transport is chosen
-by the *server* and announced to the worker in `STOKEHOLD_WORKER_SOCKET`. A worker written
+by the *server* and announced to the worker in `VOLUCER_WORKER_SOCKET`. A worker written
 before the option exists — including anything following the SDK README as it stood, which
 taught `Worker::create()` — reads `php://stdin`, which the socket transport has set to
 end-of-file, and therefore exits during its handshake. The first full-suite run after the
@@ -2124,8 +2124,8 @@ makes the child read a **bad file descriptor** (`fread(): Read of 8192 bytes fai
 so the PHP end cannot even set it up. The option is therefore closed by the platform, not by
 preference, and `connect()` is the only route.
 
-**A named pipe does not escape it either — measured.** Since stokehold already speaks FastCGI
-over a named pipe on Windows (`stokehold-fcgi/src/pipe.rs`), the obvious follow-up question was
+**A named pipe does not escape it either — measured.** Since volucer already speaks FastCGI
+over a named pipe on Windows (`volucer-fcgi/src/pipe.rs`), the obvious follow-up question was
 whether the *worker* protocol could use one: a named pipe is opened by **name**, not as the
 child's stdio, so unlike fd 0 it would not be caught by `GetFileType`'s socket-as-pipe
 coarseness, and it would still beat stdio because the server could create the pipe and hand the
@@ -2194,7 +2194,7 @@ large enough to be worth separating: an operator sizing a Windows deployment nee
 *ceiling*, and the two transports do not reach it the same way.
 
 Measured on the Windows host (Ryzen 5 7500F, 6 cores / 12 threads, PHP 8.3.31 ZTS,
-`GET /items`, 12 workers, both arms behind the same `stokehold` binary at `279dc35`,
+`GET /items`, 12 workers, both arms behind the same `volucer` binary at `279dc35`,
 home-grown keep-alive load generator, 5 runs of 5 s per cell, marker verified and **0
 errors in all 70 runs**):
 
@@ -2243,7 +2243,7 @@ not the page.
   across the snapshots so a contaminated row is flagged rather than believed, and the
   numbers above come from a run in which **neither arm respawned a single worker**.
 - **The raw rows are committed**, as `results/raw-windows-279dc35.tsv` in
-  `stokehold-competition` (`P` = socket, `Pp` = pipe), which closes hazard 46's
+  `volucer-competition` (`P` = socket, `Pp` = pipe), which closes hazard 46's
   "the published Windows latency claim is not committed" — the 21× and the 11× can now be
   re-derived from the repository rather than taken on trust.
 
@@ -2267,7 +2267,7 @@ not the page.
   recorded. No request failed and no throughput moved, and it did not recur in any later
   run. An all-at-once death is the signature of an external kill rather than twelve
   independent crashes, so the ordinary candidates were tested against a reproduction build
-  at `stokehold=debug` (a fresh socket pool, 12 workers, **~94,700 requests** across three
+  at `volucer=debug` (a fresh socket pool, 12 workers, **~94,700 requests** across three
   load shapes):
 
   | hypothesis | how it was driven | result |
@@ -2384,7 +2384,7 @@ FCGI pools running does not pollute another arm's measurement — they are block
 
 **50. The leak guard could not see the arms it guarded, and "not a regression" needed a
 measurement rather than an argument.** Two findings from re-running the competition's five arms
-at `91cc7b6`, both about evidence rather than about stokehold's code. Neither is a defect in the
+at `91cc7b6`, both about evidence rather than about volucer's code. Neither is a defect in the
 server; both are defects in the *instrument*, which is why they are recorded here.
 
 *The guard.* `bench.sh` reported "8 stray php-cgi pools after teardown" and the report explained
@@ -2418,9 +2418,9 @@ the four intervening commits touched**.
 
 | arm | what it is | median change | cells that fell |
 | --- | --- | --- | --- |
-| P | stokehold worker — **the arm the commits changed** | **+0.35%** | 2/10 |
-| T | stokehold `spawn_cgi` | −1.54% | 8/10 |
-| U | stokehold `spawn_cgi` unix | −1.77% | 8/10 |
+| P | volucer worker — **the arm the commits changed** | **+0.35%** | 2/10 |
+| T | volucer `spawn_cgi` | −1.54% | 8/10 |
+| U | volucer `spawn_cgi` unix | −1.77% | 8/10 |
 | R | RoadRunner — untouched | −2.79% | **10/10** |
 | F | nginx + php-fpm — untouched | −1.63% | 7/10 |
 
@@ -2445,7 +2445,7 @@ harness.** `stop_powershell` kills the `ssh.exe` locally; the remote `bash` surv
 its `EXIT` trap never fires, `bench.sh` keeps serving and the next run contends with it. That
 happened here — two sweeps ran concurrently against the same 12 cores (load 4.33, two `wrk`
 clients, two server pools) and produced a P column ~25% low before it was caught. Cleanup is
-explicit: `pkill` the launcher, then `pkill -f 'stokehold serve'` and let each server's `Drop`
+explicit: `pkill` the launcher, then `pkill -f 'volucer serve'` and let each server's `Drop`
 take its own children, then reap any `php-cgi -b` that ignored SIGTERM.
 
 **51. The crc32c fix is worth 10–16%, and hazard 41 measured the checksum against half its own
@@ -2469,8 +2469,8 @@ starting order rotated by round so that a drift of any shape charges every varia
 | `old-req` | current `main` with **only** `crc32c` reverted to the hand-written loop |
 | `rr` | RoadRunner, resident worker — shares no code with any of the others |
 
-`rr` is the control and the reason the result is legible: a round in which every stokehold variant
-moved but `rr` did not is a round in which stokehold moved. Seven rounds × 2 endpoints × 3
+`rr` is the control and the reason the result is legible: a round in which every volucer variant
+moved but `rr` did not is a round in which volucer moved. Seven rounds × 2 endpoints × 3
 concurrencies = **168 measured cells, 0 failed**, and the guard from hazard 50 reports clean after
 every variant. The estimator is a ratio computed *within* a round, so its spread across the seven
 rounds is the error bar — which is what a blocked layout throws away.
@@ -2537,7 +2537,7 @@ differing files were CRLF in a tree that is LF in the repository, but two real d
 underneath — `worker.php` still called `Worker::create()` where `main` calls `Worker::connect()`,
 and the vendored SDK was `5ede306` where `composer.json` pins `475bfd2b`. That is the exact failure
 commit `134a7bc` documents: `connect()` on an SDK that predates it makes PHP write its error to
-stdout, stokehold reads the first byte `a` (97) as a protocol version, and the pool dies with
+stdout, volucer reads the first byte `a` (97) as a protocol version, and the pool dies with
 "unsupported protocol version 97". The published sweep's *application* source does match the repo;
 only the SDK pin and that one call differ, and on Linux both resolve to the pipe — so the published
 numbers are not invalidated, but they are not reproducible byte-for-byte from the repository
@@ -2554,14 +2554,14 @@ above it, so the cell was chased with a denser sweep — the same two variants a
 
 **There is no crossover.** The deficit is ~1% (about 200 rps in 18,000), it sits in a band from 16
 to 20 rather than at a threshold, the per-round spread crosses 1.00 at four of the six levels, and
-the sequence is not monotonic. Per-request CPU agrees: stokehold's server cost is **flat at
-121–126 µs across c=8..32** and RoadRunner's moves 9 µs, so if 16 were a threshold stokehold's
+the sequence is not monotonic. Per-request CPU agrees: volucer's server cost is **flat at
+121–126 µs across c=8..32** and RoadRunner's moves 9 µs, so if 16 were a threshold volucer's
 column would bend there and nothing bends. Attributing that cell to slot exhaustion would have
 been a story the data does not support, and the lesson generalises — at ~1% a single concurrency
 level is not a meaningful unit of evidence.
 
 *What the denser sweep did find is a tail divergence with no counterpart in throughput.* Median
-p99 on `/items`, RoadRunner against stokehold:
+p99 on `/items`, RoadRunner against volucer:
 
     c=12  1,760 µs  vs  1,640 µs   (0.93×)
     c=14  1,930 µs  vs  2,195 µs   (1.14×)
@@ -2571,7 +2571,7 @@ p99 on `/items`, RoadRunner against stokehold:
     c=24  2,690 µs  vs 10,425 µs   (3.88×)
 
 RoadRunner's tail is **flat** above its slot count, which is what a pool that holds a queue looks
-like. Stokehold's grows without bound, and its p50 is *better* than RoadRunner's at every one of
+like. Volucer's grows without bound, and its p50 is *better* than RoadRunner's at every one of
 those levels. A p99 that grows with offered load while the median improves is the signature of
 queueing with no bound on the queue: the requests are not served slower, they wait longer before
 they are served. That is also why the throughput number never showed it — a bounded queue costs
@@ -2694,9 +2694,9 @@ the same band hazard 51's interleaved A/B established for it on its `/` and `/it
 (+4.2%, +7.0%; its one `/items` c=16 cell was −1.7%)** — it still lands exactly where it always did
 — while the current build sits at +27% and +30%. So the blocked layout *understated* the gain, and
 this is the largest throughput effect this project's own code has produced — larger than the
-`crc32c` fix's +10–16%, which was called "the whole lead" over RoadRunner (the fix put stokehold
+`crc32c` fix's +10–16%, which was called "the whole lead" over RoadRunner (the fix put volucer
 4–7% ahead; this puts it 27–30% ahead). The one effect measured here that is larger is not
-stokehold's: removing xdebug from the host's CLI PHP doubled the warm arms, which was a
+volucer's: removing xdebug from the host's CLI PHP doubled the warm arms, which was a
 configuration bug that made one arm measure the host rather than the server.
 
 The pool's own columns move with it rather than against it, median over the seven rounds:
@@ -2725,7 +2725,7 @@ had not previously been able to see, because every pass it owns reported a media
 
 ### Hazard 53 — the embedded runtime, measured against the two that spawn
 
-`stokehold-competition` gained a sixth arm, and it is the only one that can test the project's
+`volucer-competition` gained a sixth arm, and it is the only one that can test the project's
 **first** constraint rather than its tuning. That constraint is *no PHP embedding, no FFI —
 `php`/`php-cgi`/`php-fpm` are always spawned as external processes*. FrankenPHP is the
 counter-proposal: a Caddy server with a ZTS PHP built into the binary, twelve worker threads in
@@ -2734,17 +2734,17 @@ one process, framework booted once. Same `BenchApp`, same page, same worker coun
 
 Interleaved, 7 rounds, order rotated, `/items`, 12 workers (`scripts/ab-perf.sh`):
 
-    conc   FrankenPHP   stokehold   RoadRunner     franken/rr    franken/stokehold
+    conc   FrankenPHP   volucer   RoadRunner     franken/rr    franken/volucer
       1      2,441        2,388        1,773         1.381x        1.018x  [0.969..1.054]
       8     14,337       15,538       11,131         1.288x        0.921x
      16     15,140       19,984       17,554         0.876x        0.759x
      32     15,823       23,250       18,164         0.867x        0.677x
 
 Every ratio held the same way in all 7 rounds except the one at concurrency 1, whose spread
-spans 1.00 — so **FrankenPHP and stokehold are indistinguishable when one request is in
+spans 1.00 — so **FrankenPHP and volucer are indistinguishable when one request is in
 flight, and FrankenPHP is the slower of the three from concurrency 8 upward.** What survives
 is the *shape*: the arm with the interpreter inside its process does not convert concurrency
-into throughput, gaining 10.4% from 8 to 32 where stokehold gains 49.6%. On this page, in the
+into throughput, gaining 10.4% from 8 to 32 where volucer gains 49.6%. On this page, in the
 range a server is actually for, the no-embedding rule was a cost rather than a saving — which
 is worth stating plainly, because the constraint was argued on other grounds (isolation, a
 rebuild per PHP version) and this is not evidence against those.
@@ -2756,10 +2756,10 @@ concurrency 16, `utime + stime` summed over each whole process tree out of `/pro
     server      pids   server CPU-s   cores used   rps
     FrankenPHP     2       85.99         7.17       15,262
     RoadRunner    13      105.90         8.83       17,794
-    stokehold     13       97.18         8.10       20,204
+    volucer     13       97.18         8.10       20,204
 
 FrankenPHP serves the fewest requests per second **and** leaves the most cores idle: 7.17 of
-12, against stokehold's 8.10 at 33% higher throughput. Capacity is sitting unused while its
+12, against volucer's 8.10 at 33% higher throughput. Capacity is sitting unused while its
 throughput is capped, which is the signature of dispatch or queueing rather than of compute.
 That is as far as the evidence goes; the reason is open decision 7 below.
 

@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/stokehold-core",
-    "crates/stokehold-worker",
-    "crates/stokehold-fcgi",
-    "crates/stokehold-server",
-    "crates/stokehold-http",
-    "crates/stokehold-cli",
+    "crates/volucer-core",
+    "crates/volucer-worker",
+    "crates/volucer-fcgi",
+    "crates/volucer-server",
+    "crates/volucer-http",
+    "crates/volucer-cli",
 ]
 
 [workspace.package]
@@ -14,14 +14,14 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/sailantis/stokehold"
+repository = "https://github.com/sailantis/volucer"
 
 [workspace.dependencies]
-stokehold-core = { path = "crates/stokehold-core" }
-stokehold-worker = { path = "crates/stokehold-worker" }
-stokehold-fcgi = { path = "crates/stokehold-fcgi" }
-stokehold-server = { path = "crates/stokehold-server" }
-stokehold-http = { path = "crates/stokehold-http" }
+volucer-core = { path = "crates/volucer-core" }
+volucer-worker = { path = "crates/volucer-worker" }
+volucer-fcgi = { path = "crates/volucer-fcgi" }
+volucer-server = { path = "crates/volucer-server" }
+volucer-http = { path = "crates/volucer-http" }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"

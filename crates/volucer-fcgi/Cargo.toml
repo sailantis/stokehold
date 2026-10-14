@@ -1,0 +1,34 @@
+[package]
+name = "volucer-fcgi"
+description = "FastCGI record codec and client for volucer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+volucer-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# `TCP_QUICKACK` has no wrapper in std, and it is a Linux-only option: it is the
+# receiver-side half of the Nagle/delayed-ACK interaction documented on
+# `Stream::arm_immediate_ack`. Nothing else here needs libc.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# A named pipe is the only FastCGI transport Windows offers besides loopback TCP,
+# and the one php-cgi binds when `-b` is given anything but `host:port`. std has no
+# named-pipe type, and the transport needs two Win32 affordances that have no safe
+# wrapper: `CreateFileW` to open the pipe, and overlapped `ReadFile`/`WriteFile` so a
+# read can carry a deadline. See `pipe.rs` for why the deadline is not optional.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

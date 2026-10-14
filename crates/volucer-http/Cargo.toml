@@ -1,0 +1,32 @@
+[package]
+name = "volucer-http"
+description = "The HTTP front-end for volucer: a hyper listener that translates HTTP to the CGI environment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+volucer-core.workspace = true
+volucer-fcgi.workspace = true
+volucer-server.workspace = true
+volucer-worker.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+httpdate.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["custom-provider"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio-rustls = "0.26"

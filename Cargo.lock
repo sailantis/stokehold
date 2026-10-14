@@ -794,89 +794,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "stokehold-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "ctrlc",
- "stokehold-core",
- "stokehold-fcgi",
- "stokehold-http",
- "stokehold-server",
- "thiserror",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "stokehold-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "stokehold-fcgi"
-version = "0.1.0"
-dependencies = [
- "libc",
- "stokehold-core",
- "thiserror",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "stokehold-http"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "http-body-util",
- "httpdate",
- "hyper",
- "hyper-util",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "stokehold-core",
- "stokehold-fcgi",
- "stokehold-server",
- "stokehold-worker",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "stokehold-server"
-version = "0.1.0"
-dependencies = [
- "serde",
- "stokehold-core",
- "stokehold-fcgi",
- "stokehold-worker",
- "thiserror",
- "tracing",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "stokehold-worker"
-version = "0.1.0"
-dependencies = [
- "crc32c",
- "serde",
- "serde_json",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1133,6 +1050,89 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "volucer-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ctrlc",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "volucer-core",
+ "volucer-fcgi",
+ "volucer-http",
+ "volucer-server",
+]
+
+[[package]]
+name = "volucer-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "volucer-fcgi"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+ "tracing",
+ "volucer-core",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "volucer-http"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "volucer-core",
+ "volucer-fcgi",
+ "volucer-server",
+ "volucer-worker",
+]
+
+[[package]]
+name = "volucer-server"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tracing",
+ "volucer-core",
+ "volucer-fcgi",
+ "volucer-worker",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "volucer-worker"
+version = "0.1.0"
+dependencies = [
+ "crc32c",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "wasi"

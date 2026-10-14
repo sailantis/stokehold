@@ -1,0 +1,171 @@
+# Example volucer configuration.
+#
+# Validate it with:  volucer check --config volucer.example.toml
+# Extra PHP search directories can be added with `--php-dir`.
+
+# The backend used when a request matches no route.
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+# nginx-facing listener; use a unix socket on Linux/macOS.
+fastcgi = "127.0.0.1:9080"
+
+# Where the application lives. Both of the next two keys are also `serve`
+# command-line flags, and a flag wins over the file -- so a systemd unit or a
+# container image can describe its whole deployment here instead of carrying
+# arguments. `volucer check` prints the path and controller it actually
+# resolved, which is the fastest way to see what a running deployment uses.
+#
+# document_root = "./public"
+#
+# The front controller, relative to the document root. This is what keeps a
+# framework working: a path that names no file is given to this script, with
+# PATH_INFO set, instead of answering 404. Use `--front-controller ''` on the
+# command line for "only real .php files" -- an empty value is not written here,
+# because TOML cannot tell an empty string from an absent key.
+# front_controller = "index.php"
+
+# ---------------------------------------------------------------------------
+# TLS. The presence of `[server.tls]` is what turns it on -- there is no
+# `enabled` flag, because a flag and a certificate are two statements about one
+# thing and two statements can disagree.
+#
+# A relative certificate/key path is resolved against the directory holding this
+# file (not the process's working directory, which is the rule document_root
+# follows). `volucer check` prints the path it resolved.
+#
+# Three shapes, all supported:
+#
+#   1. TLS only, on `http`:
+#        [server]  http = "0.0.0.0:443"
+#        [server.tls]  ...                      (plain = false, the default)
+#
+#   2. Plain and TLS on ONE port. A TLS record always begins with the byte 0x16
+#      and a plaintext request begins an ASCII method letter, so the first byte
+#      decides which of two paths a connection takes. This is what nginx's
+#      ssl_preread does. It is NOT a downgrade: a client that offers TLS and
+#      fails the handshake still fails.
+#        [server]  http = "0.0.0.0:443"
+#        [server.tls]  plain = true
+#
+#   3. Plain on :80 and TLS on :443, the conventional pair. This is the only
+#      shape that can host ACME's HTTP-01 challenge and an :80 -> :443 redirect,
+#      because those are the two parts of TLS that need a particular port.
+#        [server]  http = "0.0.0.0:80"
+#                  https = "0.0.0.0:443"
+# ---------------------------------------------------------------------------
+# [server.tls]
+# certificate = "certs/default.crt"   # PEM chain, leaf first
+# key = "certs/default.key"           # PEM private key
+# min_version = "1.2"                 # or "1.3"; a floor, not a cap
+# alpn = ["h2", "http/1.1"]           # h2 preferred; do NOT drop http/1.1
+# plain = false                       # accept cleartext on the TLS port too
+#
+# Answer cleartext requests with a 301 to the https:// equivalent. Off by
+# default: it changes what an existing cleartext deployment does. Needs a
+# plaintext listener to act on -- either a separate `https`, or `plain = true`.
+# redirect_to_https = false
+#
+# A per-site certificate, presented by SNI for that site's hosts. Only the
+# certificate and key can be per site, because the name is claimed before any
+# request exists -- min_version/alpn/plain describe the socket, so setting one
+# here is an error rather than a key that silently does nothing.
+#
+# [sites.shop.tls]
+# certificate = "certs/shop.crt"
+# key = "certs/shop.key"
+
+# ---------------------------------------------------------------------------
+# Static files, served from the document root without waking PHP at all. This is
+# a routing layer above the backends: a path that names a real file under the
+# document root is answered from disk, and a path that names nothing still goes
+# to the front controller. Off by default, so enabling it is an explicit choice.
+# ---------------------------------------------------------------------------
+# [server.static_files]
+# enabled = true
+# precompressed = false        # serve file.br / file.gz when the client accepts them
+# directory_index = true       # index.html, with a 301 from /docs to /docs/
+# dotfiles = "deny"            # or "allow"; a denied dotfile answers 404
+# cache_control = "public, max-age=3600"
+# max_multirange_bytes = 1048576   # a multi-range answer is buffered, so it is capped
+
+# ---------------------------------------------------------------------------
+# Persistent worker pool: the PHP process boots the application once and stays
+# resident. volucer talks to it over the child's stdin/stdout pipes using its
+# own framed protocol. State is NOT reset by PHP per request, so the
+# application must clear its own request scope.
+# ---------------------------------------------------------------------------
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+workers = 0               # 0 = one per logical CPU
+memory_limit_mb = 256     # recycle a worker above this RSS
+max_requests = 1000       # and after this many requests
+working_dir = "."
+# transport = "pipe"      # Defaults to "socket" on Windows and "pipe" elsewhere,
+                          # which is the measured winner on each: PHP's stream layer
+                          # reads a Windows pipe ~100x slower than a socket, and that
+                          # was 21x on the whole route. Set it only to override - and
+                          # note a worker must call `Volucer\Worker::connect()`, not
+                          # `create()`, to read a socket. See plan hazard 46.
+
+# ---------------------------------------------------------------------------
+# System php-fpm: the normal Linux/macOS deployment. volucer does not manage
+# the pool -- systemd and php-fpm do, including pm.max_requests recycling.
+# ---------------------------------------------------------------------------
+[backends.fpm]
+kind = "external"
+socket = "unix:/run/php/php8.3-fpm.sock"
+
+# ---------------------------------------------------------------------------
+# Self-contained php-fpm: volucer starts php-fpm, which still manages its own
+# children. Unix only.
+# ---------------------------------------------------------------------------
+# [backends.own_fpm]
+# kind = "spawn_fpm"
+# binary = "/usr/sbin/php-fpm"
+# config = "./fpm.conf"
+# socket = "unix:/run/volucer-fpm.sock"
+
+# ---------------------------------------------------------------------------
+# Routes. The most specific matching route wins: a route stating both a host and
+# a path beats one stating only a path, and ties go to the earlier entry. A
+# request that matches no route goes to default_backend.
+#
+# `path_prefix` is a textual prefix, like nginx's `location`. `host` is a bare
+# host name with no port, and is compared case-insensitively.
+# ---------------------------------------------------------------------------
+# [[routes]]
+# path_prefix = "/api"
+# backend = "cgi"
+#
+# [[routes]]
+# host = "admin.example.com"
+# path_prefix = "/"
+# backend = "fpm"
+
+# ---------------------------------------------------------------------------
+# php-cgi pool: N processes on N ports. The only option on Windows, where
+# php-fpm does not exist. Each process gets full per-request SAPI reset.
+# ---------------------------------------------------------------------------
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "C:/php-8.3.31/php-cgi.exe"
+workers = 8
+bind_host = "127.0.0.1"   # loopback only; never expose php-cgi
+base_port = 19001
+
+# A unix socket instead of TCP, where the platform has them (Linux, macOS).
+# This is a path PREFIX: slot 0 binds /run/volucer/cgi.0.sock, slot 1 the next.
+# `php-cgi -b` accepts an AF_UNIX path on any non-Windows platform, which removes
+# the loopback hop. `bind_host`/`base_port` are then unused.
+# socket = "unix:/run/volucer/cgi"
+
+# A named pipe instead of TCP, on Windows. `php-cgi -b` takes a pipe name there
+# rather than `host:port`, so this is the equivalent of the unix socket above and
+# the fastest transport this backend has: on the reference machine a 4 KiB request
+# costs ~168 us over a pipe against ~211 us over loopback TCP. As with `unix:`,
+# this is a PREFIX — slot 0 becomes \\.\pipe\volucer-cgi.0 and slot 1 the next.
+# `bind_host`/`base_port` are then unused.
+# socket = '\\.\pipe\volucer-cgi'

@@ -1,0 +1,23 @@
+[package]
+name = "volucer-cli"
+description = "The volucer command line interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "volucer"
+path = "src/main.rs"
+
+[dependencies]
+volucer-core.workspace = true
+volucer-fcgi.workspace = true
+volucer-http.workspace = true
+volucer-server.workspace = true
+clap.workspace = true
+ctrlc = { version = "3", features = ["termination"] }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

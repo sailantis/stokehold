@@ -1,8 +1,8 @@
-# stokehold
+# volucer
 
 A cross-platform PHP application server.
 
-`stokehold` runs PHP applications in two modes from a single Rust binary:
+`volucer` runs PHP applications in two modes from a single Rust binary:
 
 - **Worker mode** — a persistent PHP process that boots your application once and serves many
   requests.
@@ -17,22 +17,22 @@ supervises it for you.
 > client, CGI environment, `php-cgi` pool, backend dispatch and both front-ends are all
 > implemented, with integration tests driving real `php-cgi` processes end to end. The worker
 > protocol is specified in [docs/worker-protocol.md](docs/worker-protocol.md), implemented in
-> `crates/stokehold-worker`, and the PHP worker SDK implements the other end — it lives in its own
-> repository, [`sailantis/stokehold-php-sdk`](https://github.com/sailantis/stokehold-php-sdk),
+> `crates/volucer-worker`, and the PHP worker SDK implements the other end — it lives in its own
+> repository, [`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk),
 > because a Composer package needs `composer.json` at the root of a repository. It is proven by
 > tests that drive a live `php worker.php` over pipes. The worker pool that
-> supervises those workers is implemented in `crates/stokehold-server`, so `kind = "worker"` now
-> serves for real: `stokehold serve` boots the pool, handshakes each worker, and serves through it.
-> The HTTP front-end is implemented in `crates/stokehold-http` — a `hyper` listener speaking
+> supervises those workers is implemented in `crates/volucer-server`, so `kind = "worker"` now
+> serves for real: `volucer serve` boots the pool, handshakes each worker, and serves through it.
+> The HTTP front-end is implemented in `crates/volucer-http` — a `hyper` listener speaking
 > HTTP/1.1 and HTTP/2 over the same dispatcher as the FastCGI one — and it serves static files
-> from the document root, so a single `stokehold` process can front a site the way nginx plus
+> from the document root, so a single `volucer` process can front a site the way nginx plus
 > `php-fpm` would. The CLI is complete: `serve`, `check` and `version`, with the document root and
 > front controller configurable in the file rather than only on a command line. TLS and HTTP/3 are
 > not there yet; see [docs/plan.md](docs/plan.md) for the phase order.
 >
-> **The async boundary.** `stokehold-http` is the only place with a `tokio` runtime, because
+> **The async boundary.** `volucer-http` is the only place with a `tokio` runtime, because
 > `hyper` needs one. Every backend stays blocking, and the dispatcher is reached only through
-> `spawn_blocking` — see [the crate docs](crates/stokehold-http/src/lib.rs) for why.
+> `spawn_blocking` — see [the crate docs](crates/volucer-http/src/lib.rs) for why.
 
 ## Why
 
@@ -57,7 +57,7 @@ Both are served by one dispatcher, so a route can pick whichever semantics it ne
                         └──────────────────────────────────────────┘
 ```
 
-One binary. No second application is needed to try it — `stokehold serve` can be hit directly
+One binary. No second application is needed to try it — `volucer serve` can be hit directly
 by a browser and spoken to by nginx at the same time, and it serves the site's static files
 itself. Several `Host` names can be served from one process, each with its own document root; see
 [Sites](#sites).
@@ -66,7 +66,7 @@ itself. Several `Host` names can be served from one process, each with its own d
 
 | `kind` | What it is | Per-request reset | Platforms |
 | --- | --- | --- | --- |
-| `worker` | Persistent PHP process speaking stokehold's framed protocol over pipes | No — the application clears its own request scope | all |
+| `worker` | Persistent PHP process speaking volucer's framed protocol over pipes | No — the application clears its own request scope | all |
 | `external` | An already-running `php-fpm` (systemd-managed) | Yes, by php-fpm's SAPI | Linux, macOS |
 | `spawn_cgi` | N `php-cgi` processes on N ports | Yes, by php-cgi's SAPI | all, **required on Windows** |
 
@@ -80,9 +80,9 @@ systemd already runs. A file still carrying `kind = "spawn_fpm"` is now rejected
 slot, restarts one that died, and recycles on `max_requests` — the equivalent of php-fpm's
 `pm.max_requests`, which does not exist on Windows. On Unix the processes are placed in their
 own process group; on Windows they are adopted into a job object with
-`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so nothing is left running if `stokehold` dies.
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so nothing is left running if `volucer` dies.
 
-One `spawn_cgi` slot is **one process on one port**, and stokehold enforces that by setting
+One `spawn_cgi` slot is **one process on one port**, and volucer enforces that by setting
 `PHP_FCGI_CHILDREN=0` for each child. `php-cgi -b` is otherwise not one process: it spawns
 `PHP_FCGI_CHILDREN` children that all share the single bound socket, and the count is read from its
 inherited environment — so a host that exports it for `php-fpm` would silently give every slot 20
@@ -115,7 +115,7 @@ It exists for one measured reason, and it is a large one: **on Windows, PHP take
 (15 ms at p95) to return from a blocking read on a pipe, where the same read on a socket returns in
 ~0.09 ms.** A Rust process reading the identical pipe returns in 0.010 ms, and RoadRunner measured
 the same 15 ms on the same host, so this is PHP's Windows stream layer rather than anything
-stokehold does — but it is per request, not per connection, so it decides which deployment model
+volucer does — but it is per request, not per connection, so it decides which deployment model
 wins: on the whole `/items` route it was **21×** (0.72 ms against 15.24 ms median).
 
 **The default is therefore a socket on Windows and a pipe everywhere else.** A configuration that
@@ -124,7 +124,7 @@ startup (`worker pool started … transport=socket`) because the transport is in
 — a pool on the wrong one answers every request with a `200`, only slower. Set `transport = "pipe"`
 explicitly to opt out.
 
-The worker opts in with `Stokehold\Worker::connect()` (an SDK at or after the release that added
+The worker opts in with `Volucer\Worker::connect()` (an SDK at or after the release that added
 it) and needs no other change, because the protocol does not know which transport it is on. A
 worker that still calls `Worker::create()` cannot read the socket, so it is refused at startup
 with a message naming the fix — the failure is a startup error rather than a mystery on the first
@@ -136,7 +136,7 @@ default_backend = "app"
 
 [server]
 http = "127.0.0.1:8080"
-fastcgi = "unix:/run/stokehold.sock"
+fastcgi = "unix:/run/volucer.sock"
 
 [backends.app]
 kind = "worker"
@@ -163,19 +163,19 @@ rather than a path.
 A `spawn_cgi` pool talks to its `php-cgi` processes over loopback TCP by default. `socket` moves
 it off the loopback stack, and what that setting means depends on the platform: a unix socket
 path on Linux and macOS, and a **named pipe** on Windows, because that is what `php-cgi -b` binds
-there. Both are a *prefix* — each slot appends its index, so `\\.\pipe\stokehold-cgi` gives slot 0
-the pipe `\\.\pipe\stokehold-cgi.0`. The pipe is the faster of the two transports on Windows: a
+there. Both are a *prefix* — each slot appends its index, so `\\.\pipe\volucer-cgi` gives slot 0
+the pipe `\\.\pipe\volucer-cgi.0`. The pipe is the faster of the two transports on Windows: a
 4 KiB request measures ~168 µs over a pipe against ~211 µs over loopback TCP.
 
 ```toml
 # Linux and macOS
-socket = "unix:/run/stokehold/cgi"
+socket = "unix:/run/volucer/cgi"
 
 # Windows
-socket = '\\.\pipe\stokehold-cgi'
+socket = '\\.\pipe\volucer-cgi'
 ```
 
-See [stokehold.example.toml](stokehold.example.toml) for a commented version of the whole
+See [volucer.example.toml](volucer.example.toml) for a commented version of the whole
 configuration surface.
 
 ## Getting started
@@ -186,10 +186,10 @@ Requires Rust 1.85+.
 cargo build --release
 ```
 
-Validate a configuration and see what `stokehold` found on this host:
+Validate a configuration and see what `volucer` found on this host:
 
 ```bash
-cargo run -- check --config stokehold.example.toml
+cargo run -- check --config volucer.example.toml
 ```
 
 That prints the configured listeners, the document root and front controller it resolved (and
@@ -206,16 +206,16 @@ Problems it can see are reported as **warnings**, and the exit status stays 0: a
 does not exist yet is a normal thing to check before a deploy creates it. What the warnings buy is
 that a mistake is reported once, here, instead of as a puzzling 404 at the first request.
 
-`stokehold version` prints what the build is, including the worker protocol version and the PHP
+`volucer version` prints what the build is, including the worker protocol version and the PHP
 floor it supports.
 
 Then serve it:
 
 ```bash
-cargo run -- serve --config stokehold.example.toml
+cargo run -- serve --config volucer.example.toml
 ```
 
-`stokehold` prints both addresses it bound, then serves HTTP and FastCGI side by side until
+`volucer` prints both addresses it bound, then serves HTTP and FastCGI side by side until
 Ctrl-C. Open `http://127.0.0.1:8080/` in a browser, or point nginx at the FastCGI listener:
 
 ```nginx
@@ -250,10 +250,10 @@ behaviour. That form is a *flag* and not a config value, deliberately: TOML cann
 string from an absent key, so writing `front_controller = ""` in the file is rejected with a
 message saying so rather than being given a meaning of its own.
 
-`stokehold check` prints the document root and front controller it resolved and whether each is
+`volucer check` prints the document root and front controller it resolved and whether each is
 actually present, which is the fastest way to see what a running deployment uses.
 
-`stokehold` answers nginx's `GET_VALUES` health probe, so it stays in rotation rather than being
+`volucer` answers nginx's `GET_VALUES` health probe, so it stays in rotation rather than being
 marked down.
 
 Failures map to the status the client needs: **404** for a path that resolves to no script,
@@ -321,7 +321,7 @@ Because a route's `path_suffix` can prove that a path names a script, such a rou
 router's own `stat`**: `php-cgi` checks existence itself and answers `No input file specified`. A
 route that proves nothing about the extension — a bare `path_prefix`, or a path to `php-cgi` whose
 pattern could name `config.json` — keeps the check, because `php-cgi` does not verify that a file
-is PHP: given a non-PHP file it emits it verbatim with a 200. `stokehold check` prints which routes
+is PHP: given a non-PHP file it emits it verbatim with a 200. `volucer check` prints which routes
 skip it, so the saving and the guard are both visible.
 
 ## Sites
@@ -380,7 +380,7 @@ what makes two roots possible in one process.
 - `--document-root` and `--front-controller` describe the **default** site, so combining either
   with `[sites]` is refused rather than silently applying to one site.
 
-`stokehold check` prints the site table, what each site states, and which routes skip the stat.
+`volucer check` prints the site table, what each site states, and which routes skip the stat.
 
 ## Static files
 
@@ -405,7 +405,7 @@ defaults. Because static content is served over **HTTP** only, asking for it in 
 is unaffected by the default.
 
 **No backend is needed at all for a files-only site.** A configuration with a listener, a document
-root and nothing else is valid, and `stokehold serve` starts and serves it:
+root and nothing else is valid, and `volucer serve` starts and serves it:
 
 ```toml
 [server]
@@ -416,7 +416,7 @@ serve_only = "static"
 
 Serve it with `--front-controller ''` so a path that names no file is a 404 rather than something
 handed to a script. Without that flag the default front controller (`index.php`) is still in effect,
-so a path naming no file has nowhere to go and answers 500 — `stokehold check` warns about exactly
+so a path naming no file has nowhere to go and answers 500 — `volucer check` warns about exactly
 this case, once, at startup.
 
 The document root is the same `server.document_root` that routing already resolves scripts against,
@@ -443,7 +443,7 @@ Note that the static layer handles only `GET`, `HEAD` and `OPTIONS`: a `POST` to
 file goes to the front controller, so a framework can route it. Those two rules are what keep that
 from becoming a way to read a file.
 
-With it enabled, `stokehold` serves:
+With it enabled, `volucer` serves:
 
 | Feature | Detail |
 | --- | --- |
@@ -460,7 +460,7 @@ Serving a file costs no PHP worker and no `spawn_blocking`: path resolution is o
 `stat`, and the bytes stream through `tokio::fs` in 64 KiB blocks with a *content-length* frame, so
 hyper frames the response without chunked encoding. Zero-copy (`sendfile`) is *not* used — that
 would be a Unix-only second code path — so a large file is copied per block. See
-[the module docs](crates/stokehold-http/src/static_files.rs) for what is deliberately absent.
+[the module docs](crates/volucer-http/src/static_files.rs) for what is deliberately absent.
 
 ## TLS
 
@@ -482,8 +482,8 @@ plain = false                       # also answer cleartext on this same port
 
 A relative `certificate`/`key` resolves against **the directory holding the config file**. That is
 a deliberate exception to `document_root`'s rule, which is relative to the process's working
-directory: a certificate beside `stokehold.toml` is the usual case, and resolving it against
-wherever the process started would be a footgun with a security consequence. `stokehold check`
+directory: a certificate beside `volucer.toml` is the usual case, and resolving it against
+wherever the process started would be a footgun with a security consequence. `volucer check`
 prints the path it resolved.
 
 ### Plain HTTP and TLS together
@@ -581,19 +581,19 @@ runtime; those are still pre-release, so this targets 0.23 stable.
 
 | Path | Contents |
 | --- | --- |
-| `crates/stokehold-core` | Configuration model, backend types, PHP discovery, deployment preflight checks |
-| `crates/stokehold-fcgi` | FastCGI record codec, client, transport and CGI environment |
-| `crates/stokehold-worker` | The worker protocol: framed codec and message set over a worker's pipes |
-| `crates/stokehold-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |
-| `crates/stokehold-http` | The HTTP front-end: a `hyper` listener and the static file layer — the only async code in the project |
-| `crates/stokehold-cli` | The `stokehold` binary |
+| `crates/volucer-core` | Configuration model, backend types, PHP discovery, deployment preflight checks |
+| `crates/volucer-fcgi` | FastCGI record codec, client, transport and CGI environment |
+| `crates/volucer-worker` | The worker protocol: framed codec and message set over a worker's pipes |
+| `crates/volucer-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |
+| `crates/volucer-http` | The HTTP front-end: a `hyper` listener and the static file layer — the only async code in the project |
+| `crates/volucer-cli` | The `volucer` binary |
 | `docs/plan.md` | The design and the phase plan |
 | `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements |
 
 The PHP worker SDK is not in this repository. It is
-[`sailantis/stokehold-php-sdk`](https://github.com/sailantis/stokehold-php-sdk), a Composer
+[`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk), a Composer
 package that implements the other end of the worker protocol. The tests here drive its example
-worker, so a working checkout is expected beside this one — or at `STOKEHOLD_SDK_DIR`.
+worker, so a working checkout is expected beside this one — or at `VOLUCER_SDK_DIR`.
 
 ## Development
 
@@ -603,20 +603,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-The FastCGI integration tests in `crates/stokehold-fcgi/tests/php_cgi.rs` start a real
+The FastCGI integration tests in `crates/volucer-fcgi/tests/php_cgi.rs` start a real
 `php-cgi -b` process and speak the protocol to it. They skip themselves, with a printed reason,
 when no `php-cgi` binary is on `PATH`.
 
-The worker protocol tests — `crates/stokehold-worker/src/codec.rs` and
-`crates/stokehold-worker/tests/wire_format.rs` — need no PHP. They drive the codec over an
+The worker protocol tests — `crates/volucer-worker/src/codec.rs` and
+`crates/volucer-worker/tests/wire_format.rs` — need no PHP. They drive the codec over an
 in-memory stream and assert the exact wire bytes, so the protocol stays frozen without depending
 on a PHP install.
 
-`crates/stokehold-worker/tests/php_worker.rs` does the opposite: it starts a real
+`crates/volucer-worker/tests/php_worker.rs` does the opposite: it starts a real
 `example/worker.php` from the SDK checkout and speaks the protocol to it over pipes, so the Rust
 codec and the PHP SDK are checked against each other rather than only against their own fixtures.
 
-`crates/stokehold-server/tests/worker_pool.rs` tests the pool around that protocol against real
+`crates/volucer-server/tests/worker_pool.rs` tests the pool around that protocol against real
 worker processes: it boots a pool, serves through every worker in rotation, replaces a worker that
 was killed or asked to be recycled, recycles on `max_requests` and on `memory_limit_mb`, and
 checks that dropping the pool leaves no processes behind. It skips itself when no `php` is on
@@ -624,11 +624,11 @@ checks that dropping the pool leaves no processes behind. It skips itself when n
 
 The two suites above are the only tests that need the SDK. libtest hides the stderr of a passing
 test, so their skip message is invisible in an ordinary run — the suite reports the same result
-whether the SDK was exercised or not. Where it must have been (CI), set **`STOKEHOLD_E2E=1`**:
-a skip then fails instead of passing. `STOKEHOLD_SDK_DIR` points them at a checkout that is not
+whether the SDK was exercised or not. Where it must have been (CI), set **`VOLUCER_E2E=1`**:
+a skip then fails instead of passing. `VOLUCER_SDK_DIR` points them at a checkout that is not
 beside this repository.
 
-`crates/stokehold-http/tests/frontend.rs` drives the HTTP listener over a real socket against a
+`crates/volucer-http/tests/frontend.rs` drives the HTTP listener over a real socket against a
 real worker pool: a GET, a POST body verified byte for byte, request headers landing in the CGI
 environment, an application error becoming a 500 while the worker survives, `Content-Length`
 agreeing with the body that was sent, keep-alive serving two requests on one connection, four
@@ -641,7 +641,7 @@ the requested bytes, a 416 past the end, the `/assets` → `/assets/` redirect, 
 traversal, a precompressed variant, a 256 KiB file arriving whole — and, crucially, **502 for
 `/about`**, which is how the tests prove a path that names no file still reaches the application.
 
-`crates/stokehold-cli/tests/serve.rs` is the end-to-end one: it runs the shipped `stokehold`
+`crates/volucer-cli/tests/serve.rs` is the end-to-end one: it runs the shipped `volucer`
 binary with both listeners configured on port 0, then drives it over HTTP *and* over FastCGI in
 the same process, which is what proves the two front-ends really do share one dispatcher. A second
 test in that file serves a static file and reaches PHP for a route through the same config and the

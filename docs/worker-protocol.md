@@ -1,9 +1,9 @@
-# The stokehold worker protocol
+# The volucer worker protocol
 
-**Version 1.** This document is the specification; `crates/stokehold-worker` is its reference
+**Version 1.** This document is the specification; `crates/volucer-worker` is its reference
 implementation, and the tests in that crate (plus `tests/wire_format.rs`) pin it byte for byte.
 The PHP SDK implements the other end; it lives in
-[`sailantis/stokehold-php-sdk`](https://github.com/sailantis/stokehold-php-sdk), because a
+[`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk), because a
 Composer package needs `composer.json` at the root of a repository. A release of that package
 links back to this document at a pinned commit, so the two versions can be compared.
 
@@ -19,7 +19,7 @@ the child can talk back on, and neither of the obvious candidates works:
   part while importing a versioning commitment to its wire format; adopting its semantics means
   becoming a RoadRunner clone.
 
-So stokehold models the same proven header shape and owns a message set.
+So volucer models the same proven header shape and owns a message set.
 
 ## Transport
 
@@ -29,7 +29,7 @@ worker to write to, and the supervisor drains it so the pipe buffer cannot fill 
 child.
 
 ```
-  stokehold ──HELLO/REQUEST/CONTROL/PING──►  php worker  (stdin)
+  volucer ──HELLO/REQUEST/CONTROL/PING──►  php worker  (stdin)
             ◄─HELLO_ACK/RESPONSE/BODY ────  … ──LOG/METRIC/EVENT─  (stdout)
 ```
 
@@ -219,7 +219,7 @@ The worker's `protocol_version` is checked **here**, at boot, not on the first r
 mismatched SDK is a configuration problem and should look like one.
 
 `runtime` identifies the implementation and the **build** it is running, as
-`stokehold-worker-php/7c6945f`. The build is not the protocol version: the protocol is `1` and moves only
+`volucer-worker-php/7c6945f`. The build is not the protocol version: the protocol is `1` and moves only
 when the wire format does, while the build names one particular checkout or release of the SDK. A server
 that does not care about the field ignores it, since it is a free-form string; a server that does can
 report which SDK build a worker is running without shelling into the host.
@@ -311,14 +311,14 @@ Everything else means the reader can no longer trust its position in the stream.
    **captures** rather than bans it: `ob_start()` per request collects `echo` and template
    output (and turns it into the response body when the handler returns null), `ini_set('display_errors', 'stderr')`
    sends warnings to stderr, and `emitLog`/`emitMetric` are the supported way to speak outside a
-   request. See `src/Worker.php` in `sailantis/stokehold-php-sdk`.
+   request. See `src/Worker.php` in `sailantis/volucer-php-sdk`.
 2. **Graceful shutdown by construction.** Closing the child's stdin makes the worker's read
    return EOF and `waitRequest()` return `false`; the worker exits on its own. Only after a grace
    period does the supervisor kill it. There is no signal to catch and no flag to poll, which is
    why the server never has to ask twice.
 
-Both rules are implemented in the PHP SDK (`sailantis/stokehold-php-sdk`) and tested against a
-real PHP process by `crates/stokehold-worker/tests/php_worker.rs`, which drives a live
+Both rules are implemented in the PHP SDK (`sailantis/volucer-php-sdk`) and tested against a
+real PHP process by `crates/volucer-worker/tests/php_worker.rs`, which drives a live
 `php worker.php` over pipes.
 
 ## The SAPI services a worker has to supply itself
@@ -349,7 +349,7 @@ Both adapters share one implementation of this, `Azera\Http\WorkerSession` in
 
 Everything above is the wire format. This section is the policy the server applies on top of it,
 because a worker cannot enforce any of it and an application author needs to know what to expect —
-`crates/stokehold-server/src/worker_pool/` is the implementation.
+`crates/volucer-server/src/worker_pool/` is the implementation.
 
 **When a worker is replaced.** A worker is not replaced because it failed a request; it is
 replaced on exactly three signals, all of which come from the worker itself or from

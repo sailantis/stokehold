@@ -16,6 +16,7 @@
 //!
 //! Skipped, with a printed reason, when no `php` binary is on `PATH`.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -138,6 +139,7 @@ fn worker_config(workers: u32) -> Config {
         .collect(),
         default_backend: Some("app".to_string()),
         routes: Vec::new(),
+        sites: BTreeMap::new(),
     }
 }
 
@@ -473,6 +475,7 @@ fn unreachable_config() -> Config {
         .collect(),
         default_backend: Some("fpm".to_string()),
         routes: Vec::new(),
+        sites: BTreeMap::new(),
     }
 }
 

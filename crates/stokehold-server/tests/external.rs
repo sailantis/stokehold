@@ -5,6 +5,7 @@
 //! `php-cgi -b` process started by the test itself. That is the same code path:
 //! the backend only ever sees a socket it did not create.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -13,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use stokehold_core::config::{BackendConfig, Config, ExternalConfig, ServerConfig};
 use stokehold_fcgi::{
-    build_params, read_record, write_records, EndRequest, RecordType, Request, RequestInfo, Routing,
-    Stream, REQUEST_ID,
+    build_params, read_record, write_records, EndRequest, RecordType, Request, RequestInfo,
+    Routing, Stream, REQUEST_ID,
 };
 use stokehold_server::Dispatcher;
 
@@ -130,7 +131,13 @@ fn serve_once(stream: Stream, sleep: Duration) {
         return;
     }
     let end = EndRequest::complete();
-    let _ = write_records(&mut stream, RecordType::EndRequest, REQUEST_ID, &end.encode(), false);
+    let _ = write_records(
+        &mut stream,
+        RecordType::EndRequest,
+        REQUEST_ID,
+        &end.encode(),
+        false,
+    );
 }
 
 fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
@@ -149,6 +156,7 @@ fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
         .collect(),
         default_backend: Some("fpm".to_string()),
         routes: Vec::new(),
+        sites: BTreeMap::new(),
     };
     config.validate().expect("the config is valid");
 

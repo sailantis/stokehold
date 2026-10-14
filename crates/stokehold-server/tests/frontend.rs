@@ -11,6 +11,7 @@
 //! script through the CGI environment, gets a response from a real PHP process,
 //! and re-frames it back without corrupting it.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -122,6 +123,7 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
         .collect(),
         default_backend: Some("cgi".to_string()),
         routes: Vec::new(),
+        sites: BTreeMap::new(),
     };
     config.validate().expect("the config is valid");
 
@@ -258,6 +260,7 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
         .collect(),
         default_backend: Some("dead".to_string()),
         routes: Vec::new(),
+        sites: BTreeMap::new(),
     };
     config.validate().expect("valid config");
     let dispatcher =

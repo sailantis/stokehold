@@ -309,6 +309,7 @@ fn serve_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn limits_have_a_sane_default() {
@@ -352,6 +353,7 @@ mod tests {
             .collect(),
             default_backend: Some("fpm".to_string()),
             routes: Vec::new(),
+            sites: BTreeMap::new(),
         };
         let dispatcher = Dispatcher::from_config(&config, stokehold_fcgi::Routing::default())
             .expect("dispatcher");

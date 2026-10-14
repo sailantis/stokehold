@@ -37,6 +37,175 @@ pub struct Config {
     /// precedence rule.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+
+    /// Sites, by name. Empty means one site: what `[server]` describes.
+    ///
+    /// A site exists because a `host` in the route table is matched *after*
+    /// `SCRIPT_FILENAME` is resolved, so a route can choose a backend but never
+    /// a document root. Hosting two applications in one process therefore needs
+    /// the decision made earlier, and that is what this table is for.
+    #[serde(default)]
+    pub sites: BTreeMap<String, SiteConfig>,
+}
+
+/// One site: a document root, and optionally its own routing and static layer.
+///
+/// Every key except `hosts` and `document_root` falls back to the `[server]`
+/// value, so a site that only sets those two inherits the rest — the usual
+/// shape when several sites share one application.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SiteConfig {
+    /// The `Host` names this site answers to.
+    ///
+    /// An exact name, case-insensitively, with any `:port` ignored — or a
+    /// leading `*.` wildcard, which matches one or more labels (`*.example.com`
+    /// matches `a.example.com` and `a.b.example.com`).
+    pub hosts: Vec<String>,
+
+    /// Directory that this site's scripts and files resolve against.
+    ///
+    /// Absolutised at startup for the same reason `server.document_root` is:
+    /// `php-cgi` runs in a persistent pool and `chdir()`s into the directory of
+    /// the script it executed, so a relative root resolves against the previous
+    /// request's directory from the second request onwards.
+    pub document_root: PathBuf,
+
+    /// This site's front controller; see [`ServerConfig::front_controller`].
+    #[serde(default)]
+    pub front_controller: Option<FrontController>,
+
+    /// Backend used when a request to this site matches no route.
+    #[serde(default)]
+    pub default_backend: Option<String>,
+
+    /// This site's route table, replacing the global one when present.
+    #[serde(default)]
+    pub routes: Option<Vec<RouteConfig>>,
+
+    /// This site's static layer. Absent inherits the `[server]` one.
+    #[serde(default)]
+    pub static_files: Option<StaticsSetting>,
+
+    /// What this site answers with; see [`ServeOnly`].
+    ///
+    /// Absent inherits the `[server]` value, which itself defaults to
+    /// `ServeOnly::All`.
+    #[serde(default)]
+    pub serve_only: Option<ServeOnly>,
+}
+
+/// What a deployment serves.
+///
+/// The name is the rule: *serve only* this. Absent means "serve everything",
+/// which is static files first and then a backend — the behaviour that existed
+/// before this key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServeOnly {
+    /// Static files first, then the backend. The default.
+    #[default]
+    All,
+    /// The backend only: a path naming a file is dispatched like any other.
+    Backend,
+    /// Files only: a path naming no file is a 404, and no backend is consulted.
+    Static,
+}
+
+impl ServeOnly {
+    /// Whether the static layer runs for this site.
+    pub fn serves_files(self) -> bool {
+        !matches!(self, ServeOnly::Backend)
+    }
+
+    /// Whether a path that names no file may reach a backend.
+    pub fn serves_backend(self) -> bool {
+        !matches!(self, ServeOnly::Static)
+    }
+
+    /// The name as it is written in configuration, for logs and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServeOnly::All => "all",
+            ServeOnly::Backend => "backend",
+            ServeOnly::Static => "static",
+        }
+    }
+}
+
+impl std::fmt::Display for ServeOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A front controller as configuration spells it.
+///
+/// A string is the script's path below the document root. `false` means "serve
+/// only real `.php` files", which the global key can only express as an empty
+/// string on the command line — TOML cannot tell `front_controller = ""` from an
+/// absent key, so the file reserves the meaning and a *flag* supplies it. A site
+/// has no flag of its own, so it needs a spelling, and a boolean is one that
+/// cannot be confused with a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FrontController {
+    /// A relative path below the document root, e.g. `index.php`.
+    Path(String),
+    /// `false`: no front controller, so only real scripts are served.
+    FilesOnly(bool),
+}
+
+impl FrontController {
+    /// The controller as a path, or `None` for "serve only real files".
+    pub fn as_path(&self) -> Option<&str> {
+        match self {
+            FrontController::Path(path) => Some(path.as_str()),
+            FrontController::FilesOnly(_) => None,
+        }
+    }
+}
+
+/// A static-file setting as configuration spells it.
+///
+/// A table tunes the layer; `false` turns it off and `true` turns it on with the
+/// defaults. The bare boolean exists because "off" is otherwise
+/// `static_files = { enabled = false }`, and the short form is what a reader
+/// reaches for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StaticsSetting {
+    /// A tuning table.
+    Table(StaticConfig),
+    /// `false` disables the layer; `true` enables it with the defaults.
+    Switch(bool),
+}
+
+impl Default for StaticsSetting {
+    /// Absent means the layer is off, matching `StaticConfig::enabled`'s own default.
+    ///
+    /// It resolves to `Switch(false)` rather than `Table(StaticConfig::default())`
+    /// so that `check` can report a deployment which *chose* to turn the layer off
+    /// apart from one which never mentioned it.
+    fn default() -> Self {
+        StaticsSetting::Switch(false)
+    }
+}
+
+impl StaticsSetting {
+    /// The setting as a full table, resolving the bare boolean.
+    ///
+    /// `true` means "the defaults", not "inherit": a site that wants the site's own
+    /// or the server's setting simply leaves the key out.
+    pub fn resolved(&self) -> StaticConfig {
+        match self {
+            StaticsSetting::Table(config) => config.clone(),
+            StaticsSetting::Switch(enabled) => StaticConfig {
+                enabled: *enabled,
+                ..StaticConfig::default()
+            },
+        }
+    }
 }
 
 /// A route entry, selecting a backend for matching requests.
@@ -51,6 +220,16 @@ pub struct RouteConfig {
     /// Match a request whose path starts with this string, e.g. `/api`.
     #[serde(default)]
     pub path_prefix: Option<String>,
+
+    /// Match a request whose path ends with this string, e.g. `.php`.
+    ///
+    /// Compared case-insensitively, deliberately: the router decides what a
+    /// script is case-insensitively, so a case-sensitive suffix here would let
+    /// `/upload.PHP` be recognised as a script by one layer and miss its route in
+    /// the other. Two answers to "is this PHP" is the drift the static layer
+    /// already guards against by sharing `has_php_extension`.
+    #[serde(default)]
+    pub path_suffix: Option<String>,
 
     /// Match a request whose `Host` header is exactly this, ignoring the
     /// `:port` suffix. Case-insensitive.
@@ -67,7 +246,20 @@ impl RouteConfig {
     /// Used to pick a winner when several routes match, so a route naming a host
     /// and a path beats one naming only the path.
     pub fn specificity(&self) -> usize {
-        self.host.is_some() as usize + self.path_prefix.is_some() as usize
+        self.host.is_some() as usize
+            + self.path_prefix.is_some() as usize
+            + self.path_suffix.is_some() as usize
+    }
+
+    /// Whether this route's host constraint is an exact name rather than a
+    /// wildcard.
+    ///
+    /// An exact host is the more specific claim about the same request, so it wins
+    /// a tie against a wildcard that also matches — see [`Config::route_backend`].
+    pub fn has_exact_host(&self) -> bool {
+        self.host
+            .as_deref()
+            .is_some_and(|host| !host.starts_with("*."))
     }
 
     /// Whether this route's constraints all match the given host and path.
@@ -77,11 +269,23 @@ impl RouteConfig {
                 return false;
             }
         }
+        if let Some(wanted) = &self.path_suffix {
+            // Byte-wise and case-insensitive, like `has_php_extension`, rather than
+            // `path.to_ascii_lowercase().ends_with(...)`, which would allocate a copy
+            // of the whole path per request to answer a question about its last few
+            // bytes. The comparison is on bytes because a byte offset taken from the
+            // end of a `&str` can land inside a multi-byte character and slicing
+            // there panics, so a path with non-ASCII in it must still be answerable.
+            let wanted = wanted.as_bytes();
+            let bytes = path.as_bytes();
+            if bytes.len() < wanted.len()
+                || !bytes[bytes.len() - wanted.len()..].eq_ignore_ascii_case(wanted)
+            {
+                return false;
+            }
+        }
         if let Some(wanted) = &self.host {
-            let host = host.unwrap_or_default();
-            // A Host header may carry a port; the route names a host.
-            let host = host.split(':').next().unwrap_or(host);
-            if !host.eq_ignore_ascii_case(wanted) {
+            if !host_matches(wanted, host) {
                 return false;
             }
         }
@@ -89,18 +293,77 @@ impl RouteConfig {
     }
 }
 
+/// Whether a `Host` header matches a configured host pattern.
+///
+/// One function for the route table and the site table, so the two cannot
+/// disagree about what a wildcard means — a route that matched a host the site
+/// resolver did not, or the reverse, would be a bug nobody could reproduce from
+/// reading either table alone.
+///
+/// The pattern is an exact name, compared case-insensitively with any `:port`
+/// stripped, or a leading `*.` wildcard. `*.example.com` matches
+/// `a.example.com` and `a.b.example.com` but *not* `example.com` itself: a
+/// wildcard names a subdomain, and treating it as also matching the bare domain
+/// would silently widen every rule that used one.
+pub fn host_matches(pattern: &str, host: Option<&str>) -> bool {
+    let host = host.unwrap_or_default();
+    let host = strip_port(host);
+    if host.is_empty() {
+        return false;
+    }
+
+    match pattern.strip_prefix("*.") {
+        None => host.eq_ignore_ascii_case(pattern),
+        Some(suffix) => {
+            // The host must be longer than the suffix *plus* the separating dot, and
+            // that dot must be there. Both halves are needed: without the length
+            // check, `.example.com` would pass — it is exactly one byte longer than
+            // the suffix and that byte is a dot — and the wildcard would be claimed
+            // by an empty label.
+            let suffix_len = suffix.len();
+            host.len() > suffix_len + 1
+                && host.as_bytes()[host.len() - suffix_len - 1] == b'.'
+                && host[host.len() - suffix_len..].eq_ignore_ascii_case(suffix)
+        }
+    }
+}
+
+/// A `Host` header without its `:port`, handling a bracketed IPv6 literal.
+fn strip_port(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        // `[::1]:8080` and `[::1]`.
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // A bare `::1` has several colons and no port; only the last one separates a
+    // port when there is exactly one colon.
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
+            name
+        }
+        _ => host,
+    }
+}
+
 impl Config {
     /// The backend that should serve this request, if a route matches it.
     ///
-    /// The most specific matching route wins (see [`RouteConfig::specificity`]);
-    /// ties are broken by order of declaration, so the earlier entry wins. This
-    /// is deliberately the whole rule: anything more clever becomes
-    /// unguessable, and a reader of the file should be able to predict it.
+    /// The most specific matching route wins, and ties are broken by declaration
+    /// order so the earlier entry wins. "Most specific" is stated rather than
+    /// weighted, because a table whose winner could not be predicted by reading
+    /// the file would be worse than one that is merely simple:
+    ///
+    /// 1. A route stating more constraints beats one stating fewer, so
+    ///    `host + path_suffix` beats a bare `path_suffix`.
+    /// 2. Among routes stating the same number, an exact `host` beats a `*.`
+    ///    wildcard, since an exact name is the more specific claim about the same
+    ///    request.
+    /// 3. Anything still tied is settled by declaration order.
     pub fn route_backend(&self, host: Option<&str>, path: &str) -> Option<&str> {
         self.routes
             .iter()
             .filter(|route| route.matches(host, path))
-            .max_by_key(|route| route.specificity())
+            .max_by_key(|route| (route.specificity(), route.has_exact_host()))
             .map(|route| route.backend.as_str())
     }
 }
@@ -144,8 +407,16 @@ pub struct ServerConfig {
     pub front_controller: Option<String>,
 
     /// Serving files from the document root, without a backend.
+    ///
+    /// A table tunes the layer; `false` turns it off and `true` turns it on with the
+    /// defaults. Off by default, so an existing deployment is not changed by
+    /// upgrading.
     #[serde(default)]
-    pub static_files: StaticConfig,
+    pub static_files: StaticsSetting,
+
+    /// What this deployment serves; see [`ServeOnly`]. Defaults to everything.
+    #[serde(default)]
+    pub serve_only: ServeOnly,
 }
 
 /// The front controller used when neither the config nor the command line says.
@@ -167,6 +438,11 @@ impl ServerConfig {
             Some(value.to_string())
         }
     }
+
+    /// The static layer's settings, with any bare boolean resolved.
+    pub fn statics(&self) -> StaticConfig {
+        self.static_files.resolved()
+    }
 }
 
 /// How files under the document root are served.
@@ -174,7 +450,7 @@ impl ServerConfig {
 /// The HTTP front-end only. A file goes to a backend when nothing here matches,
 /// which is what keeps a front controller working: with `index.php` configured,
 /// a path that names no file is PHP's business, not this layer's.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticConfig {
     /// Serve files at all. Off by default, so an existing deployment is not
@@ -286,6 +562,7 @@ impl BackendConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     /// Command line that starts the persistent worker, e.g. `php worker.php`.
     pub command: String,
@@ -432,12 +709,14 @@ impl ChecksumMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalConfig {
     /// php-fpm listener: `unix:/run/php/php8.3-fpm.sock` or `127.0.0.1:9000`.
     pub socket: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpawnFpmConfig {
     /// php-fpm binary.
     pub binary: PathBuf,
@@ -452,6 +731,7 @@ pub struct SpawnFpmConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpawnCgiConfig {
     /// `php-cgi` binary.
     pub binary: PathBuf,
@@ -533,7 +813,7 @@ impl Config {
             self.validate_backend(name, backend)?;
         }
 
-        if self.server.static_files.enabled && self.server.http.is_none() {
+        if self.server.statics().enabled && self.server.http.is_none() {
             return Err(Error::Config(
                 "server.static_files is enabled but no server.http listener is configured; \
                  static content is served over HTTP, and a FastCGI client does its own"
@@ -579,16 +859,26 @@ impl Config {
                     .to_string(),
             ));
         }
-        if self.server.static_files.cache_control.trim().is_empty() {
+        if self.server.statics().cache_control.trim().is_empty() {
             return Err(Error::Config(
                 "server.static_files.cache_control is empty; set a value or remove the key"
                     .to_string(),
             ));
         }
-        if self.server.static_files.max_multirange_bytes == 0 {
+        if self.server.statics().max_multirange_bytes == 0 {
             return Err(Error::Config(
                 "server.static_files.max_multirange_bytes is zero, which refuses every \
                  multi-range request; set a value or remove the key"
+                    .to_string(),
+            ));
+        }
+        // `serve_only = "backend"` and an enabled static layer are contradictory:
+        // one says the static layer never runs, the other says it must. Which wins
+        // would otherwise depend on which check read the config, so it is refused.
+        if self.server.serve_only == ServeOnly::Backend && self.server.statics().enabled {
+            return Err(Error::Config(
+                "server.serve_only is \"backend\", which skips the static layer, but \
+                 server.static_files is enabled; write one of them"
                     .to_string(),
             ));
         }
@@ -613,30 +903,94 @@ impl Config {
         }
 
         for (index, route) in self.routes.iter().enumerate() {
-            if !self.backends.contains_key(&route.backend) {
+            validate_route(route, "routes", index, &self.backends)?;
+        }
+
+        self.validate_sites()?;
+
+        Ok(())
+    }
+
+    /// Validate the site table: host patterns, duplicates, and per-site settings.
+    ///
+    /// Separate from `validate` only because it is long; the two are one rule set
+    /// and are always called together.
+    fn validate_sites(&self) -> Result<()> {
+        // Host patterns, and the duplicate check. A host claimed by two sites is
+        // the one mistake a reader cannot see from either site alone: one of them
+        // would silently never be reached, and which one depends on map order.
+        let mut claimed: BTreeMap<String, &str> = BTreeMap::new();
+        for (name, site) in &self.sites {
+            if site.hosts.is_empty() {
                 return Err(Error::Config(format!(
-                    "routes[{index}].backend {:?} does not match any configured backend",
-                    route.backend
+                    "sites.{name}.hosts is empty, so this site would never be reached; list at \
+                     least one host name"
                 )));
             }
-            if route.path_prefix.is_none() && route.host.is_none() {
+            if site.document_root.as_os_str().is_empty() {
                 return Err(Error::Config(format!(
-                    "routes[{index}] has neither path_prefix nor host, so it would match every \
-                     request; set default_backend instead"
+                    "sites.{name}.document_root is empty; set the directory holding this site"
                 )));
             }
-            if let Some(prefix) = &route.path_prefix {
-                if !prefix.starts_with('/') {
+
+            for host in &site.hosts {
+                validate_host_pattern(host, &format!("sites.{name}.hosts"))?;
+                let key = host.trim().to_ascii_lowercase();
+                if let Some(existing) = claimed.insert(key, name) {
                     return Err(Error::Config(format!(
-                        "routes[{index}].path_prefix {prefix:?} must start with '/'"
+                        "sites.{existing} and sites.{name} both claim the host {host:?}; the first \
+                         one declared would be the only one ever reached"
                     )));
                 }
             }
-            if let Some(host) = &route.host {
-                if host.is_empty() || host.contains(':') {
+
+            if let Some(front) = &site.front_controller {
+                validate_front_controller(front, &format!("sites.{name}.front_controller"))?;
+            }
+
+            if let Some(routes) = &site.routes {
+                for (index, route) in routes.iter().enumerate() {
+                    validate_route(
+                        route,
+                        &format!("sites.{name}.routes"),
+                        index,
+                        &self.backends,
+                    )?;
+                }
+            }
+
+            if let Some(backend) = &site.default_backend {
+                if !self.backends.contains_key(backend) {
                     return Err(Error::Config(format!(
-                        "routes[{index}].host {host:?} must be a bare host name without a port"
+                        "sites.{name}.default_backend {backend:?} does not match any configured \
+                         backend"
                     )));
+                }
+            }
+
+            if let Some(statics) = &site.static_files {
+                validate_statics(&statics.resolved(), &format!("sites.{name}.static_files"))?;
+            }
+
+            // `static_files = false` and `serve_only = "static"` are both a way of
+            // saying "files only", so writing them together is a contradiction and
+            // writing `false` beside `"backend"` is a double negative. Rejecting is
+            // what keeps the resolved answer a single statement.
+            if let Some(StaticsSetting::Switch(enabled)) = &site.static_files {
+                match (enabled, site.serve_only) {
+                    (true, Some(ServeOnly::Backend)) => {
+                        return Err(Error::Config(format!(
+                            "sites.{name}: static_files = true cannot be combined with \
+                             serve_only = \"backend\", which skips the static layer"
+                        )))
+                    }
+                    (false, Some(ServeOnly::Static)) => {
+                        return Err(Error::Config(format!(
+                            "sites.{name}: static_files = false cannot be combined with \
+                             serve_only = \"static\"; write one of them"
+                        )))
+                    }
+                    _ => {}
                 }
             }
         }
@@ -677,6 +1031,136 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Validate one route, whichever table it came from.
+///
+/// `where_` is the table's name as a reader would write it (`routes` or
+/// `sites.<name>.routes`), so a message names the entry that owns the mistake
+/// rather than an index into something the reader cannot see.
+fn validate_route(
+    route: &RouteConfig,
+    where_: &str,
+    index: usize,
+    backends: &BTreeMap<String, BackendConfig>,
+) -> Result<()> {
+    if !backends.contains_key(&route.backend) {
+        return Err(Error::Config(format!(
+            "{where_}[{index}].backend {:?} does not match any configured backend",
+            route.backend
+        )));
+    }
+    if route.path_prefix.is_none() && route.path_suffix.is_none() && route.host.is_none() {
+        return Err(Error::Config(format!(
+            "{where_}[{index}] has no path_prefix, path_suffix or host, so it would match every \
+             request; set default_backend instead"
+        )));
+    }
+    if let Some(prefix) = &route.path_prefix {
+        if !prefix.starts_with('/') {
+            return Err(Error::Config(format!(
+                "{where_}[{index}].path_prefix {prefix:?} must start with '/'"
+            )));
+        }
+    }
+    if let Some(suffix) = &route.path_suffix {
+        // A suffix that does not start with `.` or `/` matches far more than it
+        // looks like it does — `"php"` matches `/notphp` — so it is refused rather
+        // than left to be discovered as a routing surprise.
+        if !(suffix.starts_with('.') || suffix.starts_with('/')) {
+            return Err(Error::Config(format!(
+                "{where_}[{index}].path_suffix {suffix:?} must start with '.' or '/', so that it \
+                 cannot match an unrelated path by accident"
+            )));
+        }
+    }
+    if let Some(host) = &route.host {
+        validate_host_pattern(host, &format!("{where_}[{index}].host"))?;
+    }
+    Ok(())
+}
+
+/// Validate a host pattern, as `*.example.com` or a bare name.
+fn validate_host_pattern(pattern: &str, where_: &str) -> Result<()> {
+    if pattern.is_empty() {
+        return Err(Error::Config(format!(
+            "{where_} is empty; name a host, or remove the route"
+        )));
+    }
+    // The port is not part of the pattern: a `Host` header carries one, but the
+    // name a site or route claims does not, and accepting one would make
+    // `a.test:8080` and `a.test` two different sites that look the same.
+    let name = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if name.is_empty() || name.contains(':') || name.contains('/') {
+        return Err(Error::Config(format!(
+            "{where_} {pattern:?} must be a bare host name without a port, optionally with a \
+             leading \"*.\""
+        )));
+    }
+    // `*.` must leave at least one label, or the wildcard claims the whole of a
+    // top-level domain.
+    if pattern.starts_with("*.") && !name.contains('.') {
+        return Err(Error::Config(format!(
+            "{where_} {pattern:?} would match every host under {name:?}; a wildcard needs at \
+             least two labels after it, e.g. \"*.example.com\""
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a front controller, as a relative path below the document root.
+fn validate_front_controller(controller: &FrontController, where_: &str) -> Result<()> {
+    let front = match controller {
+        // `false` means "only real files", which is what the key being absent
+        // already means in a site table — so it is redundant but not wrong, and
+        // saying it explicitly is how a reader checks the deployment's intent.
+        FrontController::FilesOnly(false) => return Ok(()),
+        // `true` is not a path and has no sensible reading: it would have to mean
+        // some particular script, and guessing which one is exactly the ambiguity
+        // the empty-string rule exists to avoid.
+        FrontController::FilesOnly(true) => {
+            return Err(Error::Config(format!(
+                "{where_} = true is not a path; name the script, e.g. \"index.php\", or write \
+                 `false` to serve only real files"
+            )))
+        }
+        FrontController::Path(path) => path.as_str(),
+    };
+    if front.trim().is_empty() {
+        return Err(Error::Config(format!(
+            "{where_} is empty; write `false` to serve only real files, or name a script"
+        )));
+    }
+    let front = front.trim_start();
+    if front.starts_with('/')
+        || front.contains('\\')
+        || Path::new(front)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(Error::Config(format!(
+            "{where_} must be a relative path below the document root, e.g. \"index.php\" or \
+             \"public/index.php\" — an absolute path, a `..` component or a backslash would \
+             escape it, and `false` means \"only real files\""
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the resolvable parts of a static-file setting.
+fn validate_statics(statics: &StaticConfig, where_: &str) -> Result<()> {
+    if statics.cache_control.trim().is_empty() {
+        return Err(Error::Config(format!(
+            "{where_}.cache_control is empty; set a value or remove the key"
+        )));
+    }
+    if statics.max_multirange_bytes == 0 {
+        return Err(Error::Config(format!(
+            "{where_}.max_multirange_bytes is zero, which refuses every multi-range request; \
+             set a value or remove the key"
+        )));
+    }
+    Ok(())
 }
 
 /// A parsed listener endpoint.
@@ -1221,7 +1705,10 @@ backend = "app"
 "#;
         let config = Config::from_toml(text).expect("config parses");
         let err = config.validate().expect_err("must fail");
-        assert!(err.to_string().contains("neither"), "{err}");
+        assert!(
+            err.to_string().contains("path_prefix, path_suffix or host"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1247,14 +1734,15 @@ backend = "app"
         let config =
             Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("config parses");
         config.validate().expect("a listener alone is enough");
+        let statics = config.server.statics();
         assert!(
-            !config.server.static_files.enabled,
+            !statics.enabled,
             "an upgrade must not start serving files an operator never asked for"
         );
         // The defaults are still populated, so enabling it needs one key.
-        assert_eq!(config.server.static_files.dotfiles, Dotfiles::Deny);
-        assert!(config.server.static_files.directory_index);
-        assert_eq!(config.server.static_files.max_multirange_bytes, 1024 * 1024);
+        assert_eq!(statics.dotfiles, Dotfiles::Deny);
+        assert!(statics.directory_index);
+        assert_eq!(statics.max_multirange_bytes, 1024 * 1024);
     }
 
     #[test]
@@ -1273,7 +1761,7 @@ max_multirange_bytes = 4096
         let config = Config::from_toml(text).expect("config parses");
         config.validate().expect("config validates");
 
-        let statics = &config.server.static_files;
+        let statics = config.server.statics();
         assert!(statics.enabled);
         assert!(statics.precompressed);
         assert!(!statics.directory_index);
@@ -1425,5 +1913,393 @@ document_root = ""
                 "{front}: {err}"
             );
         }
+    }
+
+    /// A two-site configuration, which is the shape this whole key exists for.
+    fn two_sites() -> Config {
+        let text = r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+front_controller = "index.php"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[backends.legacy]
+kind = "spawn_cgi"
+binary = 'C:\php\php-cgi.exe'
+
+[sites.example_com]
+hosts = ["example.com", "www.example.com"]
+document_root = "/srv/example/public"
+front_controller = "index.php"
+default_backend = "app"
+
+[sites.corp]
+hosts = ["corp.internal", "*.corp.internal"]
+document_root = "/srv/corp"
+front_controller = false
+default_backend = "legacy"
+serve_only = "backend"
+static_files = { precompressed = true }
+
+  routes = [
+      { path_suffix = ".php", backend = "legacy" },
+  ]
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    #[test]
+    fn parses_a_site_table() {
+        let config = two_sites();
+        assert_eq!(config.sites.len(), 2);
+
+        let example = &config.sites["example_com"];
+        assert_eq!(example.hosts, ["example.com", "www.example.com"]);
+        assert_eq!(example.document_root, PathBuf::from("/srv/example/public"));
+        assert_eq!(example.default_backend.as_deref(), Some("app"));
+
+        let corp = &config.sites["corp"];
+        assert_eq!(corp.serve_only, Some(ServeOnly::Backend));
+        // A boolean front controller is "only real files", and it round-trips as
+        // `None` path rather than an empty string, which TOML cannot express.
+        assert_eq!(
+            corp.front_controller
+                .as_ref()
+                .and_then(FrontController::as_path),
+            None
+        );
+        assert_eq!(corp.routes.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            corp.static_files.as_ref().map(StaticsSetting::resolved),
+            Some(StaticConfig {
+                precompressed: true,
+                ..StaticConfig::default()
+            })
+        );
+    }
+
+    #[test]
+    fn a_bare_boolean_static_setting_is_the_short_form_of_enabled() {
+        // The global key takes the same bare boolean a site does, so the two
+        // spellings cannot diverge — which is the point: `false` and
+        // `{ enabled = false }` must not need different words.
+        for (written, enabled) in [("false", false), ("true", true)] {
+            let text = format!("[server]\nhttp = \"127.0.0.1:8080\"\nstatic_files = {written}\n");
+            let config = Config::from_toml(&text).expect("config parses");
+            assert_eq!(
+                config.server.statics().enabled,
+                enabled,
+                "static_files = {written}"
+            );
+        }
+
+        // A table is the same setting spelled at length, so the two must agree.
+        let text = "[server]\nhttp = \"127.0.0.1:8080\"\n\
+                    static_files = { enabled = false }\n";
+        let table = Config::from_toml(text).expect("config parses");
+        let short =
+            Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\nstatic_files = false\n")
+                .expect("config parses");
+        assert_eq!(table.server.statics(), short.server.statics());
+
+        // And the real thing: a site carrying the bare boolean.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[sites.a]
+hosts = ["a.test"]
+document_root = "/srv/a"
+static_files = false
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let site = &config.sites["a"];
+        assert_eq!(
+            site.static_files.as_ref().map(StaticsSetting::resolved),
+            Some(StaticConfig {
+                enabled: false,
+                ..StaticConfig::default()
+            })
+        );
+        config.validate().expect("files-free site still validates");
+    }
+
+    #[test]
+    fn a_wildcard_host_matches_subdomains_but_not_the_bare_domain() {
+        // A wildcard names a subdomain. Matching the bare domain too would
+        // silently widen every rule that used one, which is the kind of widening a
+        // reader cannot see from the pattern alone.
+        assert!(host_matches("*.example.com", Some("a.example.com")));
+        assert!(host_matches("*.example.com", Some("a.b.example.com")));
+        assert!(host_matches("*.example.com", Some("A.Example.COM:8080")));
+        assert!(!host_matches("*.example.com", Some("example.com")));
+        assert!(!host_matches("*.example.com", Some(".example.com")));
+        assert!(!host_matches("*.example.com", Some("notexample.com")));
+
+        // An exact name is unchanged, including the port and case handling the
+        // route table already had.
+        assert!(host_matches("example.com", Some("EXAMPLE.com:8080")));
+        assert!(!host_matches("example.com", Some("www.example.com")));
+        // An IPv6 literal has several colons and no port, so the last one must not
+        // be mistaken for a port separator.
+        assert!(host_matches("::1", Some("::1")));
+        assert!(host_matches("::1", Some("[::1]:8080")));
+    }
+
+    #[test]
+    fn a_path_suffix_matches_case_insensitively_like_the_router_does() {
+        // The router decides what a script is case-insensitively, so the route
+        // table must agree or `/upload.PHP` would be a script to one layer and miss
+        // its route in the other.
+        let config = routed_suffix_config();
+        for path in ["/upload.php", "/upload.PHP", "/a/b/x.PhP"] {
+            assert_eq!(
+                config.route_backend(None, path),
+                Some("legacy"),
+                "{path} must reach the .php route"
+            );
+        }
+        assert_eq!(config.route_backend(None, "/upload.phtml"), None);
+        // A suffix is a suffix: it does not require a segment boundary, which is
+        // what a reader of `ends_with` expects.
+        assert_eq!(config.route_backend(None, "/notphp"), None);
+        assert_eq!(config.route_backend(None, "/xmy.php"), Some("legacy"));
+    }
+
+    fn routed_suffix_config() -> Config {
+        let text = r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[backends.legacy]
+kind = "spawn_cgi"
+binary = 'C:\php\php-cgi.exe'
+
+[[routes]]
+path_suffix = ".php"
+backend = "legacy"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    }
+
+    #[test]
+    fn an_exact_host_beats_a_wildcard_at_the_same_specificity() {
+        // Both routes state one constraint and both match `admin.example.com`; the
+        // exact name is the more specific claim, so it wins regardless of order.
+        let text = r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[backends.wild]
+kind = "worker"
+command = "php worker.php"
+
+[backends.exact]
+kind = "worker"
+command = "php worker.php"
+
+# Declared first, so order alone would pick it — which is what the test is about.
+[[routes]]
+host = "*.example.com"
+backend = "wild"
+
+[[routes]]
+host = "admin.example.com"
+backend = "exact"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("config validates");
+        assert_eq!(
+            config.route_backend(Some("admin.example.com"), "/"),
+            Some("exact")
+        );
+        assert_eq!(
+            config.route_backend(Some("other.example.com"), "/"),
+            Some("wild")
+        );
+    }
+
+    #[test]
+    fn rejects_a_path_suffix_that_would_match_by_accident() {
+        // `path_suffix = "php"` matches `/notphp`, which is not what it looks like
+        // it does, so it is refused rather than left as a routing surprise.
+        for suffix in ["php", "*php", "php/"] {
+            let text = format!(
+                r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[[routes]]
+path_suffix = {suffix:?}
+backend = "app"
+"#
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(err.to_string().contains("path_suffix"), "{suffix}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_site_that_would_never_be_reached() {
+        let base = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+
+        // No hosts.
+        let text = format!("{base}\n[sites.a]\nhosts = []\ndocument_root = \"/srv/a\"\n");
+        let config = Config::from_toml(&text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("hosts is empty"), "{err}");
+
+        // Nothing on disk to serve.
+        let text = format!("{base}\n[sites.a]\nhosts = [\"a.test\"]\ndocument_root = \"\"\n");
+        let config = Config::from_toml(&text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("document_root is empty"), "{err}");
+
+        // Two sites claiming one host: which one wins is map order, so neither the
+        // file nor a reader can predict it.
+        let text = format!(
+            "{base}\n[sites.a]\nhosts = [\"same.test\"]\ndocument_root = \"/srv/a\"\n\
+             [sites.b]\nhosts = [\"SAME.test\"]\ndocument_root = \"/srv/b\"\n"
+        );
+        let config = Config::from_toml(&text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("both claim"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_site_setting_that_contradicts_another() {
+        // `static_files = true` and `serve_only = "backend"` cannot both be
+        // honoured, and `false` beside `"static"` is a double negative. Refusing
+        // keeps the resolved answer a single statement.
+        let base = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+        for (statics, serve) in [("true", "\"backend\""), ("false", "\"static\"")] {
+            let text = format!(
+                "{base}\n[sites.a]\nhosts = [\"a.test\"]\ndocument_root = \"/srv/a\"\n\
+                 static_files = {statics}\nserve_only = {serve}\n"
+            );
+            let config = Config::from_toml(&text).expect("parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(
+                err.to_string().contains("static_files"),
+                "{statics}/{serve}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_site_naming_an_unknown_backend_or_escaping_its_root() {
+        let base = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+        let text = format!(
+            "{base}\n[sites.a]\nhosts = [\"a.test\"]\ndocument_root = \"/srv/a\"\n\
+             default_backend = \"nope\"\n"
+        );
+        let config = Config::from_toml(&text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("default_backend"), "{err}");
+
+        // A site's front controller is validated by the same rule as the global
+        // one, so it cannot escape the site's root either.
+        for front in ["/etc/passwd", "../index.php"] {
+            let text = format!(
+                "{base}\n[sites.a]\nhosts = [\"a.test\"]\ndocument_root = \"/srv/a\"\n\
+                 front_controller = {front:?}\n"
+            );
+            let config = Config::from_toml(&text).expect("parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(
+                err.to_string().contains("below the document root"),
+                "{front}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_wildcard_that_would_claim_a_whole_top_level_domain() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[sites.a]
+hosts = ["*.com"]
+document_root = "/srv/a"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("at least two labels"), "{err}");
+    }
+
+    #[test]
+    fn a_front_controller_of_false_means_only_real_files() {
+        // The site spelling of `--front-controller ''`, which the global key can
+        // only express on the command line.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[sites.a]
+hosts = ["a.test"]
+document_root = "/srv/a"
+front_controller = false
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("validates");
+        let controller = config.sites["a"].front_controller.as_ref().unwrap();
+        assert_eq!(controller.as_path(), None);
+        assert_eq!(controller, &FrontController::FilesOnly(false));
+
+        // `true` is accepted as a value but is not a path, so it is refused as
+        // meaningless rather than silently meaning "yes, index.php".
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[sites.a]
+hosts = ["a.test"]
+document_root = "/srv/a"
+front_controller = true
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("front_controller"), "{err}");
     }
 }

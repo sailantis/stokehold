@@ -85,7 +85,7 @@ pub fn inspect(config: &Config, document_root: &Path) -> Vec<Warning> {
         }
     }
 
-    if config.server.static_files.enabled && !document_root.is_dir() {
+    if config.server.statics().enabled && !document_root.is_dir() {
         warnings.push(Warning::new(
             "server.static_files is enabled, but nothing can be served while the document root \
              is unusable",

@@ -212,6 +212,7 @@ mod tests {
                 .collect(),
             default_backend: Some(default.to_string()),
             routes: Vec::new(),
+            sites: BTreeMap::new(),
         }
     }
 
@@ -297,6 +298,7 @@ mod tests {
         );
         config.routes = vec![RouteConfig {
             path_prefix: Some("/api".to_string()),
+            path_suffix: None,
             host: None,
             backend: "legacy".to_string(),
         }];
@@ -332,11 +334,13 @@ mod tests {
         config.routes = vec![
             RouteConfig {
                 path_prefix: Some("/api".to_string()),
+                path_suffix: None,
                 host: None,
                 backend: "api".to_string(),
             },
             RouteConfig {
                 path_prefix: Some("/".to_string()),
+                path_suffix: None,
                 host: Some("admin.test".to_string()),
                 backend: "admin_api".to_string(),
             },

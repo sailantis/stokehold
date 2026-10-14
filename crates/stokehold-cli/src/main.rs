@@ -217,7 +217,7 @@ fn serve(
         .server
         .resolve_front_controller(front_controller_flag);
     let routing = routing_for(&document_root, front_controller.as_deref());
-    let static_state = config.server.static_files.clone();
+    let static_state = config.server.statics();
     let http_address = config.server.http.clone();
     let fastcgi_address = config.server.fastcgi.clone();
     if http_address.is_none() && fastcgi_address.is_none() {
@@ -507,11 +507,11 @@ fn check(
     }
 
     println!("  static files:");
-    if config.server.static_files.enabled {
+    if config.server.statics().enabled {
         println!("    enabled for the HTTP listener");
         println!(
             "      precompressed:   {}",
-            if config.server.static_files.precompressed {
+            if config.server.statics().precompressed {
                 "yes (.br, then .gz)"
             } else {
                 "no"
@@ -519,7 +519,7 @@ fn check(
         );
         println!(
             "      directory index: {}",
-            if config.server.static_files.directory_index {
+            if config.server.statics().directory_index {
                 "index.html, with a redirect from the bare path"
             } else {
                 "no"
@@ -527,11 +527,11 @@ fn check(
         );
         println!(
             "      dotfiles:        {:?}",
-            config.server.static_files.dotfiles
+            config.server.statics().dotfiles
         );
         println!(
             "      cache-control:   {}",
-            config.server.static_files.cache_control
+            config.server.statics().cache_control
         );
     } else {
         println!("    (disabled: every request goes to a backend)");

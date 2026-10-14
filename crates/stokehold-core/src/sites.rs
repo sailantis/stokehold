@@ -60,9 +60,20 @@ pub struct Sites {
     /// Host pattern (lowercased) to site name, exact names first in the sense that
     /// an exact match is looked up before a wildcard one.
     exact: BTreeMap<String, String>,
-    /// Wildcard patterns as `(suffix, site name)`, longest suffix first so that a
-    /// `*.a.example.com` rule beats a `*.example.com` rule for the same host.
-    wildcard: Vec<(String, String)>,
+    /// Wildcard suffix (no `*.`, lowercased) to site name.
+    ///
+    /// Keyed rather than scanned. A wildcard matches a host exactly when the host ends
+    /// with it, so the host's own suffixes can be probed instead of every pattern —
+    /// which is O(number of labels in the host) rather than O(patterns), and the label
+    /// count is two to four in any real host name.
+    ///
+    /// Enumerating the host's suffixes yields them longest-first for free, which is the
+    /// whole rule: the first hit is the longest match. Two distinct patterns cannot both
+    /// match one host at the same length, so no tie is possible and declaration order
+    /// cannot matter. `validate_host_pattern` has already refused `*.` with fewer than
+    /// two labels, and `Config::validate` has refused a duplicate claim, so the keys
+    /// cannot collide.
+    wildcard: BTreeMap<String, String>,
 }
 
 impl Sites {
@@ -106,7 +117,7 @@ impl Sites {
 
         let mut named = BTreeMap::new();
         let mut exact = BTreeMap::new();
-        let mut wildcard = Vec::new();
+        let mut wildcard = BTreeMap::new();
 
         for (name, site) in &config.sites {
             let resolved = resolve_site(
@@ -125,18 +136,14 @@ impl Sites {
                     None => {
                         exact.insert(host, name.clone());
                     }
-                    Some(suffix) => wildcard.push((suffix.to_string(), name.clone())),
+                    Some(suffix) => {
+                        wildcard.insert(suffix.to_string(), name.clone());
+                    }
                 }
             }
 
             named.insert(name.clone(), resolved);
         }
-
-        // Longest suffix first, so the most specific wildcard wins when two match.
-        // `sort_by_key` on the reversed length is stable, so two patterns of equal
-        // length keep declaration order — which for a `BTreeMap` means name order,
-        // and that is at least predictable.
-        wildcard.sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
 
         Sites {
             default,
@@ -186,12 +193,20 @@ impl Sites {
             }
         }
 
-        for (suffix, name) in &self.wildcard {
-            if crate::config::host_matches(&format!("*.{suffix}"), Some(host.as_str())) {
+        // Walk the host's labels left to right, probing the suffix table at each step.
+        // A step strips one leading label before probing, so `a.b.example.com` tries
+        // `b.example.com` and then `example.com` — strictly longest first, which is the
+        // whole rule. It also never tries the host itself, so a bare `example.com`
+        // cannot be claimed by a `*.example.com` rule; that is the wildcard's own
+        // subdomain-only meaning, enforced here rather than by a comparison.
+        let mut rest = host.as_str();
+        while let Some((_, tail)) = rest.split_once('.') {
+            if let Some(name) = self.wildcard.get(tail) {
                 if let Some(site) = self.named.get(name.as_str()) {
                     return site;
                 }
             }
+            rest = tail;
         }
 
         &self.default
@@ -316,6 +331,44 @@ front_controller = false
     }
 
     #[test]
+    fn a_longer_wildcard_beats_a_shorter_one_for_the_same_host() {
+        // The site names must differ, or the assertion cannot tell which pattern won.
+        // The fixture above has both `*.corp.internal` and `*.deep.corp.internal` on
+        // *one* site, so "the longest won" and "the shortest won" are the same answer
+        // there — this test is the one that would catch a walk running shortest-first.
+        let config = config(
+            r#"
+default_backend = "app"
+
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/default"
+
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+
+[sites.wide]
+hosts = ["*.corp.internal"]
+document_root = "/srv/wide"
+
+[sites.narrow]
+hosts = ["*.deep.corp.internal"]
+document_root = "/srv/narrow"
+"#,
+        );
+        let sites = Sites::from_config(&config, Path::new("/srv/default"));
+
+        // Three labels past the suffix: both patterns match, the longer one must win.
+        assert_eq!(sites.resolve_str("x.deep.corp.internal").name, "narrow");
+        // Two labels past `corp.internal`: only the wide rule matches.
+        assert_eq!(sites.resolve_str("x.corp.internal").name, "wide");
+        // The suffix itself, and its immediate parent, match neither wildcard.
+        assert_eq!(sites.resolve_str("corp.internal").name, "<default>");
+        assert_eq!(sites.resolve_str("deep.corp.internal").name, "wide");
+    }
+
+    #[test]
     fn an_exact_host_wins_then_the_longest_wildcard_then_the_default() {
         let config = config(TWO_SITES);
         let sites = Sites::from_config(&config, Path::new("/srv/default"));
@@ -325,7 +378,9 @@ front_controller = false
         assert_eq!(sites.resolve_str("a.shop.example.com").name, "example_com");
         assert_eq!(sites.resolve_str("corp.internal").name, "corp");
         assert_eq!(sites.resolve_str("a.corp.internal").name, "corp");
-        // The longest wildcard wins: `*.deep.corp.internal` beats `*.corp.internal`.
+        // Both of this site's wildcards match here and both name the same site, so
+        // this only asserts the match; `a_longer_wildcard_beats_a_shorter_one_for_the_
+        // same_host` is the test that distinguishes which one won.
         assert_eq!(sites.resolve_str("x.deep.corp.internal").name, "corp");
 
         // Unlisted, so the default site answers.

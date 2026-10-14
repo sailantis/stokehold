@@ -1541,7 +1541,12 @@ the wiring.
     one. Two things the tests forced: the default front controller is applied here rather than
     left to the CLI, and `static_files` in a site table is a table of *optional* keys — a
     `StaticConfig` has defaults, so `{ precompressed = true }` would also have asserted
-    `enabled = false` over the server's setting for the whole document root.
+    `enabled = false` over the server's setting for the whole document root. The wildcards are
+    keyed by suffix rather than held in a sorted list: since a wildcard matches a host exactly when
+    the host ends with it, the host's *own* suffixes are probed in place of every pattern, which
+    enumerates them longest-first for free and removes a `format!` per candidate. Two distinct
+    suffixes cannot match one host at the same length, so the ordering tie the old sorted list
+    documented is unreachable.
 29. `route-matchers` — **done** (with 27). `path_suffix`, wildcard `host`, one `host_matches` shared
     by sites and routes, and the extended ordering.
 30. `serve-only` — **done** (model in `b9d34c4`, behaviour in `3ae93f2`). The three states, the

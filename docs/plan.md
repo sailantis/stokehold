@@ -1619,7 +1619,7 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     unmatched host means differs between callers and inventing one is how SNI and site selection
     would come to disagree). `Sites` is re-homed on `HostMap<String>` and the eight vhost tests pass
     **unchanged**, which is the control for the refactor. Extracting it found a real divergence
-    between the two implementations, recorded as hazard 54a and now pinned by a test that runs
+    between the two implementations, recorded as hazard 54b and now pinned by a test that runs
     every pattern against every host and requires them to agree.
 45. `tls-termination` — **done.** `crates/stokehold-http/src/tls.rs` loads the chain and key, pairs
     them, and resolves SNI over `HostMap<Arc<CertifiedKey>>`; `serve_connection` is generic over the
@@ -2845,6 +2845,49 @@ rather than a feature. Checked on crates.io: `rustls` is at `0.24.0-dev.2`,
 targeting it would mean a dev dependency in a server's TLS path. **0.23 stable is the target**;
 the provider move is a mechanical migration when 0.24 and its siblings release.
 
+### Hazard 54a — the redirect turned the plaintext listener into a TLS port
+
+Step 46 was verified by hand against a running server, which is the only reason this was found:
+the tests that existed all passed, and so did `check`.
+
+`HttpListener::bind_with_tls` took `Option<TlsSettings>`, and *both* the TLS acceptor and the
+redirect were derived from that one `Some`. So a deployment that wanted a redirect had to pass
+settings, and passing settings built an acceptor — meaning the listener the redirect lived on
+was a TLS port. In the split `:80`/`:443` shape that is the **plaintext** listener:
+
+    [server]
+    http  = "0.0.0.0:80"
+    https = "0.0.0.0:443"
+    redirect_to_https = true
+
+`http` on :80 then built an acceptor and stopped answering cleartext, while `run` logged a
+successful `TLS enabled` for it and `check` reported the deployment as valid. A client got a
+connection that was accepted and then went nowhere. Nothing in the log said which listener was
+wrong, because from the code's point of view nothing was: `Some(settings)` genuinely meant "this
+listener speaks TLS", and the *caller* was wrong.
+
+**Two bugs in this one step, and they were found differently, which is the point.** The first
+(the redirect looping TLS clients when `plain = true`) was caught by a test as soon as the test
+existed. This one was caught by running the deployment and watching a plaintext port not answer —
+no test covered the shape, because every test constructed its listener the way the buggy code
+expected. The fix separates the two decisions:
+
+    pub struct ListenerSettings<'a> {
+        pub tls: Option<TlsSettings<'a>>,   // does *this* listener speak TLS
+        pub redirect_to_https: bool,        // does it redirect cleartext
+        pub https_port: Option<u16>,
+    }
+
+so a listener carries a redirect with no certificate, which is what the split shape needs. Pinned
+by `a_redirect_does_not_turn_a_plaintext_listener_into_a_tls_port`, a test that constructs a
+plaintext listener with a redirect and asserts it still answers cleartext — the test that would
+have caught it, written after the fact because the shape was never tried.
+
+**The lesson is about which shapes the tests reproduce.** Six TLS tests passed while the shipped
+configuration shape was broken, because they were written against the API rather than against the
+configurations an operator writes. The end-to-end run is what closed the gap; the test was written
+from it rather than instead of it.
+
 **One correction to the step-24 text, which claimed the `Sites` table is "the map SNI certificate
 selection needs":** it is not. `Sites`' host maps are private, `named()` returns `ResolvedSite`, and
 `ResolvedSite` carries no `hosts` — so SNI needs its own host→certificate map. The saving is real but
@@ -2852,7 +2895,7 @@ smaller than stated: the *rule* is reusable (exact name, then longest `*.` wildc
 certificate), and it is extracted into `HostMap<V>` so sites, SNI and route matching share one
 implementation of it rather than growing a third.
 
-### Hazard 54a — the wildcard walk and `host_matches` had already disagreed
+### Hazard 54b — the wildcard walk and `host_matches` had already disagreed
 
 `HostMap<V>` (step 44) is the second implementation of "does this host match this pattern", because
 the site table was rewritten to walk the host's own labels while the route table still compares the
@@ -2882,6 +2925,7 @@ Recorded rather than quietly fixed because the lesson generalises: **the optimis
 was verified against the tests that existed, and they did not cover the empty label.** The
 `HostMap` extraction is what surfaced it, which is a reason to do this kind of consolidation before
 building on top of the old behaviour rather than after.
+
 
 
 

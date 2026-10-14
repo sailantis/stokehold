@@ -175,6 +175,9 @@ impl FrontController {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StaticsSetting {
+    /// The key was not written. On, by default — see `Default` — but *not* an explicit
+    /// request, which is what lets a FastCGI-only deployment leave it out and still validate.
+    Unspecified,
     /// A tuning table, naming only the keys it changes.
     Table(StaticOverrides),
     /// `false` disables the layer; `true` enables it with the defaults.
@@ -182,17 +185,40 @@ pub enum StaticsSetting {
 }
 
 impl Default for StaticsSetting {
-    /// Absent means the layer is off, matching `StaticConfig::enabled`'s own default.
+    /// Absent means the layer is **on**, with the defaults.
     ///
-    /// It resolves to `Switch(false)` rather than an empty table so that `check` can
-    /// report a deployment which *chose* to turn the layer off apart from one which
-    /// never mentioned it.
+    /// It used to be off, so that upgrading did not change an existing deployment: a path
+    /// that had reached the front controller still did. There are no deployments yet, and
+    /// the cost of the old default was that every new site had to be told to serve its own
+    /// assets. Turning it on only changes the outcome for a path that names a real,
+    /// non-script file — `/about` still reaches the front controller — so a front-controller
+    /// application is unaffected either way.
+    ///
+    /// `Unspecified` rather than `Switch(true)`, because the two have to be told apart:
+    /// static content is served over HTTP only, so *asking* for it with no HTTP listener is a
+    /// mistake worth reporting, while never mentioning it is not asking for anything. A
+    /// FastCGI-only deployment that leaves the key out must still validate.
     fn default() -> Self {
-        StaticsSetting::Switch(false)
+        StaticsSetting::Unspecified
     }
 }
 
 impl StaticsSetting {
+    /// Whether a deployment actually asked for the static layer, as opposed to getting it by
+    /// default. Only an explicit request can be contradicted by the rest of the file.
+    pub fn is_explicit(&self) -> bool {
+        !matches!(self, StaticsSetting::Unspecified)
+    }
+
+    /// Whether the key is present and says "on".
+    pub fn asks_for_statics(&self) -> bool {
+        match self {
+            StaticsSetting::Unspecified => false,
+            StaticsSetting::Switch(enabled) => *enabled,
+            StaticsSetting::Table(overrides) => overrides.enabled == Some(true),
+        }
+    }
+
     /// The setting applied over `base`.
     ///
     /// A site resolves its static layer against the server's rather than against
@@ -201,6 +227,11 @@ impl StaticsSetting {
     /// `cache_control` to the default for its whole document root.
     pub fn applied_to(&self, base: &StaticConfig) -> StaticConfig {
         match self {
+            // The key was not written, so the layer is the one already in effect. That the
+            // *default* is on is expressed by `ServerConfig::statics` seeding the base with
+            // `enabled: true`, not by this arm — which is what keeps "absent" and "written
+            // true" distinguishable for validation.
+            StaticsSetting::Unspecified => base.clone(),
             StaticsSetting::Table(overrides) => overrides.apply(base),
             // A bare boolean says one thing about `enabled` and nothing about the
             // rest, so the rest is inherited — which is what makes
@@ -246,6 +277,11 @@ pub struct StaticOverrides {
 
 impl StaticOverrides {
     /// The base settings with these overrides applied.
+    ///
+    /// `enabled` is the field whose default differs from [`StaticOverrides::default`]: a
+    /// site that tunes only `precompressed` gets the layer it was already getting, while
+    /// `static_files = false` is one key that says only "off". Both come out of this one
+    /// function so the two spellings cannot disagree.
     pub fn apply(&self, base: &StaticConfig) -> StaticConfig {
         StaticConfig {
             enabled: self.enabled.unwrap_or(base.enabled),
@@ -563,8 +599,16 @@ impl ServerConfig {
     }
 
     /// The static layer's settings, with any bare boolean resolved.
+    ///
+    /// The layer is **on** unless a deployment says otherwise, so an absent key resolves to
+    /// `enabled = true`. Only a path that names a real, non-script file changes behaviour:
+    /// a front-controller application answers every unmatched path exactly as it did when the
+    /// default was off.
     pub fn statics(&self) -> StaticConfig {
-        self.static_files.resolved()
+        self.static_files.applied_to(&StaticConfig {
+            enabled: true,
+            ..StaticConfig::default()
+        })
     }
 }
 
@@ -925,9 +969,21 @@ impl Config {
             self.validate_backend(name, backend)?;
         }
 
-        if self.server.statics().enabled && self.server.http.is_none() {
+        // Static content is served over HTTP, and a FastCGI client does its own — so asking
+        // for it with no HTTP listener is a mistake worth reporting. But *asking* is the
+        // operative word: the layer is on unless a deployment says otherwise, and a
+        // FastCGI-only config that never mentioned it is not asking for anything. Rejecting
+        // that would make the default unshippable, so only an explicit request is refused —
+        // which is why `StaticsSetting` has an `Unspecified` variant to tell them apart.
+        let asked_for_statics = self.server.static_files.asks_for_statics()
+            || self.sites.values().any(|site| {
+                site.static_files
+                    .as_ref()
+                    .is_some_and(StaticsSetting::asks_for_statics)
+            });
+        if asked_for_statics && self.server.http.is_none() {
             return Err(Error::Config(
-                "server.static_files is enabled but no server.http listener is configured; \
+                "static_files is enabled but no server.http listener is configured; \
                  static content is served over HTTP, and a FastCGI client does its own"
                     .to_string(),
             ));
@@ -1836,19 +1892,49 @@ backend = "app"
     }
 
     #[test]
-    fn static_files_are_off_unless_asked_for() {
+    fn static_files_are_on_unless_a_deployment_says_otherwise() {
         let config =
             Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\n").expect("config parses");
         config.validate().expect("a listener alone is enough");
         let statics = config.server.statics();
         assert!(
-            !statics.enabled,
-            "an upgrade must not start serving files an operator never asked for"
+            statics.enabled,
+            "a site serves its own assets unless it says not to"
         );
-        // The defaults are still populated, so enabling it needs one key.
+        // A front controller is unaffected by the default: `/about` still reaches it, because
+        // what changed is only the answer for a path that names a real, non-script file.
         assert_eq!(statics.dotfiles, Dotfiles::Deny);
         assert!(statics.directory_index);
         assert_eq!(statics.max_multirange_bytes, 1024 * 1024);
+
+        // And turning it off is one key.
+        let off = Config::from_toml(
+            "[server]\nhttp = \"127.0.0.1:8080\"\nstatic_files = false\n",
+        )
+        .expect("config parses");
+        assert!(!off.server.statics().enabled);
+    }
+
+    /// A FastCGI-only deployment never serves static content, and `stokehold` refuses to
+    /// start one that asks for it. Leaving the key out is not asking.
+    #[test]
+    fn a_fastcgi_only_deployment_may_leave_the_static_key_out() {
+        let text = r#"
+[server]
+fastcgi = "127.0.0.1:9000"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config
+            .validate()
+            .expect("the default must not make a FastCGI-only config unshippable");
+
+        // But an explicit request with no HTTP listener is a mistake worth reporting.
+        for written in ["static_files = true\n", "static_files = { enabled = true }\n"] {
+            let text = format!("[server]\nfastcgi = \"127.0.0.1:9000\"\n{written}");
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(err.to_string().contains("static"), "{written}: {err}");
+        }
     }
 
     #[test]

@@ -406,12 +406,18 @@ http = "127.0.0.1:8080"
         let root = Fixture::new("missing");
         let gone = root.path().join("not-created-yet");
         let warnings = inspect(&config(), &gone);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // Two: the root is gone, and the static layer — on by default — has nothing to
+        // serve from. Both are true and both name the same cause, which is the point.
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].message.contains("does not exist"),
             "{warnings:?}"
         );
         assert!(warnings[0].hint.is_some());
+        assert!(
+            warnings[1].message.contains("static_files is enabled"),
+            "the static layer's own consequence must be stated: {warnings:?}"
+        );
     }
 
     #[test]
@@ -460,9 +466,13 @@ http = "127.0.0.1:8080"
         let root = Fixture::new("is-a-file");
         root.write("index.php");
         let warnings = inspect(&config(), &root.path().join("index.php"));
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].message.contains("not a directory"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].message.contains("static_files is enabled"),
             "{warnings:?}"
         );
     }

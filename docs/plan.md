@@ -46,7 +46,7 @@ collides with a GPU forest-fire simulator; `php-wpm` — narrows the scope to wo
 ```
                         ┌──────────────────────────────────────────┐
  browser ──HTTP───────► │ HTTP listener (hyper)                    │
-                        │                                          │──► worker pool    (php worker.php, persistent)
+                        │   └► Host ► site (root, controller)      │──► worker pool    (php worker.php, persistent)
  nginx  ──FastCGI─────► │ FastCGI listener                         │──► php-fpm         (external unix socket / TCP)
                         │  └► CGI env builder ► dispatcher         │──► php-cgi.exe     (N processes, N ports, Windows)
                         └──────────────────────────────────────────┘
@@ -55,6 +55,11 @@ collides with a GPU forest-fire simulator; `php-wpm` — narrows the scope to wo
 - Both front-ends are just **listeners** that produce the same CGI environment and hand off to
   one dispatcher — so `stokehold serve` can be hit directly by a browser **and** spoken to by
   nginx. One binary, no second application.
+- The HTTP listener resolves the `Host` header **before** anything else, because that is the one
+  decision the FastCGI path cannot make for itself: a `host` matcher in the route table is
+  consulted after `SCRIPT_FILENAME` is resolved, so it can choose a backend but never a document
+  root. `[sites.<name>]` gives each host its own root, controller, routes and static layer, and
+  the routing for each is built once at startup rather than per request.
 - stokehold is a **protocol gateway, not a forward proxy**: it terminates the client protocol
   (HTTP or FastCGI) and originates FastCGI to the backend. It owns both ends, so it translates
   rather than relays — with one exception (pass-through below).
@@ -69,19 +74,24 @@ command = "php worker.php"
 kind   = "external"
 socket = "unix:/run/php/php8.3-fpm.sock"
 
-[backends.own_fpm]                   # Unix only: stokehold starts php-fpm itself
-kind   = "spawn_fpm"
-binary = "/usr/sbin/php-fpm"
-config = "./fpm.conf"
-
 [backends.cgi]                       # portable fallback; the only option on Windows
 kind      = "spawn_cgi"
 binary    = 'C:\php-8.3.31\php-cgi.exe'
 workers   = 8
+
+[sites.app]                          # one host, one root, in the same process
+hosts            = ["app.example.com", "*.app.example.com"]
+document_root    = "/srv/app/public"
+front_controller = "index.php"
+default_backend  = "app"
 ```
 
-Route → backend selection is per-vhost or per-route. Worker-safe hot paths go to the worker
+Route → backend selection is per-site or per-route. Worker-safe hot paths go to the worker
 pool; anything needing real isolation or SAPI-specific behaviour goes to a FastCGI backend.
+
+There was a fourth backend kind, `spawn_fpm`, which stokehold would have started itself. It
+parsed and validated while `Backend::from_config` refused it, so `version` advertised a feature
+that could not run — see the decisions table for why it was removed rather than implemented.
 
 ### Pass-through on the hot path
 
@@ -105,6 +115,13 @@ opt-in and only when configured.
 | PHP floor | **8.2** — the floor is `memory_reset_peak_usage()`, which the SDK calls to make each `END` report that request's peak rather than a high-water mark that never falls. 8.1 was never verified, and azera and clarity already require 8.2+, so one floor across the stack beats three |
 | Static files | **In the HTTP front-end, above the backends, off by default** — a path naming a file is answered from disk, a path naming nothing is dispatched. Streaming through `tokio::fs` rather than zero-copy: `sendfile` is Unix-only, so it would be a second code path rather than a faster one |
 | Where the document root lives | **`server.document_root`, with the `--document-root` flag overriding it** — a deployment fact belongs in the file a systemd unit already reads, and the more specific statement (the flag) is the one that takes effect. Same rule for `front_controller`. An empty file value is **rejected** rather than given a meaning, because TOML cannot distinguish it from an absent key |
+| Several hosts in one process | **`[sites.<name>]`, resolved from `Host` before anything else** — because a route's `host` matcher runs after `SCRIPT_FILENAME` is resolved, so it can choose a backend but never a document root. Name-keyed like `[backends.<name>]` so every diagnostic can name the site at fault. Exact name, then the longest `*.` wildcard, then `[server]`; a key a site omits is the server's, and `static_files` falls back per key |
+| A route's `path_suffix` and `host` wildcards | **Added**, because `"all `.php` files go to this backend" is the common answer for a project with several entry points and was not expressible with `path_prefix` alone. `path_suffix` is compared **case-insensitively**, the way `has_php_extension` is, so `/upload.PHP` cannot be a script to one layer and miss its route in the other. Ordering stays three readable sentences: more matchers wins, an exact host beats a wildcard, declaration order settles the rest |
+| Whether the router must `stat` a path | **Inferred per route, never configured.** The stat does two jobs: existence, which `php-cgi` checks itself and answers `No input file specified` for, and the extension guard, which it does *not* check — handed `config.json` it emits it verbatim with a 200 (hazard 19). So it is skipped only where the pattern already proves the extension (`path_suffix = ".php"`) or where the backend never interprets the path (a **worker**, which routes on `REQUEST_URI`). A `path_prefix` route to `php-cgi` keeps it. `check` prints which routes skip it, and it is not a key because the decision belongs with the code that knows why it is safe |
+| `serve_only` | **One key replacing `static_files.enabled`**: unset serves everything, `"backend"` skips the static layer, `"static"` never consults a backend. `static_files = false` is exactly `"backend"`, and a contradictory pair is rejected. The three states are what a reader needs: "static files first" and "no static layer" differ by a stat per request, and "files only" is a site the previous shape could not express at all |
+| `spawn_fpm` | **Removed**, not implemented. It parsed and validated while `Backend::from_config` refused it with `Misconfigured`, so `version` advertised a feature that could not run and `check` called such a file OK. §9 already says not to reimplement what php-fpm does — pool management, `pm.max_requests`, multi-pool tenancy, graceful reload — and `external` attaches to the php-fpm systemd already supervises. The key is now rejected by name |
+| Path traversal in the router | **Refused**, sharing one predicate with the static layer. `cgi::route` only did `trim_start_matches('/')`, so `..` was carried into `PATH_INFO`, `REQUEST_URI` and the `SCRIPT_FILENAME` built from them; nginx normalises the URI, so the two front-ends disagreed about the same request. Checked **after** percent-decoding, because `%2e%2e` is `..` by the time a path is compared, and per segment, because a URL path always begins with `/` and a backslash separates on Windows but is a filename byte on Unix |
+| Per-route static and header policy | **Designed, not built** — `policy = { cache_control, precompressed, headers }` with `backend` becoming optional, so a route is a location rather than only a backend selector. Kept out of the vhosts change because it shares no code with host resolution, and a site's own `static_files` already covers the multi-site case. There is **no** on-the-fly compression today: `precompressed` serves a file that was already built |
 | Configuration reload | **Not built** — see open decision 5. Restarting the process is the honest answer until the dispatcher can be reloaded whole rather than in part |
 | Where the PHP SDK lives | **Its own repository, `sailantis/stokehold-php-sdk`** — Packagist requires `composer.json` at the root of a repository, so a tagged `sailantis/stokehold-worker` cannot exist while the SDK sits in `sdk/php/`. The spec (`docs/worker-protocol.md`) stays here: it is the shared document both ends are tested against, and two copies of a specification are two specifications. A release of the package links back to it at a **pinned commit**, because a branch link would silently start describing a later protocol than the release implements |
 | Skipped end-to-end tests | **A skip is visible, and a failure when `STOKEHOLD_E2E=1`** — `libtest` hides a passing test's stderr, so "skipped with a printed reason" was in practice identical to "passed". The suites that need PHP or the SDK are the ones that actually prove the wire format, so CI sets `STOKEHOLD_E2E=1` and a skip fails there |
@@ -1499,11 +1516,74 @@ Phase 7 — packaging
 Later milestone
 24. `tls-acme` — `rustls` + `rustls-acme`, ALPN for HTTP/2 over TLS, optional HTTP/3. HTTP/3 is
     `quinn` + `h3` + `rustls`, not `hyper`; `quinn` runs on `tokio`, which the HTTP front-end
-    already has.
+    already has. The `Sites` table is the map SNI certificate selection needs, so this step no
+    longer has to grow one.
 25. `prefork-optional` — Unix-only prefork to cut worker bootstrap cost, forked from a PHP boot
     parent (never the Tokio runtime).
 26. `rpc-sidechannel` — only if a v2 need appears (background jobs, websockets) that the
     request/response protocol genuinely cannot express.
+
+Phase 8 — sites (vhosts)
+
+A `host` matcher in the route table is consulted *after* `SCRIPT_FILENAME` is resolved, so it can
+choose a backend but never a document root. Serving two applications from one process therefore
+needs the `Host` resolved first, which is what this phase adds. Steps 27–31 are the model, 32–36
+the wiring.
+
+27. `sites-model` — **done** (`b9d34c4`). `SiteConfig` and `Config::sites`, with `path_suffix` and
+    wildcard `host` matchers on `RouteConfig`, `serve_only`, and a `static_files` key that takes a
+    bare boolean. `deny_unknown_fields` was added to the backend structs, which were missing it:
+    a top-level `routes` written after a `[backends.x]` header was being absorbed into the backend
+    table rather than rejected, so the configuration silently had no routes at all.
+28. `sites-resolver` — **done** (`b609cf6`). `stokehold_core::sites::Sites`: exact name, then the
+    longest `*.` wildcard, then `[server]`; ports and case are the client's spelling. It returns
+    configuration rather than a `Routing`, because `Routing` lives in a crate that depends on this
+    one. Two things the tests forced: the default front controller is applied here rather than
+    left to the CLI, and `static_files` in a site table is a table of *optional* keys — a
+    `StaticConfig` has defaults, so `{ precompressed = true }` would also have asserted
+    `enabled = false` over the server's setting for the whole document root.
+29. `route-matchers` — **done** (with 27). `path_suffix`, wildcard `host`, one `host_matches` shared
+    by sites and routes, and the extended ordering.
+30. `serve-only` — **done** (model in `b9d34c4`, behaviour in `3ae93f2`). The three states, the
+    static-on-by-default rule with the HTTP-listener validation narrowed to an explicit enable,
+    and the ordering change so `"backend"` does not 404 before the dispatcher runs.
+31. `path-normalisation` — **done** (`950d59f`). A pre-existing hazard, not a vhost feature:
+    `cgi::route` never refused `..`, so it reached `PATH_INFO`, `REQUEST_URI` and
+    `SCRIPT_FILENAME` while the static layer refused the same shape. One predicate, both layers.
+32. `spawn-fpm-decision` — **done** (`fec492c`). The unimplemented kind is removed and rejected by
+    name, rather than advertised by `version` and refused at startup.
+33. `sites-http` — **done** (`3ae93f2`). The host is resolved before the static decision and each
+    site serves from its own prebuilt `Routing` and `StaticFiles`; `serve_only` and `skip_stat` are
+    honoured; `to_cgi` and `to_cgi_routed` are separate entry points so the unsafe direction is not
+    the easy one. `two_sites_in_one_process_serve_different_roots` is the test that proves it.
+34. `sites-fastcgi` — **outstanding.** The FastCGI front-end still calls `dispatch_to_default`, so
+    the route table is bypassed for a request arriving from nginx. Behind nginx the document root
+    cannot be re-decided anyway — nginx resolved it — but the *backend* could still be chosen from
+    the route table, and that is a real difference from the HTTP side.
+35. `sites-cli` — **done** (`10e7e48`). `check` prints the site table, each site's own settings,
+    all three route matchers, and which routes skip the stat; preflight checks each site's root and
+    controller. `--document-root` / `--front-controller` are refused when `[sites]` is present.
+36. `sites-docs` — **done.** README "Sites", "Routing" and "Backends" sections; this file's
+    architecture, decisions and step list.
+
+Later, and deliberately not part of Phase 8:
+
+37. `worker-sdks` — Python / Ruby / Node worker **clients**, mirroring `docs/worker-protocol.md`,
+    one repository each. Nothing blocks them: `HelloAck` carries a free-form `runtime` and the
+    handshake checks the *protocol* version, not the language, so a non-PHP worker handshakes
+    today. What each needs is its own answer to "how does this process report its RSS", because
+    the recycling contract is otherwise silently unenforced.
+38. `script-extensions` — make "what counts as a script" configurable per site instead of the
+    hardcoded `[".php", ".php3", ".phtml"]`. Required before a non-PHP worker can serve `.py` or
+    `.rb`: `path_suffix` can *route* such a path, but `has_php_extension` decides what resolves as a
+    script, so today `/foo.rb` reaches the front controller as `PATH_INFO` instead.
+39. `plugin-abis` — only if a real need appears. RoadRunner's "plugins" are statically linked Go
+    packages resolved by a compile-time DI container (`container/plugins.go`; there is no
+    `plugin.Open` anywhere), so the enum backend kind stays the extension point.
+40. `route-policy` — `RouteConfig` gains `policy` and `backend` becomes optional, so a route is a
+    location rather than only a backend selector. §4.8 of the design notes.
+41. `compression` — on-the-fly gzip/brotli, and the ETag and negotiation-cache questions it raises.
+    Belongs with packaging (step 22), not with sites.
 
 ## 7. Testing strategy
 

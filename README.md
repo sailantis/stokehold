@@ -51,7 +51,7 @@ Both are served by one dispatcher, so a route can pick whichever semantics it ne
 ```
                         ┌──────────────────────────────────────────┐
  browser ──HTTP───────► │ HTTP listener (hyper)                    │
-                        │                                          │──► worker pool   (persistent PHP, pipes)
+                        │   └► Host ► site (root, controller)      │──► worker pool   (persistent PHP, pipes)
  nginx  ──FastCGI─────► │ FastCGI listener                         │──► php-fpm        (external socket / TCP)
                         │  └► CGI env builder ► dispatcher         │──► php-cgi        (N processes, N ports)
                         └──────────────────────────────────────────┘
@@ -59,7 +59,8 @@ Both are served by one dispatcher, so a route can pick whichever semantics it ne
 
 One binary. No second application is needed to try it — `stokehold serve` can be hit directly
 by a browser and spoken to by nginx at the same time, and it serves the site's static files
-itself.
+itself. Several `Host` names can be served from one process, each with its own document root; see
+[Sites](#sites).
 
 ## Backends
 
@@ -67,8 +68,13 @@ itself.
 | --- | --- | --- | --- |
 | `worker` | Persistent PHP process speaking stokehold's framed protocol over pipes | No — the application clears its own request scope | all |
 | `external` | An already-running `php-fpm` (systemd-managed) | Yes, by php-fpm's SAPI | Linux, macOS |
-| `spawn_fpm` | `stokehold` starts `php-fpm`, which still manages its own children | Yes | Linux, macOS |
 | `spawn_cgi` | N `php-cgi` processes on N ports | Yes, by php-cgi's SAPI | all, **required on Windows** |
+
+A fourth kind, `spawn_fpm`, was accepted by the parser and refused at startup — `version`
+advertised it while `Backend::from_config` rejected it. It is **gone** rather than implemented:
+php-fpm already does pool management, `pm.max_requests` recycling, multi-pool tenancy and graceful
+reload better than a supervisor we would write, and `external` attaches to the php-fpm that
+systemd already runs. A file still carrying `kind = "spawn_fpm"` is now rejected by name.
 
 `spawn_cgi` is implemented: the pool starts the processes, assigns ports, health-checks each
 slot, restarts one that died, and recycles on `max_requests` — the equivalent of php-fpm's
@@ -257,8 +263,8 @@ slot is free.
 
 ## Routing
 
-A route selects a backend, so one process can serve a worker-backed API and a php-fpm-backed
-admin area at once:
+A route selects a backend, so one process can serve a worker-backed API and a php-cgi-backed
+legacy area at once:
 
 ```toml
 default_backend = "app"
@@ -268,35 +274,144 @@ path_prefix = "/api"        # a textual prefix, like nginx's `location`
 backend = "app"
 
 [[routes]]
-host = "admin.example.com"  # a bare host name: no port, case-insensitive
+path_suffix = ".php"        # every PHP entry point, wherever it lives
+backend = "cgi"
+
+[[routes]]
+host = "admin.example.com"  # a bare name, or `*.example.com`; no port, case-insensitive
 path_prefix = "/"
 backend = "fpm"
 ```
 
-The **most specific** matching route wins — a route stating both a host and a path beats one
-stating only a path — and ties go to the earlier entry. That is deliberately the whole rule: a
-table whose winner depended on something cleverer could not be predicted by reading the file.
+The **most specific** matching route wins, and ties go to the earlier entry. "Most specific" is
+three sentences rather than a weight, because a table whose winner could not be predicted by
+reading the file would be worse than a simple one:
+
+1. a route stating **more** constraints beats one stating fewer;
+2. at the same count, an **exact** `host` beats a `*.` wildcard;
+3. anything still tied goes to the route declared **first**.
+
+`path_suffix` is compared **case-insensitively**, deliberately: the router decides what a script
+is the same way, so `/upload.PHP` cannot be a script to one layer and miss its route in the other.
+It must start with `.` or `/` — `"php"` would match `/notphp`, which is not what it looks like it
+does, so it is refused.
+
+### Several PHP entry points
+
+`.php` files are resolved to real scripts, so `path_suffix = ".php"` sends *every* PHP entry point
+to one backend — the usual answer for a project with more than one front controller:
+
+```toml
+[[routes]]
+path_prefix = "/api"                # a framework API on the persistent worker pool
+backend = "app"
+
+[[routes]]
+path_suffix = ".php"                # each real script on the CGI pool
+backend = "cgi"
+```
+
+A **worker** backend is told each request's `script_filename` but does not switch file on it: it
+routes on `REQUEST_URI`. So an entry script reached through a worker gets its real path in
+`$_SERVER`, and the worker's own bootstrap decides what to run — correct for one application per
+site, and wrong for several independent scripts that each need their own bootstrap. Use
+`spawn_cgi` for those.
+
+Because a route's `path_suffix` can prove that a path names a script, such a route **skips the
+router's own `stat`**: `php-cgi` checks existence itself and answers `No input file specified`. A
+route that proves nothing about the extension — a bare `path_prefix`, or a path to `php-cgi` whose
+pattern could name `config.json` — keeps the check, because `php-cgi` does not verify that a file
+is PHP: given a non-PHP file it emits it verbatim with a 200. `stokehold check` prints which routes
+skip it, so the saving and the guard are both visible.
+
+## Sites
+
+One process can serve several hosts, each with its own document root:
+
+```toml
+[server]
+http             = "127.0.0.1:8080"
+document_root    = "/srv/default/public"   # the fallback site
+front_controller = "index.php"
+
+[backends.app]
+kind    = "worker"
+command = "php worker.php"
+
+[backends.cgi]
+kind    = "spawn_cgi"
+binary  = 'C:\php-8.3.31\php-cgi.exe'
+
+[sites.example_com]
+hosts            = ["example.com", "www.example.com", "*.shop.example.com"]
+document_root    = "/srv/example/public"
+default_backend  = "app"
+
+[sites.corp]
+hosts            = ["corp.internal", "*.corp.internal"]
+document_root    = "/srv/corp"
+front_controller = false                   # files-only: no front controller
+serve_only       = "backend"               # no static layer
+static_files     = { precompressed = true }
+
+  routes = [
+      { path_suffix = ".php", backend = "cgi" },
+  ]
+```
+
+This exists because a `host` matcher in the route table is consulted **after** the script is
+resolved, so it can choose a backend but never a document root. Sites are resolved first, which is
+what makes two roots possible in one process.
+
+- `hosts` takes exact names, case-insensitively and ignoring any `:port`, or a leading `*.`
+  wildcard. `*.example.com` matches `a.example.com` and `a.b.example.com`, but **not**
+  `example.com` itself — a wildcard names a subdomain.
+- The rule is: an exact name, then the **longest** matching wildcard, then `[server]`. A host
+  nobody claims is the default site's.
+- Every key except `hosts` and `document_root` falls back to the `[server]` value, so a site that
+  states only a root and a host list inherits the rest. `static_files` falls back **per key**: a
+  site naming `precompressed` keeps the server's `cache_control`.
+- `front_controller = false` means "serve only real `.php` files". The global key cannot say this —
+  TOML cannot tell `front_controller = ""` from an absent key, so that spelling stays reserved for
+  the `--front-controller ''` flag — but a site can, because there is no flag per site.
+- `serve_only` says what the site serves: unset serves everything (static first, then a backend),
+  `"backend"` skips the static layer, `"static"` answers a path naming no file with a 404 and never
+  consults a backend. `static_files = false` is exactly `serve_only = "backend"`.
+- `--document-root` and `--front-controller` describe the **default** site, so combining either
+  with `[sites]` is refused rather than silently applying to one site.
+
+`stokehold check` prints the site table, what each site states, and which routes skip the stat.
 
 ## Static files
 
-Static serving is a routing layer of its own, and it is **off by default**: a request that used to
-reach the front controller still does, so upgrading does not change an existing deployment.
+Static serving is a routing layer of its own, and it is **on by default**: a site serves its own
+assets unless it says otherwise.
 
 ```toml
 [server.static_files]
-enabled = true
+precompressed = true
 ```
 
+Turning it on only changes the answer for a path that names a real, non-script file. A path that
+names nothing, or names a `.php` script, reaches the front controller exactly as before — so a
+front-controller application behaves the same either way. The reason it is on rather than off is
+simply that every site has assets, and making each one ask for its own was a line that said
+nothing.
+
+`static_files = false` — or `serve_only = "backend"`, which is the same state — turns it off for a
+site. `static_files = true` is the short form of `enabled = true` when the rest is at its
+defaults. Because static content is served over **HTTP** only, asking for it in a config with no
+`server.http` listener is refused; leaving the key out is not asking, so a FastCGI-only deployment
+is unaffected by the default.
+
 **No backend is needed at all for a files-only site.** A configuration with a listener, a document
-root and this block is valid, and `stokehold serve` starts and serves it:
+root and nothing else is valid, and `stokehold serve` starts and serves it:
 
 ```toml
 [server]
 http = "127.0.0.1:8080"
 document_root = "/srv/site"
-
-[server.static_files]
-enabled = true
+serve_only = "static"
 ```
 
 Serve it with `--front-controller ''` so a path that names no file is a 404 rather than something

@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use stokehold_core::sites::Sites;
+
 use crate::dispatch::Dispatcher;
 use crate::error::{Result, ServerError};
 use crate::frontend::fastcgi::{self, ServerErrorKind};
@@ -79,6 +81,13 @@ impl Stats {
 pub struct FastCgiListener {
     listener: TcpListener,
     dispatcher: Arc<Dispatcher>,
+    /// The site table, so a request from nginx is routed by the table of the site its `Host`
+    /// names rather than by the server's.
+    ///
+    /// Site selection behind nginx can only change the *backend*: nginx resolved
+    /// `SCRIPT_FILENAME` before forwarding and the params are relayed verbatim, so the document
+    /// root is already settled. That is still the difference between one pool and another.
+    sites: Arc<Sites>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Stats>,
     limits: Limits,
@@ -94,7 +103,12 @@ impl FastCgiListener {
     /// front-end serves the same backends, so there is one set of processes
     /// behind one routing decision, whichever protocol a request arrived on. It
     /// needs no lock because each backend synchronises internally.
-    pub fn bind(address: &str, dispatcher: Arc<Dispatcher>, limits: Limits) -> Result<Self> {
+    pub fn bind(
+        address: &str,
+        dispatcher: Arc<Dispatcher>,
+        sites: Arc<Sites>,
+        limits: Limits,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(address).map_err(|source| ServerError::Misconfigured {
             backend: "<listener>".to_string(),
             reason: format!("cannot bind {address}: {source}"),
@@ -104,6 +118,7 @@ impl FastCgiListener {
         Ok(FastCgiListener {
             listener,
             dispatcher,
+            sites,
             shutdown: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Stats::default()),
             limits,
@@ -148,14 +163,20 @@ impl FastCgiListener {
                     }
 
                     let dispatcher = Arc::clone(&self.dispatcher);
+                    let sites = Arc::clone(&self.sites);
                     let stats = Arc::clone(&self.stats);
                     let shutdown = Arc::clone(&self.shutdown);
                     let max_connections = self.limits.max_connections;
                     handlers.retain(|handle: &std::thread::JoinHandle<()>| !handle.is_finished());
                     handlers.push(std::thread::spawn(move || {
-                        if let Err(err) =
-                            serve_connection(stream, dispatcher, stats, shutdown, max_connections)
-                        {
+                        if let Err(err) = serve_connection(
+                            stream,
+                            dispatcher,
+                            sites,
+                            stats,
+                            shutdown,
+                            max_connections,
+                        ) {
                             tracing::debug!(%peer, %err, "connection ended");
                         }
                     }));
@@ -202,6 +223,7 @@ impl ShutdownHandle {
 fn serve_connection(
     stream: std::net::TcpStream,
     dispatcher: Arc<Dispatcher>,
+    sites: Arc<Sites>,
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
     max_connections: usize,
@@ -266,7 +288,30 @@ fn serve_connection(
         let keep_conn = incoming.keep_conn;
         let request_id = stokehold_fcgi::REQUEST_ID;
 
-        let response = dispatcher.dispatch_to_default(&incoming.into_backend_request());
+        // Routed, not `dispatch_to_default`. A request arriving from nginx still has a route
+        // table, and a route naming a host or a path is the operator's way of saying which pool
+        // serves it; bypassing the table meant the two front-ends chose differently for the same
+        // request. The site is resolved from `HTTP_HOST` first, then `SERVER_NAME`, because a
+        // client that sent no `Host` must not lose its site to nginx's `fastcgi_param`.
+        //
+        // What site selection *cannot* change behind nginx is the document root: nginx resolved
+        // `SCRIPT_FILENAME` before forwarding and the params are relayed verbatim. So this
+        // reaches the backend and nothing else, which is still the difference between one pool
+        // and another.
+        let request = incoming.into_backend_request();
+        let host = request
+            .params
+            .iter()
+            .find(|(key, _)| key.as_slice() == b"HTTP_HOST")
+            .or_else(|| {
+                request
+                    .params
+                    .iter()
+                    .find(|(key, _)| key.as_slice() == b"SERVER_NAME")
+            })
+            .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
+        let site = sites.resolve(host.as_deref());
+        let response = dispatcher.dispatch_with_routes(&site.routes, &request);
 
         match response {
             Ok(response) => {
@@ -358,10 +403,14 @@ mod tests {
         let dispatcher = Dispatcher::from_config(&config, stokehold_fcgi::Routing::default())
             .expect("dispatcher");
 
-        let err =
-            FastCgiListener::bind(&address, std::sync::Arc::new(dispatcher), Limits::default())
-                .err()
-                .unwrap_or_else(|| panic!("binding {address} should have failed"));
+        let err = FastCgiListener::bind(
+            &address,
+            std::sync::Arc::new(dispatcher),
+            std::sync::Arc::new(Sites::from_config(&config, std::path::Path::new("."))),
+            Limits::default(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("binding {address} should have failed"));
         assert!(matches!(err, ServerError::Misconfigured { .. }), "{err}");
         assert!(err.to_string().contains("cannot bind"), "{err}");
     }

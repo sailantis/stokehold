@@ -324,6 +324,7 @@ fn serve(
             let listener = FastCgiListener::bind(
                 address,
                 Arc::clone(&dispatcher),
+                Arc::clone(&sites),
                 Limits { max_connections },
             )?;
             println!("  fastcgi:          {}", listener.local_addr()?);

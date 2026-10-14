@@ -1556,10 +1556,13 @@ the wiring.
     site serves from its own prebuilt `Routing` and `StaticFiles`; `serve_only` and `skip_stat` are
     honoured; `to_cgi` and `to_cgi_routed` are separate entry points so the unsafe direction is not
     the easy one. `two_sites_in_one_process_serve_different_roots` is the test that proves it.
-34. `sites-fastcgi` — **outstanding.** The FastCGI front-end still calls `dispatch_to_default`, so
-    the route table is bypassed for a request arriving from nginx. Behind nginx the document root
-    cannot be re-decided anyway — nginx resolved it — but the *backend* could still be chosen from
-    the route table, and that is a real difference from the HTTP side.
+34. `sites-fastcgi` — **done.** The FastCGI front-end resolves the site from `HTTP_HOST` (falling
+    back to `SERVER_NAME`) and dispatches against that site's own route table via
+    `Dispatcher::dispatch_with_routes`, rather than always `dispatch_to_default`. Behind nginx the
+    document root still cannot be re-decided — nginx resolved it, and the params are relayed
+    verbatim — but the *backend* is now chosen the same way the HTTP front-end chooses it, so a
+    route naming a host or path picks the same pool on either protocol.
+    `a_route_selects_the_backend_for_a_fastcgi_request_too` is the test that proves it.
 35. `sites-cli` — **done** (`10e7e48`). `check` prints the site table, each site's own settings,
     all three route matchers, and which routes skip the stat; preflight checks each site's root and
     controller. `--document-root` / `--front-controller` are refused when `[sites]` is present.

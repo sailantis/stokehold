@@ -109,22 +109,50 @@ impl Dispatcher {
     /// The backend that should serve this request.
     ///
     /// A route may override the default, and both front-ends reach the decision
-    /// through here, so a request gets the same answer whichever protocol
-    /// carried it.
+    /// through `stokehold_core::config::select_backend`, so a request gets the same
+    /// answer whichever protocol carried it and whichever front-end asked. That
+    /// sharing is the point: the two used to have their own copy of the precedence
+    /// rule, and the HTTP one had grown `path_suffix` and the exact-host tiebreak
+    /// while this one had not.
     pub fn backend_for(&self, request: &Request) -> &str {
-        let host = param(request, "HTTP_HOST");
+        self.backend_for_routes(&self.routes, request)
+    }
+    /// [`Dispatcher::backend_for`], against a site's own route table.
+    ///
+    /// A site carries its own routes, so a request from nginx must be routed by the table
+    /// of the site its `Host` names rather than by the server's. Passing the table in keeps
+    /// one rule for both front-ends; what differs behind nginx is only that the document root
+    /// is already settled, because nginx resolved `SCRIPT_FILENAME` before forwarding.
+    pub fn backend_for_routes<'a>(
+        &'a self,
+        routes: &'a [RouteConfig],
+        request: &Request,
+    ) -> &'a str {
+        let host = param(request, "HTTP_HOST").or_else(|| param(request, "SERVER_NAME"));
         let path = param(request, "REQUEST_URI");
         let path = path
             .as_deref()
             .map(|uri| uri.split(['?', '#']).next().unwrap_or(uri))
             .unwrap_or("/");
 
-        self.routes
-            .iter()
-            .filter(|route| route.matches(host.as_deref(), path))
-            .max_by_key(|route| route.specificity())
-            .map(|route| route.backend.as_str())
+        stokehold_core::config::select_backend(routes, host.as_deref(), path)
+            // A route that matches nothing leaves the decision to `default_backend`, which is
+            // the name this deployment's configuration gave — not necessarily the first route.
             .unwrap_or(self.default.as_str())
+    }
+
+    /// Send a request to a backend chosen from a given route table.
+    ///
+    /// The routes are a parameter rather than a field because a site carries its own: a request
+    /// from nginx must be routed by the table of the site its `Host` names. One rule, two callers
+    /// — which is what keeps the two front-ends interchangeable.
+    pub fn dispatch_with_routes(
+        &self,
+        routes: &[RouteConfig],
+        request: &Request,
+    ) -> Result<Response> {
+        let name = self.backend_for_routes(routes, request);
+        self.dispatch_to(name, request)
     }
 
     /// Send a request to the backend its route selects.

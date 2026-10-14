@@ -241,6 +241,71 @@ fn the_front_end_serves_several_requests_in_a_row() {
 }
 
 #[test]
+fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
+    let _serial = serial();
+
+    // Two backends, both unreachable, so nothing is started — the assertion is about *which*
+    // one the front-end chooses, and the error message names it. That is the whole reason the
+    // route table has to be consulted here: it decides which pool serves a request, and the two
+    // front-ends must not decide differently.
+    let socket_of = |port: u16| stokehold_core::config::ExternalConfig {
+        socket: format!("127.0.0.1:{port}"),
+    };
+    let config = Config {
+        server: ServerConfig {
+            fastcgi: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        },
+        backends: [
+            ("default_pool".to_string(), BackendConfig::External(socket_of(1))),
+            ("api_pool".to_string(), BackendConfig::External(socket_of(2))),
+        ]
+        .into_iter()
+        .collect(),
+        default_backend: Some("default_pool".to_string()),
+        routes: vec![stokehold_core::config::RouteConfig {
+            path_prefix: Some("/api".to_string()),
+            path_suffix: None,
+            host: None,
+            backend: "api_pool".to_string(),
+        }],
+        sites: BTreeMap::new(),
+    };
+    config.validate().expect("valid config");
+    let dispatcher =
+        Dispatcher::from_config(&config, stokehold_fcgi::Routing::default()).expect("dispatcher");
+
+    // `/api` is routed to the pool the route names; anything else falls to the default. The
+    // environment is built directly rather than through the wire codec, because this test is
+    // about which backend is chosen, not about parsing.
+    let request_with = |uri: &str| stokehold_fcgi::Request {
+        params: vec![
+            (b"REQUEST_METHOD".to_vec(), b"GET".to_vec()),
+            (b"REQUEST_URI".to_vec(), uri.as_bytes().to_vec()),
+            (b"HTTP_HOST".to_vec(), b"example.test".to_vec()),
+        ],
+        body: Vec::new(),
+        keep_conn: true,
+    };
+
+    let err = dispatcher
+        .dispatch_with_routes(&config.routes, &request_with("/api/users"))
+        .expect_err("nothing listens on either port");
+    assert!(
+        err.to_string().contains("api_pool"),
+        "the route must have chosen the pool it names: {err}"
+    );
+
+    let err = dispatcher
+        .dispatch_with_routes(&config.routes, &request_with("/other"))
+        .expect_err("nothing listens on either port");
+    assert!(
+        err.to_string().contains("default_pool"),
+        "an unrouted request must reach the default backend: {err}"
+    );
+}
+
+#[test]
 fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
     let _serial = serial();
 

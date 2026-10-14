@@ -191,6 +191,11 @@ whether they are actually there), each backend and whether it resets per request
 settings, and every PHP binary discovered (role, version, ZTS/NTS flavour and path) — flagging any
 that are below the worker floor. Extra search directories can be added with `--php-dir <dir>`.
 
+It also checks that each configured program can actually be started: a `spawn_cgi` `binary` or the
+first token of a worker's `command` that names nothing on disk is reported, which is the mistake a
+configuration file is most likely to make and the one `Config::validate` cannot see, because it is
+about the shape of the file rather than the contents of the disk.
+
 Problems it can see are reported as **warnings**, and the exit status stays 0: a document root that
 does not exist yet is a normal thing to check before a deploy creates it. What the warnings buy is
 that a mistake is reported once, here, instead of as a puzzling 404 at the first request.
@@ -281,6 +286,23 @@ reach the front controller still does, so upgrading does not change an existing 
 [server.static_files]
 enabled = true
 ```
+
+**No backend is needed at all for a files-only site.** A configuration with a listener, a document
+root and this block is valid, and `stokehold serve` starts and serves it:
+
+```toml
+[server]
+http = "127.0.0.1:8080"
+document_root = "/srv/site"
+
+[server.static_files]
+enabled = true
+```
+
+Serve it with `--front-controller ''` so a path that names no file is a 404 rather than something
+handed to a script. Without that flag the default front controller (`index.php`) is still in effect,
+so a path naming no file has nowhere to go and answers 500 — `stokehold check` warns about exactly
+this case, once, at startup.
 
 The document root is the same `server.document_root` that routing already resolves scripts against,
 so one setting describes the whole site.

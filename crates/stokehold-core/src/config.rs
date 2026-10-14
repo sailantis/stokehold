@@ -595,6 +595,9 @@ impl Config {
 
         match &self.default_backend {
             None => {
+                // Backends without a `default_backend` is a typo: nothing could
+                // select them. No backends at all is the static-only deployment,
+                // which `Dispatcher` accepts and the CLI warns about.
                 if !self.backends.is_empty() {
                     return Err(Error::Config(
                         "backends are defined but default_backend is not set".to_string(),
@@ -962,7 +965,10 @@ command = "php worker.php"
         // The platform default has to be overridable in both directions, or the setting is
         // only half a setting: a Windows deployment may want the pipe, and a Linux one may
         // want the socket to compare the two on its own hardware.
-        for (written, expected) in [("pipe", WorkerTransport::Pipe), ("socket", WorkerTransport::Socket)] {
+        for (written, expected) in [
+            ("pipe", WorkerTransport::Pipe),
+            ("socket", WorkerTransport::Socket),
+        ] {
             let text = format!(
                 r#"
 default_backend = "app"
@@ -1008,7 +1014,8 @@ checksum = "none"
     }
 
     #[test]
-    fn parses_a_spawn_cgi_unix_socket() {        let text = r#"
+    fn parses_a_spawn_cgi_unix_socket() {
+        let text = r#"
 default_backend = "cgi"
 [server]
 http = "127.0.0.1:8080"

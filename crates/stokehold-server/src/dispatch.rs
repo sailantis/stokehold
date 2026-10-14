@@ -33,20 +33,31 @@ impl Dispatcher {
     /// reported at startup instead of on the first request that happens to hit
     /// the broken one.
     pub fn from_config(config: &Config, routing: cgi::Routing) -> Result<Self> {
-        let default = config
-            .default_backend
-            .clone()
-            .ok_or_else(|| ServerError::Misconfigured {
-                backend: "<default>".to_string(),
-                reason: "no default_backend is configured".to_string(),
-            })?;
-
         let mut backends = BTreeMap::new();
         for (name, backend_config) in &config.backends {
             backends.insert(name.clone(), Backend::from_config(name, backend_config)?);
         }
 
-        if !backends.contains_key(&default) {
+        // No backends at all is a legitimate deployment rather than a mistake: a
+        // listener with nothing to dispatch to is how static files are served
+        // without PHP, and with no backends there is also no route that could
+        // select one, because `Config::validate` requires every route to name a
+        // configured backend. It is allowed here so that `check` and `serve`
+        // agree about the file — `check` reports it as a warning, because a server
+        // that can answer nothing but static files is usually a configuration
+        // still being written rather than a finished one.
+        let default = match config.default_backend.clone() {
+            Some(name) => name,
+            None if backends.is_empty() => String::new(),
+            None => {
+                return Err(ServerError::Misconfigured {
+                    backend: "<default>".to_string(),
+                    reason: "no default_backend is configured".to_string(),
+                })
+            }
+        };
+
+        if !backends.contains_key(&default) && !backends.is_empty() {
             return Err(ServerError::Misconfigured {
                 backend: default,
                 reason: "default_backend does not match any configured backend".to_string(),
@@ -59,6 +70,15 @@ impl Dispatcher {
             routing,
             routes: config.routes.clone(),
         })
+    }
+
+    /// Whether any backend was configured.
+    ///
+    /// False is the static-only deployment, where a request that names no file
+    /// has nowhere to go. The front-ends answer 500 for one, and the CLI warns at
+    /// startup, so an operator is not left reading a bare "internal error".
+    pub fn has_backends(&self) -> bool {
+        !self.backends.is_empty()
     }
 
     /// The routing table in use, so a front-end can resolve paths for logging.
@@ -107,22 +127,28 @@ impl Dispatcher {
         self.dispatch_to(name, request)
     }
 
-    /// Send a request to the default backend, ignoring the route table.
-    ///
-    /// An alias used by the listener, where "default" is the meaningful word.
-    pub fn dispatch_to_default(&self, request: &Request) -> Result<Response> {
-        self.dispatch_to(&self.default, request)
-    }
-
     /// Send a request to a named backend.
     pub fn dispatch_to(&self, name: &str, request: &Request) -> Result<Response> {
         let backend = self
             .backends
             .get(name)
+            // A static-only configuration reaches here with no backends at all.
+            // Reported as `NoWorker` rather than as a misconfiguration, because by
+            // the time a request arrives the file is a decision rather than a
+            // mistake — the CLI already warned about it at startup.
             .ok_or_else(|| ServerError::NoWorker {
                 backend: name.to_string(),
             })?;
         backend.request(request)
+    }
+
+    /// Send a request to the default backend, ignoring the route table.
+    ///
+    /// An alias used by the listener, where "default" is the meaningful word.
+    /// Returns `NoWorker` for a static-only configuration, which is the one case
+    /// where a request can arrive with nowhere to go.
+    pub fn dispatch_to_default(&self, request: &Request) -> Result<Response> {
+        self.dispatch_to(&self.default, request)
     }
 
     /// Slot contention in every worker pool, for the caller to report.

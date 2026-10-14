@@ -9,7 +9,8 @@
 
 use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{BackendConfig, Config};
+use crate::program::{resolve_program, split_command};
 
 /// One thing that is probably not what the operator meant.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +92,104 @@ pub fn inspect(config: &Config, document_root: &Path) -> Vec<Warning> {
         ));
     }
 
+    // A listener with no backends is a static-only deployment, which works — but
+    // only for paths that name a file. A path that names nothing has nowhere to go
+    // and answers 500, so it is worth saying once here rather than leaving it to be
+    // discovered as an "internal error" at the first request.
+    if config.backends.is_empty() {
+        warnings.push(Warning::with_hint(
+            "no backends are configured: only paths naming a real file can be answered",
+            "with a front controller set, every other path is a 500 — either add a backend, or \
+             serve with `--front-controller ''` if this really is files only",
+        ));
+    }
+
+    inspect_programs(config, &mut warnings);
+
     warnings
+}
+
+/// Report every configured program that cannot be started.
+///
+/// This is the check `check` was missing: a mistyped `binary` is the mistake a
+/// configuration file is *most* likely to make, and it is the one thing in the
+/// file that is a filesystem path rather than a value with a default. Without
+/// this, `stokehold check` answered "configuration OK" for a configuration that
+/// could not start a single backend, because `Config::validate` is about the
+/// shape of the file and the pool's own existence check only ran inside `serve`.
+///
+/// A warning rather than an error, for the same reason the document-root checks
+/// are: an image that installs PHP in a later layer is a normal thing to check,
+/// and refusing to report anything else because one binary is not there yet
+/// would be the wrong trade. The value is that the mistake is reported once,
+/// here, instead of as a startup failure the operator has to go looking for.
+fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
+    for (name, backend) in &config.backends {
+        match backend {
+            BackendConfig::Worker(worker) => {
+                let (program, _) = match split_command(&worker.command) {
+                    Ok(parts) => parts,
+                    // An empty or unbalanced command is a hard error in
+                    // `Config::validate`, so this is unreachable in practice;
+                    // skipping keeps the two checks from disagreeing about
+                    // who reports what.
+                    Err(_) => continue,
+                };
+                let binary = resolve_program(&program);
+                if !binary.is_file() {
+                    warnings.push(Warning::with_hint(
+                        format!(
+                            "backends.{name}: the worker program {} does not exist (from command \
+                             {:?})",
+                            binary.display(),
+                            worker.command
+                        ),
+                        "check the path, or the `command` of this backend — the worker is started \
+                         with `command`, not with `binary`, so the two are independent settings",
+                    ));
+                }
+            }
+            BackendConfig::SpawnCgi(cgi) => {
+                if !cgi.binary.is_file() {
+                    warnings.push(Warning::with_hint(
+                        format!("backends.{name}: {} does not exist", cgi.binary.display()),
+                        "point `binary` at the php-cgi executable for this host — \
+                         `stokehold check` lists every PHP binary it found above",
+                    ));
+                }
+            }
+            BackendConfig::SpawnFpm(fpm) => {
+                // `serve` refuses `spawn_fpm` outright, so the file check is not
+                // the whole story for this backend. Saying so here is what keeps
+                // `check` and `serve` from disagreeing about a configuration that
+                // is unbuildable for a reason other than a missing file.
+                warnings.push(Warning::with_hint(
+                    format!(
+                        "backends.{name}: spawn_fpm is not implemented; {} will not be started",
+                        fpm.binary.display()
+                    ),
+                    "point at a running php-fpm with `kind = \"external\"` instead",
+                ));
+            }
+            BackendConfig::External(external) => {
+                // Nothing to look for on disk: the socket belongs to another
+                // process, and whether it is there yet is not a configuration
+                // mistake. A `unix:` path can be checked cheaply, though, and a
+                // missing one is the common cause of a first-request 502.
+                if let Some(path) = external.socket.strip_prefix("unix:") {
+                    if !Path::new(path).exists() {
+                        warnings.push(Warning::with_hint(
+                            format!(
+                                "backends.{name}: nothing is listening on {} yet",
+                                external.socket
+                            ),
+                            "start php-fpm before serving, or ignore this if it starts first",
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -99,15 +197,41 @@ mod tests {
     use super::*;
 
     fn config() -> Config {
-        let text = r#"
+        // The worker command names a program that certainly exists, so these
+        // tests stay about the document root. `inspect` now also reports a
+        // configured program that cannot be started, so a fixture naming `php`
+        // would make every test in this module depend on whether PHP happens to
+        // be installed on the host.
+        let exe = std::env::current_exe().expect("the test binary path");
+        let text = format!(
+            r#"
 default_backend = "app"
 [server]
 http = "127.0.0.1:8080"
 [backends.app]
 kind = "worker"
-command = "php worker.php"
-"#;
-        Config::from_toml(text).expect("config parses")
+command = "{}"
+"#,
+            // Backslashes are escaped because this is a TOML basic string, which
+            // is the same papercut a hand-written Windows path hits.
+            exe.display().to_string().replace('\\', "\\\\")
+        );
+        Config::from_toml(&text).expect("config parses")
+    }
+
+    /// A configuration with one backend whose program cannot be started.
+    fn config_with_worker_command(command: &str) -> Config {
+        let text = format!(
+            r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "{command}"
+"#
+        );
+        Config::from_toml(&text).expect("config parses")
     }
 
     /// A directory that is removed when the test ends.
@@ -146,6 +270,127 @@ command = "php worker.php"
         let root = Fixture::new("clean");
         root.write("index.php");
         assert_eq!(inspect(&config(), root.path()), Vec::new());
+    }
+
+    /// The check `check` was missing: a `binary` that is not there.
+    ///
+    /// This is the mistake a configuration file is most likely to make, because
+    /// `binary` is the one setting that is a filesystem path rather than a value
+    /// with a default — and it is the one `Config::validate` cannot see.
+    #[test]
+    fn a_php_cgi_binary_that_does_not_exist_is_reported() {
+        let root = Fixture::new("bad-binary");
+        root.write("index.php");
+        let text = r#"
+default_backend = "cgi"
+[server]
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "C:/definitely/not/php-cgi.exe"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        // Validation is about the shape of the file, so the missing file is not
+        // its business — which is exactly why `inspect` has to catch it.
+        config.validate().expect("the shape of the file is valid");
+
+        let warnings = inspect(&config, root.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("does not exist"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A worker's program comes from `command`, not from a `binary` key, so the
+    /// check has to read the command rather than look for a field that is not
+    /// there.
+    #[test]
+    fn a_worker_command_naming_a_missing_program_is_reported() {
+        let root = Fixture::new("bad-command");
+        root.write("index.php");
+        let config = config_with_worker_command("definitely-not-php worker.php");
+        let warnings = inspect(&config, root.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("does not exist"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].message.contains("command"),
+            "the message must name `command`, since that is the setting at fault: {warnings:?}"
+        );
+    }
+
+    /// `serve` refuses `spawn_fpm` outright, so a file that asks for it must be
+    /// reported as unbuildable even though its `binary` is present. Without this
+    /// the warning would be conditional on the file check and `check` would call
+    /// a configuration OK that `serve` cannot start.
+    #[test]
+    fn the_unimplemented_spawn_fpm_backend_is_reported() {
+        let root = Fixture::new("spawn-fpm");
+        root.write("index.php");
+        let exe = std::env::current_exe().expect("the test binary path");
+        let text = format!(
+            r#"
+default_backend = "fpm"
+[server]
+http = "127.0.0.1:8080"
+[backends.fpm]
+kind = "spawn_fpm"
+binary = "{}"
+"#,
+            exe.display().to_string().replace('\\', "\\\\")
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        let warnings = inspect(&config, root.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("not implemented"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("external"),
+            "the hint must say what to use instead: {warnings:?}"
+        );
+    }
+
+    /// No backends is a static-only deployment: valid, warned about, and the
+    /// warning has to say what breaks (a path that names no file).
+    #[test]
+    fn a_static_only_configuration_is_valid_and_warned_about() {
+        let root = Fixture::new("static-only");
+        // A front controller that *is* present, so the warning under test is the
+        // only one: this fixture deliberately has nothing to dispatch to while
+        // still naming a script, which is the shape that answers 500.
+        root.write("index.php");
+        // No front controller key, so the default (`index.php`) is in effect and
+        // a path naming no file would answer 500 — which is what the warning
+        // exists to say before the first request does.
+        let config = Config::from_toml(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+"#,
+        )
+        .expect("config parses");
+        config.validate().expect("no backends is valid");
+
+        let warnings = inspect(&config, root.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains("no backends"), "{warnings:?}");
+        assert!(
+            warnings[0]
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("front-controller"),
+            "the hint must offer the files-only escape: {warnings:?}"
+        );
     }
 
     #[test]

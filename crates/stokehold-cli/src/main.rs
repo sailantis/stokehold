@@ -232,6 +232,15 @@ fn serve(
     for name in dispatcher.backend_names() {
         tracing::info!(backend = %name, "backend ready");
     }
+    // A static-only deployment answers a path that names no file with a 500 and
+    // nothing else in the log, so the reason is stated once here rather than left
+    // to be inferred from a request that failed for no visible cause.
+    if !dispatcher.has_backends() {
+        tracing::warn!(
+            "no backends are configured: only paths naming a real file will be answered, and \
+             every other path will be a 500"
+        );
+    }
     let dispatcher = Arc::new(dispatcher);
 
     println!("stokehold");

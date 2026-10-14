@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, RouteConfig, ServeOnly, SiteConfig, StaticConfig};
+use crate::hostmap::HostMap;
 
 /// The settings a request is served with, after a host has been resolved.
 ///
@@ -57,23 +58,10 @@ pub struct Sites {
     default: ResolvedSite,
     /// Every configured site by name, so `stokehold check` can list them.
     named: BTreeMap<String, ResolvedSite>,
-    /// Host pattern (lowercased) to site name, exact names first in the sense that
-    /// an exact match is looked up before a wildcard one.
-    exact: BTreeMap<String, String>,
-    /// Wildcard suffix (no `*.`, lowercased) to site name.
-    ///
-    /// Keyed rather than scanned. A wildcard matches a host exactly when the host ends
-    /// with it, so the host's own suffixes can be probed instead of every pattern —
-    /// which is O(number of labels in the host) rather than O(patterns), and the label
-    /// count is two to four in any real host name.
-    ///
-    /// Enumerating the host's suffixes yields them longest-first for free, which is the
-    /// whole rule: the first hit is the longest match. Two distinct patterns cannot both
-    /// match one host at the same length, so no tie is possible and declaration order
-    /// cannot matter. `validate_host_pattern` has already refused `*.` with fewer than
-    /// two labels, and `Config::validate` has refused a duplicate claim, so the keys
-    /// cannot collide.
-    wildcard: BTreeMap<String, String>,
+    /// Which site claims a host. The rule — exact, then longest wildcard — lives in
+    /// [`HostMap`] so the certificate table and the route table share it rather than each
+    /// growing a copy that could drift.
+    hosts: HostMap<String>,
 }
 
 impl Sites {
@@ -116,8 +104,7 @@ impl Sites {
         };
 
         let mut named = BTreeMap::new();
-        let mut exact = BTreeMap::new();
-        let mut wildcard = BTreeMap::new();
+        let mut hosts: HostMap<String> = HostMap::new();
 
         for (name, site) in &config.sites {
             let resolved = resolve_site(
@@ -131,15 +118,10 @@ impl Sites {
             );
 
             for host in &site.hosts {
-                let host = host.trim().to_ascii_lowercase();
-                match host.strip_prefix("*.") {
-                    None => {
-                        exact.insert(host, name.clone());
-                    }
-                    Some(suffix) => {
-                        wildcard.insert(suffix.to_string(), name.clone());
-                    }
-                }
+                // `HostMap::insert` does the trimming, lowercasing and `*.` split; doing it
+                // here as well would be a second normalisation that could drift from the one
+                // the lookup applies to the header.
+                hosts.insert(host, name.clone());
             }
 
             named.insert(name.clone(), resolved);
@@ -148,8 +130,7 @@ impl Sites {
         Sites {
             default,
             named,
-            exact,
-            wildcard,
+            hosts,
         }
     }
 
@@ -179,37 +160,22 @@ impl Sites {
 
     /// [`Sites::resolve`], taking the header directly.
     pub fn resolve_str(&self, host: &str) -> &ResolvedSite {
-        let host = strip_port(host);
-        if host.is_empty() {
-            return &self.default;
-        }
-        let host = host.to_ascii_lowercase();
+        // The matching rule is `HostMap`'s, so this is only the fallback decision: a host
+        // nobody claims is the default site's. A name in the table is a name in `named`,
+        // because both were filled from the same map in the same pass.
+        self.hosts
+            .get(host)
+            .and_then(|name| self.named.get(name.as_str()))
+            .unwrap_or(&self.default)
+    }
 
-        if let Some(name) = self.exact.get(&host) {
-            // A name in the table is a name in `named`, because both were filled
-            // from the same map in the same pass.
-            if let Some(site) = self.named.get(name.as_str()) {
-                return site;
-            }
-        }
-
-        // Walk the host's labels left to right, probing the suffix table at each step.
-        // A step strips one leading label before probing, so `a.b.example.com` tries
-        // `b.example.com` and then `example.com` — strictly longest first, which is the
-        // whole rule. It also never tries the host itself, so a bare `example.com`
-        // cannot be claimed by a `*.example.com` rule; that is the wildcard's own
-        // subdomain-only meaning, enforced here rather than by a comparison.
-        let mut rest = host.as_str();
-        while let Some((_, tail)) = rest.split_once('.') {
-            if let Some(name) = self.wildcard.get(tail) {
-                if let Some(site) = self.named.get(name.as_str()) {
-                    return site;
-                }
-            }
-            rest = tail;
-        }
-
-        &self.default
+    /// The host patterns this deployment claims, for diagnostics.
+    ///
+    /// The same table site selection uses, exposed so a caller can ask "is this name
+    /// configured at all" without re-deriving the rule. The certificate resolver does not
+    /// share this — it needs host→certificate, not host→site — but it shares `HostMap`.
+    pub fn host_map(&self) -> &HostMap<String> {
+        &self.hosts
     }
 }
 
@@ -258,21 +224,10 @@ fn resolve_site(
 
 /// A `Host` header without its `:port`, handling a bracketed IPv6 literal.
 ///
-/// A copy of the rule the router and the route table use, kept next to the site
-/// lookup so the two cannot drift; `config::host_matches` does the pattern
-/// comparison, and this only removes the port before it.
-fn strip_port(host: &str) -> &str {
-    let host = host.trim();
-    if let Some(rest) = host.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
-    }
-    match host.rsplit_once(':') {
-        Some((name, port)) if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
-            name
-        }
-        _ => host,
-    }
-}
+/// Moved to [`crate::hostmap`] so the site table, the certificate table and the route table
+/// normalise a header identically; re-exported here because callers of this module had it.
+#[allow(unused_imports)]
+pub(crate) use crate::hostmap::strip_port;
 
 #[cfg(test)]
 mod tests {

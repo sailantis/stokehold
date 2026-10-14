@@ -394,16 +394,18 @@ impl RouteConfig {
 
 /// Whether a `Host` header matches a configured host pattern.
 ///
-/// One function for the route table and the site table, so the two cannot
-/// disagree about what a wildcard means — a route that matched a host the site
-/// resolver did not, or the reverse, would be a bug nobody could reproduce from
-/// reading either table alone.
+/// One function for the route table, and [`crate::hostmap::HostMap`] for the site and
+/// certificate tables. The two are separate implementations of one rule — a map probe versus a
+/// walk over the host's own labels — so they are pinned against each other by a test
+/// (`this_table_and_host_matches_agree_on_every_shape` in the hostmap module) rather than
+/// trusted to stay in step. That test found the divergence it was written for: this function
+/// used to accept `a..example.com` for `*.example.com`, because an empty label is still a label
+/// by this arithmetic.
 ///
-/// The pattern is an exact name, compared case-insensitively with any `:port`
-/// stripped, or a leading `*.` wildcard. `*.example.com` matches
-/// `a.example.com` and `a.b.example.com` but *not* `example.com` itself: a
-/// wildcard names a subdomain, and treating it as also matching the bare domain
-/// would silently widen every rule that used one.
+/// The pattern is an exact name, compared case-insensitively with any `:port` stripped, or a
+/// leading `*.` wildcard. `*.example.com` matches `a.example.com` and `a.b.example.com` but
+/// *not* `example.com` itself: a wildcard names a subdomain, and treating it as also matching
+/// the bare domain would silently widen every rule that used one.
 pub fn host_matches(pattern: &str, host: Option<&str>) -> bool {
     let host = host.unwrap_or_default();
     let host = strip_port(host);
@@ -414,15 +416,26 @@ pub fn host_matches(pattern: &str, host: Option<&str>) -> bool {
     match pattern.strip_prefix("*.") {
         None => host.eq_ignore_ascii_case(pattern),
         Some(suffix) => {
-            // The host must be longer than the suffix *plus* the separating dot, and
-            // that dot must be there. Both halves are needed: without the length
-            // check, `.example.com` would pass — it is exactly one byte longer than
-            // the suffix and that byte is a dot — and the wildcard would be claimed
-            // by an empty label.
+            // The host must be longer than the suffix *plus* the separating dot, and that dot
+            // must be there. Both halves are needed: without the length check, `.example.com`
+            // would pass — it is exactly one byte longer than the suffix and that byte is a
+            // dot — and the wildcard would be claimed by an empty label.
             let suffix_len = suffix.len();
-            host.len() > suffix_len + 1
-                && host.as_bytes()[host.len() - suffix_len - 1] == b'.'
-                && host[host.len() - suffix_len..].eq_ignore_ascii_case(suffix)
+            if host.len() <= suffix_len + 1 {
+                return false;
+            }
+            let dot = host.len() - suffix_len - 1;
+            if host.as_bytes()[dot] != b'.' {
+                return false;
+            }
+            // And the label *before* that dot must be non-empty, which one length check cannot
+            // express: `a..example.com` is longer than the suffix, and the byte before the
+            // suffix really is a dot — but the label it separates is empty, so this is not a
+            // subdomain of `example.com`. A name with a zero-length label is not a host name.
+            if dot == 0 || host.as_bytes()[dot - 1] == b'.' {
+                return false;
+            }
+            host[host.len() - suffix_len..].eq_ignore_ascii_case(suffix)
         }
     }
 }
@@ -500,21 +513,11 @@ fn is_script_extension(suffix: &str) -> bool {
 }
 
 /// A `Host` header without its `:port`, handling a bracketed IPv6 literal.
-fn strip_port(host: &str) -> &str {
-    let host = host.trim();
-    if let Some(rest) = host.strip_prefix('[') {
-        // `[::1]:8080` and `[::1]`.
-        return rest.split(']').next().unwrap_or(rest);
-    }
-    // A bare `::1` has several colons and no port; only the last one separates a
-    // port when there is exactly one colon.
-    match host.rsplit_once(':') {
-        Some((name, port)) if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
-            name
-        }
-        _ => host,
-    }
-}
+///
+/// One implementation, in [`crate::hostmap`], because `host_matches` below and that module's
+/// lookup have to normalise a header the same way — a port stripped in one and not the other
+/// would make a route and a site disagree about the same request.
+use crate::hostmap::strip_port;
 
 impl Config {
     /// The backend that should serve this request, if a route matches it.

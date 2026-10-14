@@ -1614,8 +1614,13 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     allows and every one it does not; `check` reports the resolved certificate paths and says per
     site whether a certificate is its own or inherited; preflight reports a certificate that is
     missing, unreadable, or not PEM.
-44. `host-map` — extract `HostMap<V>` and re-home `Sites` on it; the existing sites tests are the
-    control and must pass unchanged.
+44. `host-map` — **done.** `stokehold_core::hostmap::HostMap<V>` holds the rule (exact name, then
+    the longest `*.` wildcard, then the caller's fallback — no default is stored, because what an
+    unmatched host means differs between callers and inventing one is how SNI and site selection
+    would come to disagree). `Sites` is re-homed on `HostMap<String>` and the eight vhost tests pass
+    **unchanged**, which is the control for the refactor. Extracting it found a real divergence
+    between the two implementations, recorded as hazard 54a and now pinned by a test that runs
+    every pattern against every host and requires them to agree.
 45. `tls-termination` — the `Acceptor`, the SNI resolver over `HostMap<Arc<CertifiedKey>>`, the
     wrapped accept loop, and `serve_connection` made generic over the stream so one code path
     serves both protocols.
@@ -2833,6 +2838,37 @@ selection needs":** it is not. `Sites`' host maps are private, `named()` returns
 smaller than stated: the *rule* is reusable (exact name, then longest `*.` wildcard, then the server's
 certificate), and it is extracted into `HostMap<V>` so sites, SNI and route matching share one
 implementation of it rather than growing a third.
+
+### Hazard 54a — the wildcard walk and `host_matches` had already disagreed
+
+`HostMap<V>` (step 44) is the second implementation of "does this host match this pattern", because
+the site table was rewritten to walk the host's own labels while the route table still compares the
+pattern. Two implementations of one rule is exactly the drift this codebase refuses elsewhere, so
+they are **pinned against each other by a test** rather than trusted:
+`this_table_and_host_matches_agree_on_every_shape` runs four patterns against seventeen hosts and
+asserts the two agree on every pair.
+
+**It failed on the first run, on a real divergence, and the divergence was introduced by the
+earlier optimisation.** Host `a..example.com`, pattern `*.example.com`:
+
+    HostMap::get          -> no match
+    host_matches          -> match
+
+The label walk refuses an empty label; `host_matches` did not, because its check was `host.len() >
+suffix.len() + 1` plus "the byte before the suffix is a dot". `a..example.com` is longer than the
+suffix and the byte before the suffix *is* a dot — the empty label is the one two bytes earlier, and
+one length comparison cannot see it. So a route with `host = "*.example.com"` matched a host that the
+site table sent to the default site, which is precisely the unreproducible-from-either-table bug the
+shared rule was meant to prevent.
+
+Fixed by refusing a zero-length label in `host_matches` as well, and the fix is pinned by the
+agreement test rather than by either side's own tests — neither implementation could have caught
+this alone, which is the argument for the test existing at all.
+
+Recorded rather than quietly fixed because the lesson generalises: **the optimisation in `206b41f`
+was verified against the tests that existed, and they did not cover the empty label.** The
+`HostMap` extraction is what surfaced it, which is a reason to do this kind of consolidation before
+building on top of the old behaviour rather than after.
 
 
 

@@ -149,6 +149,14 @@ pub struct TlsSettings<'a> {
     pub config: &'a stokehold_core::config::Config,
     /// Where a relative `certificate`/`key` resolves.
     pub config_dir: &'a std::path::Path,
+    /// Answer cleartext requests with a `301` to the `https://` equivalent.
+    ///
+    /// Per listener rather than per configuration, because only the listener that serves
+    /// cleartext may redirect: with a separate `https` port the plaintext listener redirects,
+    /// and with TLS sharing the port only the cleartext half of it does.
+    pub redirect_to_https: bool,
+    /// The port a redirect should name, when it is not this listener's own.
+    pub https_port: Option<u16>,
 }
 
 /// Stops the listener from another thread.
@@ -193,6 +201,10 @@ struct FrontEnd {
     /// The port this listener is bound to, for `SERVER_PORT` when the client
     /// sends no `Host`.
     server_port: u16,
+    /// Answer cleartext requests with a `301` to the `https://` equivalent.
+    redirect_to_https: bool,
+    /// The port a redirect should name, when it differs from this listener's own.
+    https_port: Option<u16>,
 }
 
 impl FrontEnd {
@@ -379,6 +391,11 @@ impl HttpListener {
             source,
         })?;
 
+        // The redirect settings come from the listener's own settings, so a plaintext listener in
+        // a split :80/:443 deployment can carry them with no TLS of its own.
+        let redirect_to_https = tls.map(|s| s.redirect_to_https).unwrap_or(false);
+        let requested_https_port = tls.and_then(|s| s.https_port);
+
         // The acceptor is built before anything is served, and its failure is reported as a
         // configuration error: a certificate that cannot be read must not become a listener.
         let (acceptor, accept_plain) = match tls {
@@ -404,6 +421,7 @@ impl HttpListener {
                         .collect::<Vec<_>>(),
                     plaintext_accepted = settings.config.server.tls.as_ref()
                         .is_some_and(|t| t.plain),
+                    redirect_to_https = settings.redirect_to_https,
                     "TLS enabled"
                 );
                 (
@@ -417,6 +435,19 @@ impl HttpListener {
         // The bound port, which matters when port 0 was requested. The port is needed
         // here rather than by the caller because only the listener knows what it got.
         let port = bound.port();
+        // A redirect names the `https` port when there is a separate one, and this listener's
+        // own port when TLS shares it. `unwrap_or(port)` covers both, because `bind` sets
+        // `https_port` only for the split case — and with TLS on this port, redirecting
+        // cleartext to `https://host:this-port` is a real redirect to a real endpoint, not a
+        // loop, since the client comes back speaking TLS.
+        let https_port = requested_https_port.unwrap_or(port);
+        if redirect_to_https {
+            tracing::info!(
+                https_port, plaintext_accepted = accept_plain,
+                "cleartext requests will be answered with a 301 to https"
+            );
+        }
+
         let mut routings = BTreeMap::new();
         let mut statics = BTreeMap::new();
         for site in sites
@@ -453,6 +484,8 @@ impl HttpListener {
                 stats: Arc::new(HttpStats::default()),
                 shutdown: Arc::new(AtomicBool::new(false)),
                 server_port: port,
+                redirect_to_https,
+                https_port: Some(https_port),
             }),
             tls: acceptor,
             accept_plain,
@@ -570,7 +603,7 @@ async fn serve_accepted(
     peer: SocketAddr,
 ) {
     let Some(acceptor) = tls else {
-        if let Err(err) = serve_connection(stream, front_end, peer).await {
+        if let Err(err) = serve_connection(stream, front_end, peer, true).await {
             tracing::debug!(%peer, %err, "http connection ended");
         }
         return;
@@ -581,7 +614,7 @@ async fn serve_accepted(
             .stats
             .plaintext_on_tls_port
             .fetch_add(1, Ordering::Relaxed);
-        if let Err(err) = serve_connection(stream, front_end, peer).await {
+        if let Err(err) = serve_connection(stream, front_end, peer, true).await {
             tracing::debug!(%peer, %err, "http connection ended");
         }
         return;
@@ -593,7 +626,8 @@ async fn serve_accepted(
                 .stats
                 .handshakes
                 .fetch_add(1, Ordering::Relaxed);
-            if let Err(err) = serve_connection(tls_stream, front_end, peer).await {
+            // `false`: this connection is already encrypted, so a redirect would loop it.
+            if let Err(err) = serve_connection(tls_stream, front_end, peer, false).await {
                 tracing::debug!(%peer, %err, "https connection ended");
             }
         }
@@ -632,6 +666,7 @@ async fn serve_connection<S>(
     stream: S,
     front_end: Arc<FrontEnd>,
     peer: SocketAddr,
+    cleartext: bool,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -642,7 +677,9 @@ where
         let remote_addr = remote_addr.clone();
         // Infallible because a failure is turned into an error page, not
         // propagated: a 502 the client can read beats a dropped connection.
-        async move { Ok::<_, Infallible>(handle(request, front_end, remote_addr).await) }
+        async move {
+            Ok::<_, Infallible>(handle(request, front_end, remote_addr, cleartext).await)
+        }
     });
 
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
@@ -672,8 +709,9 @@ async fn handle(
     request: Request<Incoming>,
     front_end: Arc<FrontEnd>,
     remote_addr: String,
+    cleartext: bool,
 ) -> Response<ResponseBody> {
-    match prepare(request, &front_end, remote_addr).await {
+    match prepare(request, &front_end, remote_addr, cleartext).await {
         Ok(response) => {
             front_end.stats.requests.fetch_add(1, Ordering::Relaxed);
             response
@@ -686,13 +724,72 @@ async fn handle(
     }
 }
 
+/// The authority a redirect should name.
+///
+/// The `Host` header carries the *client's* spelling, including whatever port it reached us on —
+/// and a redirect must not send the client to `https://host:80`, which is the port it just used.
+/// So the port is replaced rather than kept: the target's own port when one is configured, the
+/// listener's own when TLS shares this port, and none at all when it is the default 443 (a bare
+/// authority is what a browser expects, and `:443` in a URL is noise).
+fn redirect_authority(host: &str, https_port: Option<u16>, own_port: u16) -> String {
+    // Everything before the port, so an IPv6 literal's brackets and colons survive.
+    let name = match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host,
+    };
+    let name = if name.is_empty() { "localhost" } else { name };
+
+    let port = https_port.unwrap_or(own_port);
+    if port == 443 {
+        name.to_string()
+    } else {
+        format!("{name}:{port}")
+    }
+}
+
 /// Read the body, build the CGI environment, dispatch, and translate the answer.
 async fn prepare(
     request: Request<Incoming>,
     front_end: &Arc<FrontEnd>,
     remote_addr: String,
+    cleartext: bool,
 ) -> Result<Response<ResponseBody>> {
     let (parts, body) = request.into_parts();
+
+    // A plaintext listener may redirect before anything else looks at the request. Done here
+    // rather than in the accept path because it needs the `Host` and the path, and it is checked
+    // before the site is resolved so a redirect costs one comparison rather than a lookup.
+    //
+    // Gated on `cleartext`, which is the whole correctness of it when TLS shares the port: a
+    // connection that arrived over TLS has already done what the redirect asks for, so
+    // redirecting it would loop the client for ever. The flag is per connection, not per
+    // listener, because with `plain = true` one listener carries both.
+    if front_end.redirect_to_https && cleartext {
+        let host = parts
+            .headers
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let authority = redirect_authority(host, front_end.https_port, front_end.server_port);
+        let target = format!(
+            "https://{authority}{}",
+            parts
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/")
+        );
+        return Ok(Response::builder()
+            .status(301)
+            .header(hyper::header::LOCATION, target)
+            .header(hyper::header::CONTENT_LENGTH, "0")
+            .body(body_of(Bytes::new()))
+            .expect("a 301 with a location is a valid response"));
+    }
 
     // The site is resolved first, because everything after this is per site: which
     // document root a path resolves under, which front controller serves it, and which

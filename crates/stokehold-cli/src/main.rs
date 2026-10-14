@@ -395,10 +395,43 @@ fn serve(
     let tls_active = config.server.tls.is_some();
     let https_address = config.server.https.clone();
     let tls_on_http = tls_active && https_address.is_none();
-    let tls_for_http = if tls_on_http {
+    let wants_redirect = config.server.redirect_to_https;
+
+    // The redirect lives on whichever listener serves cleartext. With a split :80/:443 that is
+    // `http` (which has no TLS of its own), and with TLS sharing the port it is the cleartext
+    // half of that one listener. Validation has already ensured some plaintext listener exists.
+    //
+    // Only a TCP listener has a port. A unix socket cannot be reached over a redirect at all,
+    // so it yields `None` and the redirect falls back to the listener's own port — which is
+    // then only used to build a URL nobody can follow. `validate` requires `https` to parse, so
+    // the `None` case here is a unix socket rather than a malformed address.
+    let https_port = match &https_address {
+        Some(address) => match stokehold_core::config::parse_listener(address) {
+            Ok(stokehold_core::config::Listener::Tcp(addr)) => Some(addr.port()),
+            _ => None,
+        },
+        None => None,
+    };
+
+    let http_tls = if tls_on_http {
         Some(stokehold_http::TlsSettings {
             config: &config,
             config_dir,
+            redirect_to_https: wants_redirect && config
+                .server
+                .tls
+                .as_ref()
+                .is_some_and(|t| t.plain),
+            https_port: None,
+        })
+    } else if wants_redirect && tls_active {
+        // The plaintext listener beside a separate `https`: it carries the redirect without any
+        // TLS of its own, which is why the settings exist independently of the acceptor.
+        Some(stokehold_http::TlsSettings {
+            config: &config,
+            config_dir,
+            redirect_to_https: true,
+            https_port,
         })
     } else {
         None
@@ -414,7 +447,7 @@ fn serve(
                     max_connections,
                     ..HttpLimits::default()
                 },
-                tls_for_http,
+                http_tls,
             )
             .map_err(|err| ServerError::Listener {
                 reason: err.to_string(),
@@ -445,6 +478,8 @@ fn serve(
                 Some(stokehold_http::TlsSettings {
                     config: &config,
                     config_dir,
+                    redirect_to_https: false,
+                    https_port,
                 }),
             )
             .map_err(|err| ServerError::Listener {

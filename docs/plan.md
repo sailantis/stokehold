@@ -1621,13 +1621,25 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     **unchanged**, which is the control for the refactor. Extracting it found a real divergence
     between the two implementations, recorded as hazard 54a and now pinned by a test that runs
     every pattern against every host and requires them to agree.
-45. `tls-termination` — the `Acceptor`, the SNI resolver over `HostMap<Arc<CertifiedKey>>`, the
-    wrapped accept loop, and `serve_connection` made generic over the stream so one code path
-    serves both protocols.
-46. `dual-protocol` — the first-byte sniff for plain-and-TLS on one port, the second `https`
-    listener, and the `:80` → `:443` redirect.
-47. `alpn-h2` — ALPN advertisement, confirming `auto::Builder` picks HTTP/2 from it, and the two
-    HTTP/2 tests the repository has never had.
+45. `tls-termination` — **done.** `crates/stokehold-http/src/tls.rs` loads the chain and key, pairs
+    them, and resolves SNI over `HostMap<Arc<CertifiedKey>>`; `serve_connection` is generic over the
+    stream so one code path serves both protocols; `bind` builds the acceptor and **fails before
+    binding** on a certificate it cannot load. A real bug was found by running it rather than
+    reading it: rustls 0.23 installs its crypto provider lazily and `CertifiedKey::from_der` runs
+    before any call that would install it, so the first version failed with "no usable crypto
+    provider" on a machine where the provider was compiled in — `install_crypto_provider` makes the
+    order irrelevant.
+46. `dual-protocol` — **done.** `peek` on the first byte (`0x16` = TLS record) picks the path when
+    `[server.tls].plain` asks for both on one port, which is what nginx's `ssl_preread` does; the
+    second `https` listener is a second `RunningHttp`, and `redirect_to_https` answers cleartext
+    with a `301`. Verified by hand and by test: cleartext is refused on a TLS-only port and served
+    on a `plain = true` one, with TLS still working on the same socket. **The first version of the
+    redirect was wrong and a test caught it** — with `plain` on it redirected TLS requests too, so
+    a client would have been sent to the endpoint it had already reached, for ever. The redirect is
+    now gated on the connection being cleartext, which is only knowable per connection because one
+    listener carries both protocols.
+47. `alpn-h2` — **done** (with 45). ALPN advertisement, and `alpn_negotiates_http2_then_http11`,
+    the repository's first HTTP/2 test. The `Upgrade: h2c` gap remains pre-existing and unpinned.
 48. `tls-cli` — `serve` parses the certificates for real and fails before binding; `version`, whose
     front-end line currently describes a build with no TLS.
 49. `tls-docs` — README and this file.
@@ -1834,7 +1846,8 @@ reading out of a crate description.
 | HTTP/1.1 | **works** | `GET`/`HEAD`/`OPTIONS` on a static file, 200 with the right `content-type` |
 | HTTP/2 cleartext, **prior knowledge** | **works** | `curl --http2-prior-knowledge` reports HTTP/2 and answers `HTTP/2 200`; a hand-built preface + empty SETTINGS gets a real SETTINGS frame back |
 | HTTP/2 cleartext, **`Upgrade: h2c`** | **does not work** | a client offering `Upgrade: h2c` is answered **HTTP/1.1 200** with no `101` |
-| TLS / HTTPS | **configuration and validation work; the listener does not** | `[server.tls]`, `server.https`, `redirect_to_https`, per-site `[sites.x.tls]`, all validation for the listener matrix, `check`'s resolved certificate paths and preflight's missing/unreadable/not-PEM warnings all work. The accept loop is **not yet wrapped**: no `rustls` dependency is in any `Cargo.toml`, so a TLS handshake to the HTTP port still fails. Steps 44–47 |
+| TLS / HTTPS | **works** | `[server.tls]` with `certificate`/`key`/`min_version`/`alpn`/`plain`; `server.https` for a second listener; per-site `[sites.x.tls]` certificates selected by SNI; `redirect_to_https`. Verified by hand against a running server (a real `curl`/schannel handshake, `200` over HTTPS, cleartext refused on a TLS-only port, cleartext and TLS both answering on one port) and then by six integration tests that use `rustls` as a client, including `sni_selects_a_per_site_certificate`, which compares the presented certificate byte for byte |
+| TLS / HTTP-2 over ALPN | **works** | `alpn_negotiates_http2_then_http11` — h2 wins when both are offered, and `http/1.1` when h2 is not. This is the **first HTTP/2 test** in the repository |
 | HTTP/3 | **does not exist** | needs `quinn` + `h3`; step 24 |
 | FastCGI front-end | **works** | `crates/stokehold-server/src/frontend/`, wired into `serve`, 5 tests in `tests/frontend.rs` |
 | `/index.php` is executed, not disclosed | **works** | the body is the script's output, not its source |

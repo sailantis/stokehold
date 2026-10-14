@@ -532,10 +532,15 @@ key = "certs/default.key"
 
 `redirect_to_https` is off by default because a redirect is a deployment's decision. It needs
 something actually serving cleartext to fire on — a separate `https`, or `plain = true` — so
-setting it with TLS on `http` alone is an error rather than a silently inert key.
+setting it with TLS on `http` alone is an error rather than a silently inert key. The redirect
+answers `301`, keeps the path and query, and names the `https` port rather than the port the
+request arrived on; `:443` is left out of the authority because it is the default.
+
+**It applies to cleartext connections only.** With `plain = true` one listener carries both
+protocols, and a redirect on the TLS half would send the client back to where it just came from
+— an infinite loop. The decision is per connection for exactly that reason.
 
 ### Per-site certificates (SNI)
-
 ```toml
 [sites.shop.tls]
 certificate = "certs/shop.crt"

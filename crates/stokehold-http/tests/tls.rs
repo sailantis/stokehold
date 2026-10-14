@@ -120,6 +120,8 @@ async fn start(config: Config, config_dir: &Path) -> SocketAddr {
         Some(TlsSettings {
             config: &config,
             config_dir,
+            redirect_to_https: false,
+            https_port: None,
         }),
     )
     .await
@@ -178,7 +180,11 @@ async fn fetch(addr: SocketAddr, server_name: &str, alpn: &[&str]) -> Seen {
         .await
         .expect("write request");
     let mut response = Vec::new();
+    // Read to the end and shut down, so the listener's task finishes and releases its slot.
+    // Leaving the connection open would make the *next* request on the same listener see "too
+    // many connections", which is a confusing way to fail.
     let _ = tls.read_to_end(&mut response).await;
+    let _ = tls.shutdown().await;
 
     Seen {
         certificate,
@@ -193,17 +199,29 @@ async fn fetch(addr: SocketAddr, server_name: &str, alpn: &[&str]) -> Seen {
 /// a TLS alert, which is bytes. The question that matters is whether the request was served, and
 /// a served request begins with an HTTP status line.
 async fn fetch_cleartext(addr: SocketAddr) -> Option<Vec<u8>> {
+    fetch_cleartext_with_host(addr, "test").await
+}
+
+/// [`fetch_cleartext`], with a chosen `Host` header — which the redirect case needs, because the
+/// redirect is built from the host the client asked for.
+async fn fetch_cleartext_with_host(addr: SocketAddr, host: &str) -> Option<Vec<u8>> {
     let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
     stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
         .await
         .ok()?;
     let mut response = Vec::new();
+    // Read to the end, so the connection is closed from this side and the listener's task
+    // finishes and releases its slot. Returning early would leave the slot held, which the
+    // next test in the same listener would see as "too many connections".
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         stream.read_to_end(&mut response),
     )
     .await;
+    drop(stream);
     if response.starts_with(b"HTTP/") {
         Some(response)
     } else {
@@ -391,6 +409,127 @@ async fn a_1_3_floor_still_serves_a_1_3_client() {
 
     let seen = fetch(addr, "example.test", &["http/1.1"]).await;
     assert!(seen.response.starts_with(b"HTTP/1.1"));
+}
+
+#[tokio::test]
+async fn redirect_to_https_answers_cleartext_with_a_301() {
+    // The redirect must name the https port, not the port the request arrived on — otherwise it
+    // sends the client back to the plaintext port it just used, which is a loop.
+    let cert = Cert::new("redirect", "example.test");
+    let config = write_config(&cert, "plain = true");
+    let addr = start_redirecting(config, cert.dir()).await;
+
+    let response = fetch_cleartext_with_host(addr, "example.test")
+        .await
+        .expect("a redirecting listener must answer");
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 301"),
+        "the answer must be a 301: {text}"
+    );
+    assert!(
+        text.contains(&format!("location: https://example.test:{}/", addr.port())),
+        "the redirect must name the https endpoint and keep the path: {text}"
+    );
+
+    // And TLS on the same port must NOT be redirected, which is the half that makes this safe:
+    // a redirect on the TLS path would be an infinite loop, because the client would come back
+    // over TLS and be redirected again.
+    //
+    // Asserted as "not a 301" rather than "200": this fixture has no backends, so a non-static
+    // path legitimately answers 503. What matters is the status class, not the exact code.
+    let tls = fetch(addr, "example.test", &["http/1.1"]).await;
+    let text = String::from_utf8_lossy(&tls.response);
+    assert!(
+        !text.starts_with("HTTP/1.1 301"),
+        "a TLS request must be served, not redirected to itself: {text}"
+    );
+    assert!(
+        !text.contains("location:"),
+        "a TLS answer must not carry a redirect: {text}"
+    );
+}
+
+#[tokio::test]
+async fn redirect_on_the_default_port_leaves_it_out_of_the_location() {
+    // `:443` in a URL is noise, so a bare authority is what a client should be sent. The
+    // listener cannot bind 443 without privileges, so the port is supplied directly — which is
+    // also the shape a split :80/:443 deployment uses, where `https_port` is what matters.
+    let cert = Cert::new("redirect443", "example.test");
+    let config = write_config(&cert, "plain = true");
+    let addr = start_redirecting_to(config, cert.dir(), Some(443)).await;
+
+    let response = fetch_cleartext_with_host(addr, "example.test")
+        .await
+        .expect("answered");
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.contains("location: https://example.test/"),
+        "port 443 must be omitted from the location: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_redirect_keeps_the_path_and_query() {
+    // A redirect that dropped the path would send every request to the front controller.
+    let cert = Cert::new("redirectpath", "example.test");
+    let config = write_config(&cert, "plain = true");
+    let addr = start_redirecting(config, cert.dir()).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(b"GET /docs/page?x=1&y=2 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write");
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_to_end(&mut response),
+    )
+    .await;
+
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.contains("HTTP/1.1 301"), "{text}");
+    assert!(
+        text.contains("/docs/page?x=1&y=2"),
+        "the path and query must survive: {text}"
+    );
+}
+
+/// Start a listener with the redirect turned on, which `write_config` does not set.
+async fn start_redirecting(config: Config, config_dir: &Path) -> SocketAddr {
+    start_redirecting_to(config, config_dir, None).await
+}
+
+/// [`start_redirecting`], naming the https port a redirect should reach.
+async fn start_redirecting_to(
+    config: Config,
+    config_dir: &Path,
+    https_port: Option<u16>,
+) -> SocketAddr {
+    let sites = Arc::new(Sites::from_config(&config, config_dir));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, stokehold_fcgi::Routing::default()).expect("dispatcher"),
+    );
+
+    let listener = HttpListener::bind_with_tls(
+        "127.0.0.1:0",
+        dispatcher,
+        sites,
+        HttpLimits::default(),
+        Some(TlsSettings {
+            config: &config,
+            config_dir,
+            redirect_to_https: true,
+            https_port,
+        }),
+    )
+    .await
+    .expect("bind with redirect");
+
+    let addr = listener.local_addr().expect("bound address");
+    tokio::spawn(listener.run());
+    addr
 }
 
 /// The DER payload of a PEM certificate file.

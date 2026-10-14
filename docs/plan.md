@@ -37,9 +37,16 @@ session-store database was empty for this machine. The full prior discussion was
 verified `php-cgi.exe -b` probe, the naming evaluation and the open questions. This plan
 restores and extends it.
 
-Naming is **settled**: `volucer`. crates.io-free, low search collision. (Rejected along the
-way: `firestarter` — taken on crates.io and collides with the Linux firewall GUI; `tinderbox` —
-collides with a GPU forest-fire simulator; `php-wpm` — narrows the scope to worker pooling.)
+Naming is **settled**: `volucer` (formerly `stokehold`) — Latin for *winged, swift*, from *volāre*
+("to fly"). The name is the performance claim rather than a metaphor for it, and it replaced
+`stokehold`, whose `hold` reads as *withhold* to anyone who does not know the nautical term — arguing
+against the `stoke` half of the name. Free on crates.io, npm, PyPI and RubyGems; `.dev`, `.io`,
+`.org`, `.co` and `.app` unclaimed; no trademark found in a screen of USPTO and the major databases
+(**screened, not legally cleared**). See hazard 55 for the rename itself and the one name that had to
+be withdrawn on trademark grounds. (Rejected along the way: `velifer` — the Latin is exactly right
+("sail-bearing"), but *Velifer®* is a registered BASF bioinsecticide, EPA Reg. No. 71840-22;
+`firestarter` — taken on crates.io and collides with the Linux firewall GUI; `tinderbox` — collides
+with a GPU forest-fire simulator; `php-wpm` — narrows the scope to worker pooling.)
 
 ## 3. Architecture
 
@@ -571,7 +578,7 @@ against the specification and secondary implementations, and are confirmed by fi
     request to redo; a 3 ms Laravel bootstrap costs 7.5×, and Laravel's `GET /` is otherwise almost
     free, so the boot is most of the request. Against ~1.1× on the trivial handler (hazard 25), this
     is the answer to "does the worker model pay off": on an empty handler hardly at all, on a real
-    framework by a multiple. `deploy/stoke/` and `scripts/fw-bench.sh` in `azera-competition` add
+    framework by a multiple. `deploy/volucer/` and `scripts/fw-bench.sh` in `azera-competition` add
     volucer as a third server so the comparison has two independent server pairs rather than one.
 
     **What is deliberately not claimed here: my own four-arm run's cold numbers.** In that run
@@ -2926,7 +2933,51 @@ was verified against the tests that existed, and they did not cover the empty la
 `HostMap` extraction is what surfaced it, which is a reason to do this kind of consolidation before
 building on top of the old behaviour rather than after.
 
+### Hazard 55 — the rename, and the one name that had to be withdrawn
 
+`stokehold` was renamed to `volucer`. The reason is in §2; this entry records the mechanics and the
+two traps, because both cost real time and neither is obvious from the code.
 
+**The name that looked perfect and was not.** `velifer` was the strongest candidate on the merits:
+Latin *vēlum* ("sail") + *-fer* ("bearing"), so "sail-bearing" — a portmanteau of the Sailantris
+maritime theme and "carries requests", with the productive English `-fer` that also gives conifer and
+aquifer. It was free on crates.io, npm, PyPI and RubyGems with `.dev`, `.io` and `.org` unclaimed,
+and no trademark turned up in the usual search. It was still unusable: **`Velifer®` is a registered
+BASF bioinsecticide**, EPA Reg. No. 71840-22, active ingredient *Beauveria bassiana*. The lesson is
+the order of checks: registry availability and etymology screening are cheap and were done first,
+while the one check that decides the outcome — a trademark search — was done last. For a name that
+will be a crate, a package and a domain, the trademark check belongs first, not as a confirmation
+pass. Note also that a web search for the bare word ranked etymological dictionaries above the
+commercial product, so "no trademark found" from a general search is weak evidence on its own.
 
+**A name rename can break a length-dependent test, and here it did.**
+`reading_one_request_does_not_enter_the_kernel_once_per_field` asserted **40** unbuffered reads for a
+twelve-record environment. That total is not a property of the codec — it depends on how the
+environment's byte length falls across record boundaries, and `params_pairs` uses **the project's own
+name** as `SERVER_SOFTWARE`. Shortening that value by two bytes (`stokehold` → `volucer`) moved a
+record boundary and the count became **39**. A controlled experiment settled it: restoring the
+9-byte value made the test pass again, twice, and setting the 7-byte value made it fail, twice.
 
+The test was wrong, not the rename — but only in the sense that it was over-specified. The assertion
+worth keeping is the *ratio* between the buffered and unbuffered readings, which is what the test
+exists to defend; the exact integer is a fixture artefact. It is now pinned at 39 with a comment
+saying it must be re-measured if that fixture's length changes again. **The general hazard: a test
+that hard-codes a value derived from the project's own name will fail on a rename for a reason that
+has nothing to do with the rename**, and the failure looks like a real regression.
+
+**Renaming a directory tree is not a substitute for verifying content.** Every renamed file was
+checked mechanically rather than by eye: for each file in `HEAD`, apply the name substitutions to the
+`HEAD` bytes and compare with the working-tree file. 78 of 78 in this crate tree matched with two
+reviewed exceptions (the regenerated `Cargo.lock`, and the test above). Two things that check caught
+or was needed for: the substitutions must be applied **most-specific-first** (`STOKEHOLD_SDK_DIR`
+before `STOKEHOLD`; `stokehold-php-sdk` before `stokehold`), or the general rule eats the specific
+one; and a bare `stoke` rule must come **after** every `stokehold` rule, or it rewrites `stokehold`
+into `volucerhold`. Both are silent corruption rather than an error.
+
+**Renaming a package can silently disable a hook.** `azera-worker.php` looks for `volucer-worker.php`
+in the application root. The Sailantis homepage's file was named `stokehold-worker.php`, so the
+rename would have made the site's custom not-found handler **quietly stop loading** — no error, just
+a different 404. This is the hazard worth carrying forward: when a name appears in a *convention*
+(a filename a framework looks up, an environment variable, a default config filename) rather than
+only in code, renaming the project changes that convention, and every consumer has to be found by
+searching for the convention rather than for the name.

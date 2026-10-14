@@ -69,6 +69,21 @@ pub fn route(path: &str, routing: &Routing) -> Route {
     let path = path.split(['?', '#']).next().unwrap_or(path);
     let decoded = percent_decode_cow(path);
 
+    // A path that climbs out of the document root is refused before anything else is
+    // decided about it. Without this, `..` is carried into `PATH_INFO` and
+    // `REQUEST_URI` — which an application that joins either onto a path would follow
+    // out of the root — and into the `SCRIPT_FILENAME` built below, where it would
+    // compose with the root the same way. nginx normalises the URI before forwarding,
+    // so this is also what keeps the two front-ends behaving alike for one request.
+    //
+    // Checked *after* percent-decoding, because `%2e%2e` is `..` by the time it reaches
+    // a path and a check on the raw bytes would miss it. The static layer refuses the
+    // same shape in `resolve_under_root`; the two share [`climbs_out`] so that neither
+    // can start accepting something the other rejects.
+    if climbs_out(&decoded) {
+        return Route::NotFound;
+    }
+
     // Compared on bytes, case-insensitively, rather than through
     // `decoded.to_ascii_lowercase().ends_with(&ext.to_ascii_lowercase())`. That expression
     // allocated *twice* on every request — a copy of the whole path and a copy of every
@@ -192,6 +207,39 @@ fn split_at_script<'a>(relative: &'a str, routing: &Routing) -> Option<(String, 
 /// the bytes and no boundary is ever needed.
 pub fn has_php_extension(path: &str) -> bool {
     php_extension_of(path.as_bytes())
+}
+
+/// Whether a percent-decoded path climbs out of the document root.
+///
+/// A `..` segment anywhere in the path, or a Windows drive prefix. Both mean the same
+/// thing for the caller — the path is not one to resolve under a root — so they share
+/// one answer.
+///
+/// Deliberately not a normaliser. The question is only "may this be resolved under a
+/// root", and the answer is a refusal rather than a rewritten path: rewriting would
+/// quietly change which script runs, and a request for something outside the root has
+/// no correct script to run. nginx answers the same way, by rejecting the URI.
+///
+/// Byte-wise rather than through `Path::components()`, because a backslash is a legal
+/// filename byte on Unix and a separator on Windows, and a path that would climb out on
+/// one platform must not be accepted on the other. This is shared with the static
+/// layer, which reaches the same conclusion through `Path::components()` on the
+/// segments it can see; the two must not be able to disagree, so both call this.
+pub fn climbs_out(path: &str) -> bool {
+    for segment in path.split(['/', '\\']) {
+        if segment == ".." {
+            return true;
+        }
+        // A drive-relative prefix, e.g. `C:` or `C:Windows`. Checked per segment rather
+        // than only at the start, because a URL path always begins with `/` and the
+        // prefix only appears once that is stripped — `/C:/Windows/win.ini` is a URL,
+        // and `C:/Windows/win.ini` is what a root would be joined with.
+        let bytes = segment.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            return true;
+        }
+    }
+    false
 }
 
 /// PHP extensions this server will execute, as ASCII bytes for a case-insensitive
@@ -991,6 +1039,68 @@ mod tests {
             ..RequestInfo::default()
         };
         assert!(build_params(&info, &routing).is_err());
+    }
+
+    #[test]
+    fn a_path_that_climbs_out_of_the_root_is_never_routed() {
+        // The static layer refuses this shape in `resolve_under_root`, and this is the
+        // other half: without it the same path reaches `PATH_INFO`, `REQUEST_URI` and
+        // the `SCRIPT_FILENAME` built from it, where it composes with the document root.
+        // nginx normalises the URI, so this is also what keeps the front-ends alike.
+        let root = fixture("traversal", &[("index.php", "<?php")]);
+        let routing = Routing {
+            document_root: root.clone(),
+            front_controller: Some("index.php".to_string()),
+            ..Routing::default()
+        };
+
+        for path in [
+            "/../secret",
+            "/a/../../secret",
+            "/..",
+            // Percent-encoded, so the check has to happen after decoding: `%2e` is `.`
+            // by the time a path is compared.
+            "/%2e%2e/secret",
+            "/%2E%2E/secret",
+            "/a/%2e%2e/%2e%2e/secret",
+            // A backslash separates on Windows, so it must not be a way past a check
+            // that only knows about `/`.
+            "/..\\secret",
+            "\\..\\secret",
+            // A drive prefix is not a path under the root on any platform.
+            "/C:/Windows/win.ini",
+        ] {
+            assert_eq!(route(path, &routing), Route::NotFound, "{path}");
+        }
+
+        // An ordinary path still routes, and a `..` that is part of a file name rather
+        // than a whole segment is not a traversal.
+        for path in ["/about", "/index.php", "/a..b/c.php"] {
+            assert!(
+                matches!(route(path, &routing), Route::Script { .. }),
+                "{path} must still route"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_traversal_predicate_agrees_with_what_the_static_layer_refuses() {
+        // One predicate, two call sites, so neither layer can start accepting what the
+        // other rejects.
+        assert!(climbs_out("/../x"));
+        assert!(climbs_out("/a/../b"));
+        assert!(climbs_out(".."));
+        assert!(climbs_out("C:/Windows"));
+        assert!(climbs_out("/a\\..\\b"));
+
+        assert!(!climbs_out("/a/b"));
+        assert!(!climbs_out("/a..b/c"));
+        assert!(!climbs_out("/.../x"));
+        assert!(!climbs_out("/a/b.."));
+        assert!(!climbs_out("/"));
+        assert!(!climbs_out(""));
     }
 
     #[test]

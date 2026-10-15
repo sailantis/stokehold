@@ -120,6 +120,18 @@ impl Certs {
     pub fn named(&self) -> usize {
         self.hosts.len()
     }
+
+    /// Every named entry, as host-and-certificate pairs.
+    ///
+    /// For a caller building the *next* table from this one — an ACME installation, which adds a
+    /// name and must not drop the rest. Sorted by host, and exact names before wildcards, because
+    /// [`HostMap::iter`] guarantees it.
+    pub fn entries(&self) -> Vec<(String, LoadedCert)> {
+        self.hosts
+            .iter()
+            .map(|(host, cert)| (host.clone(), Arc::clone(cert)))
+            .collect()
+    }
 }
 
 /// Resolve a certificate for a name the client claimed in the handshake.
@@ -281,6 +293,38 @@ impl SniResolver {
         }
     }
 
+    /// Build a resolver around a table another resolver already holds.
+    ///
+    /// The ACME case, and the reason it exists rather than a `clone`: the challenge source has to
+    /// be composed in at construction, while the certificate table is what a reload and an issuance
+    /// replace. Rebuilding the resolver around the *same* table means there is one table and two
+    /// names for it — the composed resolver answers handshakes and the original handle installs
+    /// certificates — rather than two tables that would drift apart on the next issuance.
+    ///
+    /// So: one `Swappable` behind two `SniResolver`s, which is safe because the field is an `Arc`
+    /// and everything about it is a pointer swap.
+    pub fn from_shared(table: Arc<Swappable<Certs>>, config_dir: &Path) -> Self {
+        SniResolver {
+            config_dir: config_dir.to_path_buf(),
+            state: table,
+            acme: None,
+        }
+    }
+
+    /// The table this resolver reads and replaces, for a caller building another resolver over it.
+    pub fn table(&self) -> Arc<Swappable<Certs>> {
+        Arc::clone(&self.state)
+    }
+
+    /// Where relative `certificate`/`key` paths resolve for this resolver.
+    ///
+    /// Exposed for the same reason as [`SniResolver::table`]: a caller composing a second resolver
+    /// over the same table has to give it the same directory, and reading this one's answer is what
+    /// keeps the two from being told different things.
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
     /// Compose an ACME challenge source into this resolver, keeping the site table's rule.
     ///
     /// **This is the whole reason the composition is ours.** `rustls-acme`'s
@@ -334,6 +378,41 @@ impl SniResolver {
     /// filesystem at the moment it matters.
     pub fn replace(&self, state: Certs) -> Arc<Certs> {
         self.state.replace(state)
+    }
+
+    /// Install one issued certificate, so the **next handshake** presents it.
+    ///
+    /// The ACME path, and the whole reason this resolver is replaceable at all. What it does is
+    /// narrow on purpose: the issued pair becomes the certificate for the names it covers *and*
+    /// the fallback, while every other entry in the table is left exactly as it was.
+    ///
+    /// That last part is the correctness rather than an optimisation. A deployment can serve
+    /// several sites from several certificates — a per-site table, or a mix of issued and named
+    /// pairs — and a renewal of one name must not take away the others. So this is a *partial*
+    /// update where [`refresh`](SniResolver::refresh) is whole-or-nothing: refresh rebuilds from a
+    /// configuration, and this adds what a CA just issued to what is already serving.
+    ///
+    /// Returns the table that was replaced, so a caller can report what changed.
+    pub fn install_issued(
+        &self,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        domains: &[String],
+    ) -> Result<Arc<Certs>, TlsError> {
+        let certified = load_from_pem(cert_pem, key_pem, "acme")?;
+        let previous = self.state.load();
+
+        // Rebuilt rather than mutated: rustls may be resolving against the current table on
+        // another thread, so an edit in place would be visible mid-lookup. Same rule as `Certs`
+        // itself follows.
+        let mut next = Certs::new(Arc::clone(&certified), std::iter::empty());
+        for (host, cert) in previous.entries() {
+            next = next.with_host(&host, Arc::clone(&cert));
+        }
+        for domain in domains {
+            next = next.with_host(domain, Arc::clone(&certified));
+        }
+        Ok(self.state.replace(next))
     }
 
     /// The certificate table being served right now.
@@ -472,6 +551,63 @@ pub fn load_certified(
 
     // The provider is installed by `install_crypto_provider` above, which is what makes the
     // order of loading and configuring irrelevant.
+    let provider =
+        rustls::crypto::CryptoProvider::get_default().ok_or(TlsError::NoCryptoProvider)?;
+    CertifiedKey::from_der(chain, key, provider.as_ref())
+        .map(Arc::new)
+        .map_err(|source| TlsError::KeyDoesNotMatch {
+            where_: where_.to_string(),
+            source,
+        })
+}
+
+/// Load a certificate chain and private key from PEM text already in memory.
+///
+/// The path ACME takes, and the reason it is a separate function rather than a variant of
+/// [`load_certified`]: an issued certificate's bytes never went through a file this process wrote,
+/// so requiring a path would mean writing a PEM and reading it back — a second, slower loop that
+/// can fail *after* the first already succeeded. `rustls-acme` hands over PEM, so PEM is what this
+/// takes.
+///
+/// Paired through exactly the same `CertifiedKey::from_der` call as the file path, deliberately:
+/// a certificate loaded from memory and one loaded from disk must produce the same value, and two
+/// construction sites is how they would come to differ.
+pub fn load_from_pem(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    where_: &str,
+) -> Result<LoadedCert, TlsError> {
+    install_crypto_provider();
+
+    let chain: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut std::io::BufReader::new(std::io::Cursor::new(cert_pem)))
+            .collect::<Result<_, _>>()
+            .map_err(|source| TlsError::Certificate {
+                where_: where_.to_string(),
+                path: "(in memory)".to_string(),
+                source: ChainError::Pem(source),
+            })?;
+    if chain.is_empty() {
+        return Err(TlsError::Certificate {
+            where_: where_.to_string(),
+            path: "(in memory)".to_string(),
+            source: ChainError::Empty,
+        });
+    }
+
+    let key =
+        rustls_pemfile::private_key(&mut std::io::BufReader::new(std::io::Cursor::new(key_pem)))
+            .map_err(|source| TlsError::Key {
+                where_: where_.to_string(),
+                path: "(in memory)".to_string(),
+                source: KeyError::Pem(source),
+            })?
+            .ok_or(TlsError::Key {
+                where_: where_.to_string(),
+                path: "(in memory)".to_string(),
+                source: KeyError::Empty,
+            })?;
+
     let provider =
         rustls::crypto::CryptoProvider::get_default().ok_or(TlsError::NoCryptoProvider)?;
     CertifiedKey::from_der(chain, key, provider.as_ref())

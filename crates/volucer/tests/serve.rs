@@ -1583,3 +1583,119 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
         ]
     }
 }
+
+/// An ACME-configured server serves its **cached** certificate, with no network.
+///
+/// This is the end-to-end assertion for the engine wiring, and without it the wiring has no test at
+/// all: every other ACME test drives a unit or a stub, so deleting the engine from `serve` would
+/// leave them all green while a deployment with `[server.acme]` issued and served nothing.
+///
+/// It is also the cache's whole purpose from the operator's side: a restart with a valid cached
+/// certificate serves it **immediately and spends no rate limit**. So the certificate is written
+/// through the crate's own `CertCache` trait — the file name is a hash of the names and the
+/// directory URL, so a file written by hand would be one nothing reads — and the assertion is that
+/// the handshake gets the *cached* certificate rather than the fallback the configuration names.
+///
+/// No account, no directory, no network: `install_cached` runs before any port is bound. The
+/// authority is staging, so even a bug that did reach out could not issue a real certificate.
+#[cfg(unix)]
+#[test]
+fn an_acme_configured_server_serves_its_cached_certificate() {
+    use rustls_acme::CertCache;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-acme-serve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let site = root.join("site");
+    std::fs::create_dir_all(&site).expect("create a document root");
+    std::fs::write(site.join("whoami.txt"), "cached").expect("write the marker");
+    let certs = root.join("certs");
+    std::fs::create_dir_all(&certs).expect("create the certificate directory");
+
+    // The **fallback** the configuration names: self-signed, and deliberately not what the handshake
+    // should end up with.
+    let fallback = rcgen::generate_simple_self_signed(vec!["example.test".to_string()])
+        .expect("generate the fallback certificate");
+    std::fs::write(certs.join("fallback.crt"), fallback.cert.pem()).expect("write the cert");
+    std::fs::write(
+        certs.join("fallback.key"),
+        fallback.key_pair.serialize_pem(),
+    )
+    .expect("write the key");
+    let fallback_der = fallback.cert.der().to_vec();
+
+    // The **issued** certificate, in the shape `rustls-acme` stores: a chain plus a key concatenated
+    // into one PEM blob. Written that way on purpose, so this exercises `split_pem_pair` rather than
+    // a convenient one-certificate file.
+    let issued = rcgen::generate_simple_self_signed(vec!["example.test".to_string()])
+        .expect("generate the issued certificate");
+    let issued_blob = format!("{}{}", issued.cert.pem(), issued.key_pair.serialize_pem());
+    let issued_der = issued.cert.der().to_vec();
+    assert_ne!(
+        fallback_der, issued_der,
+        "the fixture must differ, or the assertion below is vacuous"
+    );
+
+    // The directory URL the engine will use, from **the same function `serve` calls** — so this
+    // cannot drift from what the engine looks for without the server and the test disagreeing about
+    // the authority, which is the failure being guarded.
+    let directory = volucer_acme::Authority::Staging.directory();
+    assert!(
+        directory.contains("staging"),
+        "the fixture must use staging, so a bug that reached the network could not issue a real \
+         certificate: {directory}"
+    );
+
+    let cache_dir = root.join("acme-cache");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the cache write");
+    runtime.block_on(async {
+        rustls_acme::caches::DirCache::new(&cache_dir)
+            .store_cert(
+                &["example.test".to_string()],
+                directory,
+                issued_blob.as_bytes(),
+            )
+            .await
+            .expect("the cache is writable");
+    });
+
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {site}\n\n\
+         [server.tls]\ncertificate = \"certs/fallback.crt\"\nkey = \"certs/fallback.key\"\n\n\
+         [server.acme]\ndomains = [\"example.test\"]\ncontact = [\"mailto:ops@example.test\"]\n",
+        site = toml_string(&site.display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the config asks for an http listener");
+
+    let seen = tls_get(&address, "example.test", "/whoami.txt");
+    assert_eq!(
+        seen.body, "cached",
+        "the request must be served from the configured document root"
+    );
+    assert_eq!(
+        seen.certificate, issued_der,
+        "an ACME-configured server must serve the **cached** certificate rather than the fallback \
+         the configuration names — without the engine wired into `serve`, the answer is the \
+         fallback, and every unit test in the tree still passes"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}

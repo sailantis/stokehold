@@ -128,6 +128,21 @@ impl<V> HostMap<V> {
     pub fn len(&self) -> usize {
         self.exact.len() + self.wildcard.len()
     }
+
+    /// Every entry, exact names first then wildcards, each group in key order.
+    ///
+    /// For a caller that has to rebuild this table rather than resolve against it — the TLS
+    /// resolver installing an ACME-issued certificate must keep every *other* name, and a reload
+    /// of one site's certificate must not drop another's. Iteration order is therefore part of the
+    /// contract: `BTreeMap` order, so a table rebuilt from this one and a table rebuilt identically
+    /// agree, and a difference between two of them is attributable to the value rather than to
+    /// where the iteration happened to start.
+    ///
+    /// Exact names before wildcards, matching the rule in the module doc: a reader of a rebuilt
+    /// table sees the precedence in the order it is listed.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &V)> {
+        self.exact.iter().chain(self.wildcard.iter())
+    }
 }
 
 /// A `Host` header without its `:port`, handling a bracketed IPv6 literal.
@@ -190,15 +205,26 @@ mod tests {
         assert_eq!(map.get("a.example.com").map(String::as_str), Some("wide"));
         assert_eq!(map.get("example.com"), None, "a wildcard names a subdomain");
         assert_eq!(map.get("notexample.com"), None, "the dot must be there");
-        assert_eq!(map.get(".example.com"), None, "an empty label is not a label");
+        assert_eq!(
+            map.get(".example.com"),
+            None,
+            "an empty label is not a label"
+        );
     }
 
     #[test]
     fn a_host_matches_without_its_port_and_without_regard_to_case() {
         let map = map(&[("example.com", "exact"), ("*.corp.test", "wild")]);
 
-        assert_eq!(map.get("EXAMPLE.com:8080").map(String::as_str), Some("exact"));
-        assert_eq!(map.get("corp.test:443"), None, "the bare suffix is not the subdomain");
+        assert_eq!(
+            map.get("EXAMPLE.com:8080").map(String::as_str),
+            Some("exact")
+        );
+        assert_eq!(
+            map.get("corp.test:443"),
+            None,
+            "the bare suffix is not the subdomain"
+        );
         assert_eq!(map.get("a.CORP.test:443").map(String::as_str), Some("wild"));
         assert_eq!(map.get("  spaced.test  "), None);
     }
@@ -297,7 +323,9 @@ mod tests {
         // form, so a deeper host is a subdomain of it and does match.
         let table = map(&[("*.wide.example.com", "inner")]);
         assert_eq!(
-            table.get("a.b.c.d.e.f.wide.example.com").map(String::as_str),
+            table
+                .get("a.b.c.d.e.f.wide.example.com")
+                .map(String::as_str),
             Some("inner")
         );
         // A single label has nothing to strip, so nothing is probed.
@@ -305,7 +333,10 @@ mod tests {
 
         // An exact pattern is not a suffix rule: it matches only itself.
         let exact = map(&[("wide.example.com", "inner")]);
-        assert_eq!(exact.get("wide.example.com").map(String::as_str), Some("inner"));
+        assert_eq!(
+            exact.get("wide.example.com").map(String::as_str),
+            Some("inner")
+        );
         assert_eq!(exact.get("a.wide.example.com"), None);
 
         // A trailing dot leaves an empty label, which matches nothing rather than matching

@@ -601,6 +601,10 @@ machine behind a NAT, and it puts DNS API credentials on the web server.
 limits, and a first deployment that reached production by omission would spend them on its own
 mistakes. Staging runs the real protocol and issues certificates no browser trusts.
 
+An issued certificate is cached, and a **restart with a valid cached certificate serves it
+immediately and spends no rate limit** — the cache is a directory beside the configuration file
+(`acme-cache` by default), and the account lives there too.
+
 ```bash
 kill -HUP $(pidof volucer)     # pick up a certificate you replaced by hand
 volucer check --config volucer.toml   # authority, names, cache state, and days left

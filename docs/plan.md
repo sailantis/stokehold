@@ -1838,6 +1838,21 @@ claims turned out to understate.
 65. `acme-verify` — the phase's own verification (§8 of the ACME plan): the 12 `tests/tls.rs` and
     27 `tests/frontend.rs` unchanged as the control for "ACME is additive", offline issuance against
     Pebble, and the certificate served without a restart.
+66. `acme-wire` — **done, and it was not on the plan's step list at all.** The five steps above were
+    each committed and green before anyone noticed that `serve` never built an `Engine`: a complete
+    `[server.acme]` table validated, printed nothing about ACME, bound its ports, served the fallback
+    certification, and never attempted an order. **Hazard 68.** The plan named *parts* rather than the
+    path through them, and no ACME test starts the binary, so nothing could see it.
+
+    Fixed and pinned by `an_acme_configured_server_serves_its_cached_certificate` in
+    `volucer/tests/serve.rs` — the real binary, a real `[server.acme]`, a certificate written through
+    the crate's own `CertCache` trait, and an assertion that the handshake gets the *cached*
+    certificate rather than the fallback. Falsified by making `serve` build no engine: it fails, and
+    every other ACME test stays green.
+
+    The wiring also needed one table behind two names (`SniResolver::from_shared`) and the engine on a
+    thread of its own with a current-thread runtime, because `AcmeState` is not `Sync`. Both are
+    hazards 69 and 70.
 
 ## 7. Testing strategy
 
@@ -2098,6 +2113,7 @@ reading out of a crate description.
 | ACME: config validation | **works** | `an_acme_domain_that_cannot_be_validated_is_refused_with_its_reason` (five cases, each asserting its own reason), `an_acme_contact_must_be_a_mailto_uri`, `a_duplicate_acme_domain_is_refused_with_both_positions`, `acme_without_a_fallback_certificate_is_refused`, `an_unknown_key_under_server_acme_is_refused`. Every one is something a CA would reject *after* an order had started |
 | ACME: additive — off unless configured | **works** | `acme_is_absent_until_the_table_is_written` in `volucer-core`, and the 12 `tests/tls.rs` + 27 `tests/frontend.rs` suites unchanged, which is the control the phase was planned around |
 | ACME: days-to-expiry visibility | **works** | `a_certificates_days_left_are_reported_with_the_warning_they_deserve` and `a_real_certificates_expiry_is_read`, both in `volucer` (the second falsified by making the parser report nothing). `volucer check` prints the authority, names, contact, cache state and days left, because silence is this feature's failure mode |
+| ACME: the engine is actually **wired into `serve`** | **works** | `an_acme_configured_server_serves_its_cached_certificate` — the real binary, a real `[server.acme]`, a certificate written through the crate's own `CertCache` trait, and an assertion that the handshake gets the **cached** certificate rather than the fallback. Falsified by making `serve` build no engine: it fails, and **every other ACME test stays green**, so this is the only coverage of the wiring. Hazard 68: the five steps before it were each committed and green while `serve` never constructed an `Engine` — a deployment with a complete ACME config issued nothing, silently |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
@@ -3663,3 +3679,65 @@ a normal offer is not validating, and a substring check would hand it a validati
 The near-miss is instructive rather than embarrassing: the falsification was *run*, which is the only
 reason it was caught. A plan that had trusted the first green run would have shipped a test that could
 not fail.
+
+### Hazard 68 — the parts were built and the server never used them
+
+`acme-deps`, `acme-branch`, `acme-engine`, `acme-config` and `acme-cli` were all done, committed and
+green — 589 tests on Linux — and **`serve` never constructed an `Engine`**. A deployment with a
+complete `[server.acme]` table validated, printed nothing about ACME, bound its ports, served its
+fallback certificate, and never attempted an order. No test could see it, because every ACME test
+drives a unit or a stub and none of them starts the binary.
+
+This is the phase's own subject matter turned on the phase: the failure mode of ACME is silence, and
+the plan had five steps each of which was individually verifiable without ever asking whether the
+composition existed. A step list that names *parts* rather than *the path through them* will do that.
+
+**The countermeasure is the shape of the test, not more care.** `an_acme_configured_server_serves_its_cached_certificate`
+starts the real binary with a real `[server.acme]`, writes a certificate through the crate's own
+`CertCache` trait (so the hashed file name is the one the engine looks for), and asserts the handshake
+gets the **cached** certificate rather than the fallback the configuration names. Falsified by making
+`serve` build no engine: the test fails, and every other ACME test in the tree stays green — which is
+the evidence that this is the only thing covering the wiring.
+
+There is a second, smaller lesson inside it. The first falsification attempt probed
+`Engine::install_cached` in `serve`, and **passed**, because `Engine::run` installs the cached
+certificate too — on its own thread, a moment later. The probe was too narrow as well as unreachable
+in an earlier form: what needed removing was the *engine*, not one of its two calls. A falsification
+narrows to the claim, and "the wiring exists" is not the same claim as "this one call happens".
+
+### Hazard 69 — an `ArcSwap` behind two names, and why that had to be the design
+
+Wiring the engine meant breaking a genuine cycle: the resolver is composed with the engine's challenge
+source, so the engine must exist first, and the engine needs a resolver to install issued certificates
+into. Three shapes were available, and two of them are wrong in ways worth recording.
+
+**Rebuilding the resolver around a *copy* of the table** was the first attempt, and it does not
+compile — but the reason matters more than the error. A copy would mean the composed resolver and the
+reload handle's resolver each hold their own `Swappable`, so a certificate installed through one would
+not be visible to the other, and an ACME renewal would be *silently* undone by the next site reload.
+That is hazard 66's failure with an extra step.
+
+**Spawning the engine on the HTTP listener's runtime** was the second, and it fails on a type
+requirement that is easy to read past: `AcmeState` holds `Pin<Box<dyn Future + Send>>`, so it is not
+`Sync`, and `Handle::spawn` requires `Send + Sync`. A current-thread runtime of the engine's own has no
+such requirement — one background thread for a task that does a network round trip every few weeks.
+
+What shipped is one `Arc<Swappable<Certs>>` shared by both resolvers through
+`SniResolver::from_shared`, with the sink reaching it through a `OnceLock` set before any port is
+bound. The invariant is stated as a property rather than a convention: **there is one certificate
+table, and two ways of naming it.**
+
+### Hazard 70 — a second `rustls` would compile, and this is what it would look like
+
+Recorded because it is the failure hazard 64's sibling would produce and it is genuinely confusing:
+`rustls-acme` reaches the ACME directory through `async-web-client`, which is built on
+`futures-rustls` — a *different* TLS wrapper from the `tokio-rustls` this server uses. Both re-export
+their own `rustls`, and `is_tls_alpn_challenge` takes the `futures_rustls::rustls::ClientHello` while
+our resolver is handed the `tokio_rustls::rustls::ClientHello`.
+
+Those two are the **same type** only because the lockfile resolves one `rustls 0.23.46` for both. Had
+it resolved two, the composition would not have compiled — with an error naming a trait "not
+implemented for" a type that appears identical to the reader, at a line where both spellings say
+`rustls::server::ClientHello`. `crates/volucer-http/tests/one_rustls.rs` exists to turn that into one
+sentence, and this note is why the test is worth its lines: the confusing error is the *likely*
+outcome of a routine `cargo update`.

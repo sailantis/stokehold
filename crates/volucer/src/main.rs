@@ -319,6 +319,108 @@ impl CertificateLifetime {
     }
 }
 
+/// Install an ACME-issued certificate into the process's serving table.
+///
+/// The engine's sink, and the only bridge from issuance to what a handshake resolves against.
+///
+/// It reaches the **process's one resolver**, not a listener's, for the reason `reload-shared`
+/// already established one layer down: an `:80`/`:443` deployment has two TLS-speaking listeners
+/// sharing one table, so a certificate installed per listener would appear on one port and not the
+/// other — the same one-protocol-only failure, one layer up.
+///
+/// The resolver arrives through a cell rather than as a field because the two are mutually
+/// dependent and only one order can be written: the resolver is composed with the engine's
+/// challenge source, so the engine has to exist first, and the engine needs somewhere to install
+/// what it issues. A cell breaks the cycle without a lock on any path that matters — nothing writes
+/// it after startup, and the only read is on an issuance, which happens seconds or weeks later.
+struct ResolverSink {
+    resolver: Arc<std::sync::OnceLock<Arc<volucer_http::SniResolver>>>,
+}
+
+impl volucer_acme::CertificateSink for ResolverSink {
+    fn install(&self, pem: &[u8], domains: &[String]) -> Result<(), volucer_acme::AcmeError> {
+        let Some(resolver) = self.resolver.get() else {
+            // Only reachable if an issuance completed between the engine starting and the
+            // resolver being installed, which `serve` does not allow — but a missing resolver is a
+            // certificate installed nowhere, and that is the failure this whole path exists to
+            // prevent, so it is an error rather than a silent success.
+            tracing::error!(
+                "an issued certificate arrived before the serving resolver was installed"
+            );
+            return Err(volucer_acme::AcmeError::State);
+        };
+
+        // `rustls-acme` hands over the certificate and key as *one* PEM blob — the shape its cache
+        // stores — so the split is by PEM label rather than by position: a chain may have any
+        // number of certificates followed by exactly one key, and "first is the cert, second is
+        // the key" would break the moment a chain had an intermediate.
+        let (cert_pem, key_pem) = split_pem_pair(pem);
+        match resolver.install_issued(cert_pem, key_pem, domains) {
+            Ok(replaced) => {
+                tracing::info!(
+                    domains = ?domains,
+                    named_before = replaced.named(),
+                    "the issued certificate is now being served"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                tracing::error!(%err, "an issued certificate could not be installed");
+                Err(volucer_acme::AcmeError::State)
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ResolverSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolverSink")
+            .field("installed", &self.resolver.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Split one PEM blob into its certificate chain and its private key.
+///
+/// By PEM *label* rather than by position, because that is what the two actually are and a chain is
+/// not a fixed length: the blob is the chain (leaf, then any intermediates) followed by the key, so
+/// a reader that took "the second block" would hand an intermediate over as the key.
+///
+/// A blob with no key yields an empty key half rather than a guess: it cannot be installed either
+/// way, and the loader names the reason (`KeyError::Empty`) instead of a parser failing on an
+/// intermediate.
+fn split_pem_pair(pem: &[u8]) -> (&[u8], &[u8]) {
+    const KEY_MARKERS: [&str; 4] = [
+        "-----BEGIN PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+    ];
+
+    match KEY_MARKERS
+        .iter()
+        .filter_map(|marker| find_bytes(pem, marker.as_bytes()))
+        .min()
+    {
+        Some(at) => (&pem[..at], &pem[at..]),
+        // No key marker: the whole blob is the chain, and the key half is empty so the loader
+        // reports a missing key rather than the chain being silently truncated.
+        None => (pem, &[]),
+    }
+}
+
+/// The offset of `needle` in `haystack`, or `None`.
+///
+/// `windows` rather than a dependency: this runs once per issuance, on a few kilobytes.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 /// Run the configured listeners until interrupted.
 ///
 /// Both front-ends share one dispatcher, so a request gets the same backend
@@ -531,6 +633,98 @@ fn serve(
         false => None,
     };
 
+    // The ACME engine, when configured. Built *before* the listeners bind, because a challenge
+    // handshake can arrive as soon as a port is open, so the challenge source has to be composed
+    // into the resolver already.
+    //
+    // The resolver arrives through a cell: the resolver is composed with the engine's challenge
+    // source, so the engine must exist first, and the engine needs somewhere to install what it
+    // issues. See [`ResolverSink`].
+    let (tls_state, acme) = match (&config.server.acme, tls_state) {
+        (Some(acme), Some(resolver)) => {
+            let cache = match acme.cache.is_absolute() {
+                true => acme.cache.clone(),
+                false => config_dir.join(&acme.cache),
+            };
+            let cell = Arc::new(std::sync::OnceLock::new());
+            let engine = volucer_acme::Engine::new(
+                acme.domains.clone(),
+                match acme.authority {
+                    volucer_core::config::Authority::Staging => volucer_acme::Authority::Staging,
+                    volucer_core::config::Authority::Production => {
+                        volucer_acme::Authority::Production
+                    }
+                },
+                cache,
+                Arc::new(ResolverSink {
+                    resolver: Arc::clone(&cell),
+                }),
+            )
+            .map_err(|err| ServerError::Listener {
+                reason: err.to_string(),
+            })?;
+
+            // The challenge source is composed in **before** any port is bound, and only for a
+            // challenge handshake — `SniResolver::resolve` consults it behind an exact `acme-tls/1`
+            // ALPN match, so a normal handshake is answered by the site table exactly as it was.
+            //
+            // The resolver object is rebuilt rather than mutated, because the ACME field is set at
+            // construction and the table behind it is what moves. The *table* is shared into the
+            // new resolver, so an installation through the cell and a reload through the old handle
+            // both reach the same place.
+            let composed = Arc::new(
+                volucer_http::SniResolver::from_shared(resolver.table(), resolver.config_dir())
+                    .with_acme(Arc::new(engine.challenge_source())),
+            );
+            if cell.set(Arc::clone(&composed)).is_err() {
+                return Err(ServerError::Listener {
+                    reason: "the ACME sink could not be wired to the serving resolver".to_string(),
+                });
+            }
+
+            println!("  acme:             {}", acme.domains.join(", "));
+            println!("    authority:      {}", acme.authority.as_str());
+            if acme.contact.is_empty() {
+                tracing::warn!(
+                    "no server.acme.contact is set, so the CA has no way to warn this deployment \
+                     that renewals are failing; `volucer check` reports the days left instead"
+                );
+            }
+            (Some(composed), Some(engine))
+        }
+        (Some(_), None) => {
+            // Validation refuses this, so reaching it means the two rules have come apart.
+            return Err(ServerError::Listener {
+                reason: "[server.acme] needs [server.tls]: ACME replaces the certificate being \
+                         served, so name a fallback pair"
+                    .to_string(),
+            });
+        }
+        (None, other) => (other, None),
+    };
+
+    // The cached certificate is installed before anything is bound, so a restart serves it from the
+    // first handshake rather than from whenever the state's own first poll completes. Blocking here
+    // is deliberate: it is one file read, and a listener that accepted a handshake before it
+    // finished would be presenting the fallback certificate to a client that should have had the
+    // issued one.
+    // The cached certificate is installed before anything is bound, so a restart serves it from the
+    // first handshake rather than from whenever the state's own first poll completes. Blocking here
+    // is deliberate: it is one file read, and a listener that accepted a handshake before it
+    // finished would be presenting the fallback certificate to a client that should have had the
+    // issued one.
+    //
+    // `run` installs it too, and the two are not redundant: a renewal has to reach the table months
+    // after startup, and that is the event path. This one is what makes the *window before the first
+    // poll* serve the issued certificate — the engine's own `load_cert` step is asynchronous, and
+    // `serve` does not wait for it.
+    if let Some(engine) = &acme {
+        let installed = futures::executor::block_on(engine.install_cached());
+        if installed {
+            tracing::info!("the cached certificate is serving before any port was bound");
+        }
+    }
+
     // The handles one listener needs: the shared table, the one registry, and TLS when it speaks
     // it. Built per listener because the resolver is `Some` for a TLS listener and `None` for a
     // plaintext one, which is what keeps a plaintext listener from carrying TLS state at all.
@@ -606,6 +800,39 @@ fn serve(
     };
 
     println!("press Ctrl-C to stop");
+
+    // The engine runs on a thread of its own with a **current-thread** runtime, and that is not a
+    // preference: `AcmeState` holds `Pin<Box<dyn Future + Send>>` fields, so it is not `Sync` and
+    // its `run` future cannot be spawned onto the multi-threaded runtime the HTTP listener owns.
+    // A current-thread runtime has no such requirement, and one thread for a background task that
+    // does a network round trip every few weeks is not a cost worth designing around.
+    //
+    // The task is *not* joined at shutdown, deliberately: an interrupted order is retried on the
+    // next start and the cache is written per file, so there is nothing to flush, and waiting for a
+    // network round trip on Ctrl-C would make a stop take as long as an ACME request.
+    if let Some(engine) = acme {
+        std::thread::Builder::new()
+            .name("acme".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        tracing::error!(
+                            %err,
+                            "no runtime for ACME issuance; certificates will not be renewed"
+                        );
+                        return;
+                    }
+                };
+                runtime.block_on(engine.run());
+            })
+            .map_err(|err| ServerError::Listener {
+                reason: format!("the ACME task could not be started: {err}"),
+            })?;
+    }
 
     install_shutdown_handler(
         fastcgi.as_ref().map(|l| l.shutdown_handle()),

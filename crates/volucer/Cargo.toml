@@ -17,8 +17,12 @@ volucer-core.workspace = true
 volucer-fcgi.workspace = true
 volucer-http.workspace = true
 volucer-server.workspace = true
+# The ACME engine, so a configured `[server.acme]` actually issues rather than merely validating.
+volucer-acme.workspace = true
 clap.workspace = true
+futures.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 x509-parser.workspace = true
@@ -45,6 +49,12 @@ ctrlc = "3"
 # Certificates are generated per test run rather than committed: a committed key is a key that
 # ends up in someone's deployment.
 rcgen = "0.13"
+
+# For `an_acme_configured_server_serves_its_cached_certificate`: writing a cached certificate
+# through the crate's own `CertCache` trait, so the file name (a hash of the names and the
+# directory URL) is the one the engine will look for. A test that wrote the file by hand would pass
+# against a name nothing reads. Already in the graph via `volucer-acme`.
+rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-rs", "webpki-roots"] }
 
 # A TLS *client*, so `one_sighup_reloads_a_certificate_and_a_site_together` can assert which
 # certificate a handshake was presented with. The server's own `rustls` is a dependency of

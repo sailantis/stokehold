@@ -1699,21 +1699,51 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     Both front-ends now take a `SharedState` at bind time, `serve` builds exactly one, and the
     FastCGI listener resolves *per request* rather than per connection so nginx's keep-alive does
     not pin a connection to the configuration it was accepted under.
-57. `reload-sighup` — wire `SIGHUP` to read and apply the config, whole-or-nothing: `Config::validate`
-    already returns `Result`, so a bad file is a logged refusal with the previous config still
-    serving. **There is no `SIGHUP` on Windows**, so the watcher needs a `#[cfg]` split, and
-    `main.rs` already owns a `ctrlc` handler with the `termination` feature that covers `SIGTERM`.
+57. `reload-sighup` — **done** (`reload: SIGHUP reloads, and it used to stop the server`), and it
+    was a **live defect rather than a gap**, which reading `ctrlc`'s source is what exposed. The
+    plan said "there is no `SIGHUP` on Windows, so the watcher needs a `#[cfg]` split, and `main.rs`
+    already owns a `ctrlc` handler with the `termination` feature that covers `SIGTERM`" — true as
+    far as it goes, and it omits the part that mattered: **that feature registers `SIGHUP` too, and
+    runs the same shutdown callback for it.** So `kill -HUP volucer` — the conventional reload on
+    every Unix server — stopped the process. Reproduced against the previous binary before writing
+    any fix: the process was gone and the log read "shutting down". `ctrlc`'s public API cannot say
+    *which* signal arrived, so no handler written against it could distinguish a reload from a
+    shutdown; signals are therefore handled per signal by `signal-hook` on Unix (the iterator yields
+    the signal number), and `ctrlc` stays for Windows, where it is now a dependency without the
+    `termination` feature. Hazard 60.
+
     **Open decision 9.1 is answered: (a), re-read the file as-is** — what an operator expects from
-    SIGHUP, and no new concept.
-58. `reload-cli` — what a reload prints: what changed, and the **restart-only list** named
-    explicitly rather than discovered. That is the lesson of the TLS story — a setting the
-    implementation cannot honour has to be *stated*, or the operator finds out from behaviour.
-    Today's list: listener addresses, backend commands and worker counts, `static_files` on/off,
-    and `[server.tls]`'s `min_version`/`alpn` (they are baked into the `rustls::ServerConfig` the
-    acceptor holds).
-59. `reload-tests` — swap under concurrent requests; a failed reload leaves the previous config
-    serving; the restart-only list is reported; and **the hot-path cost is measured** rather than
-    argued. **The measurement is done** (the rest of this step is not): an interleaved A/B of two
+    SIGHUP, and no new concept. The reload replays the *command line* too (`--document-root`,
+    `--front-controller`): a deployment started with `--document-root` on a site-less config takes
+    its root from the flag, and a reload that dropped it would move the root to `.` — a working
+    server that starts answering 404s, with the change attributed to whatever the operator edited.
+
+    The trigger also forced the reload path to be one place. `Reloaded` and the site table's derived
+    maps moved from `volucer-http` into `volucer-watch`, and a new `Registry` owns the shared table
+    *and* every front-end's snapshot-holder, so `serve` and a signal handler apply the same call.
+    Before this, only a listener could apply a reload — which is why the trigger could not be
+    written at all without either duplicating the rebuild or reaching the table through one
+    listener.
+
+    Verified on Linux (WSL), because the mechanism is a signal and no Windows test can exercise it:
+    `sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing` drives a **real
+    process**. Falsified twice — stub `reload` to return immediately and the reload assertion fails;
+    ignore the validation `Result` and the *refusal* assertion fails, which is the half that had to
+    be reworked (hazard 61).
+58. `reload-cli` — **done**, folded into step 57 rather than left separate, because the list is what
+    the signal handler prints and splitting them would have meant writing the handler twice. The
+    **restart-only list** is named on every reload rather than discovered — the lesson of the TLS
+    story, that a setting the implementation cannot honour has to be *stated* or the operator finds
+    out from behaviour. `restart_only()` returns the lines, so the text is also what a test can
+    assert on.
+
+    **Two entries in the plan's list were wrong, in the code's favour.** `static_files` on/off and
+    `routes` were both listed as restart-only, and neither is: `[server.statics]` is read per request
+    out of the swapped table, and a site's `routes` travel *inside* `Sites` and are read per request
+    (`dispatch_with_routes(&site.routes, …)`). The published list is now listener addresses,
+    backends and their commands/worker counts, and `[server.tls]` `min_version`/`alpn` — which is
+    what a reader of the code would find, and what the README says.
+59. `reload-tests` — **partly done.** The **measurement** is done: an interleaved A/B of two
     release binaries, `68bfdcc` against the reload work, both with no `[server.tls]` and both
     serving a static file — so the site resolution and routing lookup the snapshot feeds are on the
     measured path — reads **−0.09%, 95% CI [−1.43%, +1.27%], n = 20**, with an A-vs-A control at
@@ -1732,6 +1762,10 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     Unlike the TLS-off comparison this window **is** an isolation: `git merge-base --is-ancestor
     68bfdcc HEAD` succeeds and the range holds only the two reload commits, so no refactor rides
     along — which is hazard 56's lesson applied *before* the measurement rather than after it.
+
+    **Still open:** swap under *concurrent* requests (the existing in-flight test is sequential), and
+    a reload that changes a certificate *and* a site in one signal. The restart-only report is done —
+    it is asserted by the reload test's log, not by a test of its own.
 
 ## 7. Testing strategy
 
@@ -1771,26 +1805,37 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
    boundary is a property of the type rather than a comment a later change can contradict.
    The tiers:
    - **Tier 1 — reloadable.** `[server.tls]` and `[sites.*.tls]` certificate/key, `[sites.*]`
-     `hosts`, `document_root`/`front_controller`, `[server.statics]`, `redirect_to_https`,
-     `https_port`. Steps 53–55.
-   - **Tier 2 — restart-only, and therefore *reported* by `volucer serve` and by a reload:**
-     listener addresses, backend commands and worker counts, `static_files` on/off, and TLS
-     `min_version`/`alpn`. Step 57.
-   - **Tier 3 — deliberately out: `routes`.** `sites` and `statics` are reloadable; the route
-     table is not. `Routing` is what every request already reads and the dispatcher derives one
-     per site at startup, so making routes reloadable means rebuilding the structure the request
-     path depends on — for a feature nobody has asked for. The dispatcher's own comment says
-     *"One routing, derived once"*.
-   **Still open: what `SIGHUP` reads.** (a) the file as-is, or (b) only a config the operator has
+     `hosts`, `document_root`/`front_controller`/`serve_only`/`default_backend`/`routes`, and
+     `[server.statics]` (including on/off), `redirect_to_https`, `https_port`. Steps 53–55 and 57.
+   - **Tier 2 — restart-only, and therefore *reported* by every reload:** listener addresses,
+     backends and their commands/worker counts, and TLS `min_version`/`alpn`.
+   - **Tier 3 — was named as out, and turned out not to be: `routes`.** The original entry read
+     *"`sites` and `statics` are reloadable; the route table is not"*, and **that was wrong about
+     the code**: a site's routes travel inside `Sites`, and dispatch reads them per request out of
+     the swapped table (`dispatch_with_routes(&site.routes, …)`), so they were already reloadable
+     in `a937f43`. `static_files` on/off was wrong for the same reason — `[server.statics]` is
+     resolved into each `ResolvedSite` and read per request. Both entries are corrected in the
+     published list, which is drawn from the code rather than from this plan; there is no remaining
+     third tier.
+   **Settled: what `SIGHUP` reads.** (a) the file as-is, or (b) only a config the operator has
    already validated and marked. (a) is what an operator expects from a Unix server and needs no
    new concept, but it means a *staged* edit is applied by a signal sent for something else, and a
    mistyped file mid-incident turns a reload into a refusal — safe, since nothing is applied, but
-   noisy. (b) is more machinery and no staging surprise. **Answered: (a).**
+   noisy. (b) is more machinery and no staging surprise. **Answered: (a).** Step 57 also replays
+   the command line's `--document-root`/`--front-controller`, because they are part of what the
+   configuration means rather than an override of it.
 
    **And the tiers are only as good as their reach** — hazard 59. The table used to be held
    per listener, so `[sites.*]` reloaded over HTTP and not behind nginx. "Does this reload
    everything it claims to" is a question about reach, and reach is not visible from inside one
    front-end, which is why the state is now a type both listeners must be handed.
+
+   **A trigger is not a reload.** `SIGHUP` arrives as a signal number or it does not arrive at all,
+   and a dependency that "handles signals" has handled them with *some* behaviour — hazard 60,
+   where `ctrlc`'s `termination` feature had registered `SIGHUP` and wired it to shutdown, so the
+   conventional reload signal stopped the server. Worth recording beside the tiers for the same
+   reason the tiers exist: what a setting does is a fact about the implementation, and it is not
+   in the plan.
 6. **Swap mechanism — answered: `arc-swap`.** It is a new dependency and the only crate this phase
    adds. The read is the request path and `RwLock` still has every reader touch an atomic counter
    and block a writer; `ArcSwap` is a pointer load that no writer ever blocks. The alternative was
@@ -1968,8 +2013,9 @@ reading out of a crate description.
 | reload: whole-or-nothing | **works** | `a_certificate_reload_that_cannot_load_applies_neither_half` — a set with one unreadable pair installs **neither** half, proven by naming a *valid* pair alongside the bad one so a partial install would be visible |
 | reload: a plaintext listener carries no TLS state | **works** | `a_plaintext_listener_has_no_resolver_and_still_reloads_sites` — `resolver()` is `None`, so there is nothing to load and no branch to take, and site reloading still works there |
 | reload: **both** front-ends, not just HTTP | **works** | `a_reload_moves_the_fastcgi_front_ends_site_table_too` — the real socket, and **both requests on one connection** because nginx keeps its upstream alive. Falsified by moving the snapshot from per request to per connection, which fails with the old pool named in the 502. Hazard 59: the table used to be per listener, so a reload took effect on `:80` and not behind the proxy |
+| reload: **one** apply path for the process | **works** | `volucer_watch::Registry` owns the shared table *and* every front-end's snapshot-holder, so `serve`'s own signal handler and `ReloadHandle::apply` are the same call. Before it, only a listener could apply a reload — which is why the trigger could not be written without duplicating the rebuild or reaching the table through one listener |
 | reload: what it costs when nothing reloads | **not measurable here** | interleaved A/B of two release binaries, `68bfdcc` against the reload work, no `[server.tls]`, static files on: **−0.09%, 95% CI [−1.43%, +1.27%], n = 20**, against an A-vs-A control at +0.34%, 95% CI [−0.91%, +1.61%]. The *first* ten-round run read +1.75% **excluding zero** while its control read −1.44%, which is why the verdict is drawn from the interval and the control rather than the point estimate. Rows in `volucer-competition/results/reload-cost-ab-20.tsv` |
-| reload: the **trigger** (`SIGHUP`) | **does not exist** | steps 57–59. `apply`/`replace`/`refresh` are the mechanism; nothing watches for a signal yet |
+| reload: the **trigger** (`SIGHUP`) | **works, Unix only** | `sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing` — a **real process**, signalled. Reloads a changed document root on the same listener, and leaves the previous configuration serving for a file that does not parse *and* for one that does not validate. Windows has no `SIGHUP`, so it is skipped there with a reason. Hazard 60: `ctrlc`'s `termination` feature had registered SIGHUP and run the **shutdown** callback for it, so `kill -HUP` stopped the server |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
@@ -3321,3 +3367,63 @@ document root. One line, and it is the same off-by-one-generation `resolve` was 
 reach is not visible from inside one front-end. The place to ask it is where the state is
 constructed — which is why the answer here is a type both listeners must be handed rather than a
 convention both are expected to follow.
+
+### Hazard 60 — `SIGHUP` was a *stop* signal, and the plan said it was a `#[cfg]`
+
+Step 57's plan text read: *"There is no `SIGHUP` on Windows, so the watcher needs a `#[cfg]` split,
+and `main.rs` already owns a `ctrlc` handler with the `termination` feature that covers `SIGTERM`."*
+Every clause is true. The sentence is still wrong, because of what it leaves out: **that feature
+registers `SIGHUP` as well**, and routes it to the same shutdown callback.
+
+So `kill -HUP volucer` — *the* conventional reload on a Unix server — did not fail to reload, and did
+not do nothing. It stopped the server. Reproduced against the previous binary before any code was
+written:
+
+    --- before ---   http=200
+    RESULT: process is DEAD after SIGHUP
+    shutting down; signal again to force
+
+**It was found by reading the dependency, not by testing.** The plan's own note pointed at `ctrlc`;
+following it into `ctrlc-3.5.2/src/platform/unix/mod.rs` showed `sigaction(SIGHUP, …)` inside
+`#[cfg(feature = "termination")]`, using the same handler as `SIGINT` and `SIGTERM`. Nothing in the
+repository would have failed: no test sends a signal, and `serve`'s own doc comment about `termination`
+explains the `SIGTERM` half correctly. A plan that names a crate as a *convenience* has to be read as
+a claim about what that crate does.
+
+**Why no handler could be written against it.** `ctrlc`'s public API is `set_handler` and
+`try_set_handler`, both taking a `FnMut()` — no signal number. One handler runs for every registered
+signal, so "reload on SIGHUP, stop on SIGTERM" was not expressible at all. The fix is per-signal
+handling on Unix (`signal-hook`'s iterator yields the number), with `ctrlc` kept for Windows and its
+`termination` feature dropped — which also removes the *only* thing that had made SIGHUP a stop.
+
+**The generalisation:** a dependency that "covers" a signal has covered it *with some behaviour*, and
+which behaviour is the whole question. The cheap check is to read the platform module, and the cheap
+verification is to send the signal to the real binary — `kill -HUP` took one line and would have
+settled it before the plan was written.
+
+### Hazard 61 — again, a refusal test that passed against a refusal that did not happen
+
+Hazard 57, one layer over, in the same phase. The new test asserts that a configuration the server
+*refuses* leaves the previous one serving. Written the obvious way, both bad files named the document
+root that was **already serving**:
+
+```rust
+std::fs::write(&config_path, "this is not toml [[[\n")            // no root at all
+std::fs::write(&config_path, format!("default_backend = \"nope\"\n\n{}", config_for(&first)))
+                                                                  // the root already in effect
+```
+
+An assertion that the answer is still `"first"` passes against code that refused the file *and*
+against code that applied it, because applying it produces the same answer. So the test could not
+have failed — and stubbing the validation `Result` to be ignored did not make it fail, which is how
+this was caught rather than reasoned about.
+
+**The fix is the same as hazard 57's, and so is the rule:** where the claim is *nothing was applied*,
+the input must contain something that **would have been** applied. Both bad files now name the
+*other* document root, so a reader that took the table despite the error is visible in the answer. The
+falsification then fails as it should — `left: "second", right: "first"` — which is the evidence that
+the assertion is now load-bearing.
+
+The malformed file is a **duplicate `document_root` key** rather than a syntactic mess, and that is
+deliberate: it fails at parse, and it still *contains* a root a partial reader would have taken. A
+file with no root in it at all would leave the assertion vacuous for a second reason.

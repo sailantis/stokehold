@@ -9,4 +9,5 @@ repository.workspace = true
 
 [dependencies]
 volucer-core.workspace = true
+volucer-fcgi.workspace = true
 arc-swap.workspace = true

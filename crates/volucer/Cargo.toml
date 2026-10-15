@@ -18,7 +18,24 @@ volucer-fcgi.workspace = true
 volucer-http.workspace = true
 volucer-server.workspace = true
 clap.workspace = true
-ctrlc = { version = "3", features = ["termination"] }
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Signals are split by platform because the *mechanism* is, not the behaviour.
+#
+# On Unix, `signal-hook` is used rather than `ctrlc` even though `ctrlc` is already here for
+# Windows. `ctrlc`'s one handler is invoked for every signal it registered, and its public API
+# cannot say *which* one arrived — so a handler that had to tell a reload from a shutdown had no
+# way to do it. Worse, its `termination` feature registers `SIGHUP` and runs the shutdown
+# callback for it, so `kill -HUP` — the conventional reload on every Unix server — stopped the
+# server instead. `signal-hook`'s iterator yields the signal number, which is what makes
+# "SIGHUP reloads, SIGTERM stops" expressible at all.
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
+# Windows has no `SIGHUP`. `ctrlc` covers `CTRL_C_EVENT`, `CTRL_BREAK_EVENT` and the
+# `CTRL_CLOSE_EVENT` a console window sends on close, and its default feature set is enough:
+# the `termination` feature is what adds `SIGHUP`, which does not exist here.
+[target.'cfg(windows)'.dependencies]
+ctrlc = "3"

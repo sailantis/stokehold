@@ -1170,3 +1170,152 @@ default_backend = "cgi"
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Send a signal to a running server, on a platform that has that signal.
+///
+/// `None` on Windows, where the test is skipped with a reason rather than failing: there is no
+/// `SIGHUP` and no equivalent, so "reload by signal" is not something a Windows build can be
+/// asked to do. The skip is *stated* for the same reason the restart-only list is — a capability
+/// that is absent should say so rather than look untested.
+#[cfg(unix)]
+fn signal(child: &Child, signal: i32) -> Option<()> {
+    // `child.id()` is a `u32` in Rust but a `pid_t` (`i32`) to the kernel, and a pid above
+    // `i32::MAX` is not a thing Linux produces.
+    let pid = i32::try_from(child.id()).ok()?;
+    let rc = unsafe { libc_kill(pid, signal) };
+    (rc == 0).then_some(())
+}
+
+#[cfg(unix)]
+extern "C" {
+    /// `kill(2)`, declared here rather than reaching through another crate's re-export of `libc`.
+    /// `libc` is in the dependency graph transitively but is not a direct dependency of this crate,
+    /// and a test that borrowed another crate's re-export would break when that crate changed.
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, signal: i32) -> i32;
+}
+
+/// `SIGHUP` reloads a running server, and a file it cannot apply changes nothing.
+///
+/// The deliverable of this phase, asserted the only way that means anything: against a **real
+/// process**, because the mechanism is a signal and a signal is not observable from a unit test of
+/// the code that handles it.
+///
+/// Both halves are here together on purpose. A reload that works is easy; the claim that matters is
+/// that a *refused* reload leaves the previous configuration serving, and the two are one mechanism
+/// seen from either side — the second is what makes the first safe to send to a live server.
+///
+/// Falsified before being trusted: against the binary from before this change, the `alive` half of
+/// this test failed with the process **gone**, because `ctrlc`'s `termination` feature registered
+/// `SIGHUP` and ran its shutdown callback for it.
+#[cfg(unix)]
+#[test]
+fn sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing() {
+    const SIGHUP: i32 = 1;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let first = root.join("first");
+    let second = root.join("second");
+    for dir in [&first, &second] {
+        std::fs::create_dir_all(dir).expect("create a document root");
+    }
+    std::fs::write(first.join("whoami.txt"), "first").expect("write the marker");
+    std::fs::write(second.join("whoami.txt"), "second").expect("write the marker");
+
+    let config_path = root.join("volucer.toml");
+    let config_for = |root: &Path| {
+        let document_root = toml_string(&root.display().to_string());
+        format!(
+            "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
+             [server.static_files]\nenabled = true\n"
+        )
+    };
+    std::fs::write(&config_path, config_for(&first)).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the config asks for an http listener");
+
+    assert_eq!(
+        http_get(&address, "/whoami.txt").text(),
+        "first",
+        "the first request must be served from the starting root"
+    );
+
+    // A file that cannot be applied. The server is signalled anyway, and the answer must not move:
+    // this is the half that makes a reload safe to send to a live server, because a typo in an
+    // unrelated key would otherwise take the deployment with it.
+    //
+    // **The malformed file names the *other* root on purpose.** A file that named the root already
+    // serving would make this assertion pass against code that applied it anyway, which is the
+    // shape of hazard 57: where the claim is "nothing was applied", the input has to contain
+    // something that would have been applied. A duplicate key fails at parse, and it still carries
+    // a root that a partial reader would have taken.
+    let duplicate_key = format!(
+        "{}document_root = {}\n",
+        config_for(&second),
+        toml_string(&second.display().to_string())
+    );
+    std::fs::write(&config_path, duplicate_key).expect("write a malformed config");
+    let Some(()) = signal(&server.child, SIGHUP) else {
+        eprintln!("skipping: could not signal the server");
+        return;
+    };
+    assert_eq!(
+        http_get(&address, "/whoami.txt").text(),
+        "first",
+        "a configuration that does not parse must leave the previous one serving, including the \
+         root that file asked for"
+    );
+
+    // Parses, and does not validate. A different code path from the first refusal: valid TOML and
+    // a bad configuration is the mistake an operator is more likely to make. This one names the
+    // *other* root too, so applying it despite the invalid key would be visible in the answer.
+    std::fs::write(
+        &config_path,
+        format!("default_backend = \"nope\"\n\n{}", config_for(&second)),
+    )
+    .expect("write an invalid config");
+    signal(&server.child, SIGHUP).expect("the server is still running");
+    assert_eq!(
+        http_get(&address, "/whoami.txt").text(),
+        "first",
+        "a configuration that does not validate must leave the previous one serving, including \
+         the root that file asked for"
+    );
+
+    // And now one that can be applied, changing exactly one thing so the reload is attributable to
+    // the document root rather than to everything about the file.
+    std::fs::write(&config_path, config_for(&second)).expect("write a valid config");
+    signal(&server.child, SIGHUP).expect("the server is still running");
+
+    // Polled rather than slept on: the signal is delivered asynchronously, so a fixed sleep is
+    // either flaky or slow, and the answer *is* the observable.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut answer = String::new();
+    while Instant::now() < deadline {
+        answer = http_get(&address, "/whoami.txt").text();
+        if answer == "second" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        answer, "second",
+        "a reload must change what the next request is served, on the same listener"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -25,7 +25,7 @@ use volucer_fcgi::{
 };
 use volucer_server::listener::{FastCgiListener, Limits};
 use volucer_server::{backend, Dispatcher};
-use volucer_watch::SharedState;
+use volucer_watch::{Registry, SharedState};
 
 mod common;
 use common::{find_php_cgi, free_port_run, serial, write_script};
@@ -442,10 +442,11 @@ backend = "{pool}"
         Dispatcher::from_config(&before, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
 
-    let listener = FastCgiListener::bind_shared(
+    let registry = Arc::new(Registry::new(sites));
+    let listener = FastCgiListener::bind_registered(
         "127.0.0.1:0",
         Arc::clone(&dispatcher),
-        sites,
+        Arc::clone(&registry),
         Limits::default(),
     )
     .expect("bind the fastcgi listener");
@@ -472,7 +473,7 @@ backend = "{pool}"
     // The reload, through the shared handle every front-end holds. The new table's site routes
     // `/probe.php` to the other pool, so a listener that kept a stale clone is visible in the
     // answer rather than only in the table.
-    let _replaced = reload.replace(Sites::from_config(&after, &roots.join("second")));
+    let _replaced = reload.apply(Sites::from_config(&after, &roots.join("second")));
 
     let second = request_on(&mut connection, 2, "any.test", "/probe.php");
     assert!(

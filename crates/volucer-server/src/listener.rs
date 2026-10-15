@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use volucer_core::sites::Sites;
-use volucer_watch::SharedState;
+use volucer_watch::{Registry, SharedState};
 
 use crate::dispatch::Dispatcher;
 use crate::error::{Result, ServerError};
@@ -91,6 +91,12 @@ pub struct FastCgiListener {
     /// reached only one front-end took effect on one protocol, which reads as the other one being
     /// right and is invisible to any test that exercises a single front-end.
     sites: SharedState,
+    /// The process's one registry, so this listener is reachable by a reload.
+    ///
+    /// Held rather than derived from `sites` because a reload has to rebuild the *derived* state of
+    /// every front-end, and this listener has none of its own — it resolves per request. Keeping
+    /// the registry here is what lets `serve` hold one place that a trigger applies through.
+    registry: Arc<Registry>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Stats>,
     limits: Limits,
@@ -106,31 +112,33 @@ impl FastCgiListener {
     /// front-end serves the same backends, so there is one set of processes
     /// behind one routing decision, whichever protocol a request arrived on. It
     /// needs no lock because each backend synchronises internally.
+    ///
+    /// A listener on its own gets a registry of its own, so that a reload still
+    /// has something to apply through.
     pub fn bind(
         address: &str,
         dispatcher: Arc<Dispatcher>,
         sites: Arc<Sites>,
         limits: Limits,
     ) -> Result<Self> {
-        Self::bind_shared(
-            address,
-            dispatcher,
-            SharedState::new((*sites).clone()),
-            limits,
-        )
+        let registry = Arc::new(Registry::new(SharedState::new((*sites).clone())));
+        Self::bind_registered(address, dispatcher, registry, limits)
     }
 
-    /// [`FastCgiListener::bind`], around a site table another listener already shares.
+    /// [`FastCgiListener::bind`], around the process's one registry.
     ///
     /// The two-listener case, and the only way `serve` can give both front-ends one table. A
-    /// listener that built its own table would be the one still serving the old configuration
-    /// after a reload, which reads as the *other* front-end being right and is invisible to any
-    /// test that exercises one protocol — so this parameter prevents the defect rather than
-    /// documenting it.
-    pub fn bind_shared(
+    /// listener that built its own would be the one still serving the old configuration after a
+    /// reload, which reads as the *other* front-end being right and is invisible to any test that
+    /// exercises one protocol — so this parameter prevents the defect rather than documenting it.
+    ///
+    /// The registry is taken rather than a bare table because a FastCGI listener needs the table
+    /// *and* the reload path that moves it; passing only the table is how a reload came to reach
+    /// this listener's data but not its configuration.
+    pub fn bind_registered(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        sites: SharedState,
+        registry: Arc<Registry>,
         limits: Limits,
     ) -> Result<Self> {
         let listener = TcpListener::bind(address).map_err(|source| ServerError::Misconfigured {
@@ -142,7 +150,8 @@ impl FastCgiListener {
         Ok(FastCgiListener {
             listener,
             dispatcher,
-            sites,
+            sites: registry.shared().clone(),
+            registry,
             shutdown: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Stats::default()),
             limits,
@@ -156,13 +165,18 @@ impl FastCgiListener {
         self.sites.clone()
     }
 
+    /// The process's one registry, which a reload applies through.
+    pub fn registry(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry)
+    }
+
     /// A handle that replaces what this listener is serving, without a restart.
     ///
-    /// The same handle the HTTP listener exposes, and that is the point: both front-ends hold one
-    /// `SharedState`, so this exists for symmetry and for the test that pins the FastCGI half —
-    /// there is deliberately no per-listener reload path, because per-listener is the bug.
-    pub fn reload_handle(&self) -> SharedState {
-        self.sites.clone()
+    /// The process's registry, and that is the point: both front-ends hold one, so replacing
+    /// through it moves both. There is deliberately no per-listener reload path, because
+    /// per-listener is the bug.
+    pub fn reload_handle(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry)
     }
 
     /// The address actually bound, which matters when port 0 was requested.

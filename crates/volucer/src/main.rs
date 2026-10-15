@@ -373,17 +373,24 @@ fn serve(
     // built here rather than per listener: a listener that built its own would keep serving the
     // old configuration after a reload, which takes effect on one protocol and reads as the
     // other front-end being right.
-    let shared = volucer_http::SharedState::new((*sites).clone());
+    //
+    // The registry is what a *trigger* holds: it knows the one shared site table and every
+    // front-end's snapshot-holder, so `apply` cannot half-succeed. Building it here rather than
+    // inside a listener is what makes the process's own `SIGHUP` path able to reach a FastCGI
+    // listener at all.
+    let registry = Arc::new(volucer_http::Registry::new(volucer_http::SharedState::new(
+        (*sites).clone(),
+    )));
 
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
     // before the runtime is built.
     let fastcgi = match &fastcgi_address {
         Some(address) => {
-            let listener = FastCgiListener::bind_shared(
+            let listener = FastCgiListener::bind_registered(
                 address,
                 Arc::clone(&dispatcher),
-                shared.clone(),
+                Arc::clone(&registry),
                 Limits { max_connections },
             )?;
             println!("  fastcgi:          {}", listener.local_addr()?);
@@ -434,12 +441,46 @@ fn serve(
         https_port,
     };
 
+    // The certificate table is built **once for the process**, before any port is bound, and
+    // handed to every TLS-speaking listener.
+    //
+    // One resolver rather than one per listener, because a renewal has to reach all of them: an
+    // `:80`/`:443` deployment has two TLS-speaking listeners, so two resolvers would mean a
+    // renewed certificate appeared on one port and not the other — the same one-protocol-only
+    // failure the shared site table exists to prevent, one layer down. A plaintext deployment
+    // builds none at all, which is the whole of "TLS costs nothing when it is off".
+    //
+    // Loading it here rather than inside the listener is also the ordering hazard 56 was about:
+    // a certificate that cannot be read must fail *before* a port is taken, not after `serve` has
+    // printed that the port came up.
+    let tls_state = match tls_active {
+        true => Some(Arc::new(
+            volucer_http::SniResolver::from_config(&config, config_dir).map_err(|err| {
+                ServerError::Listener {
+                    reason: err.to_string(),
+                }
+            })?,
+        )),
+        false => None,
+    };
+
+    // The handles one listener needs: the shared table, the one registry, and TLS when it speaks
+    // it. Built per listener because the resolver is `Some` for a TLS listener and `None` for a
+    // plaintext one, which is what keeps a plaintext listener from carrying TLS state at all.
+    let handles_for = |speaks_tls: bool| {
+        let handles = volucer_http::ReloadHandles::new(Arc::clone(&registry));
+        match (speaks_tls, &tls_state) {
+            (true, Some(resolver)) => handles.with_tls(Arc::clone(resolver)),
+            _ => handles,
+        }
+    };
+
     let http = match &http_address {
         Some(address) => {
             let running = RunningHttp::start_with_tls(
                 address,
                 Arc::clone(&dispatcher),
-                shared.clone(),
+                handles_for(tls_on_http),
                 HttpLimits {
                     max_connections,
                     ..HttpLimits::default()
@@ -467,7 +508,7 @@ fn serve(
             let running = RunningHttp::start_with_tls(
                 address,
                 Arc::clone(&dispatcher),
-                shared.clone(),
+                handles_for(true),
                 HttpLimits {
                     max_connections,
                     ..HttpLimits::default()
@@ -499,7 +540,14 @@ fn serve(
 
     println!("press Ctrl-C to stop");
 
-    install_shutdown_handler(fastcgi.as_ref().map(|l| l.shutdown_handle()));
+    install_shutdown_handler(
+        fastcgi.as_ref().map(|l| l.shutdown_handle()),
+        Arc::clone(&registry),
+        tls_state.clone(),
+        path.to_path_buf(),
+        document_root_flag.map(Path::to_path_buf),
+        front_controller_flag.map(str::to_string),
+    );
 
     // The FastCGI listener owns this thread while the HTTP listener runs on its
     // own, so both are served concurrently. With no FastCGI listener there is
@@ -588,7 +636,118 @@ fn wait_for_shutdown() {
 /// can still be waited on.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Stop the listeners on the first Ctrl-C or SIGTERM.
+/// Everything a reload needs to re-read the configuration and apply it.
+///
+/// One value rather than a handful of arguments, because that is what the handler closure has to
+/// capture and a caller that supplied half of them would be a reload that reported success and
+/// changed nothing.
+///
+/// **Unused on Windows**, where there is no `SIGHUP` and therefore nothing that could reload. It is
+/// built and passed there anyway rather than `#[cfg]`-ed away, so the two platforms' handler
+/// signatures stay the same and the difference is stated in one place — the `signals` module —
+/// instead of in every call site.
+#[cfg_attr(windows, allow(dead_code))]
+struct Reloader {
+    /// The path named on the command line. Re-read as-is, which is open decision 9.1's answer:
+    /// what an operator expects from `SIGHUP`, and no new concept such as a marker file.
+    config_path: PathBuf,
+    /// The document root and front controller **the command line resolved**.
+    ///
+    /// Replayed on a reload because they are part of what the configuration *means*: a deployment
+    /// started with `--document-root` on a site-less config takes its root from the flag, and a
+    /// reload that dropped it would move the root to `.` — a working server that starts serving
+    /// 404s, with the change attributed to whatever the operator edited.
+    document_root_flag: Option<PathBuf>,
+    front_controller_flag: Option<String>,
+    /// The one registry: the shared table and every front-end.
+    registry: Arc<volucer_http::Registry>,
+    /// The process's certificate table, when TLS is on, so a renewed PEM is picked up too.
+    tls: Option<Arc<volucer_http::SniResolver>>,
+}
+
+impl Reloader {
+    /// Re-read the configuration file and apply it, whole or not at all.
+    ///
+    /// The two failure modes are reported and *nothing is changed*: a file that does not parse, and
+    /// a file that parses and does not validate. That is the only safe direction — a reload that
+    /// installed half of a file would leave the operator unable to tell which half took effect —
+    /// and it is why this returns early rather than applying what it could.
+    ///
+    /// A reload that succeeds still may not have changed anything the implementation can honour;
+    /// the settings that are **restart-only** are named in [`restart_only`] and printed, so an
+    /// operator who edited one learns it here rather than from behaviour.
+    #[cfg_attr(windows, allow(dead_code))]
+    fn reload(&self) {
+        let config = match Config::load(&self.config_path) {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::error!(%err, "reload refused: the configuration could not be read");
+                return;
+            }
+        };
+        if let Err(err) = config.validate() {
+            tracing::error!(%err, "reload refused: the configuration is not valid");
+            return;
+        }
+
+        // The site table, with the command line replayed, exactly as `serve` built the first one.
+        // Built before anything is installed, so a table that cannot be built is a refusal rather
+        // than a half-applied reload.
+        let document_root = match &self.document_root_flag {
+            Some(root) => absolute_document_root(root),
+            None => absolute_document_root(&resolve_document_root(None, &config)),
+        };
+        let front_controller = config
+            .server
+            .resolve_front_controller(self.front_controller_flag.as_deref());
+        let sites = Sites::from_config_with(&config, &document_root, front_controller.as_deref());
+
+        let generation = self.registry.generation() + 1;
+        let _previous = self.registry.apply(sites);
+        tracing::info!(
+            generation,
+            file = %self.config_path.display(),
+            document_root = %document_root.display(),
+            sites = config.sites.len(),
+            "configuration reloaded"
+        );
+
+        // Certificates are a second, independent table. Refreshed after the sites so that a
+        // certificate that cannot be read leaves the *sites* reloaded and the certificates as they
+        // were — one table refusing must not take the other with it, and both are whole-or-nothing
+        // on their own.
+        if let Some(resolver) = &self.tls {
+            match resolver.refresh(&volucer_http::CertificateSet::from_config(&config)) {
+                Ok(_) => tracing::info!("certificate table refreshed"),
+                Err(err) => {
+                    tracing::error!(%err, "the certificate table was not replaced; the previous one is still serving")
+                }
+            }
+        }
+
+        for line in restart_only() {
+            tracing::info!("{line}");
+        }
+    }
+}
+
+/// The settings a reload cannot honour, and the reason.
+///
+/// Named rather than discovered, which is the lesson of the TLS work: a setting the implementation
+/// cannot apply has to be *stated*, or the operator finds out from behaviour instead — and a
+/// reload that appears to have worked is worse than one that refused.
+///
+/// Returned as lines so the same text is what `serve` logs and what a test can assert on, rather
+/// than a message assembled at the call site.
+pub fn restart_only() -> Vec<&'static str> {
+    vec![
+        "a reload does not change: listener addresses (the sockets are already bound)",
+        "a reload does not change: backends, their commands and worker counts (the processes are running)",
+        "a reload does not change: [server.tls] min_version and alpn (the rustls ServerConfig is built once)",
+    ]
+}
+
+/// Stop the listeners on the first Ctrl-C or SIGTERM, and **reload** on SIGHUP.
 ///
 /// A second signal forces an exit, so a stuck shutdown cannot trap the operator.
 ///
@@ -596,9 +755,14 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// process died on the spot with no chance to run a destructor — so `systemctl stop`,
 /// `docker stop` and a plain `kill` all left the php-cgi children of a `spawn_cgi`
 /// pool running. They accumulated: a benchmark host reached 68 orphans, and each one
-/// held its port, its PHP state and its share of the CPU. The `termination` feature of
-/// `ctrlc` is what makes the handler cover SIGTERM as well as SIGINT; without it this
-/// function only ever saw a Ctrl-C.
+/// held its port, its PHP state and its share of the CPU.
+///
+/// **SIGHUP reloads**, which is the conventional meaning on a Unix server and the reason the
+/// handler has to distinguish the signals at all. That is what the platform split below is about,
+/// and it is not merely a `#[cfg]` for tidiness: `ctrlc` registers `SIGHUP` under its `termination`
+/// feature and runs the *shutdown* callback for it, so before this change `kill -HUP volucer`
+/// stopped the server. Reproduced against the previous binary, not inferred: the process was gone
+/// and the log read "shutting down".
 ///
 /// Forcing is safe now, and was not before: the lifecycle guard reaps the PHP
 /// processes when the process dies, *provided* the death is one it can observe.
@@ -607,24 +771,112 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// HTTP listener runs on another thread and is stopped by *dropping* its handle,
 /// which is what `serve` does after this — so the only thing this handler has to
 /// do for it is set the static flag that `wait_for_shutdown` polls.
-fn install_shutdown_handler(shutdown: Option<volucer_server::ShutdownHandle>) {
+fn install_shutdown_handler(
+    shutdown: Option<volucer_server::ShutdownHandle>,
+    registry: Arc<volucer_http::Registry>,
+    tls: Option<Arc<volucer_http::SniResolver>>,
+    config_path: PathBuf,
+    document_root_flag: Option<PathBuf>,
+    front_controller_flag: Option<String>,
+) {
     let forced = Arc::new(AtomicBool::new(false));
-    let result = ctrlc::set_handler(move || {
-        if forced.swap(true, Ordering::SeqCst) {
-            eprintln!("\nforced exit");
-            std::process::exit(130);
+    let stop = {
+        let forced = Arc::clone(&forced);
+        move || {
+            if forced.swap(true, Ordering::SeqCst) {
+                eprintln!("\nforced exit");
+                std::process::exit(130);
+            }
+            eprintln!("\nshutting down; signal again to force");
+            SHUTDOWN.store(true, Ordering::Relaxed);
+            if let Some(shutdown) = &shutdown {
+                shutdown.shutdown();
+            }
         }
-        eprintln!("\nshutting down; signal again to force");
-        SHUTDOWN.store(true, Ordering::Relaxed);
-        if let Some(shutdown) = &shutdown {
-            shutdown.shutdown();
-        }
-    });
-    if let Err(err) = result {
+    };
+
+    let reloader = Reloader {
+        config_path,
+        document_root_flag,
+        front_controller_flag,
+        registry,
+        tls,
+    };
+
+    if let Err(err) = signals::install(stop, reloader) {
         // Not fatal, but it means a SIGTERM will leak the pools: say so at a level
         // an operator sees, because the symptom (surviving PHP processes) appears
         // long after the cause.
-        tracing::warn!(%err, "no signal handler installed; stopping this process may leave its PHP children running");
+        tracing::warn!(%err, "no signal handler installed; stopping this process may leave its PHP children running, and SIGHUP cannot reload it");
+    }
+}
+
+/// Signal handling, split by platform because the *mechanism* is — the behaviour is not.
+///
+/// The two implementations are deliberately one call apiece with the same meaning: stop on
+/// SIGINT/SIGTERM, and reload on whatever this platform calls "reload". Windows has no `SIGHUP`
+/// and no equivalent, so there the only signal is a stop, and reload is unavailable — which is
+/// stated here rather than left for an operator on Windows to discover.
+#[cfg(unix)]
+mod signals {
+    use super::Reloader;
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+    use std::sync::Arc;
+
+    /// Stop on SIGINT/SIGTERM, reload on SIGHUP.
+    ///
+    /// The signal number is what makes this possible, and it is the whole reason `signal-hook` is
+    /// used here rather than the `ctrlc` this crate already depends on for Windows: `ctrlc` calls
+    /// one handler for every signal it registered and cannot say which arrived, so a handler that
+    /// had to tell a reload from a shutdown could not be written against it. Its `termination`
+    /// feature also maps SIGHUP to the shutdown callback, which is what made `kill -HUP` stop the
+    /// server.
+    pub fn install(
+        stop: impl Fn() + Send + 'static,
+        reloader: Reloader,
+    ) -> Result<(), std::io::Error> {
+        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+        let reloader = Arc::new(reloader);
+        std::thread::Builder::new()
+            .name("signals".into())
+            .spawn(move || {
+                for signal in signals.forever() {
+                    match signal {
+                        SIGHUP => {
+                            tracing::info!("SIGHUP: reloading configuration");
+                            reloader.reload();
+                        }
+                        SIGINT | SIGTERM => stop(),
+                        // Registered signals only, so nothing else can arrive; named rather than
+                        // silently ignored so that adding one to the set above without deciding
+                        // what it means is visible here.
+                        other => tracing::warn!(signal = other, "ignoring an unhandled signal"),
+                    }
+                }
+            })
+            .map(|_| ())
+    }
+}
+
+#[cfg(windows)]
+mod signals {
+    use super::Reloader;
+    use std::sync::Arc;
+
+    /// Stop on Ctrl-C, Ctrl-Break and the console-close event.
+    ///
+    /// **There is no reload here, because Windows has no `SIGHUP`.** That is a property of the
+    /// platform rather than a gap to work around, and it is why the reloader is dropped rather than
+    /// stored: a handler that pretended to reload would be a signal nobody can send. A Windows
+    /// deployment picks up a configuration change by restarting, exactly as it did before this
+    /// phase.
+    pub fn install(
+        stop: impl Fn() + Send + 'static,
+        _reloader: Reloader,
+    ) -> Result<(), std::io::Error> {
+        let _ = Arc::new(());
+        ctrlc::set_handler(stop).map_err(std::io::Error::other)
     }
 }
 

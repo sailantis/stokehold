@@ -587,39 +587,43 @@ paragraph named the wrong confound entirely: it guessed at history instead of ch
 
 ## What can be changed without a restart
 
-The listener's reloadable state is one value behind one pointer, and replacing it affects the
-**next** request. An in-flight request keeps the configuration it started under — the only ordering
-that can be explained to an operator, and the reason there is one pointer rather than one per
-setting: three separate swaps would let a request take a new site table with an old routing map,
-which would look like a site serving the wrong document root rather than like a race.
+Send `SIGHUP` and the configuration file is re-read and applied. **Unix only** — Windows has no
+`SIGHUP` and no equivalent, so a Windows deployment restarts.
+
+    kill -HUP $(pidof volucer)      # or: systemctl reload volucer
+
+The reloadable state is one value behind one pointer, and replacing it affects the **next** request.
+An in-flight request keeps the configuration it started under — the only ordering that can be
+explained to an operator, and the reason there is one pointer rather than one per setting: three
+separate swaps would let a request take a new site table with an old routing map, which would look
+like a site serving the wrong document root rather than like a race.
+
+The same signal reaches **every** front-end: an HTTP listener and a FastCGI listener share one site
+table, so a reload cannot take effect on `:80` and leave nginx reaching the old pool.
 
 **Reloadable.** `[server.tls]` and `[sites.*.tls]` certificates and keys, `[sites.*]` `hosts`,
-`document_root`, `front_controller`, `[server.statics]`, `redirect_to_https` and `https_port`.
+`document_root`, `front_controller`, `serve_only`, `default_backend`, `routes` and
+`[server.statics]` (including turning the layer on or off), and `redirect_to_https`/`https_port`.
 
-**Restart-only, and named rather than discovered** — a setting the implementation cannot honour
-should be *stated*, not found out from behaviour:
+**Restart-only, and reported on every reload** rather than left to be discovered — a setting the
+implementation cannot honour should be *stated*, or the operator finds out from behaviour:
 
 - listener addresses (`http`, `https`, `fastcgi`) — a bound socket cannot move;
-- backend commands and worker counts — those are running processes with live pipes;
-- `static_files` on or off — that decides whether the layer exists at all;
-- `min_version` and `alpn` — they are baked into the `rustls::ServerConfig` that the acceptor
-  holds, and rustls does not let that be rebuilt in place.
+- backends, their commands and worker counts — those are running processes with live pipes;
+- `[server.tls]` `min_version` and `alpn` — they are baked into the `rustls::ServerConfig` that the
+  acceptor holds, and rustls does not let that be rebuilt in place.
 
-**Not reloadable by design: `routes`.** Sites and static settings move; the route table does not.
-The dispatcher derives one routing per site at startup and every request already reads it, so
-making routes reloadable means rebuilding the structure the request path depends on.
+**A reload is whole-or-nothing.** A file that does not parse, or does not validate, is refused with
+a logged reason and the previous configuration keeps serving. There is no way to apply half of one —
+including when the bad file names settings the server *can* apply, which is the case the test pins.
 
-**A reload is whole-or-nothing.** A file that does not validate, or a certificate set with one pair
-that cannot be read, is refused entirely and the previous configuration keeps serving. There is no
-way to apply half of one.
+> **A reload never stops the server.** That is worth stating because it was briefly untrue: the
+> `ctrlc` crate's `termination` feature registers `SIGHUP` and runs its *shutdown* callback for it,
+> so `kill -HUP` used to stop a running volucer rather than reload it. Signals are now handled per
+> signal, which is what makes "SIGHUP reloads, SIGTERM stops" expressible at all.
 
-> The mechanism is in place (`HttpListener::reload_handle`, `ReloadHandle::apply`,
-> `SniResolver::refresh`/`replace`); **the trigger is not**. Nothing watches for `SIGHUP` yet, so a
-> running process still has to be restarted to pick up a configuration change. That is steps 56–58
-> in [`docs/plan.md`](docs/plan.md).
-
-**What the indirection costs when nothing is reloaded: nothing measurable.** The request path used
-to read three `Arc`s off the front-end and now takes one `ArcSwap` snapshot, so this is the kind of
+**What the indirection costs when nothing is reloaded: nothing measurable.** The request path used to
+read three `Arc`s off the front-end and now takes one `ArcSwap` snapshot, so this is the kind of
 claim that gets measured rather than argued. An interleaved A/B of two release binaries — the last
 commit before the reload work against the current build, both with no `[server.tls]`, both serving
 a static file so the routing lookup the snapshot feeds is on the measured path:

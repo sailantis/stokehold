@@ -118,7 +118,6 @@ async fn start_keeping(
     config: Config,
     config_dir: &Path,
 ) -> (SocketAddr, volucer_http::ReloadHandle) {
-    let sites = volucer_http::SharedState::new(Sites::from_config(&config, config_dir));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -126,7 +125,7 @@ async fn start_keeping(
     let listener = HttpListener::bind_with_tls(
         "127.0.0.1:0",
         dispatcher,
-        sites,
+        Arc::new(Sites::from_config(&config, config_dir)),
         HttpLimits::default(),
         ListenerSettings {
             tls: Some(TlsSettings {
@@ -559,7 +558,6 @@ async fn start_redirecting_to(
     https_port: Option<u16>,
     with_tls: bool,
 ) -> SocketAddr {
-    let sites = volucer_http::SharedState::new(Sites::from_config(&config, config_dir));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -567,7 +565,7 @@ async fn start_redirecting_to(
     let listener = HttpListener::bind_with_tls(
         "127.0.0.1:0",
         dispatcher,
-        sites,
+        Arc::new(Sites::from_config(&config, config_dir)),
         HttpLimits::default(),
         ListenerSettings {
             tls: with_tls.then_some(TlsSettings {
@@ -664,7 +662,6 @@ key = "certs/absent.key"
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("a probe port");
     let address = occupied.local_addr().expect("address").to_string();
 
-    let sites = volucer_http::SharedState::new(Sites::from_config(&config, &config_dir));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -672,7 +669,7 @@ key = "certs/absent.key"
     let err = HttpListener::bind_with_tls(
         &address,
         dispatcher,
-        sites,
+        Arc::new(Sites::from_config(&config, &config_dir)),
         HttpLimits::default(),
         ListenerSettings {
             tls: Some(TlsSettings {
@@ -866,7 +863,6 @@ async fn an_in_memory_certificate_needs_no_file_and_no_config() {
         cert.dir(),
     ));
 
-    let sites = volucer_http::SharedState::new(Sites::from_config(&config, cert.dir()));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -874,10 +870,13 @@ async fn an_in_memory_certificate_needs_no_file_and_no_config() {
     // certificate file is read here at all**, because `bind_with_resolver` takes the table the
     // caller built. That is what lets a deployment whose certificate does not exist yet — the
     // ACME case — bind its port and start accepting.
+    let registry = Arc::new(volucer_http::Registry::new(volucer_http::SharedState::new(
+        Sites::from_config(&config, cert.dir()),
+    )));
     let listener = HttpListener::bind_with_resolver(
         "127.0.0.1:0",
         dispatcher,
-        sites,
+        volucer_http::ReloadHandles::new(registry).with_tls(Arc::clone(&resolver)),
         HttpLimits::default(),
         ListenerSettings {
             tls: Some(TlsSettings {
@@ -887,7 +886,6 @@ async fn an_in_memory_certificate_needs_no_file_and_no_config() {
             redirect_to_https: false,
             https_port: None,
         },
-        Some(Arc::clone(&resolver)),
     )
     .await
     .expect("bind with a caller-built resolver");
@@ -1056,7 +1054,9 @@ async fn a_resolver_without_tls_settings_is_refused() {
         cert.dir(),
     ));
 
-    let sites = volucer_http::SharedState::new(Sites::from_config(&config, cert.dir()));
+    let registry = Arc::new(volucer_http::Registry::new(volucer_http::SharedState::new(
+        Sites::from_config(&config, cert.dir()),
+    )));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -1064,10 +1064,9 @@ async fn a_resolver_without_tls_settings_is_refused() {
     let err = HttpListener::bind_with_resolver(
         "127.0.0.1:0",
         dispatcher,
-        sites,
+        volucer_http::ReloadHandles::new(registry).with_tls(resolver),
         HttpLimits::default(),
         ListenerSettings::default(),
-        Some(resolver),
     )
     .await
     .err()

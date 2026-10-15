@@ -45,10 +45,10 @@ pub mod tls;
 pub use error::HttpError;
 pub use listener::{
     to_cgi, to_cgi_routed, HttpLimits, HttpListener, HttpShutdown, HttpStats, ListenerSettings,
-    ReloadHandle, Reloaded, Resolved, RunningHttp, TlsSettings,
+    ReloadHandle, ReloadHandles, Reloaded, Resolved, RunningHttp, TlsSettings,
 };
 pub use tls::{
     CertificateSet, Certs, ServerCertificate, SiteCertificate, SiteCertificatePair, SniResolver,
     TlsError,
 };
-pub use volucer_watch::{SharedState, Swappable};
+pub use volucer_watch::{Registry, SharedState, Swappable, DEFAULT_SITE_KEY};

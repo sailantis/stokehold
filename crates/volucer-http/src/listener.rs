@@ -24,7 +24,6 @@
 //! done here either — the bytes go to PHP, which owns `$_FILES` and
 //! `is_uploaded_file()`.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -40,13 +39,13 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
-use volucer_core::sites::{ResolvedSite, Sites};
+use volucer_core::sites::Sites;
 use volucer_fcgi::{cgi, RequestInfo, Route, Routing};
 use volucer_server::{Dispatcher, ServerError};
-use volucer_watch::{SharedState, Swappable};
+use volucer_watch::{RegisteredFrontEnd, Registry, SharedState, Swappable};
 
 use crate::error::{HttpError, Result};
-use crate::static_files::{self, StaticFiles};
+use crate::static_files;
 
 /// The body type every response uses.
 ///
@@ -198,14 +197,12 @@ struct FrontEnd {
     /// synchronise internally, per backend slot, so requests to different
     /// workers genuinely run at the same time.
     dispatcher: Arc<Dispatcher>,
-    /// The site table, shared with the *other* front-end so a reload moves both.
+    /// The process's one registry, which a reload applies through.
     ///
-    /// The table lives here rather than in this listener because a deployment can run an HTTP
-    /// listener and a FastCGI listener at once, and `serve` hands them the same table. A reload
-    /// that replaced only this one's copy worked over `:80` and silently kept reaching the old
-    /// backend behind nginx — a difference that reads as *the other front-end being right*
-    /// rather than as a bug, which is why it is a shared handle rather than a field.
-    shared: SharedState,
+    /// Held so this listener's [`ReloadHandle`] can move *every* front-end rather than only its
+    /// own snapshot-holder. Without it a reload would be correct for one protocol and wrong for
+    /// the other, which no single-protocol test can see.
+    registry: Arc<Registry>,
     /// Everything this listener derives from the table, behind **one** pointer.
     ///
     /// One handle rather than one per field, and that is the whole correctness of a reload
@@ -237,128 +234,6 @@ struct FrontEnd {
     https_port: Option<u16>,
 }
 
-/// Everything this listener derives from the shared site table, as one replaceable value.
-///
-/// The three travel together because they are derived from one another: the routing and
-/// static maps are built *from* the site table, so a request that took them from different
-/// generations would resolve a site the map has no entry for. [`Reloaded::from_sites`] is
-/// the only constructor for that reason — the maps cannot be set independently of the table
-/// they describe.
-///
-/// The `Arc`s are for the request path: a handler takes one snapshot and moves it into the
-/// blocking dispatch task, so the request keeps the configuration it began under.
-pub struct Reloaded {
-    /// The site table this was built from, as a snapshot of [`SharedState`].
-    ///
-    /// Held rather than borrowed so a request is served under one generation even if a reload
-    /// lands while it is in flight — the property the in-flight test pins.
-    sites: Arc<Sites>,
-    /// One prebuilt routing per site, by site name, plus the default under
-    /// `"<default>"`.
-    ///
-    /// Prebuilt, not derived per request: a `Routing` is a document root and a front
-    /// controller, and rebuilding one for every request would put a `PathBuf` clone on
-    /// the hot path to answer a question the configuration already answered at startup.
-    routings: BTreeMap<String, Routing>,
-    /// The static layer per site, for the same reason.
-    statics: BTreeMap<String, StaticFiles>,
-}
-
-impl Reloaded {
-    /// Build this listener's maps from a snapshot of the shared site table.
-    ///
-    /// Takes the `Arc` the shared handle handed out rather than a table, so the value a request
-    /// reads and the per-site maps it routes against are guaranteed to be the *same* generation:
-    /// there is no constructor that could pair them from two.
-    ///
-    /// `server_port` is the bound port, which the static layer stamps into generated
-    /// redirects — a reload cannot change it, so it is passed in rather than stored.
-    pub fn from_sites(sites: Arc<Sites>, server_port: u16) -> Self {
-        let mut routings = BTreeMap::new();
-        let mut statics = BTreeMap::new();
-        for site in sites
-            .named()
-            .values()
-            .chain(std::iter::once(sites.default_site()))
-        {
-            routings.insert(
-                site.name.clone(),
-                Routing {
-                    document_root: site.document_root.clone(),
-                    front_controller: site.front_controller.clone(),
-                    ..Routing::default()
-                },
-            );
-            statics.insert(
-                site.name.clone(),
-                StaticFiles {
-                    config: site.static_files.clone(),
-                    document_root: site.document_root.clone(),
-                    server_port,
-                },
-            );
-        }
-        Reloaded {
-            sites,
-            routings,
-            statics,
-        }
-    }
-
-    /// The site table this snapshot was built from.
-    pub fn sites(&self) -> &Sites {
-        &self.sites
-    }
-
-    /// The routing and static layer for one site.
-    ///
-    /// A site resolved by [`Sites`] is always in both maps — they are built from the
-    /// same table in the same pass — so a missing entry would mean the two had
-    /// diverged, and falling back to the default is the safe direction: it serves the
-    /// deployment's own root rather than an empty path.
-    fn for_site(&self, site: &ResolvedSite) -> (&Routing, &StaticFiles) {
-        let routing = self
-            .routings
-            .get(&site.name)
-            .or_else(|| self.routings.get(DEFAULT_SITE_KEY))
-            .expect("the default site is always built");
-        let statics = self
-            .statics
-            .get(&site.name)
-            .or_else(|| self.statics.get(DEFAULT_SITE_KEY))
-            .expect("the default site is always built");
-        (routing, statics)
-    }
-}
-
-impl std::fmt::Debug for Reloaded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Reloaded")
-            .field("sites", &self.sites.named().len())
-            .finish_non_exhaustive()
-    }
-}
-
-/// One request's configuration: a resolved site and the maps that go with it, from one generation.
-///
-/// Returned as a single value rather than as a pair of calls because the pairing *is* the
-/// correctness. The site has to come from the `Reloaded` a request took, not from the shared table
-/// live at the moment of resolution: a reload landing between the two would otherwise resolve a
-/// site against one generation and route it against another, which is the failure this whole
-/// mechanism exists to prevent — and it would look like a site serving the wrong document root,
-/// once, under load.
-///
-/// The two borrows are tied to the `Arc<Reloaded>` the caller holds, so a request cannot keep them
-/// past its own snapshot.
-pub struct Resolved<'a> {
-    /// The site this request is served by.
-    pub site: &'a ResolvedSite,
-    /// Its routing.
-    pub routing: &'a Routing,
-    /// Its static layer.
-    pub statics: &'a StaticFiles,
-}
-
 impl FrontEnd {
     /// A snapshot of the reloadable state, taken once per request.
     ///
@@ -372,19 +247,54 @@ impl FrontEnd {
     }
 }
 
-impl Reloaded {
-    /// Resolve a host against *this* generation and return everything the request needs from it.
+/// `Reloaded`, `Resolved` and the site table's derived maps live in `volucer-watch`, because both
+/// front-ends build them and a reload has to be able to. Re-exported here because this is where a
+/// reader looks for them.
+pub use volucer_watch::{Reloaded, Resolved};
+
+/// What one front-end needs in hand to serve a request.
+///
+/// Built by `serve` and handed to whichever listener binds, rather than constructed by each: the
+/// registry is the process's single reload path, and a listener that built its own would be a
+/// front-end no `SIGHUP` reaches.
+#[derive(Clone)]
+pub struct ReloadHandles {
+    /// The live site table, shared by every front-end.
+    pub shared: SharedState,
+    /// The process's one registry, which a reload applies through.
+    pub registry: Arc<Registry>,
+    /// TLS, when a listener speaks it, so a certificate can be replaced too.
     ///
-    /// One call rather than a resolve followed by a lookup, because the two must agree: see
-    /// [`Resolved`].
-    pub fn resolve(&self, host: Option<&str>) -> Resolved<'_> {
-        let site = self.sites.resolve(host);
-        let (routing, statics) = self.for_site(site);
-        Resolved {
-            site,
-            routing,
-            statics,
+    /// Separate from the registry because it *has* to be: the resolver is installed into a
+    /// `rustls::ServerConfig` that rustls owns, so the resolver is the stable part and its table
+    /// is what moves. It is `None` on a deployment with no `[server.tls]`, and a plaintext
+    /// listener therefore carries no TLS state at all.
+    pub tls: Option<Arc<crate::tls::SniResolver>>,
+}
+
+impl ReloadHandles {
+    /// Handles built around a site table, with no TLS.
+    pub fn new(registry: Arc<Registry>) -> Self {
+        ReloadHandles {
+            shared: registry.shared().clone(),
+            registry,
+            tls: None,
         }
+    }
+
+    /// The same, for a listener that speaks TLS.
+    #[must_use]
+    pub fn with_tls(mut self, resolver: Arc<crate::tls::SniResolver>) -> Self {
+        self.tls = Some(resolver);
+        self
+    }
+}
+
+impl std::fmt::Debug for ReloadHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReloadHandles")
+            .field("tls", &self.tls.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -401,24 +311,16 @@ impl Reloaded {
 #[derive(Clone)]
 pub struct ReloadHandle {
     state: Arc<Swappable<Reloaded>>,
-    /// The site table, shared with the other front-end, so a reload moves both.
+    /// The process-wide registry: the shared table and every other front-end.
     ///
-    /// A second pointer, and deliberately not part of `state`: `Reloaded` holds a *snapshot* of
-    /// the table so an in-flight request keeps it, while this holds the *live* handle a reload
-    /// writes through. Folding them together would mean a reload had to reach the table through
-    /// the HTTP listener, which is exactly how the FastCGI front-end came to keep serving the old
-    /// one.
-    shared: SharedState,
+    /// Held so [`ReloadHandle::apply`] moves *all* the front-ends rather than only this one, which
+    /// is the difference between one server and one protocol.
+    registry: Arc<Registry>,
     /// TLS, when this listener speaks it, so a certificate can be replaced too.
     ///
-    /// Separate from `state` because it *has* to be: the resolver is installed into a
-    /// `rustls::ServerConfig` that rustls owns, so it is the stable part and its table is what
-    /// moves. Two pointers rather than one is the honest shape of that, not an oversight — and
-    /// the two are independent, so a reload that changes sites and certificates applies both
+    /// Independent of the registry, so a reload that changes sites and certificates applies both
     /// and a reload that changes neither installs nothing.
     tls: Option<Arc<crate::tls::SniResolver>>,
-    /// Fixed for the life of the listener, and needed to rebuild the maps on a reload.
-    server_port: u16,
 }
 
 impl ReloadHandle {
@@ -430,8 +332,13 @@ impl ReloadHandle {
     }
 
     /// The site table being served right now, shared across front-ends.
-    pub fn shared(&self) -> &SharedState {
-        &self.shared
+    pub fn shared(&self) -> SharedState {
+        self.registry.shared().clone()
+    }
+
+    /// The process-wide registry, so a caller can see how many reloads have been applied.
+    pub fn registry(&self) -> &Arc<Registry> {
+        &self.registry
     }
 
     /// The certificate resolver, when this listener speaks TLS.
@@ -444,26 +351,26 @@ impl ReloadHandle {
         self.tls.as_ref()
     }
 
-    /// Replace the shared site table, rebuilding this listener's derived maps from it.
+    /// Replace the shared site table, rebuilding every front-end's derived maps from it.
+    ///
+    /// The table is replaced through the [`Registry`], so **every** front-end moves at once. This
+    /// listener's own state is the one the registry rebuilt for it, rather than a second rebuild
+    /// here — two rebuilds of one table is how the two front-ends would come to disagree.
     ///
     /// Returns the state that was replaced, so a caller can report what changed rather than
     /// only that something did — the difference between "site `api` document_root changed"
     /// and "configuration reloaded", after which an operator has to go and diff the file.
     ///
-    /// The table is replaced through [`SharedState`], so every front-end holding the handle moves
-    /// at once. This listener's own routings and static layers are then rebuilt from the table
-    /// that is now live — read back through the handle rather than from the argument, and that
-    /// distinction is a bug that was written and caught: [`SharedState::replace`] returns the
-    /// table it *replaced*, so rebuilding from its return value rebuilt the maps from the previous
-    /// generation, and a reload then reported a change while serving the old document root.
-    ///
     /// In-flight requests are unaffected: each holds a snapshot of the state it started
     /// under, which is what makes this safe to call while the listener is serving.
     #[must_use]
     pub fn apply(&self, sites: Sites) -> Arc<Reloaded> {
-        let _previous_table = self.shared.replace(sites);
-        let next = Reloaded::from_sites(self.shared.sites(), self.server_port);
-        self.state.replace(next)
+        self.registry.apply(sites).unwrap_or_else(|| {
+            // Unreachable while `bind` registers this listener before handing out a handle, and
+            // expressed as a fresh snapshot rather than a panic so removing that could never
+            // become a crash in a signal handler.
+            self.state.load()
+        })
     }
 }
 
@@ -513,26 +420,33 @@ impl RunningHttp {
     ///
     /// Returns once the listener is bound and the thread is accepting, so a port
     /// conflict is reported to the caller rather than to a thread.
+    ///
+    /// A listener on its own still gets a registry of its own, because that is what a reload
+    /// applies through — a reload is a property of the process, not of having two listeners.
     pub fn start(
         address: &str,
         dispatcher: Arc<Dispatcher>,
         sites: Arc<Sites>,
         limits: HttpLimits,
     ) -> Result<Self> {
+        let registry = Arc::new(Registry::new(SharedState::new((*sites).clone())));
         Self::start_with_tls(
             address,
             dispatcher,
-            SharedState::new((*sites).clone()),
+            ReloadHandles::new(registry),
             limits,
             ListenerSettings::default(),
         )
     }
 
     /// [`RunningHttp::start`], with TLS and/or a redirect.
+    ///
+    /// The handles are the process's reload path, passed in rather than built here: a listener
+    /// that built its own registry would be one no reload reaches.
     pub fn start_with_tls(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        sites: SharedState,
+        handles: ReloadHandles,
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
     ) -> Result<Self> {
@@ -541,8 +455,8 @@ impl RunningHttp {
             .build()
             .map_err(HttpError::Runtime)?;
 
-        let listener = runtime.block_on(HttpListener::bind_with_tls(
-            address, dispatcher, sites, limits, settings,
+        let listener = runtime.block_on(HttpListener::bind_with_resolver(
+            address, dispatcher, handles, limits, settings,
         ))?;
         let bound = listener.local_addr()?;
         let shutdown = listener.shutdown_handle();
@@ -617,9 +531,12 @@ impl HttpListener {
     /// any backend is reached.
     ///
     /// The site table is wrapped in its own [`SharedState`], so a caller with a single listener
-    /// has nothing extra to build. A caller with more than one — `serve`, which may run a FastCGI
-    /// listener too — must use [`HttpListener::bind_with_resolver`] with a handle it shares, or a
-    /// reload would move only the HTTP listener's copy.
+    /// has nothing extra to build. A caller with more than one front-end must use
+    /// [`HttpListener::bind_with_resolver`] with handles it shares, or a reload would move only
+    /// the HTTP listener's copy.
+    ///
+    /// A listener on its own still gets a registry of its own, because that is what a reload
+    /// applies through — a reload is a property of the process, not of having two listeners.
     pub async fn bind(
         address: &str,
         dispatcher: Arc<Dispatcher>,
@@ -629,7 +546,7 @@ impl HttpListener {
         Self::bind_with_tls(
             address,
             dispatcher,
-            SharedState::new((*sites).clone()),
+            sites,
             limits,
             ListenerSettings::default(),
         )
@@ -645,21 +562,24 @@ impl HttpListener {
     pub async fn bind_with_tls(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        sites: SharedState,
+        sites: Arc<Sites>,
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
     ) -> Result<Self> {
-        let resolver = match settings.tls {
-            Some(tls) => Some(Arc::new(
+        // A listener on its own still needs a registry, because that is what a reload applies
+        // through — and a reload is a property of the process, not of having several front-ends.
+        let registry = Arc::new(Registry::new(SharedState::new((*sites).clone())));
+        let mut handles = ReloadHandles::new(registry);
+        if let Some(tls) = settings.tls {
+            handles = handles.with_tls(Arc::new(
                 crate::tls::SniResolver::from_config(tls.config, tls.config_dir).map_err(
                     |source| HttpError::Tls {
                         reason: source.to_string(),
                     },
                 )?,
-            )),
-            None => None,
-        };
-        Self::bind_with_resolver(address, dispatcher, sites, limits, settings, resolver).await
+            ));
+        }
+        Self::bind_with_resolver(address, dispatcher, handles, limits, settings).await
     }
 
     /// [`HttpListener::bind_with_tls`], around a site table and resolver another listener shares.
@@ -668,6 +588,10 @@ impl HttpListener {
     /// runs an HTTP listener and possibly a FastCGI one, and a reload that moved only one of them
     /// would take effect on one protocol and not the other. A listener that built its own table
     /// from the config would be exactly that one.
+    ///
+    /// The resolver comes from the handle rather than as a separate argument, because the resolver
+    /// and the registry have to travel together: they are the two things a reload replaces, and a
+    /// listener that took one from the caller and built the other itself would be half-reachable.
     ///
     /// The resolver's own documentation covers the certificate side: the table this starts with is
     /// the one passed in, and **no certificate file is read**. That is what lets a deployment whose
@@ -682,16 +606,16 @@ impl HttpListener {
     pub async fn bind_with_resolver(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        sites: SharedState,
+        handles: ReloadHandles,
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
-        resolver: Option<Arc<crate::tls::SniResolver>>,
     ) -> Result<Self> {
         // The redirect settings come from the listener's own settings, so a plaintext listener in
         // a split :80/:443 deployment can carry them with no TLS of its own — which is exactly
         // why they are separate from `tls` rather than derived from it.
         let redirect_to_https = settings.redirect_to_https;
         let requested_https_port = settings.https_port;
+        let resolver = handles.tls.clone();
 
         if resolver.is_some() && settings.tls.is_none() {
             return Err(HttpError::Tls {
@@ -787,21 +711,28 @@ impl HttpListener {
             );
         }
 
-        // This listener's maps, built once here from a snapshot of the shared table and replaced
-        // whole from the handle `reload_handle` gives out. `port` is the bound port, which a
-        // reload cannot change — the socket is already listening on it.
+        // This listener's maps, built once here from a snapshot of the shared table. `port` is the
+        // bound port, which a reload cannot change — the socket is already listening on it.
         //
-        // The snapshot is taken from the *same* handle that goes into `FrontEnd`, so this
-        // listener's first generation of maps is built from the table every other front-end
-        // starts with.
-        let reloaded = Reloaded::from_sites(sites.sites(), port);
+        // The snapshot is built from the shared handle's table, and the holder is *registered*, so
+        // a reload reaches this listener as well as every other one. Registering is the step that
+        // makes a reload reach a listener at all: a snapshot-holder nobody registered is a
+        // front-end the process's own reload path cannot see, which is how a reload comes to take
+        // effect on one protocol and not another.
+        let state = Arc::new(Swappable::new(Reloaded::from_sites(
+            handles.shared.sites(),
+            port,
+        )));
+        handles
+            .registry
+            .register(RegisteredFrontEnd::new(Arc::clone(&state), port));
 
         Ok(HttpListener {
             listener,
             front_end: Arc::new(FrontEnd {
                 dispatcher,
-                shared: sites,
-                state: Arc::new(Swappable::new(reloaded)),
+                registry: Arc::clone(&handles.registry),
+                state,
                 tls: resolver,
                 limits,
                 stats: Arc::new(HttpStats::default()),
@@ -822,9 +753,8 @@ impl HttpListener {
     pub fn reload_handle(&self) -> ReloadHandle {
         ReloadHandle {
             state: Arc::clone(&self.front_end.state),
-            shared: self.front_end.shared.clone(),
+            registry: Arc::clone(&self.front_end.registry),
             tls: self.front_end.tls.clone(),
-            server_port: self.front_end.server_port,
         }
     }
 

@@ -44,8 +44,6 @@ use hyper::header::{
 };
 use hyper::{HeaderMap, Method, Response, StatusCode};
 
-use volucer_core::config::StaticConfig;
-
 use crate::error::HttpError;
 use crate::listener::{body_of, ResponseBody};
 /// The boundary a multi-range answer declares its parts with.
@@ -60,14 +58,12 @@ const MULTIPART_BOUNDARY: &str = "volucer-boundary";
 const STREAM_CHUNK: usize = 64 * 1024;
 
 /// The static layer's configuration and document root.
-#[derive(Debug, Clone)]
-pub struct StaticFiles {
-    pub config: StaticConfig,
-    /// The root a request path is resolved against.
-    pub document_root: PathBuf,
-    /// The listener's own port, for a redirect when no `Host` header arrived.
-    pub server_port: u16,
-}
+///
+/// An alias for the shared type rather than a definition, because the layer is built from a site
+/// and therefore has to be buildable by whatever builds the site table — which must not be this
+/// front-end, since a reload applies whether or not an HTTP listener exists. The *behaviour* over
+/// a file is here; what it decides from is in `volucer_watch`.
+pub use volucer_watch::StaticFiles;
 
 /// A response this layer produced. The body is boxed so a file can stream while
 /// an error page is a few bytes.
@@ -1003,6 +999,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use std::fs;
+    use volucer_core::config::StaticConfig;
 
     fn fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

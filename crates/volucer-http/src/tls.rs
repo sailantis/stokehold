@@ -42,6 +42,7 @@ use rustls::sign::CertifiedKey;
 use volucer_core::config::{Config, MinTlsVersion, TlsConfig};
 use volucer_core::hostmap::HostMap;
 
+use volucer_acme::ChallengeSource;
 use volucer_watch::Swappable;
 
 /// A certificate and its key, loaded and paired.
@@ -148,6 +149,20 @@ pub struct SniResolver {
     config_dir: PathBuf,
     /// The table, behind one pointer.
     state: Arc<Swappable<Certs>>,
+    /// The ACME challenge source, when this deployment manages certificates automatically.
+    ///
+    /// Held as its own resolver rather than merged into the table above, because the two answer
+    /// **different questions** and must not be confused: this one produces a certificate for
+    /// *proving control of a name* — a one-off, valid for a single validation — while the table
+    /// is what the deployment serves to real clients. Merging them would put a validation
+    /// certificate in the serving table.
+    ///
+    /// A trait object rather than [`volucer_acme::ChallengeResolver`], so the dispatch below is
+    /// testable with a stub. The safety does not come from the type being concrete — it comes from
+    /// the *order* in [`SniResolver::resolve`], which asks [`ChallengeSource::is_challenge`] before
+    /// consulting a source at all, and from `volucer_acme::ChallengeResolver`'s own implementation
+    /// of that method being the exact ALPN match.
+    acme: Option<Arc<dyn ChallengeSource>>,
 }
 
 /// Which certificates a deployment serves, as the config states them.
@@ -250,6 +265,7 @@ impl SniResolver {
         Ok(SniResolver {
             config_dir: config_dir.to_path_buf(),
             state: Arc::new(Swappable::new(state)),
+            acme: None,
         })
     }
 
@@ -261,7 +277,38 @@ impl SniResolver {
         SniResolver {
             config_dir: config_dir.to_path_buf(),
             state: Arc::new(Swappable::new(state)),
+            acme: None,
         }
+    }
+
+    /// Compose an ACME challenge source into this resolver, keeping the site table's rule.
+    ///
+    /// **This is the whole reason the composition is ours.** `rustls-acme`'s
+    /// `ResolvesServerCertAcme` holds exactly one `cert`, and on any handshake that is not a
+    /// challenge it returns that certificate for *every* SNI name — including names this
+    /// deployment deliberately falls back on, and including a name belonging to a different site.
+    /// Installing it with `with_cert_resolver(...)` would therefore silently replace the
+    /// host→certificate rule the whole TLS layer is built around: the symptom would be one site
+    /// presenting another site's certificate, which is a security failure rather than a
+    /// misconfiguration.
+    ///
+    /// So the ACME resolver is consulted **only** for a handshake that offers the `acme-tls/1`
+    /// ALPN protocol, and everything else is answered by [`SniResolver::resolve_site`] exactly as
+    /// it was before. Taking it through a constructor rather than a public field keeps that
+    /// property in one place: there is no way to install the ACME resolver so that it answers a
+    /// normal handshake.
+    #[must_use]
+    pub fn with_acme(mut self, acme: Arc<dyn ChallengeSource>) -> Self {
+        self.acme = Some(acme);
+        self
+    }
+
+    /// Whether this resolver will consult an ACME challenge source.
+    ///
+    /// Reported rather than inferred, so `serve` can say whether issuance is wired up without a
+    /// caller having to know how the composition is built.
+    pub fn has_acme(&self) -> bool {
+        self.acme.is_some()
     }
 
     /// Replace the certificate table, loading the certificates named by `certificates`.
@@ -302,6 +349,25 @@ impl SniResolver {
 
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // The ACME challenge branch comes **first**, and it is the only place the two resolvers
+        // may be combined. See [`SniResolver::with_acme`] for why the composition is ours rather
+        // than `rustls-acme`'s.
+        if let Some(acme) = &self.acme {
+            if acme.is_challenge(&hello) {
+                return acme.challenge_cert(hello);
+            }
+        }
+        self.resolve_site(hello)
+    }
+}
+
+impl SniResolver {
+    /// Resolve against the site table alone, ignoring any ACME challenge.
+    ///
+    /// Split out from [`ResolvesServerCert::resolve`] so the challenge branch is one `if` and the
+    /// behaviour for everything else is one call — a caller in a test can therefore assert the
+    /// site table's answer without a challenge in the way.
+    pub fn resolve_site(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // One load, once per handshake: the table this handshake resolves against is one
         // generation, so a reload landing here cannot present a certificate from neither.
         let certs = self.state.load();

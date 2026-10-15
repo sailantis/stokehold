@@ -12,6 +12,7 @@ volucer-core.workspace = true
 volucer-fcgi.workspace = true
 volucer-server.workspace = true
 volucer-watch.workspace = true
+volucer-acme.workspace = true
 volucer-worker.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
@@ -33,3 +34,7 @@ rcgen = "0.13"
 rustls = { version = "0.23", features = ["custom-provider"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-rustls = "0.26"
+# For the composition test: building a real `AcmeState` so `ChallengeResolver` can be exercised
+# against the dependency's own exact-ALPN rule rather than against a stub that reimplements it.
+rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-rs", "webpki-roots"] }
+volucer-acme.workspace = true

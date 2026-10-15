@@ -7,6 +7,7 @@ members = [
     "crates/volucer-server",
     "crates/volucer-http",
     "crates/volucer-watch",
+    "crates/volucer-acme",
     "crates/volucer",
 ]
 
@@ -30,6 +31,7 @@ volucer-fcgi = { version = "0.1.0", path = "crates/volucer-fcgi" }
 volucer-server = { version = "0.1.0", path = "crates/volucer-server" }
 volucer-http = { version = "0.1.0", path = "crates/volucer-http" }
 volucer-watch = { version = "0.1.0", path = "crates/volucer-watch" }
+volucer-acme = { version = "0.1.0", path = "crates/volucer-acme" }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"
@@ -59,6 +61,7 @@ rustls-pemfile = "2"
 # composition has to be ours (challenge ALPN → ACME, else → the site table), so the wrapper is a
 # footgun rather than a convenience, and leaving it unlinked is the cheapest way to say so.
 rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-rs", "webpki-roots"] }
+
 tokio = { version = "1", features = ["net", "fs", "io-util", "rt-multi-thread", "time"] }
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["io"] }

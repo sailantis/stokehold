@@ -1,0 +1,14 @@
+[package]
+name = "volucer-acme"
+description = "ACME (RFC 8555) certificate issuance for volucer, composed behind the site certificate table"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustls.workspace = true
+rustls-acme.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

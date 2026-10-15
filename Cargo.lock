@@ -1686,6 +1686,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "volucer-acme"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "rustls-acme",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "volucer-core"
 version = "0.1.0"
 dependencies = [
@@ -1725,6 +1735,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "volucer-acme",
  "volucer-core",
  "volucer-fcgi",
  "volucer-server",

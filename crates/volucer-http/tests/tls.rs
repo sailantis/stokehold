@@ -145,6 +145,45 @@ async fn start_keeping(
     (addr, reload)
 }
 
+/// Start a listener around a resolver the caller built, for the composition tests.
+///
+/// Distinct from [`start`] because that one builds its resolver from the configuration, and the
+/// ACME dispatch is a question about *which* resolver answers — so the resolver has to be the
+/// caller's.
+async fn start_with_resolver(
+    config: Config,
+    config_dir: &Path,
+    resolver: Arc<volucer_http::SniResolver>,
+) -> SocketAddr {
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    let registry = Arc::new(volucer_http::Registry::new(volucer_http::SharedState::new(
+        Sites::from_config(&config, config_dir),
+    )));
+
+    let listener = HttpListener::bind_with_resolver(
+        "127.0.0.1:0",
+        dispatcher,
+        volucer_http::ReloadHandles::new(registry).with_tls(resolver),
+        HttpLimits::default(),
+        ListenerSettings {
+            tls: Some(TlsSettings {
+                config: &config,
+                config_dir,
+            }),
+            redirect_to_https: false,
+            https_port: None,
+        },
+    )
+    .await
+    .expect("bind with a resolver");
+
+    let addr = listener.local_addr().expect("bound address");
+    tokio::spawn(listener.run());
+    addr
+}
+
 /// What a client saw on one connection.
 struct Seen {
     /// The DER of the certificate the server presented.
@@ -1094,6 +1133,166 @@ async fn alpn_h2_negotiates_a_real_http_2_connection() {
         "the first frame back must be SETTINGS (0x04), got {frame_type:#04x}"
     );
 }
+
+/// The wrapper is available and carries the restricted trait, not `ResolvesServerCert`.
+///
+/// An *absence* cannot be asserted in a passing test, so what is checked is what exists: the type
+/// is constructible and implements `ChallengeSource`. The stronger property — that no public path
+/// in `volucer-acme` hands out something implementing `ResolvesServerCert` — is enforced at the
+/// composition site, where `SniResolver::with_acme` takes a `ChallengeSource` and the dispatch
+/// order in `SniResolver::resolve` is asserted by
+/// `the_acme_source_answers_only_an_exact_challenge_handshake`.
+#[test]
+fn the_acme_resolver_is_only_available_as_a_challenge_source() {
+    fn takes_a_challenge_source<T: volucer_acme::ChallengeSource>() {}
+    takes_a_challenge_source::<volucer_acme::ChallengeResolver>();
+}
+/// The ACME challenge source is consulted **only** for a validation handshake.
+///
+/// The composition this pins is the one place the site certificate table and the ACME state meet,
+/// and getting it wrong is a security failure rather than a misconfiguration: `rustls-acme`'s
+/// resolver holds one certificate and returns it for every non-challenge SNI name, so installing it
+/// directly would let a site present another site's certificate (Gap 3).
+///
+/// So the assertion is on the **order** of the two questions, observed with a stub that records
+/// what it was asked. A real client drives a real handshake in each of the three cases, and the
+/// stub's record is what distinguishes "the site table answered" from "the ACME source answered
+/// and happened to agree".
+///
+/// The middle case is the one worth the trouble. A client offering `h2` *and* `acme-tls/1` together
+/// is **not** a validation attempt — `is_tls_alpn_challenge` is an exact match on the ALPN list, so
+/// a client appending the challenge protocol to a normal offer must take the normal path. A naive
+/// "does the offer contain `acme-tls/1`" would hand that client a validation certificate.
+#[tokio::test]
+async fn the_acme_source_answers_only_an_exact_challenge_handshake() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use volucer_acme::{ChallengeCert, ChallengeSource};
+
+    /// A stand-in for the ACME state, which **delegates the gate to the real resolver** and records
+    /// every ALPN offer it was asked about.
+    ///
+    /// Delegating rather than implementing the check itself is the point. A stub that decided
+    /// "is this a challenge?" on its own would make this test pass against any dispatch logic at
+    /// all: the falsification run — replacing rustls-acme's exact match with a substring check —
+    /// **passed** while the stub owned the decision. So `is_challenge` goes through the real
+    /// `ChallengeResolver`, which is where `is_tls_alpn_challenge`'s exact-match rule lives, and the
+    /// recording is only the observation.
+    #[derive(Debug)]
+    struct Recording {
+        /// The real challenge resolver, for the decision.
+        real: volucer_acme::ChallengeResolver,
+        /// Every ALPN offer the gate saw, in order.
+        saw_alpn: Mutex<Vec<Vec<Vec<u8>>>>,
+        /// How often the certificate was asked for — the second half of the decision, so a gate
+        /// that said "challenge" and was then not consulted would be visible.
+        answered: AtomicUsize,
+    }
+
+    impl ChallengeSource for Recording {
+        fn is_challenge(&self, hello: &rustls::server::ClientHello<'_>) -> bool {
+            // Recorded first, so the offer is captured even if the real gate says no.
+            let offered: Vec<Vec<u8>> = match hello.alpn() {
+                Some(list) => list.map(|name: &[u8]| name.to_vec()).collect(),
+                None => Vec::new(),
+            };
+            self.saw_alpn.lock().expect("not poisoned").push(offered);
+            // The real rule, not a copy of it.
+            <volucer_acme::ChallengeResolver as ChallengeSource>::is_challenge(&self.real, hello)
+        }
+
+        fn challenge_cert(&self, hello: rustls::server::ClientHello<'_>) -> Option<ChallengeCert> {
+            self.answered.fetch_add(1, Ordering::Relaxed);
+            // The real resolver too: for a validation of a name its state is not working on, this
+            // is `None`, which is what makes a real client see a *failed handshake* rather than
+            // another site's certificate.
+            <volucer_acme::ChallengeResolver as ChallengeSource>::challenge_cert(&self.real, hello)
+        }
+    }
+
+    let cert = Cert::new("acme-dispatch", "example.test");
+    let config = write_config(&cert, "");
+    let table = load_pair(cert.dir(), "server");
+    let site_der = der_of(&cert.dir().join("certs/server.crt"));
+
+    let recording = Arc::new(Recording {
+        real: volucer_acme::ChallengeResolver::new(
+            // The resolver an `AcmeState` hands out, from an `AcmeConfig` with no cache and no
+            // account. Nothing here reaches the network: this only needs a resolver whose
+            // challenge data is empty, so its answer is `None` for every name — which is what makes
+            // "the site table answered" the observable rather than "the ACME state happened to have
+            // a certificate".
+            rustls_acme::AcmeConfig::<std::convert::Infallible, std::convert::Infallible>::new([
+                "example.test",
+            ])
+            .state()
+            .resolver(),
+        ),
+        saw_alpn: Mutex::new(Vec::new()),
+        answered: AtomicUsize::new(0),
+    });
+    let resolver = Arc::new(
+        volucer_http::SniResolver::from_certs(
+            volucer_http::Certs::new(table, std::iter::empty()),
+            cert.dir(),
+        )
+        .with_acme(Arc::clone(&recording) as Arc<dyn ChallengeSource>),
+    );
+    assert!(
+        resolver.has_acme(),
+        "the fixture must actually have the source installed, or nothing below is dispatched"
+    );
+
+    let addr = start_with_resolver(config, cert.dir(), resolver).await;
+
+    // A normal handshake: offered `h2`, `http/1.1`, and the source refused it, so the site table
+    // answered. This is the claim — a normal client gets the site certificate and never reaches
+    // the ACME source's certificate path.
+    let plain = fetch(addr, "example.test", &["h2", "http/1.1"]).await;
+    assert_eq!(
+        plain.certificate, site_der,
+        "a normal handshake must be answered by the site table"
+    );
+    assert_eq!(
+        recording.answered.load(Ordering::Relaxed),
+        0,
+        "the ACME source's certificate must not be consulted for a normal handshake"
+    );
+
+    // The combination: `h2` **and** `acme-tls/1`. Not a validation, by the exact-match rule, so it
+    // must also be the site table's — and this is where a substring check would go wrong.
+    let mixed = fetch(addr, "example.test", &["h2", "acme-tls/1"]).await;
+    assert_eq!(
+        mixed.certificate, site_der,
+        "a client offering the challenge protocol *alongside* a real one is not a validation and \
+         must be answered by the site table"
+    );
+    assert_eq!(
+        recording.answered.load(Ordering::Relaxed),
+        0,
+        "a combined offer must not reach the ACME source's certificate"
+    );
+
+    // Both were seen by the gate, so the count above is an observation rather than the source never
+    // having been wired in at all.
+    let seen = recording.saw_alpn.lock().expect("not poisoned").clone();
+    assert_eq!(
+        seen.len(),
+        2,
+        "the challenge gate must have been asked about both handshakes: {seen:?}"
+    );
+    assert!(
+        seen[0].iter().any(|p| p == b"h2"),
+        "the first offer should carry h2: {seen:?}"
+    );
+    assert!(
+        seen[1].iter().any(|p| p == b"acme-tls/1"),
+        "the second offer should carry acme-tls/1: {seen:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(cert.dir());
+}
+
 /// DER bytes of a certificate pair on disk, loaded the way the resolver loads them.
 ///
 /// Through `load_certified` rather than `CertifiedKey::from_der`, so a test that installs a

@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use volucer_core::sites::Sites;
+use volucer_watch::SharedState;
 
 use crate::dispatch::Dispatcher;
 use crate::error::{Result, ServerError};
@@ -81,13 +82,15 @@ impl Stats {
 pub struct FastCgiListener {
     listener: TcpListener,
     dispatcher: Arc<Dispatcher>,
-    /// The site table, so a request from nginx is routed by the table of the site its `Host`
-    /// names rather than by the server's.
+    /// The site table, shared with the HTTP front-end, so a reload moves both.
     ///
     /// Site selection behind nginx can only change the *backend*: nginx resolved
     /// `SCRIPT_FILENAME` before forwarding and the params are relayed verbatim, so the document
-    /// root is already settled. That is still the difference between one pool and another.
-    sites: Arc<Sites>,
+    /// root is already settled. That is still the difference between one pool and another — and
+    /// it is why this must move with the HTTP listener rather than beside it. A reload that
+    /// reached only one front-end took effect on one protocol, which reads as the other one being
+    /// right and is invisible to any test that exercises a single front-end.
+    sites: SharedState,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Stats>,
     limits: Limits,
@@ -109,6 +112,27 @@ impl FastCgiListener {
         sites: Arc<Sites>,
         limits: Limits,
     ) -> Result<Self> {
+        Self::bind_shared(
+            address,
+            dispatcher,
+            SharedState::new((*sites).clone()),
+            limits,
+        )
+    }
+
+    /// [`FastCgiListener::bind`], around a site table another listener already shares.
+    ///
+    /// The two-listener case, and the only way `serve` can give both front-ends one table. A
+    /// listener that built its own table would be the one still serving the old configuration
+    /// after a reload, which reads as the *other* front-end being right and is invisible to any
+    /// test that exercises one protocol — so this parameter prevents the defect rather than
+    /// documenting it.
+    pub fn bind_shared(
+        address: &str,
+        dispatcher: Arc<Dispatcher>,
+        sites: SharedState,
+        limits: Limits,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(address).map_err(|source| ServerError::Misconfigured {
             backend: "<listener>".to_string(),
             reason: format!("cannot bind {address}: {source}"),
@@ -123,6 +147,22 @@ impl FastCgiListener {
             stats: Arc::new(Stats::default()),
             limits,
         })
+    }
+
+    /// The site table this listener serves from, shared with every other front-end.
+    ///
+    /// A clone of the handle rather than of the table, so replacing through it moves all of them.
+    pub fn shared_state(&self) -> SharedState {
+        self.sites.clone()
+    }
+
+    /// A handle that replaces what this listener is serving, without a restart.
+    ///
+    /// The same handle the HTTP listener exposes, and that is the point: both front-ends hold one
+    /// `SharedState`, so this exists for symmetry and for the test that pins the FastCGI half —
+    /// there is deliberately no per-listener reload path, because per-listener is the bug.
+    pub fn reload_handle(&self) -> SharedState {
+        self.sites.clone()
     }
 
     /// The address actually bound, which matters when port 0 was requested.
@@ -163,7 +203,7 @@ impl FastCgiListener {
                     }
 
                     let dispatcher = Arc::clone(&self.dispatcher);
-                    let sites = Arc::clone(&self.sites);
+                    let sites = self.sites.clone();
                     let stats = Arc::clone(&self.stats);
                     let shutdown = Arc::clone(&self.shutdown);
                     let max_connections = self.limits.max_connections;
@@ -223,7 +263,7 @@ impl ShutdownHandle {
 fn serve_connection(
     stream: std::net::TcpStream,
     dispatcher: Arc<Dispatcher>,
-    sites: Arc<Sites>,
+    sites: SharedState,
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
     max_connections: usize,
@@ -310,9 +350,15 @@ fn serve_connection(
                     .find(|(key, _)| key.as_slice() == b"SERVER_NAME")
             })
             .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
-        let site = sites.resolve(host.as_deref());
+        // One snapshot for the request, so the site is resolved against one generation of the
+        // table even if a reload lands here — the same rule the HTTP front-end follows. Taken
+        // *per request* rather than per connection: nginx keeps its upstream alive, so the request
+        // that arrives after a reload very often arrives on a connection accepted before it, and a
+        // per-connection snapshot would serve the old configuration for the life of that
+        // connection. That is what this line was written to fix, and the test pins it.
+        let snapshot = sites.sites();
+        let site = snapshot.resolve(host.as_deref());
         let response = dispatcher.dispatch_with_routes(&site.routes, &request);
-
         match response {
             Ok(response) => {
                 stats.requests.fetch_add(1, Ordering::Relaxed);
@@ -400,8 +446,8 @@ mod tests {
             routes: Vec::new(),
             sites: BTreeMap::new(),
         };
-        let dispatcher = Dispatcher::from_config(&config, volucer_fcgi::Routing::default())
-            .expect("dispatcher");
+        let dispatcher =
+            Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher");
 
         let err = FastCgiListener::bind(
             &address,

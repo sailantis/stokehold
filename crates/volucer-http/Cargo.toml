@@ -11,6 +11,7 @@ repository.workspace = true
 volucer-core.workspace = true
 volucer-fcgi.workspace = true
 volucer-server.workspace = true
+volucer-watch.workspace = true
 volucer-worker.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true

@@ -118,7 +118,7 @@ async fn start_keeping(
     config: Config,
     config_dir: &Path,
 ) -> (SocketAddr, volucer_http::ReloadHandle) {
-    let sites = Arc::new(Sites::from_config(&config, config_dir));
+    let sites = volucer_http::SharedState::new(Sites::from_config(&config, config_dir));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -559,7 +559,7 @@ async fn start_redirecting_to(
     https_port: Option<u16>,
     with_tls: bool,
 ) -> SocketAddr {
-    let sites = Arc::new(Sites::from_config(&config, config_dir));
+    let sites = volucer_http::SharedState::new(Sites::from_config(&config, config_dir));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -664,7 +664,7 @@ key = "certs/absent.key"
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("a probe port");
     let address = occupied.local_addr().expect("address").to_string();
 
-    let sites = Arc::new(Sites::from_config(&config, &config_dir));
+    let sites = volucer_http::SharedState::new(Sites::from_config(&config, &config_dir));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -866,7 +866,7 @@ async fn an_in_memory_certificate_needs_no_file_and_no_config() {
         cert.dir(),
     ));
 
-    let sites = Arc::new(Sites::from_config(&config, cert.dir()));
+    let sites = volucer_http::SharedState::new(Sites::from_config(&config, cert.dir()));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );
@@ -1029,7 +1029,7 @@ static_files = {{ enabled = true }}
     assert_eq!(
         reload
             .current()
-            .sites
+            .sites()
             .default_site()
             .document_root
             .as_path(),
@@ -1056,7 +1056,7 @@ async fn a_resolver_without_tls_settings_is_refused() {
         cert.dir(),
     ));
 
-    let sites = Arc::new(Sites::from_config(&config, cert.dir()));
+    let sites = volucer_http::SharedState::new(Sites::from_config(&config, cert.dir()));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
     );

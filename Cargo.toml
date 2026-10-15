@@ -6,6 +6,7 @@ members = [
     "crates/volucer-fcgi",
     "crates/volucer-server",
     "crates/volucer-http",
+    "crates/volucer-watch",
     "crates/volucer",
 ]
 
@@ -28,6 +29,7 @@ volucer-worker = { version = "0.1.0", path = "crates/volucer-worker" }
 volucer-fcgi = { version = "0.1.0", path = "crates/volucer-fcgi" }
 volucer-server = { version = "0.1.0", path = "crates/volucer-server" }
 volucer-http = { version = "0.1.0", path = "crates/volucer-http" }
+volucer-watch = { version = "0.1.0", path = "crates/volucer-watch" }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"

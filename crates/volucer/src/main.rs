@@ -9,7 +9,8 @@ use clap::{Parser, Subcommand};
 
 use volucer_core::config::{Config, MinTlsVersion};
 use volucer_core::php;
-use volucer_core::sites::Sites;use volucer_fcgi::cgi::Routing;
+use volucer_core::sites::Sites;
+use volucer_fcgi::cgi::Routing;
 use volucer_http::{HttpLimits, RunningHttp};
 use volucer_server::{Contention, Dispatcher, FastCgiListener, Limits, ServerError};
 
@@ -368,15 +369,21 @@ fn serve(
     // strong count below.
     let reporting = Arc::clone(&dispatcher);
 
+    // One handle, cloned into every listener, so a reload moves all of them or none. It must be
+    // built here rather than per listener: a listener that built its own would keep serving the
+    // old configuration after a reload, which takes effect on one protocol and reads as the
+    // other front-end being right.
+    let shared = volucer_http::SharedState::new((*sites).clone());
+
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
     // before the runtime is built.
     let fastcgi = match &fastcgi_address {
         Some(address) => {
-            let listener = FastCgiListener::bind(
+            let listener = FastCgiListener::bind_shared(
                 address,
                 Arc::clone(&dispatcher),
-                Arc::clone(&sites),
+                shared.clone(),
                 Limits { max_connections },
             )?;
             println!("  fastcgi:          {}", listener.local_addr()?);
@@ -432,7 +439,7 @@ fn serve(
             let running = RunningHttp::start_with_tls(
                 address,
                 Arc::clone(&dispatcher),
-                Arc::clone(&sites),
+                shared.clone(),
                 HttpLimits {
                     max_connections,
                     ..HttpLimits::default()
@@ -460,7 +467,7 @@ fn serve(
             let running = RunningHttp::start_with_tls(
                 address,
                 Arc::clone(&dispatcher),
-                Arc::clone(&sites),
+                shared.clone(),
                 HttpLimits {
                     max_connections,
                     ..HttpLimits::default()
@@ -656,7 +663,11 @@ fn check(
     // process started.
     match resolved_server_tls(&config, path) {
         Some(server_tls) => {
-            let tls = config.server.tls.as_ref().expect("resolved implies present");
+            let tls = config
+                .server
+                .tls
+                .as_ref()
+                .expect("resolved implies present");
             println!("  tls:");
             println!("    certificate:      {}", server_tls.certificate.display());
             println!("    key:              {}", server_tls.key.display());

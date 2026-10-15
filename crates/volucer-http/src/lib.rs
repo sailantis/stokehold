@@ -39,17 +39,16 @@
 
 pub mod error;
 pub mod listener;
-pub mod reload;
 pub mod static_files;
 pub mod tls;
 
 pub use error::HttpError;
 pub use listener::{
     to_cgi, to_cgi_routed, HttpLimits, HttpListener, HttpShutdown, HttpStats, ListenerSettings,
-    ReloadHandle, Reloaded, RunningHttp, TlsSettings,
+    ReloadHandle, Reloaded, Resolved, RunningHttp, TlsSettings,
 };
-pub use reload::Swappable;
 pub use tls::{
     CertificateSet, Certs, ServerCertificate, SiteCertificate, SiteCertificatePair, SniResolver,
     TlsError,
 };
+pub use volucer_watch::{SharedState, Swappable};

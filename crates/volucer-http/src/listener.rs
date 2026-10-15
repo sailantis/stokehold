@@ -43,9 +43,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use volucer_core::sites::{ResolvedSite, Sites};
 use volucer_fcgi::{cgi, RequestInfo, Route, Routing};
 use volucer_server::{Dispatcher, ServerError};
+use volucer_watch::{SharedState, Swappable};
 
 use crate::error::{HttpError, Result};
-use crate::reload::Swappable;
 use crate::static_files::{self, StaticFiles};
 
 /// The body type every response uses.
@@ -198,7 +198,15 @@ struct FrontEnd {
     /// synchronise internally, per backend slot, so requests to different
     /// workers genuinely run at the same time.
     dispatcher: Arc<Dispatcher>,
-    /// Everything a reload replaces, behind **one** pointer.
+    /// The site table, shared with the *other* front-end so a reload moves both.
+    ///
+    /// The table lives here rather than in this listener because a deployment can run an HTTP
+    /// listener and a FastCGI listener at once, and `serve` hands them the same table. A reload
+    /// that replaced only this one's copy worked over `:80` and silently kept reaching the old
+    /// backend behind nginx — a difference that reads as *the other front-end being right*
+    /// rather than as a bug, which is why it is a shared handle rather than a field.
+    shared: SharedState,
+    /// Everything this listener derives from the table, behind **one** pointer.
     ///
     /// One handle rather than one per field, and that is the whole correctness of a reload
     /// under load: three separate swaps would let a request take the new site table and the
@@ -229,7 +237,7 @@ struct FrontEnd {
     https_port: Option<u16>,
 }
 
-/// Everything a reload can replace, as one value so it can be replaced in one step.
+/// Everything this listener derives from the shared site table, as one replaceable value.
 ///
 /// The three travel together because they are derived from one another: the routing and
 /// static maps are built *from* the site table, so a request that took them from different
@@ -240,8 +248,11 @@ struct FrontEnd {
 /// The `Arc`s are for the request path: a handler takes one snapshot and moves it into the
 /// blocking dispatch task, so the request keeps the configuration it began under.
 pub struct Reloaded {
-    /// The site table, to turn a `Host` header into one of the entries below.
-    pub sites: Sites,
+    /// The site table this was built from, as a snapshot of [`SharedState`].
+    ///
+    /// Held rather than borrowed so a request is served under one generation even if a reload
+    /// lands while it is in flight — the property the in-flight test pins.
+    sites: Arc<Sites>,
     /// One prebuilt routing per site, by site name, plus the default under
     /// `"<default>"`.
     ///
@@ -254,11 +265,15 @@ pub struct Reloaded {
 }
 
 impl Reloaded {
-    /// Build the reloadable state for a site table.
+    /// Build this listener's maps from a snapshot of the shared site table.
+    ///
+    /// Takes the `Arc` the shared handle handed out rather than a table, so the value a request
+    /// reads and the per-site maps it routes against are guaranteed to be the *same* generation:
+    /// there is no constructor that could pair them from two.
     ///
     /// `server_port` is the bound port, which the static layer stamps into generated
     /// redirects — a reload cannot change it, so it is passed in rather than stored.
-    pub fn from_sites(sites: Sites, server_port: u16) -> Self {
+    pub fn from_sites(sites: Arc<Sites>, server_port: u16) -> Self {
         let mut routings = BTreeMap::new();
         let mut statics = BTreeMap::new();
         for site in sites
@@ -290,6 +305,11 @@ impl Reloaded {
         }
     }
 
+    /// The site table this snapshot was built from.
+    pub fn sites(&self) -> &Sites {
+        &self.sites
+    }
+
     /// The routing and static layer for one site.
     ///
     /// A site resolved by [`Sites`] is always in both maps — they are built from the
@@ -319,6 +339,26 @@ impl std::fmt::Debug for Reloaded {
     }
 }
 
+/// One request's configuration: a resolved site and the maps that go with it, from one generation.
+///
+/// Returned as a single value rather than as a pair of calls because the pairing *is* the
+/// correctness. The site has to come from the `Reloaded` a request took, not from the shared table
+/// live at the moment of resolution: a reload landing between the two would otherwise resolve a
+/// site against one generation and route it against another, which is the failure this whole
+/// mechanism exists to prevent — and it would look like a site serving the wrong document root,
+/// once, under load.
+///
+/// The two borrows are tied to the `Arc<Reloaded>` the caller holds, so a request cannot keep them
+/// past its own snapshot.
+pub struct Resolved<'a> {
+    /// The site this request is served by.
+    pub site: &'a ResolvedSite,
+    /// Its routing.
+    pub routing: &'a Routing,
+    /// Its static layer.
+    pub statics: &'a StaticFiles,
+}
+
 impl FrontEnd {
     /// A snapshot of the reloadable state, taken once per request.
     ///
@@ -329,6 +369,22 @@ impl FrontEnd {
     /// explained to an operator.
     fn state(&self) -> Arc<Reloaded> {
         self.state.load()
+    }
+}
+
+impl Reloaded {
+    /// Resolve a host against *this* generation and return everything the request needs from it.
+    ///
+    /// One call rather than a resolve followed by a lookup, because the two must agree: see
+    /// [`Resolved`].
+    pub fn resolve(&self, host: Option<&str>) -> Resolved<'_> {
+        let site = self.sites.resolve(host);
+        let (routing, statics) = self.for_site(site);
+        Resolved {
+            site,
+            routing,
+            statics,
+        }
     }
 }
 
@@ -345,6 +401,14 @@ impl FrontEnd {
 #[derive(Clone)]
 pub struct ReloadHandle {
     state: Arc<Swappable<Reloaded>>,
+    /// The site table, shared with the other front-end, so a reload moves both.
+    ///
+    /// A second pointer, and deliberately not part of `state`: `Reloaded` holds a *snapshot* of
+    /// the table so an in-flight request keeps it, while this holds the *live* handle a reload
+    /// writes through. Folding them together would mean a reload had to reach the table through
+    /// the HTTP listener, which is exactly how the FastCGI front-end came to keep serving the old
+    /// one.
+    shared: SharedState,
     /// TLS, when this listener speaks it, so a certificate can be replaced too.
     ///
     /// Separate from `state` because it *has* to be: the resolver is installed into a
@@ -365,6 +429,11 @@ impl ReloadHandle {
         self.state.load()
     }
 
+    /// The site table being served right now, shared across front-ends.
+    pub fn shared(&self) -> &SharedState {
+        &self.shared
+    }
+
     /// The certificate resolver, when this listener speaks TLS.
     ///
     /// The handle a certificate reload goes through — see
@@ -375,17 +444,25 @@ impl ReloadHandle {
         self.tls.as_ref()
     }
 
-    /// Replace the site table, rebuilding the derived maps from it.
+    /// Replace the shared site table, rebuilding this listener's derived maps from it.
     ///
     /// Returns the state that was replaced, so a caller can report what changed rather than
     /// only that something did — the difference between "site `api` document_root changed"
     /// and "configuration reloaded", after which an operator has to go and diff the file.
     ///
+    /// The table is replaced through [`SharedState`], so every front-end holding the handle moves
+    /// at once. This listener's own routings and static layers are then rebuilt from the table
+    /// that is now live — read back through the handle rather than from the argument, and that
+    /// distinction is a bug that was written and caught: [`SharedState::replace`] returns the
+    /// table it *replaced*, so rebuilding from its return value rebuilt the maps from the previous
+    /// generation, and a reload then reported a change while serving the old document root.
+    ///
     /// In-flight requests are unaffected: each holds a snapshot of the state it started
     /// under, which is what makes this safe to call while the listener is serving.
     #[must_use]
     pub fn apply(&self, sites: Sites) -> Arc<Reloaded> {
-        let next = Reloaded::from_sites(sites, self.server_port);
+        let _previous_table = self.shared.replace(sites);
+        let next = Reloaded::from_sites(self.shared.sites(), self.server_port);
         self.state.replace(next)
     }
 }
@@ -445,7 +522,7 @@ impl RunningHttp {
         Self::start_with_tls(
             address,
             dispatcher,
-            sites,
+            SharedState::new((*sites).clone()),
             limits,
             ListenerSettings::default(),
         )
@@ -455,7 +532,7 @@ impl RunningHttp {
     pub fn start_with_tls(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        sites: Arc<Sites>,
+        sites: SharedState,
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
     ) -> Result<Self> {
@@ -538,6 +615,11 @@ impl HttpListener {
     /// runtime — which is the visible tip of the boundary this crate exists to
     /// draw. Binding happens before `run` so a port conflict is reported before
     /// any backend is reached.
+    ///
+    /// The site table is wrapped in its own [`SharedState`], so a caller with a single listener
+    /// has nothing extra to build. A caller with more than one — `serve`, which may run a FastCGI
+    /// listener too — must use [`HttpListener::bind_with_resolver`] with a handle it shares, or a
+    /// reload would move only the HTTP listener's copy.
     pub async fn bind(
         address: &str,
         dispatcher: Arc<Dispatcher>,
@@ -547,7 +629,7 @@ impl HttpListener {
         Self::bind_with_tls(
             address,
             dispatcher,
-            sites,
+            SharedState::new((*sites).clone()),
             limits,
             ListenerSettings::default(),
         )
@@ -563,7 +645,7 @@ impl HttpListener {
     pub async fn bind_with_tls(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        sites: Arc<Sites>,
+        sites: SharedState,
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
     ) -> Result<Self> {
@@ -580,14 +662,17 @@ impl HttpListener {
         Self::bind_with_resolver(address, dispatcher, sites, limits, settings, resolver).await
     }
 
-    /// [`HttpListener::bind_with_tls`], around a resolver the caller built.
+    /// [`HttpListener::bind_with_tls`], around a site table and resolver another listener shares.
     ///
-    /// The certificate table this starts with is the one passed in, and **no certificate file
-    /// is read** — which is the whole reason this exists rather than being a variant of the
-    /// call above. A deployment that obtains its certificate at runtime (ACME) has no readable
-    /// pair when the port comes up, and waiting for one would mean the port could not come up
-    /// at all. The resolver is then the handle a renewal goes through, so the certificate that
-    /// arrives later is presented on the next handshake without the listener being rebuilt.
+    /// The table arrives as a [`SharedState`] because it is **shared**, not owned: a deployment
+    /// runs an HTTP listener and possibly a FastCGI one, and a reload that moved only one of them
+    /// would take effect on one protocol and not the other. A listener that built its own table
+    /// from the config would be exactly that one.
+    ///
+    /// The resolver's own documentation covers the certificate side: the table this starts with is
+    /// the one passed in, and **no certificate file is read**. That is what lets a deployment whose
+    /// certificate does not exist yet — ACME — bind its port, and the resolver is then the handle a
+    /// renewal goes through.
     ///
     /// `settings.tls` is still read: `min_version` and `alpn` are properties of the
     /// [`rustls::ServerConfig`], not of a certificate, and they are restart-only (§ the
@@ -597,7 +682,7 @@ impl HttpListener {
     pub async fn bind_with_resolver(
         address: &str,
         dispatcher: Arc<Dispatcher>,
-        sites: Arc<Sites>,
+        sites: SharedState,
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
         resolver: Option<Arc<crate::tls::SniResolver>>,
@@ -702,15 +787,20 @@ impl HttpListener {
             );
         }
 
-        // The reloadable state, built once here and replaced whole from the handle that
-        // `reload_handle` hands out. `port` is the bound port, which a reload cannot change —
-        // the socket is already listening on it.
-        let reloaded = Reloaded::from_sites((*sites).clone(), port);
+        // This listener's maps, built once here from a snapshot of the shared table and replaced
+        // whole from the handle `reload_handle` gives out. `port` is the bound port, which a
+        // reload cannot change — the socket is already listening on it.
+        //
+        // The snapshot is taken from the *same* handle that goes into `FrontEnd`, so this
+        // listener's first generation of maps is built from the table every other front-end
+        // starts with.
+        let reloaded = Reloaded::from_sites(sites.sites(), port);
 
         Ok(HttpListener {
             listener,
             front_end: Arc::new(FrontEnd {
                 dispatcher,
+                shared: sites,
                 state: Arc::new(Swappable::new(reloaded)),
                 tls: resolver,
                 limits,
@@ -732,6 +822,7 @@ impl HttpListener {
     pub fn reload_handle(&self) -> ReloadHandle {
         ReloadHandle {
             state: Arc::clone(&self.front_end.state),
+            shared: self.front_end.shared.clone(),
             tls: self.front_end.tls.clone(),
             server_port: self.front_end.server_port,
         }
@@ -1052,8 +1143,9 @@ async fn prepare(
         .get(HOST)
         .and_then(|value| value.to_str().ok());
     let state = front_end.state();
-    let site = state.sites.resolve(host);
-    let (routing, statics) = state.for_site(site);
+    let resolved = state.resolve(host);
+    let site = resolved.site;
+    let (routing, statics) = (resolved.routing, resolved.statics);
     // Static content is decided before the body is read: a `GET` for a file has
     // no body worth buffering, and refusing to buffer one it will never use is
     // the point of a limit.

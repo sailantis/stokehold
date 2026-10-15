@@ -42,7 +42,7 @@ use rustls::sign::CertifiedKey;
 use volucer_core::config::{Config, MinTlsVersion, TlsConfig};
 use volucer_core::hostmap::HostMap;
 
-use crate::reload::Swappable;
+use volucer_watch::Swappable;
 
 /// A certificate and its key, loaded and paired.
 ///

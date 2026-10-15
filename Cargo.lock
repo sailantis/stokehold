@@ -1123,6 +1123,7 @@ dependencies = [
  "volucer-core",
  "volucer-fcgi",
  "volucer-server",
+ "volucer-watch",
  "volucer-worker",
 ]
 
@@ -1135,8 +1136,17 @@ dependencies = [
  "tracing",
  "volucer-core",
  "volucer-fcgi",
+ "volucer-watch",
  "volucer-worker",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "volucer-watch"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "volucer-core",
 ]
 
 [[package]]

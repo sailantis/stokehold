@@ -1,0 +1,12 @@
+[package]
+name = "volucer-watch"
+description = "The state volucer's front-ends serve from, and swapping it without a restart"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+volucer-core.workspace = true
+arc-swap.workspace = true

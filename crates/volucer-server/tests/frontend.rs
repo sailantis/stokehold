@@ -15,13 +15,17 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use volucer_core::config::{BackendConfig, Config, ServerConfig, SpawnCgiConfig};
+use volucer_core::sites::Sites;
 use volucer_fcgi::{
     message::BeginRequest, nvpair, protocol::RecordType, record, Endpoint, Request, Response,
 };
+use volucer_server::listener::{FastCgiListener, Limits};
 use volucer_server::{backend, Dispatcher};
+use volucer_watch::SharedState;
 
 mod common;
 use common::{find_php_cgi, free_port_run, serial, write_script};
@@ -257,8 +261,14 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
             ..Default::default()
         },
         backends: [
-            ("default_pool".to_string(), BackendConfig::External(socket_of(1))),
-            ("api_pool".to_string(), BackendConfig::External(socket_of(2))),
+            (
+                "default_pool".to_string(),
+                BackendConfig::External(socket_of(1)),
+            ),
+            (
+                "api_pool".to_string(),
+                BackendConfig::External(socket_of(2)),
+            ),
         ]
         .into_iter()
         .collect(),
@@ -303,6 +313,181 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
         err.to_string().contains("default_pool"),
         "an unrouted request must reach the default backend: {err}"
     );
+}
+
+/// Open one FastCGI connection, the way nginx's upstream keep-alive does: several requests
+/// arrive on one connection, and that connection is accepted once.
+fn fastcgi_connection(address: std::net::SocketAddr) -> std::io::BufReader<TcpStream> {
+    let stream = TcpStream::connect(address).expect("connect to the front-end");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    std::io::BufReader::new(stream)
+}
+
+/// Send one request on an existing connection, and read the answer.
+///
+/// `keep_conn` is `true` and the loop stops at `END_REQUEST`, so the connection stays open for the
+/// next call — which is the point rather than a convenience. A test that opened a fresh connection
+/// per request would pass against a listener that captured its site table when the connection was
+/// *accepted*, and that listener is the bug: nginx keeps an upstream alive, so the request that
+/// arrives after a reload very often arrives on a connection accepted before it.
+fn request_on(
+    reader: &mut std::io::BufReader<TcpStream>,
+    request_id: u16,
+    host: &str,
+    uri: &str,
+) -> String {
+    let params = [
+        (b"REQUEST_METHOD".as_slice(), b"GET".as_slice()),
+        (b"REQUEST_URI".as_slice(), uri.as_bytes()),
+        (b"SCRIPT_FILENAME".as_slice(), uri.as_bytes()),
+        (b"SERVER_PROTOCOL".as_slice(), b"HTTP/1.1".as_slice()),
+        (b"HTTP_HOST".as_slice(), host.as_bytes()),
+    ];
+    let mut wire = Vec::new();
+    let begin = BeginRequest::responder(true);
+    record::Header::new(RecordType::BeginRequest, request_id, 8)
+        .write(&mut wire)
+        .expect("write BEGIN_REQUEST");
+    wire.write_all(&begin.encode()).expect("write begin body");
+    let payload = nvpair::encode_pairs(params);
+    record::write_records(&mut wire, RecordType::Params, request_id, &payload, true)
+        .expect("write params");
+    record::write_records(&mut wire, RecordType::Stdin, request_id, b"", true)
+        .expect("write stdin");
+    reader.get_mut().write_all(&wire).expect("send the request");
+    reader.get_mut().flush().expect("flush");
+
+    // Read until END_REQUEST, which is the front-end's own terminator. A timeout here would mean
+    // the listener answered nothing, so it is a 5 s bound rather than an unbounded read.
+    let mut out = Vec::new();
+    loop {
+        let record = match record::read_record(reader) {
+            Ok(Some(record)) => record,
+            Ok(None) => break,
+            Err(err) => panic!("the front-end sent a malformed record: {err}"),
+        };
+        let end = record.record_type() == RecordType::EndRequest;
+        out.extend_from_slice(&record.content);
+        if end {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn a_reload_moves_the_fastcgi_front_ends_site_table_too() {
+    // The defect this pins, and it was real rather than hypothetical: `FastCgiListener` holds its
+    // **own** `Arc<Sites>` and resolves the site per request, while a reload replaced only the HTTP
+    // front-end's table. `serve` hands both front-ends the same `Arc`, so a site whose backend a
+    // reload changed kept reaching the old one behind nginx while the same change took effect over
+    // HTTP. That failure does not look like a race or like a bug — it looks like the *other* front
+    // end being right, and it is invisible to a test that only exercises HTTP.
+    //
+    // Asserted through the real connection path, because the property is "a request arriving after
+    // the reload reaches the new backend", and a table that moved while the accept loop kept a
+    // stale clone would pass a table-level assertion.
+    let roots = std::env::temp_dir().join(format!("volucer-fcgi-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&roots);
+    for name in ["first", "second"] {
+        std::fs::create_dir_all(roots.join(name)).expect("create a root");
+    }
+
+    // Two pools with nothing behind them, and the *site's own route table* is what selects
+    // between them. That is the mechanism this front-end uses: a request arriving from nginx has
+    // its `SCRIPT_FILENAME` already resolved, so the only thing site selection can change is which
+    // pool serves it — and a route naming a backend is the operator's way of saying which.
+    //
+    // The assertion is therefore which pool is *chosen*, and the dispatcher names it in its error.
+    // That is the technique `a_route_selects_the_backend_for_a_fastcgi_request_too` already uses,
+    // and it is why neither pool needs a PHP process behind it.
+    let config_for = |pool: &str, socket: &str, root: &Path, path_suffix: &str| {
+        let text = format!(
+            r#"
+default_backend = "unreachable"
+
+[server]
+http = "127.0.0.1:0"
+fastcgi = "127.0.0.1:0"
+document_root = {root:?}
+
+[backends.{pool}]
+kind = "external"
+socket = "{socket}"
+
+[backends.unreachable]
+kind = "external"
+socket = "127.0.0.1:9"
+
+[[routes]]
+path_suffix = "{path_suffix}"
+backend = "{pool}"
+"#,
+            root = root.to_string_lossy(),
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    };
+
+    // The two configs differ only in which pool `/probe.php` reaches, so the reload has to be
+    // attributable to the site table rather than to everything about the config.
+    let before = config_for("first_pool", "127.0.0.1:1", &roots.join("first"), ".php");
+    let after = config_for("second_pool", "127.0.0.1:2", &roots.join("second"), ".php");
+
+    let sites = SharedState::new(Sites::from_config(&before, &roots.join("first")));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&before, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+
+    let listener = FastCgiListener::bind_shared(
+        "127.0.0.1:0",
+        Arc::clone(&dispatcher),
+        sites,
+        Limits::default(),
+    )
+    .expect("bind the fastcgi listener");
+    let address = listener.local_addr().expect("bound address");
+    let reload = listener.reload_handle();
+    let shutdown = listener.shutdown_handle();
+
+    let handle = std::thread::spawn(move || listener.run());
+    // Give the accept loop a moment to reach `accept`, so the first request is not racing startup.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // **One connection for both requests**, which is the whole point: nginx keeps its upstream
+    // alive, so the request that arrives after a reload usually arrives on a connection accepted
+    // before it. A listener that captured the site table when the connection was accepted would
+    // serve the old pool for ever on that connection, and a test that dialled a fresh connection
+    // per request would pass against it.
+    let mut connection = fastcgi_connection(address);
+    let first = request_on(&mut connection, 1, "any.test", "/probe.php");
+    assert!(
+        first.contains("first_pool"),
+        "the fixture must reach the starting pool before the reload: {first}"
+    );
+
+    // The reload, through the shared handle every front-end holds. The new table's site routes
+    // `/probe.php` to the other pool, so a listener that kept a stale clone is visible in the
+    // answer rather than only in the table.
+    let _replaced = reload.replace(Sites::from_config(&after, &roots.join("second")));
+
+    let second = request_on(&mut connection, 2, "any.test", "/probe.php");
+    assert!(
+        second.contains("second_pool"),
+        "a request after the reload must reach the new backend, on a connection accepted before \
+         the reload: {second}"
+    );
+    assert!(
+        !second.contains("first_pool"),
+        "the old backend must not still be chosen: {second}"
+    );
+
+    shutdown.shutdown();
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&roots);
 }
 
 #[test]

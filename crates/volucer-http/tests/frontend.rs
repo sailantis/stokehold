@@ -1275,7 +1275,7 @@ static_files = {{ enabled = true }}
     // The handle reports what it actually replaced, which is what lets a caller log a change
     // rather than only that a reload was attempted.
     assert_eq!(
-        replaced.sites.default_site().document_root,
+        replaced.sites().default_site().document_root,
         before,
         "apply must report the state it replaced, not the one it installed"
     );
@@ -1320,24 +1320,27 @@ static_files = {{ enabled = true }}
         Sites::from_config(&config, &base.join(marker))
     };
 
-    let state =
-        volucer_http::Swappable::new(volucer_http::Reloaded::from_sites(config_for("one"), 8080));
+    let first = Arc::new(config_for("one"));
+    let state = volucer_http::Swappable::new(volucer_http::Reloaded::from_sites(first, 8080));
     // What a request does: take one snapshot and hold it.
     let in_flight = state.load();
-    let previous = state.replace(volucer_http::Reloaded::from_sites(config_for("two"), 8080));
+    let previous = state.replace(volucer_http::Reloaded::from_sites(
+        Arc::new(config_for("two")),
+        8080,
+    ));
 
     assert_eq!(
-        in_flight.sites.default_site().document_root,
+        in_flight.sites().default_site().document_root,
         base.join("one"),
         "the in-flight request must keep the root it started with"
     );
     assert_eq!(
-        previous.sites.default_site().document_root,
+        previous.sites().default_site().document_root,
         base.join("one"),
         "the replaced state is the one the request is still using"
     );
     assert_eq!(
-        state.load().sites.default_site().document_root,
+        state.load().sites().default_site().document_root,
         base.join("two"),
         "the next request takes the new root"
     );

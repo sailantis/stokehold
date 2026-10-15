@@ -11,6 +11,7 @@ repository.workspace = true
 volucer-core.workspace = true
 volucer-fcgi.workspace = true
 volucer-worker.workspace = true
+volucer-watch.workspace = true
 # Serializes the request frame's head. The server builds that head by borrowing it out of
 # the CGI environment, so it implements `Serialize` for its own borrowed header type rather
 # than collecting owned pairs for the worker crate to serialize.
@@ -25,3 +26,4 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+

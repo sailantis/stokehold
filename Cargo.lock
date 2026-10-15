@@ -1689,9 +1689,11 @@ dependencies = [
 name = "volucer-acme"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "rustls",
  "rustls-acme",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 

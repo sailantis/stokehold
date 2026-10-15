@@ -292,7 +292,13 @@ impl RunningHttp {
         sites: Arc<Sites>,
         limits: HttpLimits,
     ) -> Result<Self> {
-        Self::start_with_tls(address, dispatcher, sites, limits, ListenerSettings::default())
+        Self::start_with_tls(
+            address,
+            dispatcher,
+            sites,
+            limits,
+            ListenerSettings::default(),
+        )
     }
 
     /// [`RunningHttp::start`], with TLS and/or a redirect.
@@ -377,7 +383,14 @@ impl HttpListener {
         sites: Arc<Sites>,
         limits: HttpLimits,
     ) -> Result<Self> {
-        Self::bind_with_tls(address, dispatcher, sites, limits, ListenerSettings::default()).await
+        Self::bind_with_tls(
+            address,
+            dispatcher,
+            sites,
+            limits,
+            ListenerSettings::default(),
+        )
+        .await
     }
 
     /// [`HttpListener::bind`], with the TLS settings and the directory certificate paths
@@ -393,25 +406,21 @@ impl HttpListener {
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
     ) -> Result<Self> {
-        let listener = tokio::net::TcpListener::bind(address)
-            .await
-            .map_err(|source| HttpError::Bind {
-                address: address.to_string(),
-                source,
-            })?;
-        let bound = listener.local_addr().map_err(|source| HttpError::Bind {
-            address: address.to_string(),
-            source,
-        })?;
-
         // The redirect settings come from the listener's own settings, so a plaintext listener in
         // a split :80/:443 deployment can carry them with no TLS of its own — which is exactly
         // why they are separate from `tls` rather than derived from it.
         let redirect_to_https = settings.redirect_to_https;
         let requested_https_port = settings.https_port;
 
-        // The acceptor is built before anything is served, and its failure is reported as a
+        // The acceptor is built before the port is bound, and its failure is reported as a
         // configuration error: a certificate that cannot be read must not become a listener.
+        //
+        // The order is the point rather than a detail. Binding first and loading afterwards fails
+        // safely but *late*, and it fails after `serve` has already printed the listener lines —
+        // so an operator on a `:80`/`:443` deployment reads that both ports came up and then reads
+        // an error, and a service manager that restarts on failure takes and releases the port in
+        // a loop, with every client arriving in the window getting nothing. Nothing is bound here
+        // until the certificate that would serve it has loaded.
         let (acceptor, accept_plain) = match settings.tls {
             Some(settings) => {
                 let resolver = Arc::new(
@@ -445,6 +454,17 @@ impl HttpListener {
             None => (None, false),
         };
 
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|source| HttpError::Bind {
+                address: address.to_string(),
+                source,
+            })?;
+        let bound = listener.local_addr().map_err(|source| HttpError::Bind {
+            address: address.to_string(),
+            source,
+        })?;
+
         // The bound port, which matters when port 0 was requested. The port is needed
         // here rather than by the caller because only the listener knows what it got.
         let port = bound.port();
@@ -456,7 +476,8 @@ impl HttpListener {
         let https_port = requested_https_port.unwrap_or(port);
         if redirect_to_https {
             tracing::info!(
-                https_port, plaintext_accepted = accept_plain,
+                https_port,
+                plaintext_accepted = accept_plain,
                 "cleartext requests will be answered with a 301 to https"
             );
         }
@@ -635,10 +656,7 @@ async fn serve_accepted(
 
     match acceptor.accept(stream).await {
         Ok(tls_stream) => {
-            front_end
-                .stats
-                .handshakes
-                .fetch_add(1, Ordering::Relaxed);
+            front_end.stats.handshakes.fetch_add(1, Ordering::Relaxed);
             // `false`: this connection is already encrypted, so a redirect would loop it.
             if let Err(err) = serve_connection(tls_stream, front_end, peer, false).await {
                 tracing::debug!(%peer, %err, "https connection ended");
@@ -690,9 +708,7 @@ where
         let remote_addr = remote_addr.clone();
         // Infallible because a failure is turned into an error page, not
         // propagated: a 502 the client can read beats a dropped connection.
-        async move {
-            Ok::<_, Infallible>(handle(request, front_end, remote_addr, cleartext).await)
-        }
+        async move { Ok::<_, Infallible>(handle(request, front_end, remote_addr, cleartext).await) }
     });
 
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
@@ -747,9 +763,7 @@ async fn handle(
 fn redirect_authority(host: &str, https_port: Option<u16>, own_port: u16) -> String {
     // Everything before the port, so an IPv6 literal's brackets and colons survive.
     let name = match host.rsplit_once(':') {
-        Some((name, port))
-            if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) =>
-        {
+        Some((name, port)) if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) => {
             name
         }
         _ => host,

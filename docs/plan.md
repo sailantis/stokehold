@@ -1647,12 +1647,18 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     listener carries both protocols.
 47. `alpn-h2` — **done** (with 45). ALPN advertisement, and `alpn_negotiates_http2_then_http11`,
     the repository's first HTTP/2 test. The `Upgrade: h2c` gap remains pre-existing and unpinned.
-48. `tls-cli` — `serve` parses the certificates for real and fails before binding; `version`, whose
+48. `tls-cli` — **done, and the ordering it claimed was not the ordering it had** (hazard 56). `serve` parses the certificates for real and fails before binding; `version`, whose
     front-end line currently describes a build with no TLS.
-49. `tls-docs` — README and this file.
-50. `tls-verify` — end to end, self-signed: SNI selection, ALPN negotiation, the same-port sniff in
-    both directions, the redirect, a certificate that fails before bind, and the TLS-off benchmark
-    inside the current build's spread.
+49. `tls-docs` — **done.** README and this file.
+50. `tls-verify` — **done.** End to end, self-signed: SNI selection, ALPN negotiation, the same-port
+    sniff in both directions, the redirect, a certificate that fails before bind, and the TLS-off
+    benchmark. Nine tests in `crates/volucer-http/tests/tls.rs` plus the `h2c` one in
+    `tests/frontend.rs`. Two of the six rows did not exist when this step was first written and the
+    "fails before bind" row was **not true** — hazard 56. The TLS-off benchmark is the only number
+    in that work measured on a host rather than reasoned about: **-0.08%, 95% CI [-0.66%,
+    +0.51%]**, so the honest form of the claim is "less than about 0.7%" rather than "nothing".
+    Harness and rows in `volucer-competition`: `scripts/tls-off-ab.js`,
+    `results/tls-off-ab.tsv`, `results/tls-off-ab-noise.tsv`.
 51. `ci-build-matrix` — a build and test workflow. TLS is the workspace's first native dependency
     (C toolchain + NASM + CMake), and there is no `.github`, no CI, no release artifact and no
     systemd unit, so "it builds everywhere" is verified only by hand on one host. The prerequisite
@@ -1876,12 +1882,23 @@ the doc now says so. Prior knowledge is what a real reverse proxy uses for h2c, 
 loss is small; a browser-facing listener would carry HTTP/2 over ALPN instead, which arrives with
 step 24.
 
-**There is no HTTP/2 test anywhere in the repository.** `volucer version` has printed
-"HTTP/2 (cleartext)" since step 19, and the evidence for it is the probe above rather than a
-test — so a `hyper` upgrade that changed the negotiation would be caught by nothing. A test that
-sends the preface and asserts a SETTINGS frame comes back (and one asserting the upgrade offer
-*stays* HTTP/1.1, so the gap is a decision rather than an accident) is the obvious small
-addition; it is not in this session's scope.
+**Both HTTP/2 tests now exist, and one of them corrected this paragraph.** `volucer version` has
+printed "HTTP/2 (cleartext)" since step 19, and for a long time the evidence for it was a hand
+probe rather than a test — so a `hyper` upgrade that changed the negotiation would have been
+caught by nothing. They were added with `tls-verify` (step 50):
+
+- `alpn_h2_negotiates_a_real_http_2_connection` sends the connection preface over TLS with `h2`
+  as the only ALPN offer and **asserts a SETTINGS frame (type `0x04`) comes back**, so the claim
+  is that HTTP/2 works rather than that it was negotiated. `alpn_negotiates_http2_then_http11`
+  covers the other half — which protocol ALPN selected.
+- `an_upgrade_h2c_offer_is_answered_in_http_1_1` sends a real `Upgrade: h2c` offer and asserts no
+  `101` and no `upgrade` header, which is what makes the gap a **decision** rather than an
+  accident.
+
+The sentence that used to open this paragraph was *"There is no HTTP/2 test anywhere in the
+repository"*, which had already stopped being true when the ALPN test landed in step 47 — the
+same stale-marker problem as step 18. Corrected here rather than deleted, because the way it went
+stale is the point: a plan claim is only as good as the last time someone re-read it.
 
 ### The published Windows latency claim **is** now committed
 
@@ -2981,3 +2998,62 @@ a different 404. This is the hazard worth carrying forward: when a name appears 
 (a filename a framework looks up, an environment variable, a default config filename) rather than
 only in code, renaming the project changes that convention, and every consumer has to be found by
 searching for the convention rather than for the name.
+
+### Hazard 56 — the certificate was checked *after* the port was taken, and the plan said the opposite
+
+Step 48 recorded, as a **done** item, that *"`serve` parses the certificates for real and fails
+before binding"*. It did not. In `bind_with_tls` the port was bound first and the certificate was
+loaded afterwards, so a deployment with a bad certificate took its port and only then discovered it
+could not use it.
+
+**The comment above the load was right and the doc comment on the function was wrong**, which is
+why this survived review: the inline comment said *"the acceptor is built before anything is
+served"*, which was true, while the doc comment said *"before the port is bound"*, which was not.
+Two statements about one thing disagreed, the weaker one was true, and the stronger one was what
+the plan recorded.
+
+**Why it matters, measured by running it rather than by reading it.** Against the built binary with
+a missing certificate, the process printed the `http:` and `https:` listener lines *first* and only
+then failed:
+
+    http:             127.0.0.1:45871 (https)
+    https:            (disabled)
+      ...
+    volucer: a listener could not start: TLS is configured but unusable: server.tls: cannot read
+    the certificate ... (os error 3)
+
+So the operator reads that both ports came up, and then reads an error. Under a service manager
+that restarts on failure, a port is taken and released in a loop and every client arriving in the
+window gets nothing — **which is the failure mode the sentence in this step claimed was
+prevented.** Exit code is 1 and the port is released immediately, so it is not a hang; it is a
+window, and windows are what a restart loop turns into a permanent state.
+
+**The fix is three lines of reordering** — resolve and build the acceptor before
+`TcpListener::bind` — and it makes the code match the comment that was already there.
+
+**The test took two attempts, and the first one is the lesson.** The obvious test — assert that
+`bind_with_tls` returns a TLS error and that the port is free afterwards — **passes against the
+buggy code**, because the failed call binds and then drops the listener, so the port *is* free by
+the time anything is asserted. A second version raced two concurrent calls at the same address and
+also passed, because the first call failed and released the port before the second reached its own
+bind. Both were describing a post-condition of a sequence rather than the ordering they meant to
+pin.
+
+What works is forcing the choice: **hold the port, then call `bind_with_tls` with a certificate
+that does not exist.** Both faults are now present at once and the order decides which is reported:
+
+    certificate checked first -> the certificate error (the port was never touched)
+    port bound first          -> a bind error ("address already in use")
+
+Against the old code the test fails with `cannot bind 127.0.0.1:54912: ... (os error 10048)`,
+which is the port being taken before the certificate was ever opened. That is the failure message
+this hazard exists to explain, and it is committed as
+`a_certificate_that_cannot_load_fails_before_the_port_is_bound`.
+
+**And a second finding from the same step, which is about the plan rather than the code.**
+`alpn_h2_negotiates_a_real_http_2_connection` asserts that HTTP/2 **works** — the preface is
+answered with a SETTINGS frame — where the step-47 test only asserted that ALPN *selected* h2.
+`an_upgrade_h2c_offer_is_answered_in_http_1_1` pins the upgrade gap as a decision. Both were
+promised by step 47 and by the TLS plan's §4.5 and neither existed, which is the same stale-claim
+pattern as step 18: **a plan records an intention and then reads as a fact, and only a re-read
+catches it.**

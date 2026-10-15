@@ -59,7 +59,10 @@ pub enum HttpError {
     ///
     /// Reported before the port is bound, because a listener that starts and then fails every
     /// handshake is worse than one that refuses to start: the failure belongs to the operator
-    /// reading the log, not to every client that connects.
+    /// reading the log, not to every client that connects. Failing *before the bind* is the
+    /// stronger half of that: a listener that binds and then discovers its certificate is bad
+    /// has already taken the port, so a service manager restarting on failure takes and releases
+    /// it in a loop.
     #[error("TLS is configured but unusable: {reason}")]
     Tls { reason: String },
 }

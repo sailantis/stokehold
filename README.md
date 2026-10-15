@@ -560,8 +560,22 @@ is then served by whatever site its `Host` selects.
 
 ### What TLS costs when it is off
 
-Nothing. With no `[server.tls]` there is no peek, no branch, and no TLS value is constructed — the
-cleartext path is the same code it was before TLS existed.
+Nothing measurable. With no `[server.tls]` there is no peek, no branch, and no TLS value is
+constructed — the cleartext path is the same code it was before TLS existed.
+
+That was written from reading the code, and for a while the plan said so: it was the one claim in
+the TLS work that had not been measured. It has been now, as an interleaved A/B of **two binaries**
+— the last commit before any TLS code against the current build — both serving a config with no
+`[server.tls]` at all, so the difference is what the TLS work added to a plaintext deployment
+rather than what a handshake costs:
+
+    effect -0.08%   95% CI [-0.66%, +0.51%]   n = 12
+
+An interval containing zero is a null result, so the claim holds. The bound is the honest part:
+**less than about 0.7%**, which is finer than the measurement host resolves in a single reading
+(an A-vs-A control spans ±2%). The harness and both rows are in
+[`volucer-competition`](https://github.com/sailantis/volucer-competition) —
+`scripts/tls-off-ab.js`, `results/tls-off-ab.tsv` and `results/tls-off-ab-noise.tsv`.
 
 ### Build prerequisites
 

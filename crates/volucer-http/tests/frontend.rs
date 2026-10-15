@@ -575,6 +575,41 @@ fn concurrent_requests_are_served_in_parallel() {
 }
 
 #[test]
+fn an_upgrade_h2c_offer_is_answered_in_http_1_1() {
+    // Pinned as a *decision* rather than as a limitation. `hyper-util`'s `auto::Builder` only
+    // honours an `Upgrade` through `serve_connection_with_upgrades`; `listener.rs` calls plain
+    // `serve_connection`, and the choice is deliberate: prior knowledge is what a real reverse
+    // proxy uses for h2c, and a browser-facing listener gets HTTP/2 over ALPN instead.
+    //
+    // The gap was pre-existing and unrecorded. A test is what makes it a decision, because a
+    // `hyper` upgrade that started honouring the offer would otherwise change this silently.
+    let server = server!(2);
+
+    let request = concat!(
+        "GET /health HTTP/1.1\r\n",
+        "Host: example.test\r\n",
+        "Connection: Upgrade, HTTP2-Settings\r\n",
+        "Upgrade: h2c\r\n",
+        "HTTP2-Settings: AAMAAABkAAQAAP__\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+    );
+    let response = exchange(&server.address, request.as_bytes());
+
+    assert_eq!(response.status, 200, "{response:?}");
+    // The half that matters: no `101` and no upgrade accepted. A `101` would mean the offer was
+    // taken, and the response would then be HTTP/2 rather than the HTTP/1.1 every other test in
+    // this file assumes.
+    assert_ne!(
+        response.status, 101,
+        "an Upgrade: h2c offer must not be accepted: {response:?}"
+    );
+    assert!(
+        response.header("upgrade").is_none(),
+        "no upgrade header may be returned: {response:?}"
+    );
+}
+#[test]
 fn http_1_1_keep_alive_serves_two_requests_on_one_connection() {
     let server = server!(2);
 
@@ -649,10 +684,8 @@ fn read_one_response(reader: &mut BufReader<TcpStream>) -> u16 {
 
 /// A document root with the files a static test needs.
 fn static_root(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "volucer-http-static-{name}-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("volucer-http-static-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("assets")).expect("create the root");
     std::fs::write(root.join("index.html"), "<h1>home</h1>").expect("write index.html");

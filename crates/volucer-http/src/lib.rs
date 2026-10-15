@@ -31,7 +31,10 @@
 //! `hyper_util::server::conn::auto::Builder::serve_connection_with_upgrades`,
 //! and [`listener`] calls plain `serve_connection`, so a client that offers
 //! `Upgrade: h2c` is answered in HTTP/1.1 with no `101`. Verified by hand;
-//! the crate doc used to claim both paths. TLS is step 24, and HTTP/3 is
+//! the crate doc used to claim both paths. Both halves are now pinned by tests rather than by
+//! this paragraph — `alpn_h2_negotiates_a_real_http_2_connection`, which asserts a SETTINGS
+//! frame actually arrives, and `an_upgrade_h2c_offer_is_answered_in_http_1_1`, which asserts
+//! the offer is *not* taken — so the gap is a decision rather than an accident. HTTP/3 is
 //! `quinn` plus `h3`, not `hyper`.
 
 pub mod error;

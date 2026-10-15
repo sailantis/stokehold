@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use volucer_core::config::Config;
 use volucer_core::sites::Sites;
 use volucer_http::{HttpLimits, HttpListener, ListenerSettings, TlsSettings};
 use volucer_server::Dispatcher;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A certificate pair on disk, named after the host it is for.
 struct Cert {
@@ -118,7 +118,10 @@ async fn start(config: Config, config_dir: &Path) -> SocketAddr {
         sites,
         HttpLimits::default(),
         ListenerSettings {
-            tls: Some(TlsSettings { config: &config, config_dir }),
+            tls: Some(TlsSettings {
+                config: &config,
+                config_dir,
+            }),
             redirect_to_https: false,
             https_port: None,
         },
@@ -497,7 +500,9 @@ async fn a_redirect_keeps_the_path_and_query() {
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
     stream
-        .write_all(b"GET /docs/page?x=1&y=2 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .write_all(
+            b"GET /docs/page?x=1&y=2 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n",
+        )
         .await
         .expect("write");
     let mut response = Vec::new();
@@ -569,6 +574,139 @@ async fn start_redirecting_to(
     addr
 }
 
+/// Send the HTTP/2 connection preface and report whether a SETTINGS frame came back.
+///
+/// A client that knows the server speaks h2 opens with this exact byte sequence and then an
+/// empty SETTINGS frame; the server must answer with SETTINGS of its own. Asserted on the frame
+/// *type* byte rather than its contents, because the contents are `hyper`'s business and change
+/// between versions — what a caller of this server needs is that HTTP/2 is real rather than only
+/// negotiated.
+async fn preface_over_tls(addr: SocketAddr, server_name: &str) -> Option<u8> {
+    use rustls::pki_types::ServerName;
+
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+        .with_no_client_auth();
+    // h2 only, so a server that failed to act on ALPN cannot answer in HTTP/1.1 by accident.
+    config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let name = ServerName::try_from(server_name.to_string()).ok()?;
+    let mut tls = connector.connect(name, stream).await.ok()?;
+
+    tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .ok()?;
+    // An empty SETTINGS frame: 9-byte header, type 0x4, no flags, stream 0, zero-length payload.
+    tls.write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0]).await.ok()?;
+    tls.flush().await.ok()?;
+
+    // The server's SETTINGS frame: length(3) type(1) flags(1) stream(4), then payload.
+    let mut header = [0u8; 9];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tls.read_exact(&mut header),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(header[3])
+}
+#[tokio::test]
+async fn a_certificate_that_cannot_load_fails_before_the_port_is_bound() {
+    // The claim this pins, and why it is a test: the doc on `bind_with_tls` said "a certificate
+    // that cannot load fails this call — before the port is bound", and the code bound the port
+    // first. Only a *precedence* observation can tell the two orders apart — a call that binds
+    // and then fails still returns the TLS error, and a call that checks the certificate first
+    // returns the same error, so asserting on the error alone proves nothing.
+    //
+    // So the port is occupied before the call, and both faults are present at once. The order
+    // decides which one is reported:
+    //
+    //   certificate checked first -> the certificate error (the port was never touched)
+    //   port bound first          -> the bind error ("address already in use")
+    //
+    // This was written first as a race between two concurrent calls, and that version passed
+    // against the bug: the first call bound, failed and released the port before the second one
+    // reached its bind. An unforced race is not a test of an ordering.
+    let cert = Cert::new("bindorder", "example.test");
+
+    let text = format!(
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = '{}'
+
+[server.tls]
+certificate = "certs/absent.crt"
+key = "certs/absent.key"
+"#,
+        cert.dir().display()
+    );
+    let config = Config::from_toml(&text).expect("config parses");
+    let config_dir = cert.dir().to_path_buf();
+
+    // Hold the port, so a bind cannot succeed and `bind_with_tls` is forced to choose.
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("a probe port");
+    let address = occupied.local_addr().expect("address").to_string();
+
+    let sites = Arc::new(Sites::from_config(&config, &config_dir));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+
+    let err = HttpListener::bind_with_tls(
+        &address,
+        dispatcher,
+        sites,
+        HttpLimits::default(),
+        ListenerSettings {
+            tls: Some(TlsSettings {
+                config: &config,
+                config_dir: &config_dir,
+            }),
+            redirect_to_https: false,
+            https_port: None,
+        },
+    )
+    .await
+    .err()
+    .expect("a certificate that cannot load must not bind");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("absent.crt"),
+        "the certificate must be reported before the port is taken, so a bad certificate cannot \
+         hide behind a busy port (or vice versa): {message}"
+    );
+    assert!(
+        !message.contains("cannot bind"),
+        "the port must not have been bound at all: {message}"
+    );
+
+    drop(occupied);
+}
+#[tokio::test]
+async fn alpn_h2_negotiates_a_real_http_2_connection() {
+    // `alpn_negotiates_http2_then_http11` asserts which protocol ALPN *selected*. This asserts
+    // the selected protocol actually works, which is the claim `volucer version` makes when it
+    // prints "HTTP/2 (cleartext)": the preface is accepted and answered with a SETTINGS frame
+    // rather than with an HTTP/1.1 status line or nothing at all.
+    let cert = Cert::new("h2preface", "example.test");
+    let config = write_config(&cert, "");
+    let addr = start(config, cert.dir()).await;
+
+    let frame_type = preface_over_tls(addr, "example.test")
+        .await
+        .expect("the server must answer the HTTP/2 preface");
+
+    assert_eq!(
+        frame_type, 0x04,
+        "the first frame back must be SETTINGS (0x04), got {frame_type:#04x}"
+    );
+}
 /// The DER payload of a PEM certificate file.
 fn der_of(path: &Path) -> Vec<u8> {
     let text = std::fs::read_to_string(path).expect("read certificate");
@@ -600,6 +738,3 @@ fn base64_decode(input: &str) -> Vec<u8> {
     }
     out
 }
-
-
-

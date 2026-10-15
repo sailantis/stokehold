@@ -26,6 +26,7 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+rustls-acme.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"

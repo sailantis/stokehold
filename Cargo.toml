@@ -43,6 +43,22 @@ thiserror = "2"
 httpdate = "1"
 rustls = "0.23"
 rustls-pemfile = "2"
+
+# The ACME client: the order/renewal flow, and the TLS-ALPN-01 challenge certificate.
+#
+# The feature set is *not* `--no-default-features`: the crate is a compile-time fork of our crypto
+# provider, so `aws-lc-rs` must be named explicitly — but `webpki-roots` is where
+# `AcmeConfig::new` gets the trust anchors it verifies **Let's Encrypt's own** HTTPS endpoint
+# with. Dropping it (as an earlier draft of the plan prescribed) removes the function
+# `AcmeConfig::new` entirely, so the client cannot reach the directory at all. `tls12` is left out:
+# ACME endpoints are TLS 1.3-capable.
+#
+# `tokio` is left **off deliberately**. It enables `AcmeConfig::tokio_incoming`, a ready-made accept
+# loop — and that is exactly the shape this project must not use: `rustls-acme`'s resolver answers
+# *every* SNI name with one certificate, so it would silently replace our host→certificate rule. The
+# composition has to be ours (challenge ALPN → ACME, else → the site table), so the wrapper is a
+# footgun rather than a convenience, and leaving it unlinked is the cheapest way to say so.
+rustls-acme = { version = "0.15", default-features = false, features = ["aws-lc-rs", "webpki-roots"] }
 tokio = { version = "1", features = ["net", "fs", "io-util", "rt-multi-thread", "time"] }
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["io"] }

@@ -39,12 +39,14 @@
 
 pub mod error;
 pub mod listener;
+pub mod reload;
 pub mod static_files;
 pub mod tls;
 
 pub use error::HttpError;
 pub use listener::{
     to_cgi, to_cgi_routed, HttpLimits, HttpListener, HttpShutdown, HttpStats, ListenerSettings,
-    RunningHttp, TlsSettings,
+    ReloadHandle, Reloaded, RunningHttp, TlsSettings,
 };
+pub use reload::Swappable;
 pub use tls::{SniResolver, TlsError};

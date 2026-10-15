@@ -23,6 +23,7 @@ repository = "https://github.com/sailantis/volucer"
 # a published crate cannot depend on a version that does not exist, so these move together.
 [workspace.dependencies]
 volucer-core = { version = "0.1.0", path = "crates/volucer-core" }
+arc-swap = "1"
 volucer-worker = { version = "0.1.0", path = "crates/volucer-worker" }
 volucer-fcgi = { version = "0.1.0", path = "crates/volucer-fcgi" }
 volucer-server = { version = "0.1.0", path = "crates/volucer-server" }

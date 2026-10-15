@@ -157,6 +157,8 @@ fn front_controller_routing() -> Routing {
 struct Server {
     address: String,
     shutdown: volucer_http::HttpShutdown,
+    /// Replaces the listener's reloadable state, for the reload tests.
+    reload: volucer_http::ReloadHandle,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -229,6 +231,8 @@ impl Server {
 
         let address = listener.local_addr().expect("bound address").to_string();
         let shutdown = listener.shutdown_handle();
+        // Taken before the listener is moved onto its thread, because `run` consumes it.
+        let reload = listener.reload_handle();
 
         let handle = std::thread::spawn(move || {
             let _guard = runtime.enter();
@@ -240,6 +244,7 @@ impl Server {
         Some(Server {
             address,
             shutdown,
+            reload,
             handle: Some(handle),
         })
     }
@@ -1209,5 +1214,133 @@ static_files = {{ enabled = true }}
     assert_eq!(missing.status, 502, "{missing:?}");
 
     drop(server);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A reload changes what the next request is served, with no restart and no dropped listener.
+///
+/// This is the end-to-end claim the whole reload mechanism exists to make, so it is asserted
+/// the way a client would see it: the *same* address and the *same* listener, answering from a
+/// different document root after a reload — not by inspecting the state that was installed.
+#[test]
+fn a_reload_changes_what_the_next_request_is_served() {
+    let base = std::env::temp_dir().join(format!("volucer-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let before = base.join("before");
+    let after = base.join("after");
+    for root in [&before, &after] {
+        std::fs::create_dir_all(root).expect("create a site root");
+    }
+    std::fs::write(before.join("whoami.txt"), "before").expect("write the marker");
+    std::fs::write(after.join("whoami.txt"), "after").expect("write the marker");
+
+    // Two configs differing in exactly one setting, which is the control: the reload has to
+    // be attributable to the document root rather than to everything about the config.
+    let config_for = |root: &Path| {
+        let text = format!(
+            r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {root:?}
+static_files = {{ enabled = true }}
+"#,
+            root = root.to_string_lossy(),
+        );
+        let config = volucer_core::config::Config::from_toml(&text).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    };
+
+    let first = config_for(&before);
+    let sites = Arc::new(Sites::from_config(&first, &before));
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), front_controller_routing())
+        .expect("no process is started");
+
+    let Some(server) = Server::start_sites(dispatcher, sites, HttpLimits::default()) else {
+        return;
+    };
+    let address = server.address.clone();
+
+    assert_eq!(
+        get_as(&address, "any.test", "/whoami.txt").text(),
+        "before",
+        "the first request must be served from the starting root"
+    );
+
+    // Replace the site table. The listener keeps running: nothing is rebound, and the accept
+    // loop is never told anything happened.
+    let second = config_for(&after);
+    let replaced = server.reload.apply(Sites::from_config(&second, &after));
+
+    // The handle reports what it actually replaced, which is what lets a caller log a change
+    // rather than only that a reload was attempted.
+    assert_eq!(
+        replaced.sites.default_site().document_root,
+        before,
+        "apply must report the state it replaced, not the one it installed"
+    );
+
+    assert_eq!(
+        get_as(&address, "any.test", "/whoami.txt").text(),
+        "after",
+        "the next request must be served from the new root, on the same listener"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A request that is already in flight keeps the configuration it started under.
+///
+/// The counterpart to the test above, and the reason a snapshot is taken once per request:
+/// without it a request could resolve its site against one table and route against another,
+/// which would surface as a site serving the wrong document root — once, under load, and
+/// blamed on the filesystem.
+#[test]
+fn a_snapshot_survives_a_reload_landing_mid_request() {
+    // Driven through the state type directly rather than through a socket, because the
+    // assertion is about *which value a holder sees*, and a race with a real reload cannot be
+    // scheduled from a test. The socket-level behaviour is the test above.
+    let base = std::env::temp_dir().join(format!("volucer-snapshot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("create a root");
+
+    let config_for = |marker: &str| {
+        std::fs::create_dir_all(base.join(marker)).expect("create a site root");
+        let text = format!(
+            r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {root:?}
+static_files = {{ enabled = true }}
+"#,
+            root = base.join(marker).to_string_lossy(),
+        );
+        let config = volucer_core::config::Config::from_toml(&text).expect("config parses");
+        Sites::from_config(&config, &base.join(marker))
+    };
+
+    let state =
+        volucer_http::Swappable::new(volucer_http::Reloaded::from_sites(config_for("one"), 8080));
+    // What a request does: take one snapshot and hold it.
+    let in_flight = state.load();
+    let previous = state.replace(volucer_http::Reloaded::from_sites(config_for("two"), 8080));
+
+    assert_eq!(
+        in_flight.sites.default_site().document_root,
+        base.join("one"),
+        "the in-flight request must keep the root it started with"
+    );
+    assert_eq!(
+        previous.sites.default_site().document_root,
+        base.join("one"),
+        "the replaced state is the one the request is still using"
+    );
+    assert_eq!(
+        state.load().sites.default_site().document_root,
+        base.join("two"),
+        "the next request takes the new root"
+    );
+
     let _ = std::fs::remove_dir_all(&base);
 }

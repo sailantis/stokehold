@@ -45,6 +45,7 @@ use volucer_fcgi::{cgi, RequestInfo, Route, Routing};
 use volucer_server::{Dispatcher, ServerError};
 
 use crate::error::{HttpError, Result};
+use crate::reload::Swappable;
 use crate::static_files::{self, StaticFiles};
 
 /// The body type every response uses.
@@ -197,17 +198,17 @@ struct FrontEnd {
     /// synchronise internally, per backend slot, so requests to different
     /// workers genuinely run at the same time.
     dispatcher: Arc<Dispatcher>,
-    /// One prebuilt routing per site, by site name, plus the default under
-    /// `"<default>"`.
+    /// Everything a reload replaces, behind **one** pointer.
     ///
-    /// Prebuilt, not derived per request: a `Routing` is a document root and a front
-    /// controller, and rebuilding one for every request would put a `PathBuf` clone on
-    /// the hot path to answer a question the configuration already answered at startup.
-    routings: Arc<BTreeMap<String, Routing>>,
-    /// The static layer per site, for the same reason.
-    statics: Arc<BTreeMap<String, StaticFiles>>,
-    /// The site table, to turn a `Host` header into one of the entries above.
-    sites: Arc<Sites>,
+    /// One handle rather than one per field, and that is the whole correctness of a reload
+    /// under load: three separate swaps would let a request take the new site table and the
+    /// old routing map, which is two answers to one question. The failure would not look
+    /// like a race — it would look like a site serving the wrong document root, once, under
+    /// load, and be blamed on the filesystem.
+    ///
+    /// See [`Reloaded`] for what is in it and [`FrontEnd::state`] for how the request path
+    /// reads it.
+    state: Arc<Swappable<Reloaded>>,
     limits: HttpLimits,
     stats: Arc<HttpStats>,
     shutdown: Arc<AtomicBool>,
@@ -220,7 +221,67 @@ struct FrontEnd {
     https_port: Option<u16>,
 }
 
-impl FrontEnd {
+/// Everything a reload can replace, as one value so it can be replaced in one step.
+///
+/// The three travel together because they are derived from one another: the routing and
+/// static maps are built *from* the site table, so a request that took them from different
+/// generations would resolve a site the map has no entry for. [`Reloaded::from_sites`] is
+/// the only constructor for that reason — the maps cannot be set independently of the table
+/// they describe.
+///
+/// The `Arc`s are for the request path: a handler takes one snapshot and moves it into the
+/// blocking dispatch task, so the request keeps the configuration it began under.
+pub struct Reloaded {
+    /// The site table, to turn a `Host` header into one of the entries below.
+    pub sites: Sites,
+    /// One prebuilt routing per site, by site name, plus the default under
+    /// `"<default>"`.
+    ///
+    /// Prebuilt, not derived per request: a `Routing` is a document root and a front
+    /// controller, and rebuilding one for every request would put a `PathBuf` clone on
+    /// the hot path to answer a question the configuration already answered at startup.
+    routings: BTreeMap<String, Routing>,
+    /// The static layer per site, for the same reason.
+    statics: BTreeMap<String, StaticFiles>,
+}
+
+impl Reloaded {
+    /// Build the reloadable state for a site table.
+    ///
+    /// `server_port` is the bound port, which the static layer stamps into generated
+    /// redirects — a reload cannot change it, so it is passed in rather than stored.
+    pub fn from_sites(sites: Sites, server_port: u16) -> Self {
+        let mut routings = BTreeMap::new();
+        let mut statics = BTreeMap::new();
+        for site in sites
+            .named()
+            .values()
+            .chain(std::iter::once(sites.default_site()))
+        {
+            routings.insert(
+                site.name.clone(),
+                Routing {
+                    document_root: site.document_root.clone(),
+                    front_controller: site.front_controller.clone(),
+                    ..Routing::default()
+                },
+            );
+            statics.insert(
+                site.name.clone(),
+                StaticFiles {
+                    config: site.static_files.clone(),
+                    document_root: site.document_root.clone(),
+                    server_port,
+                },
+            );
+        }
+        Reloaded {
+            sites,
+            routings,
+            statics,
+        }
+    }
+
     /// The routing and static layer for one site.
     ///
     /// A site resolved by [`Sites`] is always in both maps — they are built from the
@@ -239,6 +300,67 @@ impl FrontEnd {
             .or_else(|| self.statics.get(DEFAULT_SITE_KEY))
             .expect("the default site is always built");
         (routing, statics)
+    }
+}
+
+impl std::fmt::Debug for Reloaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reloaded")
+            .field("sites", &self.sites.named().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrontEnd {
+    /// A snapshot of the reloadable state, taken once per request.
+    ///
+    /// The single load is the point: everything downstream — site resolution, the routing
+    /// map, the static layer — reads from the value this returns, so a request is served
+    /// under exactly one configuration even if a reload lands while it is in flight. A
+    /// reload therefore affects the *next* request, which is the only ordering that can be
+    /// explained to an operator.
+    fn state(&self) -> Arc<Reloaded> {
+        self.state.load()
+    }
+}
+
+/// A handle that replaces a running listener's reloadable state.
+///
+/// Cloned into whatever watches for a reload — a signal handler, a filesystem watcher, or a
+/// test — so the listener itself does not have to know where the trigger comes from. That
+/// separation is deliberate: the mechanism for *noticing* a change is a platform question
+/// (there is no `SIGHUP` on Windows), while the mechanism for *applying* one is not.
+///
+/// Applying is whole-or-nothing by construction. There is no setter for a single field,
+/// because a reload that changed half of what the file says would be worse than one that
+/// refused the file: the operator would have no way to tell which half took effect.
+#[derive(Clone)]
+pub struct ReloadHandle {
+    state: Arc<Swappable<Reloaded>>,
+    /// Fixed for the life of the listener, and needed to rebuild the maps on a reload.
+    server_port: u16,
+}
+
+impl ReloadHandle {
+    /// The state being served right now.
+    ///
+    /// For diagnostics and for tests: what a request made at this instant would see.
+    pub fn current(&self) -> Arc<Reloaded> {
+        self.state.load()
+    }
+
+    /// Replace the site table, rebuilding the derived maps from it.
+    ///
+    /// Returns the state that was replaced, so a caller can report what changed rather than
+    /// only that something did — the difference between "site `api` document_root changed"
+    /// and "configuration reloaded", after which an operator has to go and diff the file.
+    ///
+    /// In-flight requests are unaffected: each holds a snapshot of the state it started
+    /// under, which is what makes this safe to call while the listener is serving.
+    #[must_use]
+    pub fn apply(&self, sites: Sites) -> Arc<Reloaded> {
+        let next = Reloaded::from_sites(sites, self.server_port);
+        self.state.replace(next)
     }
 }
 
@@ -482,38 +604,16 @@ impl HttpListener {
             );
         }
 
-        let mut routings = BTreeMap::new();
-        let mut statics = BTreeMap::new();
-        for site in sites
-            .named()
-            .values()
-            .chain(std::iter::once(sites.default_site()))
-        {
-            routings.insert(
-                site.name.clone(),
-                Routing {
-                    document_root: site.document_root.clone(),
-                    front_controller: site.front_controller.clone(),
-                    ..Routing::default()
-                },
-            );
-            statics.insert(
-                site.name.clone(),
-                StaticFiles {
-                    config: site.static_files.clone(),
-                    document_root: site.document_root.clone(),
-                    server_port: port,
-                },
-            );
-        }
+        // The reloadable state, built once here and replaced whole from the handle that
+        // `reload_handle` hands out. `port` is the bound port, which a reload cannot change —
+        // the socket is already listening on it.
+        let reloaded = Reloaded::from_sites((*sites).clone(), port);
 
         Ok(HttpListener {
             listener,
             front_end: Arc::new(FrontEnd {
                 dispatcher,
-                routings: Arc::new(routings),
-                statics: Arc::new(statics),
-                sites,
+                state: Arc::new(Swappable::new(reloaded)),
                 limits,
                 stats: Arc::new(HttpStats::default()),
                 shutdown: Arc::new(AtomicBool::new(false)),
@@ -524,6 +624,17 @@ impl HttpListener {
             tls: acceptor,
             accept_plain,
         })
+    }
+
+    /// A handle that replaces this listener's reloadable state.
+    ///
+    /// The listener's own state is the handle's `Arc`, so a replacement made through it is
+    /// immediately visible to the accept loop and to every request after the one in flight.
+    pub fn reload_handle(&self) -> ReloadHandle {
+        ReloadHandle {
+            state: Arc::clone(&self.front_end.state),
+            server_port: self.front_end.server_port,
+        }
     }
 
     /// The address actually bound, which matters when port 0 was requested.
@@ -821,13 +932,18 @@ async fn prepare(
     // The site is resolved first, because everything after this is per site: which
     // document root a path resolves under, which front controller serves it, and which
     // static layer answers it. A map probe on the runtime thread, not work.
+    //
+    // One snapshot for the whole request: the three maps are taken together so a reload
+    // landing mid-request cannot have this request resolve its site against one table and
+    // route against another. The reload therefore takes effect on the next request, which
+    // is the only ordering an operator can reason about.
     let host = parts
         .headers
         .get(HOST)
         .and_then(|value| value.to_str().ok());
-    let site = front_end.sites.resolve(host);
-    let (routing, statics) = front_end.for_site(site);
-
+    let state = front_end.state();
+    let site = state.sites.resolve(host);
+    let (routing, statics) = state.for_site(site);
     // Static content is decided before the body is read: a `GET` for a file has
     // no body worth buffering, and refusing to buffer one it will never use is
     // the point of a limit.

@@ -3050,6 +3050,39 @@ which is the port being taken before the certificate was ever opened. That is th
 this hazard exists to explain, and it is committed as
 `a_certificate_that_cannot_load_fails_before_the_port_is_bound`.
 
+**A third finding, in the measurement itself, and it is the more embarrassing of the three.**
+The TLS-off A/B compares `206b41f` (the last commit before any TLS code) against `HEAD`, and the
+first version of its write-up named the fair queue `e2b031e` as a live-but-inert confound, on the
+reasoning that it is the largest effect this project has produced and that "a static file never
+leases a slot".
+
+**Both halves of that were wrong.** `git merge-base --is-ancestor e2b031e 206b41f` succeeds: the
+fair queue is *in* the baseline, so it is not a confound at all — both arms are after it, along
+with the static layer (`6d7228d`). And the "never leases a slot" claim was a guess about which path
+a static request takes and which lock protects a slot; the code shows the static layer runs *before*
+any dispatch, so the guess about the slot was harmless, but it was still reasoning from a memory of
+the code rather than from the code.
+
+**The confound that is actually live is `ba09e03`, the `HostMap` extraction**, which replaced a
+linear scan over wildcard patterns with a walk of the host's own labels on every request. It is one
+of exactly two commits in the window that touch `volucer-http/src`:
+
+    git log --oneline 206b41f..HEAD -- crates/volucer-http/src
+    e1af51b  tls: check the certificate before the port   # load-time, before any accept
+    dae2983  refactor: rename stokehold to volucer        # names only
+
+So the window is TLS (a branch not taken with no `[server.tls]`), `HostMap` (per request, and it
+is meant to be faster), a rename, and a load-time reorder — which makes the null interpretable
+rather than unexplained, but means it is **not** a pure TLS isolation.
+
+**The lesson is about how a baseline is chosen and described, and it generalises past this
+measurement:** a commit chosen by *"it is the one before the TLS work"* is a claim about history,
+and it has to be checked with `git merge-base --is-ancestor` rather than inferred from a commit
+list read top-down. Both named confounds were checked afterwards and neither was live; the
+difference that was live had not been considered, because it is a *refactor* and refactors are
+easy to assume are free — which this repository has already contradicted once, at hazard 54b,
+where the same optimisation introduced a real divergence.
+
 **And a second finding from the same step, which is about the plan rather than the code.**
 `alpn_h2_negotiates_a_real_http_2_connection` asserts that HTTP/2 **works** — the preface is
 answered with a SETTINGS frame — where the step-47 test only asserted that ALPN *selected* h2.

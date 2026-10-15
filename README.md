@@ -577,6 +577,14 @@ An interval containing zero is a null result, so the claim holds. The bound is t
 [`volucer-competition`](https://github.com/sailantis/volucer-competition) —
 `scripts/tls-off-ab.js`, `results/tls-off-ab.tsv` and `results/tls-off-ab-noise.tsv`.
 
+**What the comparison does and does not isolate.** The two builds differ by the TLS work *and* by
+whatever else landed in between, so this is not a pure TLS measurement. It is nevertheless a valid
+null for the sentence above, because that sentence is about the plaintext path before and after the
+TLS work — and the one per-request difference in the window, the `HostMap` extraction (`ba09e03`),
+is a refactor that was *meant* to be faster. Hazard 56 records why the first version of this
+paragraph named the wrong confound entirely: it guessed at history instead of checking
+`git merge-base --is-ancestor`, and the fair queue it worried about was already in the baseline.
+
 ### Build prerequisites
 
 `rustls` is used rather than OpenSSL, so there is no DLL/dylib to match against a system OpenSSL.

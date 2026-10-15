@@ -1701,7 +1701,25 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     acceptor holds).
 58. `reload-tests` — swap under concurrent requests; a failed reload leaves the previous config
     serving; the restart-only list is reported; and **the hot-path cost is measured** rather than
-    argued, with the `tls-off-ab.js` template. If the CI does not contain 0, that is the result.
+    argued. **The measurement is done** (the rest of this step is not): an interleaved A/B of two
+    release binaries, `68bfdcc` against the reload work, both with no `[server.tls]` and both
+    serving a static file — so the site resolution and routing lookup the snapshot feeds are on the
+    measured path — reads **−0.09%, 95% CI [−1.43%, +1.27%], n = 20**, with an A-vs-A control at
+    **+0.34%, 95% CI [−0.91%, +1.61%]**. The interval contains zero, so the indirection is not
+    measurable here, and the honest bound is the interval rather than the point estimate.
+
+    **The first ten-round run of the same pair read +1.75%, 95% CI [+0.56%, +2.95%] — excluding
+    zero — and its control read −1.44%**, a point estimate larger than the effect it was supposed
+    to give scale to and in the opposite direction. Twenty rounds changed the verdict without
+    changing the binaries, because the interval on log-ratios shrinks as √n while the per-round
+    spread does not. That pair of runs is kept in `volucer-competition` as
+    `results/reload-cost-ab.tsv` and `-noise.tsv`, beside the 20-round ones that supersede them,
+    with the harness at `scripts/reload-cost-ab.js`. A run that stopped at the first result would
+    have claimed the reload made the request path **faster**.
+
+    Unlike the TLS-off comparison this window **is** an isolation: `git merge-base --is-ancestor
+    68bfdcc HEAD` succeeds and the range holds only the two reload commits, so no refactor rides
+    along — which is hazard 56's lesson applied *before* the measurement rather than after it.
 
 ## 7. Testing strategy
 
@@ -1933,6 +1951,7 @@ reading out of a crate description.
 | reload: certificates | **works** | `a_certificate_reload_is_presented_on_the_next_handshake` — a renewed pair on disk is the one presented by the next handshake, on the same listener, compared byte for byte. `an_in_memory_certificate_needs_no_file_and_no_config` covers the ACME-shaped path, where the bytes never came from a file this process wrote |
 | reload: whole-or-nothing | **works** | `a_certificate_reload_that_cannot_load_applies_neither_half` — a set with one unreadable pair installs **neither** half, proven by naming a *valid* pair alongside the bad one so a partial install would be visible |
 | reload: a plaintext listener carries no TLS state | **works** | `a_plaintext_listener_has_no_resolver_and_still_reloads_sites` — `resolver()` is `None`, so there is nothing to load and no branch to take, and site reloading still works there |
+| reload: what it costs when nothing reloads | **not measurable here** | interleaved A/B of two release binaries, `68bfdcc` against the reload work, no `[server.tls]`, static files on: **−0.09%, 95% CI [−1.43%, +1.27%], n = 20**, against an A-vs-A control at +0.34%, 95% CI [−0.91%, +1.61%]. The *first* ten-round run read +1.75% **excluding zero** while its control read −1.44%, which is why the verdict is drawn from the interval and the control rather than the point estimate. Rows in `volucer-competition/results/reload-cost-ab-20.tsv` |
 | reload: the **trigger** (`SIGHUP`) | **does not exist** | steps 56–58. `apply` and `refresh` are the mechanism; nothing watches for a signal yet |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
@@ -3196,3 +3215,40 @@ construction, and is marked as such by testing the layer name rather than the ab
 is only a test if the same code path could have changed it. Where the assertion is "nothing was
 applied", the *input must contain something that would have been applied*, or the test is a
 restatement of `Ok(())`.
+
+### Hazard 58 — ten round pairs said the reload was *faster*, and the control said −1.44%
+
+Step 58's measurement is the one number in the reload work, and it produced a result that excludes
+zero and a result that contains it from **the same two binaries**, so the interesting part is why.
+
+The harness is the TLS-off one with the fixture changed, and the arms are `68bfdcc` (three `Arc`s
+on `FrontEnd`) against the reload work (one `Arc<Swappable<Reloaded>>`). Both release builds, both
+with no `[server.tls]`, `static_files` **on** — deliberately the opposite of the TLS harness's
+choice, because the site resolution and routing lookup the snapshot feeds are on the static path.
+
+    first run, 10 rounds    effect +1.75%   95% CI [+0.56%, +2.95%]   # excludes 0
+    its control, 10 rounds  effect -1.44%   95% CI [-2.91%, +0.05%]   # a point estimate larger
+                                                                       # than the effect it scales,
+                                                                       # and the wrong sign
+
+    second run, 20 rounds   effect -0.09%   95% CI [-1.43%, +1.27%]   # contains 0
+    its control, 20 rounds  effect +0.34%   95% CI [-0.91%, +1.61%]
+
+**Twenty rounds changed the verdict and nothing else did.** The servers were identical between the
+two pairs; the only difference is n. That is the mechanism: the interval is on the mean of the
+per-round *log* ratios, so it narrows as √n while the per-round spread — which is what the host
+actually contributes — does not move. The 10-round intervals were therefore not evidence of a
+1.75% effect; they were evidence that ten round pairs cannot resolve one on this host.
+
+**Both pairs are committed, and that is the point rather than completeness.** A record holding only
+the 20-round result would read as a tidy null. The 10-round pair is the *scale* of the mistake —
+without it, "we ran twenty rounds" looks like thoroughness rather than a correction, and the
+control's −1.44% is the single most useful number in the set: an A-vs-A run, which by construction
+has no effect to find, produced a point estimate larger than the one it was supposed to give scale
+to.
+
+**What this confirms rather than discovers.** The project already draws verdicts from intervals and
+already keeps an A-vs-A control beside every A/B — the TLS-off work established both, for the same
+reason, and its own write-up says so. What is new is that a *plausible* result arrived first and the
+control refused it. Hazard 56 lost three attempts to assertions about post-conditions and to a
+baseline described from memory; this one lost only the point estimate.

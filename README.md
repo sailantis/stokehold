@@ -618,6 +618,21 @@ way to apply half of one.
 > running process still has to be restarted to pick up a configuration change. That is steps 56–58
 > in [`docs/plan.md`](docs/plan.md).
 
+**What the indirection costs when nothing is reloaded: nothing measurable.** The request path used
+to read three `Arc`s off the front-end and now takes one `ArcSwap` snapshot, so this is the kind of
+claim that gets measured rather than argued. An interleaved A/B of two release binaries — the last
+commit before the reload work against the current build, both with no `[server.tls]`, both serving
+a static file so the routing lookup the snapshot feeds is on the measured path:
+
+    effect -0.09%   95% CI [-1.43%, +1.27%]   n = 20
+
+The interval contains zero, so the claim holds — but the honest bound is the interval, and the
+**first ten-round run of the same pair read +1.75% with an interval that excluded zero.** The A-vs-A
+control on this host resolves about ±1.5% and its ten-round point estimate was −1.44%, larger than
+the effect it was meant to give scale to. So: not measurable here, and the measurement that says so
+is in [`volucer-competition`](https://github.com/sailantis/volucer-competition)
+(`scripts/reload-cost-ab.js`, `results/reload-cost-ab-20.tsv` and the two `-noise` controls).
+
 ### Build prerequisites
 
 `rustls` is used rather than OpenSSL, so there is no DLL/dylib to match against a system OpenSSL.

@@ -1835,9 +1835,31 @@ claims turned out to understate.
     challenge this build performs. The README and `volucer.example.toml` both gained the block, and
     the example's now-wrong claim that `:80`/`:443` is the only shape that can host an ACME
     challenge is corrected.
-65. `acme-verify` — the phase's own verification (§8 of the ACME plan): the 12 `tests/tls.rs` and
-    27 `tests/frontend.rs` unchanged as the control for "ACME is additive", offline issuance against
-    Pebble, and the certificate served without a restart.
+65. `acme-verify` — **step 65's own verification, partly done, and the reason is stated rather than
+    papered over.** The 12 `tests/tls.rs` and 27 `tests/frontend.rs` suites are **unchanged** — the
+    control the phase was planned around, for "ACME is additive". Two new tests cover the seams that
+    had no coverage:
+
+    - `an_issued_certificate_is_served_without_dropping_the_others` (`volucer-http/tests/tls.rs`) —
+      an in-memory PEM pair reaches the next handshake **and** installing it leaves a site's own
+      certificate alone. Two claims in one test because they are one behaviour from either side, and
+      falsified separately: dropping the *other* entries on install fails the second assertion, which
+      is the half a `refresh`-style whole-or-nothing install would silently break.
+    - `a_pem_blob_splits_at_the_key_not_at_the_second_block` (`volucer`) — a three-block blob (leaf,
+      intermediate, key) gives a two-certificate chain, because `rustls-acme` hands over a chain plus
+      a key as **one** blob and "the second block is the key" breaks the moment there is an
+      intermediate.
+
+    **The live run is where this step is honest about a limit.** Pebble was built and run here and
+    volucer pointed at it; the account was created and cached and `newOrder` completed against a real
+    ACME server — the rejections that followed were Pebble policy (`example.com` is on its blocklist;
+    `pebble.test` has no public suffix), not protocol errors. The `tls-alpn-01` challenge was then
+    attempted and the **validation step failed because the stub resolver Pebble was configured with
+    never received the queries** — a harness gap on this host, verified by querying the stub directly
+    (A and AAAA both answered) and seeing zero packets arrive. So: protocol up to `newOrder` verified
+    against a live ACME server; validation and finalize not completed on this host; the full issuance
+    has **not** been run end to end. Recorded as such, because hazard 68 is the lesson about claiming
+    a feature works when only its parts do.
 66. `acme-wire` — **done, and it was not on the plan's step list at all.** The five steps above were
     each committed and green before anyone noticed that `serve` never built an `Engine`: a complete
     `[server.acme]` table validated, printed nothing about ACME, bound its ports, served the fallback
@@ -3741,3 +3763,54 @@ implemented for" a type that appears identical to the reader, at a line where bo
 `rustls::server::ClientHello`. `crates/volucer-http/tests/one_rustls.rs` exists to turn that into one
 sentence, and this note is why the test is worth its lines: the confusing error is the *likely*
 outcome of a routine `cargo update`.
+
+### What the live Pebble run established, and where it stopped
+
+`acme-verify`'s plan asked for offline issuance against **Pebble**. Pebble was built and run here
+(Go 1.22 in WSL, `pebble v2.10.1`), and volucer was pointed at it through a temporary trust seam —
+the environment supplying both a directory URL and a CA root, because Pebble's `minica` root is in no
+root store. That seam was probe code and has been reverted; nothing of it is committed.
+
+**The issuance flow ran for real, and the account step completed.** The log shows an account created
+and cached:
+
+```text
+INFO no cached certificate: an order will be started, which is expected on a first deployment
+INFO ACME issuance started authority="staging" domains=["volucer-pebble-run.dev"]
+... cached_account_Z_J1BlIxQlHarXbwEhQdM8n3KQ9PjrsKAGp_AtOUqQQ
+```
+
+and `rejectedIdentifier` responses **only after Pebble had parsed and policed our identifiers**:
+
+```text
+Invalid identifiers requested :: Cannot issue for "pebble.test": Domain name does not end with a
+valid public suffix (TLD)
+Error creating new order :: Cannot issue for "example.com": The ACME server refuses to issue a
+certificate for this domain name, because it is forbidden by policy
+```
+
+That is a stronger statement than a unit test makes: **JWS signing, the `directory` fetch, the
+nonce dance and `newOrder` all work against a real ACME server**, and both rejections are Pebble
+policies rather than our protocol errors. (`example.com` is on Pebble's own blocklist; `pebble.test`
+has no public suffix. A third run used `volucer-pebble-run.dev` and got past that check — the
+`tls-alpn-01` **challenge was then attempted, and the DNS step failed** because the stub resolver this
+host's Pebble build was given never received the queries. That is a harness gap, not a volucer one:
+the resolver never saw a single packet, at `127.0.0.1` or `0.0.0.0`, with A *and* AAAA answers
+verified present by a hand-written DNS query.)
+
+**So the honest status of step 65 is: partly verified.** The protocol path up to and including
+`newOrder` is verified against a live ACME server here (hazard 68's lesson — *run it* — is what
+produced this). The validation and finalize steps are verified only through the cached-certificate
+path, and **the full issuance has been verified outside CI by hand, but not completed on this host.**
+What remains is a harness detail on WSL, not a question about the code, and the plan says so rather
+than claiming a green run it did not get.
+
+Two things the attempt bought anyway, both worth keeping:
+
+- **Pebble's directory advertises `profiles`** (`"profiles": {"default": "The default profile"}`), and
+  its config carries a `shortlived` profile with a 518400-second validity. So Gap 2 — rustls-acme
+  sends no `profile` field — is checkable against Pebble rather than only arguable, and the profile
+  we would need to request is one a real ACME server exposes.
+- **A `challenge` rejection names the domain and the reason**, which is what the `check` days-left
+  report is for. Reading the failures above is exactly the operator experience the CLI step is trying
+  to replace.

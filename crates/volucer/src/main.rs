@@ -1686,4 +1686,69 @@ document_root = "/from/file"
             );
         }
     }
+
+    /// A PEM blob of a chain plus a key splits at the key, not at the second block.
+    ///
+    /// `rustls-acme` hands the issued certificate over as one blob, and the shape is a *chain*
+    /// followed by a key. The tempting implementation — "the first block is the certificate, the
+    /// second is the key" — is wrong the moment a chain has an intermediate, and it fails in a way
+    /// that reads as a key problem rather than a parsing one. So the split is by PEM label, and this
+    /// pins that: a three-block blob must give a two-certificate chain.
+    #[test]
+    fn a_pem_blob_splits_at_the_key_not_at_the_second_block() {
+        let chain_then_key = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n\
+                              -----BEGIN CERTIFICATE-----\nintermediate\n-----END CERTIFICATE-----\n\
+                              -----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n";
+        let (cert, key) = split_pem_pair(chain_then_key.as_bytes());
+
+        let cert = String::from_utf8_lossy(cert);
+        let key = String::from_utf8_lossy(key);
+        assert!(
+            cert.contains("leaf") && cert.contains("intermediate"),
+            "the certificate half must be the whole chain, intermediates included: {cert}"
+        );
+        assert!(
+            !cert.contains("BEGIN PRIVATE KEY"),
+            "the chain must not carry the key: {cert}"
+        );
+        assert!(
+            key.starts_with("-----BEGIN PRIVATE KEY-----"),
+            "the key half must begin at the key's own marker: {key}"
+        );
+        assert!(
+            !key.contains("intermediate"),
+            "the key half must not carry a certificate: {key}"
+        );
+
+        // The single-certificate shape, which is the common one, and the shapes of key marker an
+        // `openssl` invocation actually produces.
+        for marker in [
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+        ] {
+            let blob = format!(
+                "-----BEGIN CERTIFICATE-----\nonly\n-----END CERTIFICATE-----\n{marker}\nk\n"
+            );
+            let (cert, key) = split_pem_pair(blob.as_bytes());
+            assert_eq!(
+                String::from_utf8_lossy(cert).trim_end(),
+                "-----BEGIN CERTIFICATE-----\nonly\n-----END CERTIFICATE-----",
+                "one certificate must be the whole chain half ({marker})"
+            );
+            assert!(
+                String::from_utf8_lossy(key).starts_with(marker),
+                "the key half must begin at {marker}"
+            );
+        }
+
+        // No key at all: the whole blob is the chain and the key half is empty, so the loader
+        // reports a missing key rather than the chain being silently truncated.
+        let (cert, key) = split_pem_pair(b"-----BEGIN CERTIFICATE-----\nonly\n");
+        assert_eq!(cert, b"-----BEGIN CERTIFICATE-----\nonly\n");
+        assert!(
+            key.is_empty(),
+            "a blob with no key must give an empty key half, not a truncated chain"
+        );
+    }
 }

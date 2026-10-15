@@ -1293,7 +1293,100 @@ async fn the_acme_source_answers_only_an_exact_challenge_handshake() {
     let _ = std::fs::remove_dir_all(cert.dir());
 }
 
-/// DER bytes of a certificate pair on disk, loaded the way the resolver loads them.
+/// An in-memory certificate reaches the **handshake**, and only its own names.
+///
+/// The seam an ACME issuance goes through, and the two claims worth separating:
+///
+/// 1. A certificate loaded from PEM *text* is served on the next handshake, on the same listener —
+///    the "without a restart" property, which is the deliverable of the whole ACME phase.
+/// 2. Installing one issued certificate **does not drop the others**. A deployment can serve several
+///    sites from a per-site table plus a fallback, and a renewal of one name must leave them alone.
+///    A `refresh`-style whole-or-nothing install would silently take away every other certificate,
+///    which would surface as unrelated sites failing every handshake.
+///
+/// PEM text rather than a file, because that is what `rustls-acme` hands over and going through a
+/// file would be the slower loop with more ways to fail that the whole design avoids.
+#[tokio::test]
+async fn an_issued_certificate_is_served_without_dropping_the_others() {
+    let cert = Cert::new("issued", "default.test");
+    cert.add("other", "other.test");
+    let config = write_config(
+        &cert,
+        r#"
+[sites.other]
+hosts = ["other.test"]
+document_root = '/tmp'
+
+[sites.other.tls]
+certificate = "certs/other.crt"
+key = "certs/other.key"
+"#,
+    );
+    let (addr, reload) = start_keeping(config, cert.dir()).await;
+
+    let default_before = der_of(&cert.dir().join("certs/server.crt"));
+    let other_before = der_of(&cert.dir().join("certs/other.crt"));
+    assert_eq!(
+        fetch(addr, "default.test", &["http/1.1"]).await.certificate,
+        default_before,
+        "the fixture must serve the server certificate first"
+    );
+    assert_eq!(
+        fetch(addr, "other.test", &["http/1.1"]).await.certificate,
+        other_before,
+        "and the per-site certificate"
+    );
+
+    // The issued pair, as PEM text — the shape `rustls-acme` produces.
+    let issued = rcgen::generate_simple_self_signed(vec!["renewed.test".to_string()])
+        .expect("generate the issued certificate");
+    let issued_pem = issued.cert.pem();
+    let issued_key = issued.key_pair.serialize_pem();
+    let issued_der = issued.cert.der().to_vec();
+    assert_ne!(default_before, issued_der, "the fixture must differ");
+
+    let resolver = reload
+        .tls()
+        .expect("a TLS listener must expose its resolver");
+    let replaced = resolver
+        .install_issued(
+            issued_pem.as_bytes(),
+            issued_key.as_bytes(),
+            &["renewed.test".to_string()],
+        )
+        .expect("an issued certificate installs");
+
+    // What was replaced held the two *previous* names, so a caller can report the change rather
+    // than the attempt.
+    assert_eq!(
+        replaced.named(),
+        1,
+        "the replaced table must name the site certificate and nothing issued yet"
+    );
+
+    // The issued certificate is served for the name it covers...
+    assert_eq!(
+        fetch(addr, "renewed.test", &["http/1.1"]).await.certificate,
+        issued_der,
+        "an issued certificate must be served on the next handshake"
+    );
+    // ...and the site that had its own certificate still has it.
+    assert_eq!(
+        fetch(addr, "other.test", &["http/1.1"]).await.certificate,
+        other_before,
+        "installing an issued certificate must not drop a site's own certificate"
+    );
+    // And the fallback moved to the issued one, which is what makes an unknown name keep working.
+    assert_eq!(
+        fetch(addr, "anything.test", &["http/1.1"])
+            .await
+            .certificate,
+        issued_der,
+        "the issued certificate becomes the fallback, so an unlisted name keeps a valid handshake"
+    );
+}
+
+/// A certificate pair on disk, loaded the way the resolver loads them.
 ///
 /// Through `load_certified` rather than `CertifiedKey::from_der`, so a test that installs a
 /// certificate in memory uses the same code path a config-driven reload does — a test that

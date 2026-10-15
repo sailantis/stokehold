@@ -134,6 +134,11 @@ fn version() {
         volucer_server::MINIMUM_PHP_VERSION
     );
     println!("  backends:         worker, external fpm, spawn_cgi");
+    // ACME is advertised only as *available*, because whether it is in use is a property of the
+    // configuration rather than of the build — `volucer check` is where a deployment's own answer
+    // is printed. Saying "TLS-ALPN-01" rather than "ACME" matters: it is the one challenge this
+    // build can perform, and an operator comparing against another server needs to know that.
+    println!("  certificates:     ACME (RFC 8555), the tls-alpn-01 challenge");
 }
 
 fn init_tracing(verbosity: u8) {
@@ -250,6 +255,68 @@ fn resolved_site_tls(config: &Config, config_path: &Path) -> Vec<(String, TlsPat
             ))
         })
         .collect()
+}
+
+/// How long a certificate is valid for, and whether that is a problem.
+///
+/// The direct mitigation for ACME's failure mode, which is **silence**: issuance that never
+/// succeeds is indistinguishable from issuance that is working, so the only symptom a deployment
+/// gets is a certificate that expires. Reading the days left and saying so is what turns weeks of
+/// quiet failure into one line an operator sees.
+///
+/// A day count rather than a timestamp because that is the unit the decision is made in: 41 days
+/// means "renewals are working", 3 means "something has been failing for a while".
+fn certificate_lifetime(path: &Path) -> Option<CertificateLifetime> {
+    let pem = std::fs::read(path).ok()?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&pem).ok()?;
+    let certificate = pem.parse_x509().ok()?;
+    let validity = certificate.validity();
+    let expiry = validity.not_after.timestamp();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some(CertificateLifetime {
+        days_left: (expiry - now).div_euclid(86_400),
+        expired: expiry <= now,
+    })
+}
+
+/// What `check` reports about one certificate's lifetime.
+struct CertificateLifetime {
+    /// Whole days until `not_after`. Negative when it has already passed.
+    days_left: i64,
+    /// Whether `not_after` is in the past.
+    expired: bool,
+}
+
+impl CertificateLifetime {
+    /// The report, with the warning it deserves.
+    ///
+    /// The thresholds are chosen against how automation actually fails rather than against a
+    /// round number. A renewal is attempted at a third of the way through validity, so anything
+    /// under a third means *at least one* attempt has not taken effect yet — worth knowing, not yet
+    /// an emergency. Under a week means several have failed in a row.
+    fn report(&self, label: &str) -> String {
+        if self.expired {
+            return format!(
+                "{label}: EXPIRED — every client is being shown a certificate warning, and \
+                 no ACME renewal has succeeded"
+            );
+        }
+        match self.days_left {
+            0..=7 => format!(
+                "{label}: {} day(s) left — several renewals in a row have failed; the CA will \
+                 also be warning the account contact",
+                self.days_left
+            ),
+            8..=30 => format!(
+                "{label}: {} day(s) left — an ACME renewal should have happened by now",
+                self.days_left
+            ),
+            _ => format!("{label}: {} day(s) left", self.days_left),
+        }
+    }
 }
 
 /// Run the configured listeners until interrupted.
@@ -993,6 +1060,23 @@ fn check(
                     false => "no (the first start will place an order)",
                 }
             );
+
+            // The days left on each certificate this deployment serves. Reported whenever ACME is
+            // configured, because the *question* — is anything about to expire — is the same
+            // whether or not issuance is working, and expiry is this feature's only symptom.
+            if let Some(server_tls) = resolved_server_tls(&config, path) {
+                if let Some(lifetime) = certificate_lifetime(&server_tls.certificate) {
+                    println!("      {}", lifetime.report("serving certificate"));
+                }
+            }
+            for (name, site_tls) in resolved_site_tls(&config, path) {
+                if let Some(lifetime) = certificate_lifetime(&site_tls.certificate) {
+                    println!(
+                        "      {}",
+                        lifetime.report(&format!("site {name} certificate"))
+                    );
+                }
+            }
         }
         None => println!("  acme:             (disabled)"),
     }
@@ -1235,6 +1319,104 @@ document_root = "/from/file"
     fn an_empty_front_controller_means_files_only() {
         let routing = routing_for(Path::new("."), None);
         assert_eq!(routing.front_controller, None);
+    }
+
+    /// Days left are reported in the units the decision is made in, and each band says something
+    /// different.
+    ///
+    /// The thresholds are not round numbers chosen for looks: a renewal is attempted a third of the
+    /// way through validity, so **under a third** means a renewal that should have happened has
+    /// not, and **under a week** means several have failed in a row. Both are what an operator
+    /// needs told, and the difference between them is the difference between "look at this" and
+    /// "this has been broken for a while".
+    ///
+    /// Asserted per band rather than by containing a substring, because a single over-broad message
+    /// would satisfy "contains days" for all of them.
+    #[test]
+    fn a_certificates_days_left_are_reported_with_the_warning_they_deserve() {
+        let report = |days_left: i64| {
+            CertificateLifetime {
+                days_left,
+                expired: days_left < 0,
+            }
+            .report("cert")
+        };
+
+        // Healthy: a bare count, no alarm.
+        let healthy = report(75);
+        assert_eq!(healthy, "cert: 75 day(s) left", "{healthy}");
+        assert!(!healthy.contains("failed"), "{healthy}");
+
+        // Under a third of 90 days: a renewal should have happened by now.
+        let late = report(20);
+        assert!(late.contains("20 day(s) left"), "{late}");
+        assert!(late.contains("should have happened"), "{late}");
+
+        // Under a week: several in a row have failed, and the CA is already warning.
+        let urgent = report(3);
+        assert!(urgent.contains("3 day(s) left"), "{urgent}");
+        assert!(urgent.contains("several renewals"), "{urgent}");
+        assert!(urgent.contains("contact"), "{urgent}");
+
+        // Expired is its own message, because the consequence is different in kind: clients are
+        // already being shown warnings.
+        let expired = report(-1);
+        assert!(expired.contains("EXPIRED"), "{expired}");
+        assert!(expired.contains("client"), "{expired}");
+    }
+
+    /// A certificate file that is not a certificate is reported as *nothing*, not as a failure.
+    ///
+    /// `check` runs against a deployment that may not have its certificate yet — that is the state
+    /// an ACME-managed first start is in — so a missing or unreadable file must not make `check`
+    /// fail. The preflight warnings already report an unreadable certificate by name; this is the
+    /// extra information when there *is* one.
+    #[test]
+    fn a_certificate_that_cannot_be_read_reports_no_lifetime_rather_than_failing() {
+        let missing = std::env::temp_dir().join("volucer-no-such-cert-1.crt");
+        assert!(
+            certificate_lifetime(&missing).is_none(),
+            "a missing certificate must report nothing"
+        );
+
+        let not_a_cert =
+            std::env::temp_dir().join(format!("volucer-not-a-cert-{}.crt", std::process::id()));
+        std::fs::write(&not_a_cert, b"this is not a certificate").expect("write the fixture");
+        assert!(
+            certificate_lifetime(&not_a_cert).is_none(),
+            "a file that is not a certificate must report nothing"
+        );
+        let _ = std::fs::remove_file(&not_a_cert);
+    }
+
+    /// A real certificate's expiry is actually read, so the report is not always absent.
+    ///
+    /// The counterpart to the test above, and the one that would catch a parser wired up wrongly:
+    /// "reports nothing for a bad file" passes just as well against code that reports nothing for
+    /// every file. A certificate generated here has a real `not_after`, so a lifetime must come
+    /// back — and its sign is checked rather than its value, because the fixture's validity window
+    /// is not this test's business.
+    #[test]
+    fn a_real_certificates_expiry_is_read() {
+        let generated = rcgen::generate_simple_self_signed(vec!["example.test".to_string()])
+            .expect("generate a certificate");
+        let path =
+            std::env::temp_dir().join(format!("volucer-real-cert-{}.crt", std::process::id()));
+        std::fs::write(&path, generated.cert.pem()).expect("write the fixture");
+
+        let lifetime =
+            certificate_lifetime(&path).expect("a real certificate must have a readable lifetime");
+        assert!(
+            !lifetime.expired,
+            "a freshly generated certificate must not read as expired"
+        );
+        assert!(
+            lifetime.days_left > 0,
+            "a freshly generated certificate must have days left: {}",
+            lifetime.days_left
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The restart-only list names the three classes that genuinely cannot be replaced, and

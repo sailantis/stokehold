@@ -21,6 +21,7 @@ clap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+x509-parser.workspace = true
 
 # Signals are split by platform because the *mechanism* is, not the behaviour.
 #

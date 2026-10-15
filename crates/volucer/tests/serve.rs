@@ -1058,6 +1058,11 @@ fn version_prints_the_protocol_and_the_php_floor() {
     );
     assert!(text.contains("FastCGI"), "{text}");
     assert!(
+        text.contains("tls-alpn-01"),
+        "the challenge a build performs must be advertised, because it is the difference between \
+         a deployment that can be issued a certificate and one that cannot: {text}"
+    );
+    assert!(
         !text.contains("spawn_fpm"),
         "a removed backend must not be advertised: {text}"
     );

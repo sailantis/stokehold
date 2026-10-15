@@ -45,6 +45,11 @@ signal-hook = "0.3"
 thiserror = "2"
 httpdate = "1"
 rustls = "0.23"
+# Reading a certificate's expiry, for `volucer check`. Already in the graph as a dependency of
+# `rustls-acme`, and taken with `default-features = false` — the same features rustls-acme uses —
+# so this adds not one crate to the build. The alternative was a hand-rolled ASN.1 walk, which is
+# not the kind of parsing to write by hand.
+x509-parser = { version = "0.18", default-features = false }
 rustls-pemfile = "2"
 
 # The ACME client: the order/renewal flow, and the TLS-ALPN-01 challenge certificate.

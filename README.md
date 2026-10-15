@@ -563,6 +563,57 @@ is then served by whatever site its `Host` selects.
 Nothing measurable. With no `[server.tls]` there is no peek, no branch, and no TLS value is
 constructed — the cleartext path is the same code it was before TLS existed.
 
+## Automatic certificates (ACME)
+
+Opt in with a `[server.acme]` table. Without one, nothing about the server changes.
+
+```toml
+[server]
+http = "0.0.0.0:443"           # the TLS port the challenge is validated on
+document_root = "/srv/app"
+
+[server.tls]                    # still required: this is the *fallback* certificate
+certificate = "certs/fallback.crt"
+key = "certs/fallback.key"
+
+[server.acme]
+domains = ["example.com", "www.example.com"]
+contact = ["mailto:ops@example.com"]
+# authority = "production"      # staging by default; see below
+# cache = "acme-cache"          # relative to this file
+```
+
+An issued certificate **replaces the one being served, without a restart** — the reload mechanism
+does the work, and the next handshake gets the new certificate. That is also why `[server.tls]` is
+still required rather than optional: a TLS listener with nothing to serve fails every handshake that
+is not a challenge, so a first deployment names a self-signed pair and issuance replaces it. Making
+the certificate a *file* and reloading the *file* is the slower loop with more ways to fail, so the
+issued bytes go straight into the resolver in memory.
+
+**Only the `tls-alpn-01` challenge is used**, and not by preference: `http-01` serves
+`/.well-known/acme-challenge/<token>`, a path this server's own static layer refuses because it
+starts with a dot. TLS-ALPN-01 needs no `:80` and no dotfile policy change — the handshake goes to
+the same `:443` the site already uses. It does require the **TLS port to be publicly reachable** and
+the name to resolve to this machine. There is no DNS-01 support: that is the escape hatch for a
+machine behind a NAT, and it puts DNS API credentials on the web server.
+
+**Staging is the default and production must be named.** A production account has per-week rate
+limits, and a first deployment that reached production by omission would spend them on its own
+mistakes. Staging runs the real protocol and issues certificates no browser trusts.
+
+```bash
+kill -HUP $(pidof volucer)     # pick up a certificate you replaced by hand
+volucer check --config volucer.toml   # authority, names, cache state, and days left
+```
+
+`check` is the one to watch, because **the failure mode here is silence**. Issuance that never
+succeeds looks exactly like issuance that is working: the port is up, the previous certificate
+serves, and the only symptom is a certificate that expires weeks later. So `check` prints the
+authority, the names, whether a certificate has ever been cached, and the days left on each
+certificate being served — and shouts when the authority is production. A deployment with no
+`contact` is also called out: it is the only channel the CA has to warn that renewals are failing.
+
+
 That was written from reading the code, and for a while the plan said so: it was the one claim in
 the TLS work that had not been measured. It has been now, as an interleaved A/B of **two binaries**
 — the last commit before any TLS code against the current build — both serving a config with no

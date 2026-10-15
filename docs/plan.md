@@ -1784,6 +1784,61 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
       `volucer/tests/serve.rs` also now parses the listener banner's address by first token, so the
       `(https)` suffix `serve` prints cannot leak into an address.
 
+### Phase — ACME issuance (steps 60–64)
+
+This phase has its own working plan (revision 2 of the reload/ACME plan), which is where the
+reasoning and the open decisions live. What is recorded here is the outcome and the corrections,
+because the tracked plan's step 52 was written from a reading of `rustls-acme` that two of its
+claims turned out to understate.
+
+60. `acme-deps` — **done.** `rustls-acme` 0.15.4 with `default-features = false, features =
+    ["aws-lc-rs", "webpki-roots"]`. The second feature is the correction: `webpki-roots` is one of
+    the crate's three defaults *and* the gate on `AcmeConfig::new` itself — the constructor that
+    builds the `RootCertStore` verifying **Let's Encrypt's own** HTTPS endpoint. Dropping it, as the
+    draft prescribed, removes the function, so the client cannot reach the directory. The error names
+    no feature and suggests no cause. `tokio` is **off deliberately**, because it enables
+    `AcmeConfig::tokio_incoming` — a ready-made accept loop that would mean adopting the crate's
+    resolver rather than composing ours (step 61). One `rustls 0.23.46` in the graph, asserted by
+    `volucer-http/tests/one_rustls.rs` rather than by a one-off `cargo tree`.
+61. `acme-branch` — **done, and it is not an accept-loop branch.** `ResolvesServerCert::resolve` is
+    handed the `ClientHello` *including its ALPN* (`rustls/server_conn.rs:129`, `ClientHello::alpn`),
+    so the dispatch belongs inside our resolver — which is where `rustls-acme` puts it too
+    (`acceptor.rs`). `LazyConfigAcceptor` was not needed, and adding it would have created a second
+    accept path answering the same question. New crate `volucer-acme` holds the composition;
+    `ChallengeResolver` deliberately does **not** implement `ResolvesServerCert`, so installing the
+    ACME resolver where it could answer every SNI name does not type-check. Pinned by
+    `the_acme_source_answers_only_an_exact_challenge_handshake` (three real handshakes: normal,
+    `h2`+`http/1.1`, `h2`+`acme-tls/1`), falsified against a substring ALPN check — which first
+    passed, because the stub owned the decision; the stub now delegates to the real resolver. Hazard
+    62's shape.
+62. `acme-engine` — **done, and it found the defect that would have made the phase decoration.**
+    `AcmeState` installs an issued certificate into *its own* resolver and the bytes are not
+    reachable from there, so reacting to `DeployedNewCert` with "install the certificate" would have
+    installed nothing a handshake can see — and the symptom would not appear for **weeks**. What is
+    reachable is the cache: `rustls-acme` writes the PEM there and reports `EventOk::CertCacheStore`
+    when that has returned `Ok`. So `Engine::install_cached` reads it back, called before the first
+    poll (so a restart serves its cached certificate and spends no rate limit) **and** on
+    `CertCacheStore` (which is the renewal reaching the serving table without a restart — the
+    deliverable of the whole phase). Falsified by disabling the second call.
+63. `acme-config` — **done.** `[server.acme]` as a table rather than a flag, with `Authority` an
+    enum so production must be named. **Open decision §9.5 is answered *no*:** a `[server.tls]`-less
+    ACME listener stays refused, because a listener with nothing to serve fails every handshake that
+    is not a challenge — hazard 56's sibling — so `[server.tls]` remains the required *fallback* and
+    ACME changes which certificate is served. `domains` is stated rather than derived from
+    `[sites.*].hosts`, because a wildcard host pattern cannot go on a certificate and TLS-ALPN-01
+    cannot validate one. Nine tests, each failing on the thing its own message names.
+64. `acme-cli` — **done.** `check` reports the authority, the names, the contact, the resolved
+    cache path, whether a certificate has ever been cached, and **the days left on each certificate
+    being served** — which is the direct mitigation for this feature's failure mode, silence. A
+    production authority is called out, and so is a missing `contact`, since that is the CA's only
+    channel for warning that renewals are failing. `version` advertises `tls-alpn-01` as the one
+    challenge this build performs. The README and `volucer.example.toml` both gained the block, and
+    the example's now-wrong claim that `:80`/`:443` is the only shape that can host an ACME
+    challenge is corrected.
+65. `acme-verify` — the phase's own verification (§8 of the ACME plan): the 12 `tests/tls.rs` and
+    27 `tests/frontend.rs` unchanged as the control for "ACME is additive", offline issuance against
+    Pebble, and the certificate served without a restart.
+
 ## 7. Testing strategy
 
 - **Codec unit tests** first, against the specification's own examples, plus byte-exact
@@ -2036,6 +2091,13 @@ reading out of a crate description.
 | reload: a certificate **and** a site from one signal | **works, Unix only** | `one_sighup_reloads_a_certificate_and_a_site_together` — one `SIGHUP`, read from a handshake *and* a request on the same listener, against a real process. Falsified by deleting the certificate refresh from `Reloader::reload`: the test fails and **every other test in the tree still passes**, so this was the only thing pinning that half. Hazard 63: the two tables are applied in sequence on purpose, so the test waits for both rather than reading the window between them |
 | reload: no request sees a **mixture** of generations | **works** | `a_reload_under_concurrent_requests_is_one_configuration_per_request` — two samplers and four requesters race one reload on a real listener; the assertion is that the site, its routing and its static layer always come from one generation, with the three made individually identifiable so a mixture has something to be wrong about. Sampling is what makes it observable: falsifying it by pairing the new table with the previous maps is caught **only** by the sampler, and no request-level assertion sees it at all (hazard 62) |
 | reload: the **restart-only report** | **works** | `the_restart_only_list_names_what_cannot_be_replaced_and_nothing_else` — pins the three classes that genuinely cannot be replaced *and* the two (`routes`, `static_files`) an earlier draft wrongly listed, since the README's split is copied from this text |
+| ACME: the composition, ours not the crate's | **works** | `the_acme_source_answers_only_an_exact_challenge_handshake` — three real handshakes through a real listener (normal; `h2`+`http/1.1`; `h2`+`acme-tls/1`) assert which resolver answered each, and the combined offer gets the **site** certificate because an exact ALPN match is what makes it not a validation. `rustls-acme`'s resolver returns one certificate for *every* non-challenge SNI name, so installing it directly would let a site present another site's. `ChallengeResolver` does not implement `ResolvesServerCert`, so that mistake does not type-check. Hazard 67: the first version's stub owned the decision, and the falsification passed |
+| ACME: a renewal reaches the serving table | **works** | `a_published_certificate_is_read_back_into_the_serving_table` — driven on the real `EventOk::CertCacheStore` with a real `DirCache`, so only the network is stubbed. `AcmeState` installs an issued certificate into *its own* resolver, whose bytes are unreachable, so the certificate is read back from the cache. Falsified by disabling that call. Hazard 66: without it a renewal would work, be logged, and never be served — for weeks |
+| ACME: only one `rustls`, and the features that build it | **works** | `exactly_one_rustls_is_in_the_graph` reads the lockfile; `the_acme_client_is_built_with_a_root_store` names `AcmeConfig::new`, so removing the `webpki-roots` feature fails the build with the reason. Hazard 64: the plan's own feature line removed that constructor, because `webpki-roots` is the `#[cfg]` gate on it *and* one of the crate's three defaults |
+| ACME: staging by default, production named | **works** | `acme_defaults_to_staging_and_production_is_named` in `volucer-core`. A named enum rather than a `bool`, because the cost of getting it wrong is a real certificate for a name somebody owns, against per-week limits |
+| ACME: config validation | **works** | `an_acme_domain_that_cannot_be_validated_is_refused_with_its_reason` (five cases, each asserting its own reason), `an_acme_contact_must_be_a_mailto_uri`, `a_duplicate_acme_domain_is_refused_with_both_positions`, `acme_without_a_fallback_certificate_is_refused`, `an_unknown_key_under_server_acme_is_refused`. Every one is something a CA would reject *after* an order had started |
+| ACME: additive — off unless configured | **works** | `acme_is_absent_until_the_table_is_written` in `volucer-core`, and the 12 `tests/tls.rs` + 27 `tests/frontend.rs` suites unchanged, which is the control the phase was planned around |
+| ACME: days-to-expiry visibility | **works** | `a_certificates_days_left_are_reported_with_the_warning_they_deserve` and `a_real_certificates_expiry_is_read`, both in `volucer` (the second falsified by making the parser report nothing). `volucer check` prints the authority, names, contact, cache state and days left, because silence is this feature's failure mode |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
@@ -3501,3 +3563,103 @@ the same instant*.
 
 Found by running the real binary and reading its log, not by reasoning about the code — the same
 technique hazard 60 needed.
+
+### Hazard 64 — the plan's own dependency features removed the function it needed
+
+The ACME plan (§3.3) said to take `rustls-acme` with `--no-default-features, features =
+["aws-lc-rs"]`, reasoning — correctly — that the crate is a compile-time fork of our crypto provider,
+so the provider must be named explicitly. It then drew the wrong conclusion from a right premise:
+dropping the defaults also drops `webpki-roots`, which is the gate on `AcmeConfig::new` **itself**.
+
+The constructor it removes is the one that builds the `RootCertStore` verifying Let's Encrypt's own
+HTTPS endpoint (`config.rs:65`), so the client cannot reach the directory at all. The error is
+
+```text
+error[E0599]: no associated function or constant named `new` found for struct `AcmeConfig`
+   --> rustls-acme-0.15.4/src/config.rs:135:5
+```
+
+which names no feature and suggests no cause. A `#[cfg]` attribute on a function is invisible from
+the call site, so the missing thing looks like an API change rather than a build configuration.
+
+**The generalisation is narrower than "read the features", and worth stating precisely:** the crate's
+*docs* are not where this lives. The feature table and the `#[cfg]` on the constructor are, and the
+README of a crate like this describes the recommended usage — which is with the defaults on, so it
+never mentions that one default gates a function. Two of three defaults were right to reconsider
+(`tls12`, and the provider name); the third was load-bearing in a way nothing at the call site could
+show.
+
+**The fix is permanent rather than a comment:** `volucer-http/tests/one_rustls.rs` names
+`AcmeConfig::new`, so removing `webpki-roots` fails the *build* on a line that says why. Verified by
+removing it and reading the error back.
+
+### Hazard 65 — the plan specified a second accept path for a question already answered in one place
+
+The ACME plan (§6.1) specified `LazyConfigAcceptor` in the accept loop, peeking the `ClientHello` and
+choosing between two `ServerConfig`s — and §6.3, two pages later, specified that a *normal* handshake
+must be answered by the site table. Those two are in tension, and the plan did not notice: the first
+puts the decision in the accept loop, the second requires it wherever the sites are consulted.
+
+The resolution is that `ResolvesServerCert::resolve` is already handed the `ClientHello` *including
+its ALPN*:
+
+```rust
+// rustls-0.23.46/src/server/server_conn.rs:129
+fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>>;
+```
+
+so the sites' resolver — installed in the one `ServerConfig` built at startup, replaceable by design
+since the reload phase — is the only place the question needs answering. `rustls-acme` itself does it
+this way (`acceptor.rs`: `if is_tls_alpn_challenge(&handshake.client_hello())`), which the plan had
+read and did not draw the conclusion from.
+
+**What shipped is simpler *and* safer than the plan**: one `ServerConfig`, one accept path, and the
+composition as a single `if` in one function. An accept-loop branch would have been a second place
+that could disagree with the first — the same failure the reload work spent a hazard on, at one layer
+down.
+
+The lesson is about plan length rather than about rustls: a design written across two sections that
+each specify *where* a decision is made, without naming the function that already receives its input,
+can specify the same decision twice.
+
+### Hazard 66 — a certificate that is issued, cached, and never served
+
+The plan's §6.1 said an issued certificate "must reach the resolver *in memory*", and the engine step
+initially reacted to `DeployedNewCert` by installing the certificate. There was nothing to install
+from: `AcmeState` installs it into `ResolvesServerCertAcme` — **its own** resolver, the one with Gap 3
+— and the certificate bytes are not reachable from that resolver or from the event.
+
+The failure this would have produced is the worst shape in the project: **nothing visible for weeks.**
+The port is up, the previous certificate serves, the renewal appears to succeed in the log, and the
+first symptom is an expired certificate. Every test in the tree would have passed, because every
+one of them configures a certificate by file.
+
+What is reachable is the cache. `rustls-acme` writes the PEM there (its `store_cert` early action)
+and reports `EventOk::CertCacheStore` once that has returned `Ok`, so reading the cache back on that
+event gets exactly the certificate just issued — through the public `CertCache` trait, with no fork.
+`Engine::install_cached` is therefore called on that event, which is the renewal path, **and before
+the first poll**, which is what makes a restart serve its cached certificate immediately instead of
+ordering a new one.
+
+**Falsified by disabling the call on `CertCacheStore`:** the test fails with "a published renewal
+must reach the serving table exactly once: []". The generalisation: *for a value that arrives
+asynchronously, ask where it can be read from, not where it was written.* The event reports that a
+write happened; it does not, and cannot, hand over the bytes.
+
+### Hazard 67 — the stub owned the decision, so the falsification passed
+
+The first version of `the_acme_source_answers_only_an_exact_challenge_handshake` put the
+"is this a challenge?" decision in the test's own stub. Replacing `rustls-acme`'s exact-match
+`is_tls_alpn_challenge` with a substring ALPN check — the falsification — **passed**, and the test
+was therefore asserting its own stub rather than the composition.
+
+This is hazard 62's shape in a smaller place, and it has a sharper rule: **a stub may record, but
+what it asserts has to come from the code under test.** The stub now delegates both the gate and the
+resolution to a real `ChallengeResolver` built from a real (network-free) `AcmeState`, so the exact
+ALPN match being asserted is the dependency's own. The same falsification then fails on the combined
+`h2`+`acme-tls/1` offer, which is the case that matters: a client appending the challenge protocol to
+a normal offer is not validating, and a substring check would hand it a validation-only certificate.
+
+The near-miss is instructive rather than embarrassing: the falsification was *run*, which is the only
+reason it was caught. A plan that had trusted the first green run would have shipped a test that could
+not fail.

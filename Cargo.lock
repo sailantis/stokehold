@@ -1683,6 +1683,7 @@ dependencies = [
  "volucer-fcgi",
  "volucer-http",
  "volucer-server",
+ "x509-parser",
 ]
 
 [[package]]

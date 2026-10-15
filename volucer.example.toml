@@ -49,11 +49,14 @@ fastcgi = "127.0.0.1:9080"
 #        [server]  http = "0.0.0.0:443"
 #        [server.tls]  plain = true
 #
-#   3. Plain on :80 and TLS on :443, the conventional pair. This is the only
-#      shape that can host ACME's HTTP-01 challenge and an :80 -> :443 redirect,
-#      because those are the two parts of TLS that need a particular port.
+#   3. Plain on :80 and TLS on :443, the conventional pair.
 #        [server]  http = "0.0.0.0:80"
 #                  https = "0.0.0.0:443"
+#
+# Note on ACME: `[server.acme]` below uses the **tls-alpn-01** challenge, which
+# is validated on the TLS port -- so it works in shape 1 or 2 as well, and needs
+# no :80. (`http-01` would need :80 *and* a dotfile policy change, because
+# /.well-known/... is refused by the static layer.)
 # ---------------------------------------------------------------------------
 # [server.tls]
 # certificate = "certs/default.crt"   # PEM chain, leaf first
@@ -75,6 +78,32 @@ fastcgi = "127.0.0.1:9080"
 # [sites.shop.tls]
 # certificate = "certs/shop.crt"
 # key = "certs/shop.key"
+
+# ---------------------------------------------------------------------------
+# Automatic certificates (ACME, RFC 8555). The presence of `[server.acme]` is
+# what turns it on, and a deployment without it behaves exactly as before.
+#
+# `[server.tls]` stays REQUIRED even with ACME: it is the fallback certificate
+# served until an order completes, so a first deployment names a self-signed pair
+# and issuance replaces it. An issued certificate reaches the running server
+# without a restart -- the next handshake presents it.
+#
+# Only `tls-alpn-01` is used, so the certificate is validated on the TLS port and
+# no :80 is needed. That port must be publicly reachable and the names must
+# resolve here.
+#
+# `authority` defaults to staging on purpose: a production account has per-week
+# rate limits, and a first deployment should spend its mistakes on staging.
+# `volucer check` prints the authority, the names, whether a certificate has ever
+# been cached, and the days left on each one -- because the failure mode here is
+# silence, and an expired certificate is its only symptom.
+# ---------------------------------------------------------------------------
+# [server.acme]
+# domains = ["example.com", "www.example.com"]   # stated, not derived from sites:
+#                                                # this is what the cert must COVER
+# contact = ["mailto:ops@example.com"]           # the CA's only way to warn you
+# authority = "staging"                          # or "production"; staging default
+# cache = "acme-cache"                           # relative to this file
 
 # ---------------------------------------------------------------------------
 # Static files, served from the document root without waking PHP at all. This is

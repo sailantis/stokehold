@@ -1666,40 +1666,52 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
 52. `tls-acme` — **24b.** `rustls-acme`, whose default and recommended mechanism is TLS-ALPN-01 and
     needs no second port. The plaintext listener this phase adds is what HTTP-01 would need, so
     that option is open rather than blocked.
-53. `reload-handle` — **done** (`a937f43`). `volucer_http::reload::Swappable<T>` (an `ArcSwap`
-    behind an `Arc`), and `listener::Reloaded` — the *one* value a request path reads, holding the
-    site table, the per-site routings and the per-site static layers. One pointer rather than
-    three, and that is the correctness: three separate swaps are not one snapshot, so a request
-    could take a new site table with an old routing map and resolve a site the map has no entry
-    for. The failure would not look like a race — it would look like a site serving the wrong
-    document root, once, under load. `ReloadHandle::apply` is whole-or-nothing by construction
-    (there is no setter for a single field) and returns the state it replaced, so a caller can
-    report *what* changed.
+53. `reload-handle` — **done** (`a937f43`, moved into `volucer-watch` by `931daaa`).
+    `volucer_watch::Swappable<T>` (an `ArcSwap` behind an `Arc`), and `listener::Reloaded` — the
+    *one* value this listener's request path reads, holding a snapshot of the site table plus the
+    per-site routings and static layers derived from it. One pointer rather than three, and that is
+    the correctness: three separate swaps are not one snapshot, so a request could take a new site
+    table with an old routing map and resolve a site the map has no entry for. The failure would not
+    look like a race — it would look like a site serving the wrong document root, once, under load.
+    `ReloadHandle::apply` is whole-or-nothing by construction (there is no setter for a single
+    field) and returns the state it replaced, so a caller can report *what* changed.
 54. `reload-sites` — **done** (`a937f43`). The request path takes one snapshot per request
     (`FrontEnd::state`) and moves it into the blocking dispatch task, so an in-flight request keeps
     the configuration it started under and a reload affects the **next** request. That ordering is
-    the only one explainable to an operator.
-55. `reload-tls` — **done.** The certificate table is replaceable too, because a certificate that
-    appears while the process is running has to be presented on the next handshake — which is the
-    half ACME needs and cannot be worked around. `SniResolver` gained a `config_dir`, a
-    `Swappable<Certs>` and two ways in: `refresh` (re-read the pairs a `CertificateSet` names) and
+    the only one explainable to an operator — and it is now enforced *inside* the snapshot rather
+    than by convention: `Reloaded::resolve` returns the site *and* its maps from one call, so a
+    request cannot resolve against one generation and route against another.
+55. `reload-tls` — **done** (`8c63807`). The certificate table is replaceable too, because a
+    certificate that appears while the process is running has to be presented on the next handshake
+    — which is the half ACME needs and cannot be worked around. `SniResolver` gained a `config_dir`,
+    a `Swappable<Certs>` and two ways in: `refresh` (re-read the pairs a `CertificateSet` names) and
     `replace` (install a table already in memory, for a certificate whose bytes never came from a
-    file this process wrote). Whole-or-nothing: the whole set loads before anything is installed,
-    so one unreadable pair leaves the previous table serving untouched. `HttpListener` gained
+    file this process wrote). Whole-or-nothing: the whole set loads before anything is installed, so
+    one unreadable pair leaves the previous table serving untouched. `HttpListener` gained
     `resolver()` and `bind_with_resolver`, the latter reading **no certificate file at all** — the
     only way a deployment whose certificate does not exist yet can bind its port.
-56. `reload-sighup` — wire `SIGHUP` to read and apply the config, whole-or-nothing: `Config::validate`
+56. `reload-shared` — **done** (`931daaa`), and it was a live defect rather than tidying.
+    `FastCgiListener` held its **own** `Arc<Sites>` while a reload replaced only the HTTP
+    front-end's, so a reloaded site took effect over `:80` and kept reaching the old pool behind
+    nginx — a difference that reads as *the other front-end being right* and that no single-protocol
+    test can see. A new crate, `volucer-watch`, owns `SharedState` (the live table both listeners
+    hold) and absorbs `volucer-http`'s `reload.rs`, because the mechanism was never HTTP-specific.
+    Both front-ends now take a `SharedState` at bind time, `serve` builds exactly one, and the
+    FastCGI listener resolves *per request* rather than per connection so nginx's keep-alive does
+    not pin a connection to the configuration it was accepted under.
+57. `reload-sighup` — wire `SIGHUP` to read and apply the config, whole-or-nothing: `Config::validate`
     already returns `Result`, so a bad file is a logged refusal with the previous config still
     serving. **There is no `SIGHUP` on Windows**, so the watcher needs a `#[cfg]` split, and
     `main.rs` already owns a `ctrlc` handler with the `termination` feature that covers `SIGTERM`.
-    Blocked on open decision 5 below (what the signal reads).
-57. `reload-cli` — what a reload prints: what changed, and the **restart-only list** named
+    **Open decision 9.1 is answered: (a), re-read the file as-is** — what an operator expects from
+    SIGHUP, and no new concept.
+58. `reload-cli` — what a reload prints: what changed, and the **restart-only list** named
     explicitly rather than discovered. That is the lesson of the TLS story — a setting the
     implementation cannot honour has to be *stated*, or the operator finds out from behaviour.
     Today's list: listener addresses, backend commands and worker counts, `static_files` on/off,
     and `[server.tls]`'s `min_version`/`alpn` (they are baked into the `rustls::ServerConfig` the
     acceptor holds).
-58. `reload-tests` — swap under concurrent requests; a failed reload leaves the previous config
+59. `reload-tests` — swap under concurrent requests; a failed reload leaves the previous config
     serving; the restart-only list is reported; and **the hot-path cost is measured** rather than
     argued. **The measurement is done** (the rest of this step is not): an interleaved A/B of two
     release binaries, `68bfdcc` against the reload work, both with no `[server.tls]` and both
@@ -1773,8 +1785,12 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
    already validated and marked. (a) is what an operator expects from a Unix server and needs no
    new concept, but it means a *staged* edit is applied by a signal sent for something else, and a
    mistyped file mid-incident turns a reload into a refusal — safe, since nothing is applied, but
-   noisy. (b) is more machinery and no staging surprise. **Leaning (a); this needs a call rather
-   than an assumption.**
+   noisy. (b) is more machinery and no staging surprise. **Answered: (a).**
+
+   **And the tiers are only as good as their reach** — hazard 59. The table used to be held
+   per listener, so `[sites.*]` reloaded over HTTP and not behind nginx. "Does this reload
+   everything it claims to" is a question about reach, and reach is not visible from inside one
+   front-end, which is why the state is now a type both listeners must be handed.
 6. **Swap mechanism — answered: `arc-swap`.** It is a new dependency and the only crate this phase
    adds. The read is the request path and `RwLock` still has every reader touch an atomic counter
    and block a writer; `ArcSwap` is a pointer load that no writer ever blocks. The alternative was
@@ -1951,8 +1967,9 @@ reading out of a crate description.
 | reload: certificates | **works** | `a_certificate_reload_is_presented_on_the_next_handshake` — a renewed pair on disk is the one presented by the next handshake, on the same listener, compared byte for byte. `an_in_memory_certificate_needs_no_file_and_no_config` covers the ACME-shaped path, where the bytes never came from a file this process wrote |
 | reload: whole-or-nothing | **works** | `a_certificate_reload_that_cannot_load_applies_neither_half` — a set with one unreadable pair installs **neither** half, proven by naming a *valid* pair alongside the bad one so a partial install would be visible |
 | reload: a plaintext listener carries no TLS state | **works** | `a_plaintext_listener_has_no_resolver_and_still_reloads_sites` — `resolver()` is `None`, so there is nothing to load and no branch to take, and site reloading still works there |
+| reload: **both** front-ends, not just HTTP | **works** | `a_reload_moves_the_fastcgi_front_ends_site_table_too` — the real socket, and **both requests on one connection** because nginx keeps its upstream alive. Falsified by moving the snapshot from per request to per connection, which fails with the old pool named in the 502. Hazard 59: the table used to be per listener, so a reload took effect on `:80` and not behind the proxy |
 | reload: what it costs when nothing reloads | **not measurable here** | interleaved A/B of two release binaries, `68bfdcc` against the reload work, no `[server.tls]`, static files on: **−0.09%, 95% CI [−1.43%, +1.27%], n = 20**, against an A-vs-A control at +0.34%, 95% CI [−0.91%, +1.61%]. The *first* ten-round run read +1.75% **excluding zero** while its control read −1.44%, which is why the verdict is drawn from the interval and the control rather than the point estimate. Rows in `volucer-competition/results/reload-cost-ab-20.tsv` |
-| reload: the **trigger** (`SIGHUP`) | **does not exist** | steps 56–58. `apply` and `refresh` are the mechanism; nothing watches for a signal yet |
+| reload: the **trigger** (`SIGHUP`) | **does not exist** | steps 57–59. `apply`/`replace`/`refresh` are the mechanism; nothing watches for a signal yet |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
@@ -3252,3 +3269,55 @@ already keeps an A-vs-A control beside every A/B — the TLS-off work establishe
 reason, and its own write-up says so. What is new is that a *plausible* result arrived first and the
 control refused it. Hazard 56 lost three attempts to assertions about post-conditions and to a
 baseline described from memory; this one lost only the point estimate.
+
+### Hazard 59 — a reload would have reached one of the two front-ends, and no test could see it
+
+Found while starting step 57 (SIGHUP), by asking *what does a reload actually reach* rather than by
+running anything — and it was live in `a937f43`, the commit that introduced reload.
+
+`FastCgiListener` held its **own** `Arc<Sites>`, resolved per request, while `serve` handed the HTTP
+listener and the FastCGI listener *the same* `Arc`. So the table a reload replaced was the HTTP
+front-end's, and only its. A site whose routes or backend a reload changed took effect over `:80`
+and kept reaching the old pool behind nginx — for the life of the process, with no error anywhere.
+
+**Why no test could have caught it.** Every reload test in the repository drives the HTTP listener.
+`a_reload_changes_what_the_next_request_is_served` is a good test and it passed, because on the
+protocol it exercises the reload worked. The failure is *relational* — one front-end moved and the
+other did not — so it needs two front-ends in one assertion, which nothing had.
+
+**Why it would not have looked like a bug.** A deployment behind nginx has both listeners, and nginx
+talks to the FastCGI one. The operator reloads, sees the new site answer on `:80`, and sees the old
+behaviour through the proxy. The most natural reading is that nginx needs a reload too; the next is
+that the proxy is caching. Neither is checkable in a way that points at this code.
+
+**The fix names the shared thing.** A new crate, `volucer-watch`, owns `SharedState` — the live
+`Arc<Swappable<Sites>>` both listeners hold — and absorbs `volucer-http`'s `reload.rs`, because the
+mechanism was never HTTP-specific: `volucer-server` needed the same one, and `volucer-http` owning it
+is *why* the FastCGI listener built its own copy. Both front-ends now take a `SharedState` at bind
+time, `serve` constructs exactly one, and a per-listener table is not expressible.
+
+**Three further bugs surfaced, and the ways they were caught are the useful part.**
+
+*The snapshot was per connection, not per request.* The first FastCGI version took `sites.sites()`
+once at connection start — *nearly* right, which is what makes it dangerous: a fresh connection per
+request still sees the new table, but nginx keeps its upstream alive, so the request after a reload
+usually arrives on a connection accepted before it. **The first version of the test dialled a fresh
+connection each time and passed against the defect.** It now sends both requests on **one
+connection**, and moving the snapshot from per request to per connection makes it fail with the old
+pool named in the 502. This is hazard 57's shape exactly: a test that cannot fail.
+
+*`Reloaded::resolve` had to exist.* The original `Reloaded` stored a `Sites` that `sites.resolve()`
+read back off the value, which let a request resolve a site against one generation and route against
+another — the failure `Reloaded` was introduced to prevent, reintroduced through the accessor.
+`resolve` now returns the site *and* its maps from one call.
+`a_reload_changes_what_the_next_request_is_served` caught it, so the test from `a937f43` was still
+doing its job.
+
+*`SharedState::replace` returns the table it replaced*, so rebuilding from its return value rebuilt
+the maps from the **previous** generation: a reload that reported a change and served the old
+document root. One line, and it is the same off-by-one-generation `resolve` was about.
+
+**The generalisation:** "does this reload everything it claims to" is a question about *reach*, and
+reach is not visible from inside one front-end. The place to ask it is where the state is
+constructed — which is why the answer here is a type both listeners must be handed rather than a
+convention both are expected to follow.

@@ -13,6 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// Only the Unix half needs it: the TLS client that reads which certificate a handshake was
+// presented with is `#[cfg(unix)]`, for the same reason the signal tests are.
+#[cfg(unix)]
+use std::sync::Arc;
+
 use volucer_fcgi::{message::BeginRequest, nvpair, protocol::RecordType, record};
 
 /// The `volucer` binary, found next to this test's own executable.
@@ -156,12 +161,16 @@ impl Server {
             // starts serving.
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("fastcgi:") {
-                let address = rest.trim();
+                // The first whitespace-delimited token, so a line that carries a suffix can still
+                // be read: `http:` prints `(https)` after the address when TLS shares the port,
+                // and a parser that took the rest of the line would hand a caller
+                // `127.0.0.1:8080 (https)` as an address.
+                let address = rest.split_whitespace().next().unwrap_or("");
                 if !address.is_empty() && address != "(disabled)" {
                     server.address = address.to_string();
                 }
             } else if let Some(rest) = trimmed.strip_prefix("http:") {
-                let address = rest.trim();
+                let address = rest.split_whitespace().next().unwrap_or("");
                 if !address.is_empty() && address != "(disabled)" {
                     server.http_address = Some(address.to_string());
                 }
@@ -1318,4 +1327,254 @@ fn sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing() {
 
     drop(server);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One `SIGHUP` changes a certificate **and** a site, and both take effect.
+///
+/// The two tables a reload installs are independent — the shared site table through the
+/// `Registry`, the certificate table through the `SniResolver` — and that independence is exactly
+/// why this needs its own test. Nothing else in the tree drives both through the *signal*: the
+/// reloader's certificate half could be deleted and every other test would still pass, because
+/// each half is exercised on its own somewhere else.
+///
+/// It is also the one assertion that needs the parts to be **simultaneously** observable. The
+/// certificate is read from the handshake and the document root from the request body, so a
+/// client that gets `renewed` back on `:0` and the new root's marker has seen both — which is
+/// the only way to tell "one signal applied two things" from "two signals applied one thing
+/// each". The site is a named site rather than the default one so that the *site* half is
+/// attributable to the site table rather than to a root that moved on its own.
+///
+/// Unix only, for the same reason the `SIGHUP` test is: it is the signal path under test.
+#[cfg(unix)]
+#[test]
+fn one_sighup_reloads_a_certificate_and_a_site_together() {
+    const SIGHUP: i32 = 1;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-cert-site-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let first = root.join("first");
+    let second = root.join("second");
+    // The **site's** root is a subdirectory of the server's, and the marker lives only there. That
+    // is what makes the site half attributable: `app.test` resolves to the site, so a reload that
+    // moved only the server's default root would leave this answer at "first" and the test would
+    // see it. Two roots that were the same path would make the assertion pass either way.
+    for dir in [&first, &second] {
+        std::fs::create_dir_all(dir.join("app")).expect("create a document root");
+    }
+    std::fs::write(first.join("app/whoami.txt"), "first").expect("write the marker");
+    std::fs::write(second.join("app/whoami.txt"), "second").expect("write the marker");
+
+    // Two server certificates, and the second is what the reload installs. Generated here rather
+    // than committed, because a committed key ends up in someone's deployment.
+    let certs = root.join("certs");
+    std::fs::create_dir_all(&certs).expect("create the certificate directory");
+    let write_pair = |file: &str, name: &str| -> Vec<u8> {
+        let generated = rcgen::generate_simple_self_signed(vec![name.to_string()])
+            .expect("generate a certificate");
+        std::fs::write(certs.join(format!("{file}.crt")), generated.cert.pem())
+            .expect("write the certificate");
+        std::fs::write(
+            certs.join(format!("{file}.key")),
+            generated.key_pair.serialize_pem(),
+        )
+        .expect("write the key");
+        generated.cert.der().to_vec()
+    };
+    let original_der = write_pair("server", "example.test");
+    // Written now but named only by the *second* config, so the first config never reads it and
+    // the reload is what installs it.
+    let renewed_der = write_pair("renewed", "example.test");
+    assert_ne!(
+        original_der, renewed_der,
+        "the fixture must generate a different certificate, or the reload assertion is vacuous"
+    );
+
+    let config_path = root.join("volucer.toml");
+    let config_for = |certificate: &str, root: &Path| {
+        let document_root = toml_string(&root.display().to_string());
+        let site_root = toml_string(&root.join("app").display().to_string());
+        format!(
+            "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {document_root}\n\n\
+             [server.tls]\ncertificate = \"certs/{certificate}.crt\"\n\
+             key = \"certs/{certificate}.key\"\n\n\
+             [server.static_files]\nenabled = true\n\n\
+             [sites.app]\nhosts = [\"app.test\"]\ndocument_root = {site_root}\n"
+        )
+    };
+    std::fs::write(&config_path, config_for("server", &first)).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the config asks for an http listener");
+
+    // Both halves before the reload, from one handshake and one request: the certificate this
+    // deployment started with, and the root it started with. Asserted together so a fixture that
+    // silently served one of them from the start would be visible here rather than as a passing
+    // reload test.
+    let before = tls_get(&address, "app.test", "/whoami.txt");
+    assert_eq!(
+        before.certificate, original_der,
+        "the fixture must serve the certificate it was started with"
+    );
+    assert_eq!(
+        before.body, "first",
+        "the fixture must serve the root it was started with"
+    );
+
+    // One signal. Both configs differ in exactly two settings — which certificate, and which
+    // site root — so what changes is attributable to the reload rather than to everything about
+    // the file.
+    std::fs::write(&config_path, config_for("renewed", &second)).expect("write the config");
+    let Some(()) = signal(&server.child, SIGHUP) else {
+        eprintln!("skipping: could not signal the server");
+        return;
+    };
+
+    // Polled rather than slept on, and polled on **both** halves. That is not belt-and-braces:
+    // the two tables are deliberately independent — the sites are applied first and the
+    // certificates after, so a refused certificate cannot take the sites with it — which means
+    // there is a real window in which the new site is serving under the old certificate. Closing
+    // the loop on the first half alone would read that window and call it a failure; the claim is
+    // that one signal applied *both* by the time it finished, so both are what is waited for.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut after = tls_get(&address, "app.test", "/whoami.txt");
+    while Instant::now() < deadline && (after.body != "second" || after.certificate != renewed_der)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+        after = tls_get(&address, "app.test", "/whoami.txt");
+    }
+
+    assert_eq!(
+        after.body, "second",
+        "one signal must reload the site table"
+    );
+    assert_eq!(
+        after.certificate, renewed_der,
+        "the same signal must reload the certificate table too — a reloader that refreshed only \
+         the sites would pass every other test in this tree"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One TLS exchange: which certificate arrived, and what the request was answered with.
+///
+/// Raw sockets and `rustls` directly, rather than a TLS client library, for the same reason the
+/// HTTP tests use raw sockets: this asserts *which bytes* the server presented, and a client that
+/// abstracts that away cannot answer the question.
+#[cfg(unix)]
+struct TlsExchange {
+    /// The DER of the leaf certificate the server presented.
+    certificate: Vec<u8>,
+    /// The response body.
+    body: String,
+}
+
+/// Connect over TLS, ask for `path` on `host`, and report the certificate and the body.
+#[cfg(unix)]
+fn tls_get(address: &str, host: &str, path: &str) -> TlsExchange {
+    use rustls::pki_types::ServerName;
+
+    // The client half of the handshake needs a crypto provider, and there is more than one in the
+    // dependency graph, so rustls will not guess. The server's own installer is reused rather than
+    // duplicating the choice: a test that picked differently from the server would be testing a
+    // configuration no deployment has.
+    volucer_http::tls::install_crypto_provider();
+
+    // A self-signed fixture is in no root store, so the verifier is replaced wholesale. The
+    // assertion is about *which* certificate arrived, not whether a chain validates.
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let name = ServerName::try_from(host.to_string()).expect("a server name");
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), name).expect("a client connection");
+    let socket = TcpStream::connect(address).expect("connect to the TLS listener");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("a read timeout");
+    let mut stream = rustls::StreamOwned::new(connection, socket);
+
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write the request");
+    stream.flush().expect("flush");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read the response");
+
+    let certificate = stream
+        .conn
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| cert.as_ref().to_vec())
+        .expect("the server must present a certificate");
+
+    let body = match raw.windows(4).position(|window| window == b"\r\n\r\n") {
+        Some(split) => String::from_utf8_lossy(&raw[split + 4..]).into_owned(),
+        None => String::new(),
+    };
+
+    TlsExchange { certificate, body }
+}
+
+/// Accepts any certificate, for a self-signed fixture.
+#[cfg(unix)]
+#[derive(Debug)]
+struct AcceptAnyCertificate;
+
+#[cfg(unix)]
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+        ]
+    }
 }

@@ -1347,3 +1347,169 @@ static_files = {{ enabled = true }}
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A reload landing *while requests are in flight* is still one configuration per request.
+///
+/// The sequential test above pins that a reload reaches the *next* request, and the held-snapshot
+/// test under it pins that a request keeps the generation it started under. Neither covers what
+/// this one does, and the gap is not academic: the state a front-end serves from is a site table,
+/// a routing map and a static layer, and it is **one** `Swappable<Reloaded>` rather than three
+/// `Swappable`s because three swaps are not one snapshot — a request could take the new routing
+/// map and the old site table, resolve a site the map is not for, and be served from the wrong
+/// document root. That failure would appear once, under load, and be blamed on the filesystem.
+///
+/// So the assertion is the invariant, sampled while a reload is being applied: the site a sample
+/// resolves, its routing and its static layer must all name the same document root. The two
+/// generations are built so that **each of the three is individually identifiable** — the
+/// default site's root, the named site's root, and the static layer's root are three different
+/// directories — because an invariant between three values that are always equal cannot fail.
+///
+/// The sampling technique is validated by `three_separate_swaps_be_observed_mid_generation` in
+/// `volucer-watch`, which runs the same loop against the three parts *deliberately* separated and
+/// observes the disagreement. Without that, a clean run here would mean nothing.
+///
+/// Two things run at once: requesters driving a real listener, and samplers reading the handle.
+/// The reload happens once, between them.
+#[test]
+fn a_reload_under_concurrent_requests_is_one_configuration_per_request() {
+    let base = std::env::temp_dir().join(format!("volucer-concurrent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let first = base.join("first");
+    let second = base.join("second");
+    // The default site's root, the named site's root and the static layer's root are all distinct
+    // — `first`, `first/app` and the file that is only in one of them — so a sample that mixed two
+    // generations would have to disagree about something rather than about nothing.
+    for root in [&first, &second] {
+        std::fs::create_dir_all(root.join("app")).expect("create a site root");
+        std::fs::write(
+            root.join("app/whoami.txt"),
+            root.file_name().unwrap().to_string_lossy().to_string(),
+        )
+        .expect("write the marker");
+    }
+
+    let config_for = |root: &Path| {
+        let text = format!(
+            r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {root:?}
+static_files = {{ enabled = true }}
+
+[sites.app]
+hosts = ["app.test"]
+document_root = {app:?}
+"#,
+            root = root.to_string_lossy(),
+            app = root.join("app").to_string_lossy(),
+        );
+        let config = volucer_core::config::Config::from_toml(&text).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    };
+
+    let one = config_for(&first);
+    let sites = Arc::new(Sites::from_config(&one, &first));
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), front_controller_routing())
+        .expect("no process is started");
+
+    let Some(server) = Server::start_sites(dispatcher, sites, HttpLimits::default()) else {
+        return;
+    };
+    let address = server.address.clone();
+    let reload = server.reload.clone();
+
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let bodies = std::sync::Mutex::new(Vec::new());
+    let samples = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        // The invariant sampler. Every trip reads a site, its routing and its static layer *from
+        // one snapshot* and checks they describe the same place. A mixture is the only way those
+        // three can disagree, and they can only disagree if the one pointer becomes three.
+        for _ in 0..2 {
+            let reload = reload.clone();
+            let stop = &stop;
+            let samples = &samples;
+            scope.spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let snapshot = reload.current();
+                    for host in [Some("app.test"), None] {
+                        let resolved = snapshot.resolve(host);
+                        let site = resolved.site.document_root.clone();
+                        assert_eq!(
+                            resolved.routing.document_root, site,
+                            "the routing came from a different generation than the site it \
+                             resolved: a request would stat one root and render another"
+                        );
+                        assert_eq!(
+                            resolved.statics.document_root, site,
+                            "the static layer came from a different generation than the site it \
+                             resolved: a request would resolve one root and read another"
+                        );
+                    }
+                    samples.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+
+        // Real requests on the same listener, throughout. What these add is that the reload does
+        // not *break* a request: a rebuild that left a map without an entry for the site it
+        // resolved would fail here rather than in a sampler.
+        for _ in 0..4 {
+            let address = address.clone();
+            let stop = &stop;
+            let bodies = &bodies;
+            scope.spawn(move || {
+                let mut local = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let answer = get_as(&address, "app.test", "/whoami.txt");
+                    local.push((answer.status, answer.text()));
+                }
+                bodies.lock().expect("not poisoned").extend(local);
+            });
+        }
+
+        // Let every reader get into its loop, then apply the reload between them.
+        std::thread::sleep(Duration::from_millis(100));
+        let _replaced = reload.apply(Sites::from_config(&config_for(&second), &second));
+        std::thread::sleep(Duration::from_millis(100));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+
+    let samples = samples.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        samples > 100,
+        "the sampler must actually have raced the reload, or this asserts nothing: {samples} \
+         sample(s)"
+    );
+
+    let bodies = bodies.into_inner().expect("not poisoned");
+    assert!(
+        bodies.len() > 20,
+        "the fixture must actually have run requests across the reload: {} answer(s)",
+        bodies.len()
+    );
+    for (status, body) in &bodies {
+        assert_eq!(
+            *status, 200,
+            "a reload must not break a request in flight: {body:?}"
+        );
+        assert!(
+            body == "first" || body == "second",
+            "a request was served body {body:?}, which neither generation's document root holds \
+             — the site resolved against one generation and served from another"
+        );
+    }
+
+    // And the reload took effect, which is what keeps the assertions above from passing against a
+    // reload that applied nothing at all — hazard 57's vacuity.
+    assert_eq!(
+        get_as(&address, "app.test", "/whoami.txt").text(),
+        "second",
+        "the reload must be in effect by the end, or the invariants above prove nothing"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&base);
+}

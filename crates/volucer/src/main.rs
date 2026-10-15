@@ -1191,4 +1191,45 @@ document_root = "/from/file"
         let routing = routing_for(Path::new("."), None);
         assert_eq!(routing.front_controller, None);
     }
+
+    /// The restart-only list names the three classes that genuinely cannot be replaced, and
+    /// **not** the two that an earlier draft wrongly listed.
+    ///
+    /// This is the text an operator reads on every reload, so it is the thing that tells them a
+    /// setting they edited is not in effect. It is asserted rather than trusted for two reasons.
+    /// First, the list is a claim about the implementation, and the implementation moved: a site's
+    /// `routes` and `[server.statics]` on/off were both listed as restart-only here and are both
+    /// read per request out of the swapped table, so both *are* reloadable — an operator told
+    /// otherwise would restart a server for nothing.
+    /// Second, this list is what the README's reloadable/restart-only split is copied from, so a
+    /// silent drift between the two is a documentation bug in a file no test reads.
+    ///
+    /// The assertion is deliberately about class rather than wording: what matters is that a bound
+    /// socket, a running process and a built `rustls::ServerConfig` are named, and that nothing
+    /// the reload *does* apply appears.
+    #[test]
+    fn the_restart_only_list_names_what_cannot_be_replaced_and_nothing_else() {
+        let lines = restart_only();
+        let joined = lines.join("\n");
+
+        for required in ["listener addresses", "backends", "min_version"] {
+            assert!(
+                joined.contains(required),
+                "the restart-only list must name {required:?}, or an operator who edited it gets \
+                 silence: {joined}"
+            );
+        }
+
+        // The two an earlier draft got wrong, in the code's favour. Both are read per request out
+        // of the swapped table, so telling an operator they are restart-only is telling them to
+        // restart for nothing.
+        for wrong in ["routes", "statics", "static_files"] {
+            assert!(
+                !joined.contains(wrong),
+                "{wrong:?} is read per request out of the swapped table and is therefore \
+                 reloadable; listing it as restart-only is the half-reload claim in reverse: \
+                 {joined}"
+            );
+        }
+    }
 }

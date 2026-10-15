@@ -601,6 +601,11 @@ like a site serving the wrong document root rather than like a race.
 The same signal reaches **every** front-end: an HTTP listener and a FastCGI listener share one site
 table, so a reload cannot take effect on `:80` and leave nginx reaching the old pool.
 
+A reload that lands while requests are in flight is still **one** configuration per request, and the
+test for it samples the invariant rather than trusting a request to reveal it — the site a request
+resolved, its routing and its static layer always come from one generation. That is the whole reason
+the reloadable state is one pointer and not one per setting.
+
 **Reloadable.** `[server.tls]` and `[sites.*.tls]` certificates and keys, `[sites.*]` `hosts`,
 `document_root`, `front_controller`, `serve_only`, `default_backend`, `routes` and
 `[server.statics]` (including turning the layer on or off), and `redirect_to_https`/`https_port`.
@@ -616,6 +621,13 @@ implementation cannot honour should be *stated*, or the operator finds out from 
 **A reload is whole-or-nothing.** A file that does not parse, or does not validate, is refused with
 a logged reason and the previous configuration keeps serving. There is no way to apply half of one —
 including when the bad file names settings the server *can* apply, which is the case the test pins.
+
+There are two tables — the sites and the certificates — and each is whole-or-nothing **on its own**,
+applied site table first and certificates after. That ordering is deliberate: a certificate that
+cannot be read then leaves a valid site change in effect instead of refusing both. The visible
+consequence is a window of a few hundred microseconds in which the new document root is serving
+under the previous certificate, so a script that watches the certificate immediately after the
+signal may see the old one once. Both are in effect when the reload has finished.
 
 > **A reload never stops the server.** That is worth stating because it was briefly untrue: the
 > `ctrlc` crate's `termination` feature registers `SIGHUP` and runs its *shutdown* callback for it,

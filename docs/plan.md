@@ -1743,7 +1743,7 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     (`dispatch_with_routes(&site.routes, …)`). The published list is now listener addresses,
     backends and their commands/worker counts, and `[server.tls]` `min_version`/`alpn` — which is
     what a reader of the code would find, and what the README says.
-59. `reload-tests` — **partly done.** The **measurement** is done: an interleaved A/B of two
+59. `reload-tests` — **done.** The **measurement** is done: an interleaved A/B of two
     release binaries, `68bfdcc` against the reload work, both with no `[server.tls]` and both
     serving a static file — so the site resolution and routing lookup the snapshot feeds are on the
     measured path — reads **−0.09%, 95% CI [−1.43%, +1.27%], n = 20**, with an A-vs-A control at
@@ -1763,9 +1763,26 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     68bfdcc HEAD` succeeds and the range holds only the two reload commits, so no refactor rides
     along — which is hazard 56's lesson applied *before* the measurement rather than after it.
 
-    **Still open:** swap under *concurrent* requests (the existing in-flight test is sequential), and
-    a reload that changes a certificate *and* a site in one signal. The restart-only report is done —
-    it is asserted by the reload test's log, not by a test of its own.
+    **Still open:** none. The two that were open are now done, and both turned out to have a lesson
+    worth keeping (hazards 62 and 63):
+
+    - **Swap under *concurrent* requests** — `a_reload_under_concurrent_requests_is_one_configuration_per_request`
+      in `volucer-http/tests/frontend.rs`. Two samplers and four requesters race one reload; the
+      assertion is the one-pointer invariant (site, routing and static layer from one generation),
+      with the three parts made individually identifiable so a mixture has something to be wrong
+      about. Sampling is what makes it observable — **no request-level assertion can see this**, and
+      that was established by falsifying it, not argued.
+    - **A certificate *and* a site in one signal** — `one_sighup_reloads_a_certificate_and_a_site_together`
+      in `volucer/tests/serve.rs`, Unix-only, against a real process: one `SIGHUP` moves both, read
+      from a handshake *and* a request on the same listener. Falsified by deleting the certificate
+      refresh from `Reloader::reload`, which fails the test and **passes every other test in the
+      tree** — the reloader's certificate half was previously unpinned.
+    - **The restart-only report** — now asserted rather than observed:
+      `the_restart_only_list_names_what_cannot_be_replaced_and_nothing_else` pins the three classes
+      that cannot be replaced *and* the two that an earlier draft wrongly listed, because the README's
+      split is copied from this text and a drift between them is a documentation bug no test read.
+      `volucer/tests/serve.rs` also now parses the listener banner's address by first token, so the
+      `(https)` suffix `serve` prints cannot leak into an address.
 
 ## 7. Testing strategy
 
@@ -2016,6 +2033,9 @@ reading out of a crate description.
 | reload: **one** apply path for the process | **works** | `volucer_watch::Registry` owns the shared table *and* every front-end's snapshot-holder, so `serve`'s own signal handler and `ReloadHandle::apply` are the same call. Before it, only a listener could apply a reload — which is why the trigger could not be written without duplicating the rebuild or reaching the table through one listener |
 | reload: what it costs when nothing reloads | **not measurable here** | interleaved A/B of two release binaries, `68bfdcc` against the reload work, no `[server.tls]`, static files on: **−0.09%, 95% CI [−1.43%, +1.27%], n = 20**, against an A-vs-A control at +0.34%, 95% CI [−0.91%, +1.61%]. The *first* ten-round run read +1.75% **excluding zero** while its control read −1.44%, which is why the verdict is drawn from the interval and the control rather than the point estimate. Rows in `volucer-competition/results/reload-cost-ab-20.tsv` |
 | reload: the **trigger** (`SIGHUP`) | **works, Unix only** | `sighup_reloads_the_running_configuration_and_a_bad_file_changes_nothing` — a **real process**, signalled. Reloads a changed document root on the same listener, and leaves the previous configuration serving for a file that does not parse *and* for one that does not validate. Windows has no `SIGHUP`, so it is skipped there with a reason. Hazard 60: `ctrlc`'s `termination` feature had registered SIGHUP and run the **shutdown** callback for it, so `kill -HUP` stopped the server |
+| reload: a certificate **and** a site from one signal | **works, Unix only** | `one_sighup_reloads_a_certificate_and_a_site_together` — one `SIGHUP`, read from a handshake *and* a request on the same listener, against a real process. Falsified by deleting the certificate refresh from `Reloader::reload`: the test fails and **every other test in the tree still passes**, so this was the only thing pinning that half. Hazard 63: the two tables are applied in sequence on purpose, so the test waits for both rather than reading the window between them |
+| reload: no request sees a **mixture** of generations | **works** | `a_reload_under_concurrent_requests_is_one_configuration_per_request` — two samplers and four requesters race one reload on a real listener; the assertion is that the site, its routing and its static layer always come from one generation, with the three made individually identifiable so a mixture has something to be wrong about. Sampling is what makes it observable: falsifying it by pairing the new table with the previous maps is caught **only** by the sampler, and no request-level assertion sees it at all (hazard 62) |
+| reload: the **restart-only report** | **works** | `the_restart_only_list_names_what_cannot_be_replaced_and_nothing_else` — pins the three classes that genuinely cannot be replaced *and* the two (`routes`, `static_files`) an earlier draft wrongly listed, since the README's split is copied from this text |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
@@ -3427,3 +3447,57 @@ the assertion is now load-bearing.
 The malformed file is a **duplicate `document_root` key** rather than a syntactic mess, and that is
 deliberate: it fails at parse, and it still *contains* a root a partial reader would have taken. A
 file with no root in it at all would leave the assertion vacuous for a second reason.
+
+### Hazard 62 — an invariant between three values that were always equal
+
+Writing the concurrency test for step 59, the first version asserted that a request answered under a
+reload still named one of the two document roots — the site table and the static layer agreeing about
+which root the request was for. The fixture gave both roots a file of the same name, so the body said
+which generation answered.
+
+That assertion **cannot fail**, and the reason is the one this project keeps meeting in a new
+costume: `Reloaded` holds the site table, the routing map and the static layer behind a *single*
+`Swappable`, built by one constructor, so the three are equal to each other by construction. A test
+that checks they agree is checking that a thing is itself. The request-level version was worse than
+useless — it was reassuring.
+
+The replacement asserts the invariant but makes the three parts **individually identifiable**: the
+default site's root, the named site's root and the static layer's root are three different directories
+(`first`, `first/app`, and a file under one of them), so a mixture has something to be wrong about.
+And the sampling is validated separately, because "no sample ever disagreed" is exactly hazard 57's
+shape: `three_separate_swaps_be_observed_mid_generation` in `volucer-watch` runs the same loop against
+the three parts deliberately separated — three `Swappable`s with a `yield_now` between the writes —
+and *asserts that it observes the disagreement*. Without that control a clean run of the real test
+would mean nothing at all.
+
+**Falsified properly afterwards**, and the result is the part worth keeping: making `Registry::apply`
+pair the new site table with the previous generation's maps **is** caught, by the sampler rather than
+by any request. The request assertion passed throughout, which is the evidence for why the invariant
+had to be sampled rather than observed through the socket. A test written only against HTTP would
+have been green against a mixed generation.
+
+### Hazard 63 — the reload's two tables are applied in sequence, and that is visible
+
+`one_sighup_reloads_a_certificate_and_a_site_together` polls until both halves have moved, and the
+first version polled only on the site. It failed on the certificate, intermittently — and the reason
+is a property of the design rather than a flake, which a manual reproduction in WSL settled in one
+run: the log shows
+
+    configuration reloaded generation=1 document_root=/tmp/vcert/second sites=1
+    certificate table refreshed
+
+in that order, and for good reason. `Reloader::reload` applies the site table first and refreshes the
+certificates after, **specifically** so that a certificate that cannot be read leaves the *sites*
+reloaded and the certificates as they were — one table refusing must not take the other with it. The
+consequence is a genuine window in which the new document root is serving under the previous
+certificate, and a test that closes its poll loop on the first half reads that window and calls it a
+failure.
+
+The test now waits for both. The window itself is left alone — it is the whole-or-nothing rule applied
+per table, and the alternative (all-or-nothing across *both* tables) would make an unreadable
+certificate refuse a valid site change, which is the worse failure. What was fixed is the test's
+description of the claim: *one signal applied both by the time it finished*, not *both are visible at
+the same instant*.
+
+Found by running the real binary and reading its log, not by reasoning about the code — the same
+technique hazard 60 needed.

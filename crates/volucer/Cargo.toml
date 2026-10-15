@@ -39,3 +39,15 @@ signal-hook.workspace = true
 # the `termination` feature is what adds `SIGHUP`, which does not exist here.
 [target.'cfg(windows)'.dependencies]
 ctrlc = "3"
+
+[dev-dependencies]
+# Certificates are generated per test run rather than committed: a committed key is a key that
+# ends up in someone's deployment.
+rcgen = "0.13"
+
+# A TLS *client*, so `one_sighup_reloads_a_certificate_and_a_site_together` can assert which
+# certificate a handshake was presented with. The server's own `rustls` is a dependency of
+# `volucer-http` and cannot be used to read what it presented — the client half of the
+# handshake is the observation.
+[target.'cfg(unix)'.dev-dependencies]
+rustls = { version = "0.23", features = ["custom-provider"] }

@@ -564,4 +564,139 @@ mod tests {
             Path::new("/srv/second")
         );
     }
+
+    /// A site table whose site and root are both named, so a sample can tell them apart.
+    fn named_sites(root: &str) -> Sites {
+        let text = format!(
+            "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {root:?}\n\n\
+             [sites.app]\nhosts = [\"app.test\"]\ndocument_root = {root:?}\n",
+            root = root
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        Sites::from_config(&config, Path::new(root))
+    }
+
+    /// The sampling technique used by the concurrency test **would** catch a split generation.
+    ///
+    /// This is the control for `a_reload_under_concurrent_requests_is_one_configuration_per_request`
+    /// in `volucer-http`, and it exists because a test whose claim is "no sample ever disagreed"
+    /// passes just as well against a sampler that cannot disagree. Hazard 57's shape exactly: the
+    /// assertion has to be able to fail.
+    ///
+    /// So the three parts are split *deliberately* — three `Swappable`s where the real type has
+    /// one — and the same loop is run. If a disagreement is not observed here, the real test is
+    /// not observing anything either.
+    ///
+    /// `Reloaded` is the type that makes this unwritable for callers, so the split is modelled
+    /// with what a caller *could* have written: separate values for the table, the routing and the
+    /// static layer, moved one after another.
+    #[test]
+    fn three_separate_swaps_be_observed_mid_generation() {
+        let table = Swappable::new(named_sites("/srv/first"));
+        let routings = Swappable::new(Path::new("/srv/first").to_path_buf());
+        let statics = Swappable::new(Path::new("/srv/first").to_path_buf());
+
+        let observed_a_mixture = std::sync::atomic::AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    // A request's three reads, in the order it would make them. Between any two
+                    // of these a writer can land, which is the whole defect.
+                    let sites = table.load();
+                    let root = sites.default_site().document_root.clone();
+                    let routing = routings.load();
+                    let statics = statics.load();
+                    if root != *routing || root != *statics {
+                        observed_a_mixture.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+
+            for round in 0..20_000 {
+                // Alternating, so a reader that only ever samples one direction cannot look clean
+                // by accident.
+                let to = if round % 2 == 0 {
+                    "/srv/second"
+                } else {
+                    "/srv/first"
+                };
+                // A yield between the three writes, which is what makes a mixture observable
+                // rather than a matter of luck: the reader's loop is pure atomic loads, so it gets
+                // in between them every time. Without the yields this test is a race that would
+                // only *sometimes* see the split, and a control that sometimes cannot fail is not
+                // a control.
+                let _ = table.replace(named_sites(to));
+                std::thread::yield_now();
+                let _ = routings.replace(Path::new(to).to_path_buf());
+                std::thread::yield_now();
+                let _ = statics.replace(Path::new(to).to_path_buf());
+            }
+            stop.store(true, Ordering::Relaxed);
+            reader.join().expect("the reader thread panicked");
+        });
+
+        assert!(
+            observed_a_mixture.load(Ordering::Relaxed),
+            "the sampler never saw a split generation even with the parts deliberately separated, \
+             so the concurrency test's clean run proves nothing"
+        );
+    }
+
+    /// Every part of one generation is installed by **one** swap, which is what makes the
+    /// concurrency test's clean run meaningful rather than lucky.
+    ///
+    /// The counterpart to the test above: the same racing reader, against the real type. The
+    /// reader can only ever see two complete generations, and the assertion is that the sampling
+    /// loop *ran* — a sampler that never sampled would "observe no mixture" too.
+    #[test]
+    fn one_swap_never_yields_a_partial_generation() {
+        let state = Swappable::new(Reloaded::from_sites(
+            Arc::new(named_sites("/srv/first")),
+            8080,
+        ));
+
+        let stop = AtomicBool::new(false);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let mut seen = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let snapshot = state.load();
+                    let resolved = snapshot.resolve(Some("app.test"));
+                    assert_eq!(
+                        resolved.routing.document_root, resolved.site.document_root,
+                        "one swap produced a routing from another generation"
+                    );
+                    assert_eq!(
+                        resolved.statics.document_root, resolved.site.document_root,
+                        "one swap produced a static layer from another generation"
+                    );
+                    seen.push(resolved.site.document_root.clone());
+                }
+                seen
+            });
+
+            for round in 0..5_000 {
+                let root = if round % 2 == 0 {
+                    "/srv/first"
+                } else {
+                    "/srv/second"
+                };
+                let _ = state.replace(Reloaded::from_sites(Arc::new(named_sites(root)), 8080));
+            }
+            stop.store(true, Ordering::Relaxed);
+            seen = reader.join().expect("the reader thread panicked");
+        });
+
+        assert!(
+            !seen.is_empty(),
+            "the sampler never ran, so it observed nothing"
+        );
+        assert!(
+            seen.iter()
+                .all(|root| root == Path::new("/srv/first") || root == Path::new("/srv/second")),
+            "a sample resolved to a root no generation named"
+        );
+    }
 }

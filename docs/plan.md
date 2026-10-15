@@ -1666,6 +1666,42 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
 52. `tls-acme` — **24b.** `rustls-acme`, whose default and recommended mechanism is TLS-ALPN-01 and
     needs no second port. The plaintext listener this phase adds is what HTTP-01 would need, so
     that option is open rather than blocked.
+53. `reload-handle` — **done** (`a937f43`). `volucer_http::reload::Swappable<T>` (an `ArcSwap`
+    behind an `Arc`), and `listener::Reloaded` — the *one* value a request path reads, holding the
+    site table, the per-site routings and the per-site static layers. One pointer rather than
+    three, and that is the correctness: three separate swaps are not one snapshot, so a request
+    could take a new site table with an old routing map and resolve a site the map has no entry
+    for. The failure would not look like a race — it would look like a site serving the wrong
+    document root, once, under load. `ReloadHandle::apply` is whole-or-nothing by construction
+    (there is no setter for a single field) and returns the state it replaced, so a caller can
+    report *what* changed.
+54. `reload-sites` — **done** (`a937f43`). The request path takes one snapshot per request
+    (`FrontEnd::state`) and moves it into the blocking dispatch task, so an in-flight request keeps
+    the configuration it started under and a reload affects the **next** request. That ordering is
+    the only one explainable to an operator.
+55. `reload-tls` — **done.** The certificate table is replaceable too, because a certificate that
+    appears while the process is running has to be presented on the next handshake — which is the
+    half ACME needs and cannot be worked around. `SniResolver` gained a `config_dir`, a
+    `Swappable<Certs>` and two ways in: `refresh` (re-read the pairs a `CertificateSet` names) and
+    `replace` (install a table already in memory, for a certificate whose bytes never came from a
+    file this process wrote). Whole-or-nothing: the whole set loads before anything is installed,
+    so one unreadable pair leaves the previous table serving untouched. `HttpListener` gained
+    `resolver()` and `bind_with_resolver`, the latter reading **no certificate file at all** — the
+    only way a deployment whose certificate does not exist yet can bind its port.
+56. `reload-sighup` — wire `SIGHUP` to read and apply the config, whole-or-nothing: `Config::validate`
+    already returns `Result`, so a bad file is a logged refusal with the previous config still
+    serving. **There is no `SIGHUP` on Windows**, so the watcher needs a `#[cfg]` split, and
+    `main.rs` already owns a `ctrlc` handler with the `termination` feature that covers `SIGTERM`.
+    Blocked on open decision 5 below (what the signal reads).
+57. `reload-cli` — what a reload prints: what changed, and the **restart-only list** named
+    explicitly rather than discovered. That is the lesson of the TLS story — a setting the
+    implementation cannot honour has to be *stated*, or the operator finds out from behaviour.
+    Today's list: listener addresses, backend commands and worker counts, `static_files` on/off,
+    and `[server.tls]`'s `min_version`/`alpn` (they are baked into the `rustls::ServerConfig` the
+    acceptor holds).
+58. `reload-tests` — swap under concurrent requests; a failed reload leaves the previous config
+    serving; the restart-only list is reported; and **the hot-path cost is measured** rather than
+    argued, with the `tls-off-ab.js` template. If the CI does not contain 0, that is the result.
 
 ## 7. Testing strategy
 
@@ -1696,14 +1732,36 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
    for v1? — **Answered: in scope, as its own routing layer above the backends, off by default.**
    See step 20 and the Static files section of the README.
 5. **Configuration reload.** Re-reading `volucer.toml` on `SIGHUP` without dropping a connection
-   is the obvious next thing an operator asks for, and it is **not** built. The reason is that
-   only part of the file can be reloaded in place: listeners are bound, backends are running
-   processes with live pipes, and both front-ends hold the dispatcher behind a handle. Reloading
-   routes or static settings into a *running* dispatcher needs the dispatcher to be re-readable
-   rather than owned, which is a real change to how `serve` holds it — so the honest options are
-   (a) leave it out and restart the process, (b) reload only what is cheap, or (c) make the
-   dispatcher a reloadable handle. Pick deliberately rather than growing a half-reload that
-   changes some settings and silently ignores others.
+   is the obvious next thing an operator asks for, and it is **now being built** — steps 53–58
+   above, after TLS. The original reason it was deferred still holds and is why it is tiered
+   rather than wholesale: only part of the file can be reloaded in place. Listeners are bound,
+   backends are running processes with live pipes, and both front-ends hold the dispatcher behind
+   a handle. So the line is drawn deliberately, and the rule is that **everything behind a
+   `Swappable` is replaceable *whole* and everything outside one is restart-only** — so the
+   boundary is a property of the type rather than a comment a later change can contradict.
+   The tiers:
+   - **Tier 1 — reloadable.** `[server.tls]` and `[sites.*.tls]` certificate/key, `[sites.*]`
+     `hosts`, `document_root`/`front_controller`, `[server.statics]`, `redirect_to_https`,
+     `https_port`. Steps 53–55.
+   - **Tier 2 — restart-only, and therefore *reported* by `volucer serve` and by a reload:**
+     listener addresses, backend commands and worker counts, `static_files` on/off, and TLS
+     `min_version`/`alpn`. Step 57.
+   - **Tier 3 — deliberately out: `routes`.** `sites` and `statics` are reloadable; the route
+     table is not. `Routing` is what every request already reads and the dispatcher derives one
+     per site at startup, so making routes reloadable means rebuilding the structure the request
+     path depends on — for a feature nobody has asked for. The dispatcher's own comment says
+     *"One routing, derived once"*.
+   **Still open: what `SIGHUP` reads.** (a) the file as-is, or (b) only a config the operator has
+   already validated and marked. (a) is what an operator expects from a Unix server and needs no
+   new concept, but it means a *staged* edit is applied by a signal sent for something else, and a
+   mistyped file mid-incident turns a reload into a refusal — safe, since nothing is applied, but
+   noisy. (b) is more machinery and no staging surprise. **Leaning (a); this needs a call rather
+   than an assumption.**
+6. **Swap mechanism — answered: `arc-swap`.** It is a new dependency and the only crate this phase
+   adds. The read is the request path and `RwLock` still has every reader touch an atomic counter
+   and block a writer; `ArcSwap` is a pointer load that no writer ever blocks. The alternative was
+   a hand-rolled pointer swap, which is the kind of code that is easier to get subtly wrong than
+   to review.
 
 ## 9. Notes
 
@@ -1871,6 +1929,11 @@ reading out of a crate description.
 | static: multi-range | **works** | `bytes=0-2,4-6` answers 206 `multipart/byteranges; boundary=volucer-boundary` |
 | static: dotfile denial, directory redirect | **works** | `/.env` → 404; `/docs` → 301 to `/docs/`, then the index |
 | static: no traversal escape | **works** | `/../secret.txt`, `/..%2fsecret.txt`, `/%2e%2e/secret.txt` and `/....//secret.txt` all fail to reach a file outside the document root — the encoded ones are treated as *names that do not exist*, not decoded into segments |
+| reload: sites, routings and statics | **works** | `a_reload_changes_what_the_next_request_is_served` — the *same* address and the *same* listener answer from a different `document_root` after `ReloadHandle::apply`, asserted as a client sees it. In-flight requests keep their snapshot (`a_snapshot_survives_a_reload_landing_mid_request`) |
+| reload: certificates | **works** | `a_certificate_reload_is_presented_on_the_next_handshake` — a renewed pair on disk is the one presented by the next handshake, on the same listener, compared byte for byte. `an_in_memory_certificate_needs_no_file_and_no_config` covers the ACME-shaped path, where the bytes never came from a file this process wrote |
+| reload: whole-or-nothing | **works** | `a_certificate_reload_that_cannot_load_applies_neither_half` — a set with one unreadable pair installs **neither** half, proven by naming a *valid* pair alongside the bad one so a partial install would be visible |
+| reload: a plaintext listener carries no TLS state | **works** | `a_plaintext_listener_has_no_resolver_and_still_reloads_sites` — `resolver()` is `None`, so there is nothing to load and no branch to take, and site reloading still works there |
+| reload: the **trigger** (`SIGHUP`) | **does not exist** | steps 56–58. `apply` and `refresh` are the mechanism; nothing watches for a signal yet |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
@@ -3090,3 +3153,46 @@ answered with a SETTINGS frame — where the step-47 test only asserted that ALP
 promised by step 47 and by the TLS plan's §4.5 and neither existed, which is the same stale-claim
 pattern as step 18: **a plan records an intention and then reads as a fact, and only a re-read
 catches it.**
+
+### Hazard 57 — a test that asserts *nothing changed* passes against a test that does nothing
+
+Found while falsifying `reload-tls` (step 55), and it is a distinct failure from the usual "the
+test passed because the bug was never reachable".
+
+The claim is whole-or-nothing: a certificate set with one unreadable pair must install **nothing**.
+So the natural test loads a set, expects `Err`, and asserts that the certificate being served is
+still the one from before. Written that way, **it passed against a deliberately broken `refresh`
+that installed nothing at all** — the stub I used to falsify it:
+
+```rust
+pub fn refresh(&self, certificates: &CertificateSet) -> Result<Arc<Certs>, TlsError> {
+    let _ = load(certificates, &self.config_dir)?;
+    Ok(self.state.load())          // FALSIFY: loads, reports, installs nothing
+}
+```
+
+That stub refuses the bad set *and* refuses the good set, so "the old certificate is still being
+served" is true for the wrong reason. The assertion was about a *post-condition of a sequence*
+rather than about the ordering — the same shape as hazard 56's first two attempts, where a failed
+`bind_with_tls` releases the port and so "the port is free" proved nothing about the order.
+
+**What makes it an observation: name something in the refused set that *could* have been
+installed.** The reworked test passes a perfectly good *server* pair alongside the unreadable
+*site* pair, so a partial install is visible as a **changed** answer for the server's host:
+
+```
+refresh({  server: renewed (valid),  sites: [ shop -> absent (invalid) ] })
+  whole-or-nothing -> Err, and default.test still serves the OLD server certificate
+  partial install  -> Err, and default.test serves the NEW one   <- the test now fails
+```
+
+Against the partial-install stub it fails with *"a refused reload must not install the half that
+could be read"*, and against the real implementation it passes. A separate case keeps the original
+shape (an invalid server pair, an empty site table) because its **message** is what an operator
+acts on and it is the failure a first issuance produces — that one is not falsifiable by
+construction, and is marked as such by testing the layer name rather than the absence of change.
+
+**The generalisation, and it is the one worth keeping:** an assertion that a state is *unchanged*
+is only a test if the same code path could have changed it. Where the assertion is "nothing was
+applied", the *input must contain something that would have been applied*, or the test is a
+restatement of `Ok(())`.

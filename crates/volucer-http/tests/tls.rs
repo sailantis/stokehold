@@ -107,6 +107,17 @@ key = "certs/server.key"
 /// The listener task owns the listener; only the address comes back, because `run` consumes it
 /// and the task lives until the test's runtime shuts down.
 async fn start(config: Config, config_dir: &Path) -> SocketAddr {
+    start_keeping(config, config_dir).await.0
+}
+
+/// [`start`], keeping the handle that replaces what the running listener is serving.
+///
+/// The handle has to be taken *before* `run` consumes the listener, which is why both are
+/// returned from one function rather than the caller binding and then asking.
+async fn start_keeping(
+    config: Config,
+    config_dir: &Path,
+) -> (SocketAddr, volucer_http::ReloadHandle) {
     let sites = Arc::new(Sites::from_config(&config, config_dir));
     let dispatcher = Arc::new(
         Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
@@ -130,8 +141,9 @@ async fn start(config: Config, config_dir: &Path) -> SocketAddr {
     .expect("bind with TLS");
 
     let addr = listener.local_addr().expect("bound address");
+    let reload = listener.reload_handle();
     tokio::spawn(listener.run());
-    addr
+    (addr, reload)
 }
 
 /// What a client saw on one connection.
@@ -688,6 +700,382 @@ key = "certs/absent.key"
 
     drop(occupied);
 }
+/// A certificate renewed on disk is presented on the next handshake, with no restart.
+///
+/// This is the property ACME depends on and the reason TLS was made replaceable at all: an
+/// issuance happens while the process is running, and the very next client that connects has to
+/// get the new certificate. Asserted the way a client sees it — the *same* address, the *same*
+/// listener, a byte-different certificate after the swap — rather than by inspecting the table
+/// that was installed.
+#[tokio::test]
+async fn a_certificate_reload_is_presented_on_the_next_handshake() {
+    use volucer_http::{CertificateSet, ServerCertificate};
+
+    let cert = Cert::new("reload", "example.test");
+    let config = write_config(&cert, "");
+    let (addr, reload) = start_keeping(config, cert.dir()).await;
+
+    let first_der = der_of(&cert.dir().join("certs/server.crt"));
+    let before = fetch(addr, "example.test", &["http/1.1"]).await;
+    assert_eq!(
+        before.certificate, first_der,
+        "the fixture must serve the certificate it was started with"
+    );
+
+    // Replace the pair on disk, which is what a renewal does, and reload. The *file* is what
+    // changed, so this also pins that a reload re-reads rather than reusing what it loaded at
+    // startup — the mistake that would make an operator's renewal appear to do nothing.
+    cert.add("server", "example.test");
+    let renewed_der = der_of(&cert.dir().join("certs/server.crt"));
+    assert_ne!(
+        first_der, renewed_der,
+        "the fixture must generate a different certificate, or the test is vacuous"
+    );
+
+    let resolver = reload
+        .tls()
+        .expect("a TLS listener must expose its resolver");
+    let replaced = resolver
+        .refresh(&CertificateSet {
+            server: Some(ServerCertificate {
+                certificate: "certs/server.crt".into(),
+                key: "certs/server.key".into(),
+            }),
+            sites: Vec::new(),
+        })
+        .expect("the renewed pair loads");
+
+    // What was replaced, so a caller can report the change rather than the attempt.
+    assert_eq!(
+        replaced.named(),
+        0,
+        "the replaced table must be the one that was serving, not the one just installed"
+    );
+
+    let after = fetch(addr, "example.test", &["http/1.1"]).await;
+    assert_eq!(
+        after.certificate, renewed_der,
+        "the next handshake must present the renewed certificate, on the same listener"
+    );
+}
+
+/// A reload whose certificate cannot load installs **nothing** — neither half of the table.
+///
+/// The whole-or-nothing rule, at the level that matters. A half-applied table is worse than a
+/// refused one: the names it dropped fail every handshake, and the failure looks like a network
+/// problem rather than like a bad file. The set below names a perfectly good *server* pair and
+/// an unreadable *site* pair, so a refresh that loaded what it could and reported what it could
+/// not would install the server certificate and lose a site — and this test would see both.
+///
+/// That shape is deliberate rather than incidental: a test whose only assertion is that nothing
+/// changed passes just as well against a `refresh` that does nothing at all. Naming a good
+/// certificate in the refused set is what makes "nothing was applied" an observation.
+#[tokio::test]
+async fn a_certificate_reload_that_cannot_load_applies_neither_half() {
+    use volucer_http::{CertificateSet, ServerCertificate, SiteCertificate, SiteCertificatePair};
+
+    let cert = Cert::new("reload-partial", "default.test");
+    cert.add("shop", "shop.test");
+    let config = write_config(
+        &cert,
+        r#"
+[sites.shop]
+hosts = ["shop.test"]
+document_root = '/tmp'
+
+[sites.shop.tls]
+certificate = "certs/shop.crt"
+key = "certs/shop.key"
+"#,
+    );
+    let (addr, reload) = start_keeping(config, cert.dir()).await;
+
+    let server_der = der_of(&cert.dir().join("certs/server.crt"));
+    let shop_der = der_of(&cert.dir().join("certs/shop.crt"));
+    assert_eq!(
+        fetch(addr, "default.test", &["http/1.1"]).await.certificate,
+        server_der,
+        "the fixture must serve the server certificate before the reload"
+    );
+    assert_eq!(
+        fetch(addr, "shop.test", &["http/1.1"]).await.certificate,
+        shop_der,
+        "the fixture must serve the site certificate before the reload"
+    );
+
+    // A *different* server pair, so a partial install would be visible as a changed answer for
+    // `default.test` rather than as an unchanged one.
+    cert.add("renewed", "default.test");
+    let renewed_der = der_of(&cert.dir().join("certs/renewed.crt"));
+    assert_ne!(server_der, renewed_der, "the fixture must differ");
+
+    let resolver = reload
+        .tls()
+        .expect("a TLS listener must expose its resolver");
+    let err = resolver
+        .refresh(&CertificateSet {
+            // Valid, and must still not be installed.
+            server: Some(ServerCertificate {
+                certificate: "certs/renewed.crt".into(),
+                key: "certs/renewed.key".into(),
+            }),
+            sites: vec![SiteCertificate {
+                name: "shop".into(),
+                hosts: vec!["shop.test".into()],
+                tls: SiteCertificatePair {
+                    certificate: "certs/absent.crt".into(),
+                    key: "certs/absent.key".into(),
+                },
+            }],
+        })
+        .expect_err("one unreadable certificate must refuse the set");
+
+    let message = err.to_string();
+    assert!(message.contains("sites.shop.tls"), "{message}");
+    assert_eq!(
+        fetch(addr, "default.test", &["http/1.1"]).await.certificate,
+        server_der,
+        "a refused reload must not install the half that *could* be read"
+    );
+    assert_eq!(
+        fetch(addr, "shop.test", &["http/1.1"]).await.certificate,
+        shop_der,
+        "the site must keep the certificate it had, not lose it to a partial reload"
+    );
+}
+
+/// A certificate with no config behind it is served as soon as it is replaced.
+///
+/// The in-memory path, which is the one ACME actually takes: the issued bytes never go through a
+/// file this process wrote, so correctness must not depend on re-reading one. A resolver built
+/// around a table that names nothing but a fallback is the shape a first issuance starts from.
+#[tokio::test]
+async fn an_in_memory_certificate_needs_no_file_and_no_config() {
+    use volucer_http::Certs;
+
+    let cert = Cert::new("inmemory", "example.test");
+    let config = write_config(&cert, "");
+
+    // The initial table names no host at all: every handshake gets the fallback. That is what a
+    // deployment looks like before its first renewal.
+    let first = load_pair(cert.dir(), "server");
+    let original_der = der_of(&cert.dir().join("certs/server.crt"));
+
+    let resolver = Arc::new(volucer_http::SniResolver::from_certs(
+        Certs::new(first, std::iter::empty()),
+        cert.dir(),
+    ));
+
+    let sites = Arc::new(Sites::from_config(&config, cert.dir()));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    // The listener is built around a resolver that already holds its certificate: **no
+    // certificate file is read here at all**, because `bind_with_resolver` takes the table the
+    // caller built. That is what lets a deployment whose certificate does not exist yet — the
+    // ACME case — bind its port and start accepting.
+    let listener = HttpListener::bind_with_resolver(
+        "127.0.0.1:0",
+        dispatcher,
+        sites,
+        HttpLimits::default(),
+        ListenerSettings {
+            tls: Some(TlsSettings {
+                config: &config,
+                config_dir: cert.dir(),
+            }),
+            redirect_to_https: false,
+            https_port: None,
+        },
+        Some(Arc::clone(&resolver)),
+    )
+    .await
+    .expect("bind with a caller-built resolver");
+    let addr = listener.local_addr().expect("bound address");
+    tokio::spawn(listener.run());
+
+    // A name the table does not claim gets the fallback, which is `original_der`. The resolver
+    // was handed its table directly, so this pins that `replace` is what a client sees.
+    assert_eq!(
+        fetch(addr, "unclaimed.test", &["http/1.1"])
+            .await
+            .certificate,
+        original_der
+    );
+
+    cert.add("second", "example.test");
+    let renewed = load_pair(cert.dir(), "second");
+    let renewed_der = der_of(&cert.dir().join("certs/second.crt"));
+
+    let table = resolver.current().with_host("example.test", renewed);
+    let _ = resolver.replace(table);
+
+    assert_eq!(
+        fetch(addr, "example.test", &["http/1.1"]).await.certificate,
+        renewed_der,
+        "a certificate installed from memory must be presented on the next handshake"
+    );
+
+    // And nothing else moved: a name the new table still does not claim keeps the fallback.
+    assert_eq!(
+        fetch(addr, "unclaimed.test", &["http/1.1"])
+            .await
+            .certificate,
+        original_der,
+        "adding a name must not change what an unclaimed name is served"
+    );
+}
+
+/// A reload whose **server** certificate cannot load refuses, and names the layer.
+///
+/// The common failure in practice: a renewal wrote a file this process cannot read. Worth its
+/// own case because the message is what an operator acts on, and because it is the failure a
+/// first issuance produces — with the site table empty, which is a different shape from the
+/// test above.
+#[tokio::test]
+async fn a_server_certificate_that_cannot_load_names_the_layer() {
+    use volucer_http::{CertificateSet, ServerCertificate};
+
+    let cert = Cert::new("reload-nofile", "example.test");
+    let config = write_config(&cert, "");
+    let (addr, reload) = start_keeping(config, cert.dir()).await;
+
+    let serving_der = der_of(&cert.dir().join("certs/server.crt"));
+    assert_eq!(
+        fetch(addr, "example.test", &["http/1.1"]).await.certificate,
+        serving_der
+    );
+
+    let resolver = reload
+        .tls()
+        .expect("a TLS listener must expose its resolver");
+    let err = resolver
+        .refresh(&CertificateSet {
+            server: Some(ServerCertificate {
+                certificate: "certs/absent.crt".into(),
+                key: "certs/absent.key".into(),
+            }),
+            sites: Vec::new(),
+        })
+        .expect_err("a certificate that is not there must not be installed");
+
+    let message = err.to_string();
+    assert!(message.contains("server.tls"), "{message}");
+    assert!(message.contains("absent.crt"), "{message}");
+
+    // Nothing may have moved. A refresh that swapped first and loaded afterwards would report
+    // the same error and serve a broken table.
+    assert_eq!(
+        fetch(addr, "example.test", &["http/1.1"]).await.certificate,
+        serving_der,
+        "a refused reload must leave the previous certificate serving"
+    );
+}
+
+/// A listener with no TLS has no resolver at all, and still reloads its sites.
+///
+/// The TLS-off invariant is the thing this front-end's design note is about — *"the whole of
+/// the cost when TLS is off: no accept wrapping, no peek, no TLS type built"* — and making
+/// certificates replaceable is exactly the kind of change that could smuggle a TLS value onto a
+/// plaintext deployment. The assertion is the absence, which is what a handshake path cannot
+/// have: `resolver()` is `None`, so there is no table to load and no branch to take.
+///
+/// The second half matters as much as the first: reloading sites must still work on that same
+/// listener, so the reload mechanism is not accidentally tied to TLS being present.
+#[tokio::test]
+async fn a_plaintext_listener_has_no_resolver_and_still_reloads_sites() {
+    let base = std::env::temp_dir().join(format!("volucer-no-tls-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let before = base.join("before");
+    let after = base.join("after");
+    for root in [&before, &after] {
+        std::fs::create_dir_all(root).expect("create a site root");
+    }
+    std::fs::write(before.join("whoami.txt"), "before").expect("write the marker");
+    std::fs::write(after.join("whoami.txt"), "after").expect("write the marker");
+
+    let config_for = |root: &Path| {
+        let text = format!(
+            r#"
+[server]
+http = "127.0.0.1:0"
+document_root = {root:?}
+static_files = {{ enabled = true }}
+"#,
+            root = root.to_string_lossy(),
+        );
+        let config = Config::from_toml(&text).expect("config parses");
+        config.validate().expect("config validates");
+        config
+    };
+
+    let first = config_for(&before);
+    let sites = Arc::new(Sites::from_config(&first, &before));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&first, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+    let listener = HttpListener::bind("127.0.0.1:0", dispatcher, sites, HttpLimits::default())
+        .await
+        .expect("bind a plaintext listener");
+    let reload = listener.reload_handle();
+
+    assert!(
+        reload.tls().is_none(),
+        "a listener with no `[server.tls]` must not carry a certificate table at all"
+    );
+
+    let second = config_for(&after);
+    let _ = reload.apply(Sites::from_config(&second, &after));
+    assert_eq!(
+        reload
+            .current()
+            .sites
+            .default_site()
+            .document_root
+            .as_path(),
+        after.as_path(),
+        "site reloading must work on a plaintext listener too"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A certificate resolver on a listener with no TLS settings is refused, not ignored.
+///
+/// The failure a caller cannot see otherwise: a resolver nothing consults is a certificate table
+/// they believe is serving, and the symptom would be a handshake that presents a certificate
+/// from the config rather than the one just loaded. Refusing at bind time turns that into one
+/// error message instead of a mystery at 03:00.
+#[tokio::test]
+async fn a_resolver_without_tls_settings_is_refused() {
+    let cert = Cert::new("no-tls-settings", "example.test");
+    let config = write_config(&cert, "");
+    let table = load_pair(cert.dir(), "server");
+    let resolver = Arc::new(volucer_http::SniResolver::from_certs(
+        volucer_http::Certs::new(table, std::iter::empty()),
+        cert.dir(),
+    ));
+
+    let sites = Arc::new(Sites::from_config(&config, cert.dir()));
+    let dispatcher = Arc::new(
+        Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher"),
+    );
+
+    let err = HttpListener::bind_with_resolver(
+        "127.0.0.1:0",
+        dispatcher,
+        sites,
+        HttpLimits::default(),
+        ListenerSettings::default(),
+        Some(resolver),
+    )
+    .await
+    .err()
+    .expect("a resolver with no TLS settings must not bind");
+
+    assert!(err.to_string().contains("no TLS settings"), "{err}");
+}
+
 #[tokio::test]
 async fn alpn_h2_negotiates_a_real_http_2_connection() {
     // `alpn_negotiates_http2_then_http11` asserts which protocol ALPN *selected*. This asserts
@@ -707,6 +1095,26 @@ async fn alpn_h2_negotiates_a_real_http_2_connection() {
         "the first frame back must be SETTINGS (0x04), got {frame_type:#04x}"
     );
 }
+/// DER bytes of a certificate pair on disk, loaded the way the resolver loads them.
+///
+/// Through `load_certified` rather than `CertifiedKey::from_der`, so a test that installs a
+/// certificate in memory uses the same code path a config-driven reload does — a test that
+/// hand-rolled the pairing could pass while the real one was broken.
+fn load_pair(dir: &Path, file: &str) -> volucer_http::tls::LoadedCert {
+    volucer_http::tls::load_certified(
+        &volucer_core::config::TlsConfig {
+            certificate: format!("certs/{file}.crt").into(),
+            key: format!("certs/{file}.key").into(),
+            min_version: volucer_core::config::MinTlsVersion::default(),
+            alpn: Vec::new(),
+            plain: false,
+        },
+        dir,
+        "test",
+    )
+    .expect("the fixture certificate loads")
+}
+
 /// The DER payload of a PEM certificate file.
 fn der_of(path: &Path) -> Vec<u8> {
     let text = std::fs::read_to_string(path).expect("read certificate");

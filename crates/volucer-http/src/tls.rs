@@ -12,12 +12,27 @@
 //! # Why the resolver is cheap
 //!
 //! rustls calls [`rustls::server::ResolvesServerCert::resolve`] once per handshake, on whatever
-//! thread the handshake is on, and it must be `Send + Sync`. The map is built once at startup
-//! and never mutated, so a resolve is one lookup and an `Arc` clone — no allocation, no lock,
-//! and it is on the handshake path rather than the request path.
+//! thread the handshake is on, and it must be `Send + Sync`. The map is behind one pointer that
+//! a reload replaces whole, so a resolve is one pointer load, one lookup and an `Arc` clone —
+//! no allocation, no lock, and it is on the handshake path rather than the request path.
+//!
+//! # Why the map is replaceable at all
+//!
+//! A certificate issued while the process is running — by ACME, or by an operator who renewed
+//! one by hand — has to appear in the map that is consulted *now*, not on the next restart.
+//! Everything else here follows from that: the resolver handed to rustls is stable and what is
+//! behind it moves, and replacing it is a whole-or-nothing operation that fails without
+//! touching what is already serving.
+//!
+//! # What is *not* replaceable here, and must therefore be reported
+//!
+//! [`server_config`] bakes `min_version` and `alpn` into the [`rustls::ServerConfig`] that
+//! `bind_with_tls` wraps in the acceptor. Those are **restart-only**, and a reload that appeared
+//! to apply them while the acceptor kept the old values would be exactly the half-reload this
+//! project refuses to do. `volucer check` and the reload output name them for that reason.
 
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -27,24 +42,197 @@ use rustls::sign::CertifiedKey;
 use volucer_core::config::{Config, MinTlsVersion, TlsConfig};
 use volucer_core::hostmap::HostMap;
 
+use crate::reload::Swappable;
+
 /// A certificate and its key, loaded and paired.
 ///
 /// `CertifiedKey` rather than raw DER because rustls needs the key's *signing* form, which it
 /// derives from the key material; deriving that per handshake would be work for no reason.
 pub type LoadedCert = Arc<CertifiedKey>;
 
-/// Resolve a certificate for a name the client claimed in the handshake.
+/// The certificate table, as one replaceable value.
 ///
-/// Falls back to `default` for a name nothing claims, which is what makes an unknown SNI name a
-/// handshake that succeeds and then meets whatever site the `Host` selects — rather than a
-/// failed connection for a request that might have been perfectly legitimate. A client may
-/// claim one name and send another; that is legal, and the two decisions are separate.
-#[derive(Debug)]
-pub struct SniResolver {
-    /// Host pattern to certificate. Built once, never mutated, so resolving needs no lock.
-    certs: HostMap<LoadedCert>,
+/// Separate from [`SniResolver`] so that the resolver rustls holds is stable while the table
+/// behind it moves. Both halves are one value for the same reason [`crate::Reloaded`] is: the
+/// per-host entries and the fallback are two answers to one question — *which certificate is
+/// this name served under* — and a request that took one from each generation could present a
+/// certificate the deployment had already replaced.
+pub struct Certs {
+    /// Host pattern to certificate. Rebuilt on a reload rather than mutated in place, so a
+    /// resolve is a lookup with no lock to take.
+    hosts: HostMap<LoadedCert>,
     /// The certificate for a name nothing claims.
     default: LoadedCert,
+}
+
+impl std::fmt::Debug for Certs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Certs")
+            .field("named", &self.hosts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Certs {
+    /// Build a table from a fallback certificate and the names that get their own.
+    ///
+    /// The fallback is required rather than optional because a handshake for a name nothing
+    /// claims must still complete — that is what makes an unknown SNI name reach the `Host`
+    /// decision instead of failing before it.
+    pub fn new(default: LoadedCert, hosts: impl IntoIterator<Item = (String, LoadedCert)>) -> Self {
+        let mut map: HostMap<LoadedCert> = HostMap::new();
+        for (host, cert) in hosts {
+            map.insert(&host, cert);
+        }
+        Certs {
+            hosts: map,
+            default,
+        }
+    }
+
+    /// The table with one more name pointing at a certificate.
+    ///
+    /// Rebuilds rather than mutates, and that is the point: rustls may be resolving against the
+    /// current table on another thread, so an edit in place would be visible mid-lookup. The
+    /// caller installs the new value with [`SniResolver::replace`].
+    #[must_use]
+    pub fn with_host(&self, host: &str, cert: LoadedCert) -> Self {
+        let mut map = self.hosts.clone();
+        map.insert(host, cert);
+        Certs {
+            hosts: map,
+            default: Arc::clone(&self.default),
+        }
+    }
+
+    /// The certificate for a name, or the fallback when nothing claims it.
+    pub fn for_name(&self, name: &str) -> &LoadedCert {
+        self.hosts.get(name).unwrap_or(&self.default)
+    }
+
+    /// The fallback certificate, for a deployment with no config of its own.
+    pub fn default_cert(&self) -> &LoadedCert {
+        &self.default
+    }
+
+    /// How many host patterns name their own certificate.
+    pub fn named(&self) -> usize {
+        self.hosts.len()
+    }
+}
+
+/// Resolve a certificate for a name the client claimed in the handshake.
+///
+/// Falls back to the default entry for a name nothing claims, which is what makes an unknown
+/// SNI name a handshake that succeeds and then meets whatever site the `Host` selects — rather
+/// than a failed connection for a request that might have been perfectly legitimate. A client
+/// may claim one name and send another; that is legal, and the two decisions are separate.
+///
+/// # Why this is not rebuilt when the table is
+///
+/// rustls owns this resolver for the life of the [`rustls::ServerConfig`] it was installed
+/// into, and that config is built once. So the resolver is the stable part and the table is
+/// what moves: [`refresh`](SniResolver::refresh) loads the current table, and a handshake that
+/// arrives after a reload reads the new one without anything being reconfigured.
+///
+/// `T: Send + Sync` is rustls' requirement on this trait, and `HostMap<LoadedCert>` provides it
+/// as long as the map is only read — which is why the map is replaced rather than mutated.
+#[derive(Debug)]
+pub struct SniResolver {
+    /// Where relative `certificate`/`key` paths resolve, kept so a reload can read the same
+    /// files the startup read did.
+    ///
+    /// `PathBuf` rather than the borrowed `&Path` [`from_config`](SniResolver::from_config)
+    /// takes, because the resolver outlives the call: the config it was built for is dropped
+    /// when `serve` returns, while the listener keeps serving.
+    config_dir: PathBuf,
+    /// The table, behind one pointer.
+    state: Arc<Swappable<Certs>>,
+}
+
+/// Which certificates a deployment serves, as the config states them.
+///
+/// Two sources, deliberately merged into one value: a [`Config`] describes a *whole*
+/// deployment, while a *reload* often changes only certificates — an ACME renewal, or an
+/// operator replacing a renewed PEM. Taking `Config` as the only constructor would force every
+/// certificate update to round-trip through a config file, which is the slower loop with more
+/// ways to fail. Both are accepted; both produce the same table.
+#[derive(Debug, Clone)]
+pub struct CertificateSet {
+    /// The certificate `[server.tls]` names, if it is configured.
+    pub server: Option<ServerCertificate>,
+    /// Per-site certificates, by site name, each with the hosts it covers.
+    pub sites: Vec<SiteCertificate>,
+}
+
+/// A certificate pair for the whole listener, named as `[server.tls]` names it.
+///
+/// A name and a key rather than a whole [`TlsConfig`], because everything else in that struct
+/// is a property of the [`rustls::ServerConfig`] rather than of the certificate — and those are
+/// **restart-only** (§ `tls.rs`'s module doc). Storing them here would invite a reload that
+/// appeared to apply them.
+#[derive(Debug, Clone)]
+pub struct ServerCertificate {
+    /// PEM certificate chain, leaf first. Relative paths resolve against the config file.
+    pub certificate: PathBuf,
+    /// PEM private key.
+    pub key: PathBuf,
+}
+
+/// One site's certificate and the host patterns it is served for.
+#[derive(Debug, Clone)]
+pub struct SiteCertificate {
+    /// The site's name, for the error message when the pair cannot be loaded.
+    pub name: String,
+    /// The host patterns from `[sites.<name>].hosts`, unnormalised — `HostMap` normalises.
+    pub hosts: Vec<String>,
+    /// The certificate and key.
+    pub tls: SiteCertificatePair,
+}
+
+/// A per-site certificate pair, mirroring `[sites.<n>.tls]`.
+///
+/// Deliberately a separate type from [`ServerCertificate`] rather than a shared one: the two
+/// are separate tables in the config, and merging them here would make a future key valid in
+/// one of them silently valid in the other.
+#[derive(Debug, Clone)]
+pub struct SiteCertificatePair {
+    /// PEM certificate chain for this site's hosts.
+    pub certificate: PathBuf,
+    /// PEM private key for this site's hosts.
+    pub key: PathBuf,
+}
+
+impl CertificateSet {
+    /// The certificates a configuration states.
+    ///
+    /// Reads `[server.tls]` and every `[sites.*.tls]`, and nothing else — so a reload of the
+    /// table alone does not depend on the rest of the file being unchanged. A site naming no
+    /// certificate contributes nothing rather than an error: it is served under the server's
+    /// certificate, which is the same rule `SniResolver::from_config` has always applied.
+    pub fn from_config(config: &Config) -> Self {
+        CertificateSet {
+            server: config.server.tls.as_ref().map(|tls| ServerCertificate {
+                certificate: tls.certificate.clone(),
+                key: tls.key.clone(),
+            }),
+            sites: config
+                .sites
+                .iter()
+                .filter_map(|(name, site)| {
+                    let tls = site.tls.as_ref()?;
+                    Some(SiteCertificate {
+                        name: name.clone(),
+                        hosts: site.hosts.clone(),
+                        tls: SiteCertificatePair {
+                            certificate: tls.certificate.clone(),
+                            key: tls.key.clone(),
+                        },
+                    })
+                })
+                .collect(),
+        }
+    }
 }
 
 impl SniResolver {
@@ -58,49 +246,118 @@ impl SniResolver {
     /// runs at startup and a certificate that cannot load must stop the listener rather than
     /// produce one that accepts connections and fails every handshake.
     pub fn from_config(config: &Config, config_dir: &Path) -> Result<Self, TlsError> {
-        let tls = config.server.tls.as_ref().ok_or(TlsError::NotConfigured)?;
-        let default = load_certified(tls, config_dir, "server.tls")?;
+        let state = load(&CertificateSet::from_config(config), config_dir)?;
+        Ok(SniResolver {
+            config_dir: config_dir.to_path_buf(),
+            state: Arc::new(Swappable::new(state)),
+        })
+    }
 
-        let mut certs: HostMap<LoadedCert> = HostMap::new();
-        for (name, site) in &config.sites {
-            let Some(site_tls) = &site.tls else { continue };
-            let loaded = load_certified(
-                &TlsConfig {
-                    certificate: site_tls.certificate.clone(),
-                    key: site_tls.key.clone(),
-                    // Only certificate and key are per site — validation refuses the rest — so
-                    // the handshake-wide keys here are placeholders that `load_certified`
-                    // never reads.
-                    min_version: MinTlsVersion::default(),
-                    alpn: Vec::new(),
-                    plain: false,
-                },
-                config_dir,
-                &format!("sites.{name}.tls"),
-            )?;
-            for host in &site.hosts {
-                certs.insert(host, Arc::clone(&loaded));
-            }
+    /// Build a resolver around a certificate table the caller has already loaded.
+    ///
+    /// For a caller that obtains certificates itself rather than from a config file — ACME —
+    /// and for tests that want a resolver with a known table.
+    pub fn from_certs(state: Certs, config_dir: &Path) -> Self {
+        SniResolver {
+            config_dir: config_dir.to_path_buf(),
+            state: Arc::new(Swappable::new(state)),
         }
+    }
 
-        Ok(SniResolver { certs, default })
+    /// Replace the certificate table, loading the certificates named by `certificates`.
+    ///
+    /// Whole-or-nothing: every certificate in the set is loaded and paired **before** anything
+    /// is installed, so a set with one unreadable pair is refused entirely and the deployment
+    /// keeps serving the table it had. That is the only safe direction — a table that dropped
+    /// one entry would fail every handshake for the names it covered, which is a worse failure
+    /// than the one that was being reported.
+    ///
+    /// Returns the table that was replaced, so a caller can say *which* certificate changed
+    /// rather than only that the file was read.
+    pub fn refresh(&self, certificates: &CertificateSet) -> Result<Arc<Certs>, TlsError> {
+        let next = load(certificates, &self.config_dir)?;
+        Ok(self.state.replace(next))
+    }
+
+    /// Install a certificate table that is already in memory.
+    ///
+    /// For a certificate whose bytes never went through a file this process wrote — an ACME
+    /// issuance. The PEM is still written for durability and for an operator to inspect, but
+    /// correctness does not depend on re-reading it, and that is what keeps a renewal off the
+    /// filesystem at the moment it matters.
+    pub fn replace(&self, state: Certs) -> Arc<Certs> {
+        self.state.replace(state)
+    }
+
+    /// The certificate table being served right now.
+    pub fn current(&self) -> Arc<Certs> {
+        self.state.load()
     }
 
     /// How many host patterns name their own certificate.
     pub fn named_certificates(&self) -> usize {
-        self.certs.len()
+        self.state.load().named()
     }
 }
 
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // One load, once per handshake: the table this handshake resolves against is one
+        // generation, so a reload landing here cannot present a certificate from neither.
+        let certs = self.state.load();
         // `server_name` is what the client claimed. Absent is normal: a client may connect by
         // IP, or a protocol may not carry SNI at all, and the server's certificate is the
         // answer for both.
         match hello.server_name() {
-            Some(name) => Some(Arc::clone(self.certs.get(name).unwrap_or(&self.default))),
-            None => Some(Arc::clone(&self.default)),
+            Some(name) => Some(Arc::clone(certs.for_name(name))),
+            None => Some(Arc::clone(certs.default_cert())),
         }
+    }
+}
+
+/// Load every certificate a set names, or fail with the first that cannot be read.
+///
+/// Nothing is installed until all of them have loaded, which is what makes a refresh
+/// whole-or-nothing. The `where_` strings match the ones startup has always produced, so a
+/// certificate that fails on a reload and on startup is reported the same way.
+fn load(certificates: &CertificateSet, config_dir: &Path) -> Result<Certs, TlsError> {
+    let server = certificates
+        .server
+        .as_ref()
+        .ok_or(TlsError::NotConfigured)?;
+    let default = load_certified(
+        &pair(&server.certificate, &server.key),
+        config_dir,
+        "server.tls",
+    )?;
+
+    let mut named: Vec<(String, LoadedCert)> = Vec::new();
+    for site in &certificates.sites {
+        let loaded = load_certified(
+            &pair(&site.tls.certificate, &site.tls.key),
+            config_dir,
+            &format!("sites.{}.tls", site.name),
+        )?;
+        for host in &site.hosts {
+            named.push((host.clone(), Arc::clone(&loaded)));
+        }
+    }
+
+    Ok(Certs::new(default, named))
+}
+
+/// A pair as [`TlsConfig`], for the one function that reads certificate files.
+///
+/// The handshake-wide keys are placeholders `load_certified` never reads — it takes the chain
+/// and the key and pairs them — and they are not settable here so that a caller cannot believe
+/// it has set them.
+fn pair(certificate: &Path, key: &Path) -> TlsConfig {
+    TlsConfig {
+        certificate: certificate.to_path_buf(),
+        key: key.to_path_buf(),
+        min_version: MinTlsVersion::default(),
+        alpn: Vec::new(),
+        plain: false,
     }
 }
 
@@ -149,7 +406,8 @@ pub fn load_certified(
 
     // The provider is installed by `install_crypto_provider` above, which is what makes the
     // order of loading and configuring irrelevant.
-    let provider = rustls::crypto::CryptoProvider::get_default().ok_or(TlsError::NoCryptoProvider)?;
+    let provider =
+        rustls::crypto::CryptoProvider::get_default().ok_or(TlsError::NoCryptoProvider)?;
     CertifiedKey::from_der(chain, key, provider.as_ref())
         .map(Arc::new)
         .map_err(|source| TlsError::KeyDoesNotMatch {
@@ -287,7 +545,10 @@ mod tests {
         let (dir, config) = fixture("none");
         let err = SniResolver::from_config(&config, &dir).expect_err("must fail");
         assert!(matches!(err, TlsError::NotConfigured), "{err}");
-        assert!(err.to_string().contains("nothing to serve TLS with"), "{err}");
+        assert!(
+            err.to_string().contains("nothing to serve TLS with"),
+            "{err}"
+        );
     }
 
     #[test]

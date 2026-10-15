@@ -209,6 +209,14 @@ struct FrontEnd {
     /// See [`Reloaded`] for what is in it and [`FrontEnd::state`] for how the request path
     /// reads it.
     state: Arc<Swappable<Reloaded>>,
+    /// TLS, when this listener speaks it.
+    ///
+    /// The **resolver**, not the acceptor: rustls owns the acceptor and the
+    /// [`rustls::ServerConfig`] inside it for the life of the listener, so those cannot be
+    /// replaced. The resolver can, and it is what decides which certificate a handshake is
+    /// served — so a certificate that arrives while the process is running is presented on the
+    /// next handshake rather than the next restart. See [`crate::tls::SniResolver`].
+    tls: Option<Arc<crate::tls::SniResolver>>,
     limits: HttpLimits,
     stats: Arc<HttpStats>,
     shutdown: Arc<AtomicBool>,
@@ -337,6 +345,14 @@ impl FrontEnd {
 #[derive(Clone)]
 pub struct ReloadHandle {
     state: Arc<Swappable<Reloaded>>,
+    /// TLS, when this listener speaks it, so a certificate can be replaced too.
+    ///
+    /// Separate from `state` because it *has* to be: the resolver is installed into a
+    /// `rustls::ServerConfig` that rustls owns, so it is the stable part and its table is what
+    /// moves. Two pointers rather than one is the honest shape of that, not an oversight — and
+    /// the two are independent, so a reload that changes sites and certificates applies both
+    /// and a reload that changes neither installs nothing.
+    tls: Option<Arc<crate::tls::SniResolver>>,
     /// Fixed for the life of the listener, and needed to rebuild the maps on a reload.
     server_port: u16,
 }
@@ -347,6 +363,16 @@ impl ReloadHandle {
     /// For diagnostics and for tests: what a request made at this instant would see.
     pub fn current(&self) -> Arc<Reloaded> {
         self.state.load()
+    }
+
+    /// The certificate resolver, when this listener speaks TLS.
+    ///
+    /// The handle a certificate reload goes through — see
+    /// [`SniResolver::refresh`](crate::tls::SniResolver::refresh) for a pair on disk and
+    /// [`SniResolver::replace`](crate::tls::SniResolver::replace) for one already in memory.
+    /// `None` on a plaintext listener.
+    pub fn tls(&self) -> Option<&Arc<crate::tls::SniResolver>> {
+        self.tls.as_ref()
     }
 
     /// Replace the site table, rebuilding the derived maps from it.
@@ -401,6 +427,8 @@ pub struct RunningHttp {
     thread: Option<std::thread::JoinHandle<()>>,
     address: SocketAddr,
     stats: Arc<HttpStats>,
+    /// What a reload replaces, taken before the listener moved onto its thread.
+    reload: ReloadHandle,
 }
 
 impl RunningHttp {
@@ -442,6 +470,8 @@ impl RunningHttp {
         let bound = listener.local_addr()?;
         let shutdown = listener.shutdown_handle();
         let stats = listener.stats();
+        // Before `run` consumes the listener, and that is the only moment it can be taken.
+        let reload = listener.reload_handle();
 
         let thread = std::thread::spawn(move || {
             // The runtime is owned by this thread and dropped when the listener
@@ -456,12 +486,21 @@ impl RunningHttp {
             thread: Some(thread),
             address: bound,
             stats,
+            reload,
         })
     }
 
     /// The address actually bound.
     pub fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+
+    /// A handle that replaces what this listener is serving, without a restart.
+    ///
+    /// What a signal handler holds. Cloned rather than borrowed because the caller usually
+    /// wants to move it into a closure that outlives this struct's use as a listener.
+    pub fn reload_handle(&self) -> ReloadHandle {
+        self.reload.clone()
     }
 
     /// Statistics, for logging at shutdown.
@@ -528,11 +567,54 @@ impl HttpListener {
         limits: HttpLimits,
         settings: ListenerSettings<'_>,
     ) -> Result<Self> {
+        let resolver = match settings.tls {
+            Some(tls) => Some(Arc::new(
+                crate::tls::SniResolver::from_config(tls.config, tls.config_dir).map_err(
+                    |source| HttpError::Tls {
+                        reason: source.to_string(),
+                    },
+                )?,
+            )),
+            None => None,
+        };
+        Self::bind_with_resolver(address, dispatcher, sites, limits, settings, resolver).await
+    }
+
+    /// [`HttpListener::bind_with_tls`], around a resolver the caller built.
+    ///
+    /// The certificate table this starts with is the one passed in, and **no certificate file
+    /// is read** — which is the whole reason this exists rather than being a variant of the
+    /// call above. A deployment that obtains its certificate at runtime (ACME) has no readable
+    /// pair when the port comes up, and waiting for one would mean the port could not come up
+    /// at all. The resolver is then the handle a renewal goes through, so the certificate that
+    /// arrives later is presented on the next handshake without the listener being rebuilt.
+    ///
+    /// `settings.tls` is still read: `min_version` and `alpn` are properties of the
+    /// [`rustls::ServerConfig`], not of a certificate, and they are restart-only (§ the
+    /// [`crate::tls`] module doc). A resolver with a `settings.tls` of `None` is refused rather
+    /// than ignored, because a resolver nothing consults is a certificate table the caller
+    /// believes is serving.
+    pub async fn bind_with_resolver(
+        address: &str,
+        dispatcher: Arc<Dispatcher>,
+        sites: Arc<Sites>,
+        limits: HttpLimits,
+        settings: ListenerSettings<'_>,
+        resolver: Option<Arc<crate::tls::SniResolver>>,
+    ) -> Result<Self> {
         // The redirect settings come from the listener's own settings, so a plaintext listener in
         // a split :80/:443 deployment can carry them with no TLS of its own — which is exactly
         // why they are separate from `tls` rather than derived from it.
         let redirect_to_https = settings.redirect_to_https;
         let requested_https_port = settings.https_port;
+
+        if resolver.is_some() && settings.tls.is_none() {
+            return Err(HttpError::Tls {
+                reason: "a certificate resolver was given to a listener with no TLS settings, so \
+                         nothing would consult it"
+                    .to_string(),
+            });
+        }
 
         // The acceptor is built before the port is bound, and its failure is reported as a
         // configuration error: a certificate that cannot be read must not become a listener.
@@ -542,38 +624,54 @@ impl HttpListener {
         // so an operator on a `:80`/`:443` deployment reads that both ports came up and then reads
         // an error, and a service manager that restarts on failure takes and releases the port in
         // a loop, with every client arriving in the window getting nothing. Nothing is bound here
-        // until the certificate that would serve it has loaded.
-        let (acceptor, accept_plain) = match settings.tls {
-            Some(settings) => {
-                let resolver = Arc::new(
-                    crate::tls::SniResolver::from_config(settings.config, settings.config_dir)
+        // until the certificate table that would serve it is in place.
+        //
+        // The resolver is kept as well as the acceptor, and that pair is not redundant: the
+        // acceptor holds a `ServerConfig` that rustls will not let us rebuild, while the
+        // resolver behind it is what a reload replaces. Keeping only the acceptor would make a
+        // renewed certificate wait for a restart.
+        let (acceptor, resolver, accept_plain) = match (settings.tls, resolver) {
+            (Some(tls), Some(resolver)) => {
+                let server =
+                    crate::tls::server_config(tls.config, tls.config_dir, Arc::clone(&resolver))
                         .map_err(|source| HttpError::Tls {
                             reason: source.to_string(),
-                        })?,
-                );
-                let server = crate::tls::server_config(
-                    settings.config,
-                    settings.config_dir,
-                    Arc::clone(&resolver),
-                )
-                .map_err(|source| HttpError::Tls {
-                    reason: source.to_string(),
-                })?;
+                        })?;
                 tracing::info!(
                     named_certificates = resolver.named_certificates(),
                     alpn = ?server.alpn_protocols.iter()
                         .map(|p| String::from_utf8_lossy(p).into_owned())
                         .collect::<Vec<_>>(),
-                    plaintext_accepted = settings.config.server.tls.as_ref()
+                    plaintext_accepted = tls.config.server.tls.as_ref()
                         .is_some_and(|t| t.plain),
                     "TLS enabled"
                 );
                 (
                     Some(Arc::new(tokio_rustls::TlsAcceptor::from(server))),
-                    settings.config.server.tls.as_ref().is_some_and(|t| t.plain),
+                    Some(resolver),
+                    tls.config.server.tls.as_ref().is_some_and(|t| t.plain),
                 )
             }
-            None => (None, false),
+            // Refused above, so this cannot be reached; kept as an explicit arm rather than an
+            // `unreachable!()` so that removing that check could never become a panic in a
+            // listener.
+            (None, Some(_)) => {
+                return Err(HttpError::Tls {
+                    reason: "a certificate resolver was given to a listener with no TLS settings"
+                        .to_string(),
+                })
+            }
+            (None, None) => (None, None, false),
+            // TLS settings with no resolver: the caller wanted TLS and supplied no certificate
+            // table. Building one here would mean reading a file, which is the call that refuses
+            // a certificate that is not there *yet*.
+            (Some(_), None) => {
+                return Err(HttpError::Tls {
+                    reason: "TLS is configured but no certificate table was supplied; use \
+                             `bind_with_tls` to load one from the configuration"
+                        .to_string(),
+                })
+            }
         };
 
         let listener = tokio::net::TcpListener::bind(address)
@@ -614,6 +712,7 @@ impl HttpListener {
             front_end: Arc::new(FrontEnd {
                 dispatcher,
                 state: Arc::new(Swappable::new(reloaded)),
+                tls: resolver,
                 limits,
                 stats: Arc::new(HttpStats::default()),
                 shutdown: Arc::new(AtomicBool::new(false)),
@@ -633,8 +732,19 @@ impl HttpListener {
     pub fn reload_handle(&self) -> ReloadHandle {
         ReloadHandle {
             state: Arc::clone(&self.front_end.state),
+            tls: self.front_end.tls.clone(),
             server_port: self.front_end.server_port,
         }
+    }
+
+    /// The certificate resolver this listener is deciding handshakes with.
+    ///
+    /// `None` on a listener with no TLS, which is the visible half of "TLS costs nothing when
+    /// it is off": there is no resolver to refresh. A caller that wants to install a
+    /// certificate has to go through this, so a plaintext deployment cannot be handed one by
+    /// mistake.
+    pub fn resolver(&self) -> Option<Arc<crate::tls::SniResolver>> {
+        self.front_end.tls.clone()
     }
 
     /// The address actually bound, which matters when port 0 was requested.

@@ -49,4 +49,7 @@ pub use listener::{
     ReloadHandle, Reloaded, RunningHttp, TlsSettings,
 };
 pub use reload::Swappable;
-pub use tls::{SniResolver, TlsError};
+pub use tls::{
+    CertificateSet, Certs, ServerCertificate, SiteCertificate, SiteCertificatePair, SniResolver,
+    TlsError,
+};

@@ -585,6 +585,39 @@ is a refactor that was *meant* to be faster. Hazard 56 records why the first ver
 paragraph named the wrong confound entirely: it guessed at history instead of checking
 `git merge-base --is-ancestor`, and the fair queue it worried about was already in the baseline.
 
+## What can be changed without a restart
+
+The listener's reloadable state is one value behind one pointer, and replacing it affects the
+**next** request. An in-flight request keeps the configuration it started under — the only ordering
+that can be explained to an operator, and the reason there is one pointer rather than one per
+setting: three separate swaps would let a request take a new site table with an old routing map,
+which would look like a site serving the wrong document root rather than like a race.
+
+**Reloadable.** `[server.tls]` and `[sites.*.tls]` certificates and keys, `[sites.*]` `hosts`,
+`document_root`, `front_controller`, `[server.statics]`, `redirect_to_https` and `https_port`.
+
+**Restart-only, and named rather than discovered** — a setting the implementation cannot honour
+should be *stated*, not found out from behaviour:
+
+- listener addresses (`http`, `https`, `fastcgi`) — a bound socket cannot move;
+- backend commands and worker counts — those are running processes with live pipes;
+- `static_files` on or off — that decides whether the layer exists at all;
+- `min_version` and `alpn` — they are baked into the `rustls::ServerConfig` that the acceptor
+  holds, and rustls does not let that be rebuilt in place.
+
+**Not reloadable by design: `routes`.** Sites and static settings move; the route table does not.
+The dispatcher derives one routing per site at startup and every request already reads it, so
+making routes reloadable means rebuilding the structure the request path depends on.
+
+**A reload is whole-or-nothing.** A file that does not validate, or a certificate set with one pair
+that cannot be read, is refused entirely and the previous configuration keeps serving. There is no
+way to apply half of one.
+
+> The mechanism is in place (`HttpListener::reload_handle`, `ReloadHandle::apply`,
+> `SniResolver::refresh`/`replace`); **the trigger is not**. Nothing watches for `SIGHUP` yet, so a
+> running process still has to be restarted to pick up a configuration change. That is steps 56–58
+> in [`docs/plan.md`](docs/plan.md).
+
 ### Build prerequisites
 
 `rustls` is used rather than OpenSSL, so there is no DLL/dylib to match against a system OpenSSL.

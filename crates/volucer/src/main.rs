@@ -952,6 +952,51 @@ fn check(
         println!("    site {name}:        {}", site_tls.certificate.display());
     }
 
+    // ACME, when configured. Printed even when the cache is empty, because that is a state an
+    // operator has to be able to tell apart from a deployment whose issuance is working: silence
+    // is the failure mode here, so what `check` can say is which authority, which names, and
+    // whether a certificate for them is already cached.
+    match &config.server.acme {
+        Some(acme) => {
+            println!("  acme:");
+            println!("    authority:        {}", acme.authority.as_str());
+            if acme.authority == volucer_core::config::Authority::Production {
+                println!("      PRODUCTION:     real certificates, against per-week rate limits");
+            }
+            println!("    domains:          {}", acme.domains.join(", "));
+            match acme.contact.is_empty() {
+                true => println!(
+                    "    contact:          (none: the CA has no way to warn you that renewals are \
+                     failing)"
+                ),
+                false => println!("    contact:          {}", acme.contact.join(", ")),
+            }
+            let cache = resolve_tls_path(&acme.cache, path);
+            println!("    cache:            {}", cache.display());
+            // The cached certificate is *hashed* by the crate, so the file name is not derivable
+            // here — what can be said is whether the directory has anything in it, which is the
+            // question an operator actually has: has this deployment ever issued?
+            let cached = std::fs::read_dir(&cache)
+                .map(|entries| {
+                    entries.filter_map(Result::ok).any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("cached_cert_")
+                    })
+                })
+                .unwrap_or(false);
+            println!(
+                "      issued before:  {}",
+                match cached {
+                    true => "yes (a cached certificate exists, so a restart will not re-issue)",
+                    false => "no (the first start will place an order)",
+                }
+            );
+        }
+        None => println!("  acme:             (disabled)"),
+    }
+
     println!("  document root: {}", document_root.display());
     println!(
         "    exists:           {}",

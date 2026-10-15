@@ -614,6 +614,14 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls: Option<TlsConfig>,
 
+    /// Certificate issuance. **Presence of this table is what turns ACME on.**
+    ///
+    /// Opt-in *in addition* to `[server.tls]`, which stays required: a deployment with no ACME
+    /// behaves exactly as it did before this key existed. See [`AcmeConfig`] for why a fallback
+    /// certificate is not optional.
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
+
     /// Answer cleartext requests on `http` with a `301` to the `https://` equivalent.
     ///
     /// Off by default: it changes what an existing cleartext deployment does, and a
@@ -749,6 +757,153 @@ pub struct SiteTlsConfig {
 
     /// PEM private key for this site's hosts.
     pub key: PathBuf,
+}
+
+/// `[server.acme]`: obtain this deployment's certificates automatically (RFC 8555).
+///
+/// # Why this is a table and not a boolean
+///
+/// Every key here has a value a deployment has to decide, and there is no safe default for any of
+/// them except the authority — where the safe default is *staging*, spelled as an enum rather than
+/// a `bool` so that `true` cannot quietly mean "issue a real certificate for a name somebody owns"
+/// at a call site a reader skims. Presence of the table is what turns ACME on, the same rule
+/// `[server.tls]` follows: a flag and a set of names are two statements about one thing, and they
+/// can disagree.
+///
+/// # What it needs from `[server.tls]`
+///
+/// A **fallback certificate**: `[server.tls].certificate` and `.key` stay required, and an issued
+/// certificate replaces what is served once it exists. This is the answer to open decision §9.5 —
+/// *"is a `[server.tls]`-less ACME-managed listener allowed?"* — and it is **no**, deliberately,
+/// for the reason the whole TLS layer is built on: a listener with nothing to serve fails every
+/// handshake that is not a challenge, and "the port is up and every client gets a handshake error"
+/// is hazard 56's sibling. A deployment that has never issued names a self-signed pair as the
+/// fallback; the first issuance replaces it without a restart.
+///
+/// So ACME does not contradict "a TLS listener needs a certificate" — it changes *which*
+/// certificate, which is precisely what the reload phase made replaceable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeConfig {
+    /// Which authority to talk to.
+    ///
+    /// Defaults to staging, and production must be named. The reason is a rate limit as much as a
+    /// safety one: a production account has weekly limits, and a first deployment that reached
+    /// production by omission would spend them on its own mistakes.
+    #[serde(default)]
+    pub authority: Authority,
+
+    /// The names to issue for.
+    ///
+    /// Stated rather than derived from `[sites.*].hosts`, because the two are different questions: a
+    /// site's hosts say which requests it answers, and this says which names the certificate must
+    /// *cover*. A wildcard host pattern cannot be a name on a certificate, so deriving would be
+    /// wrong exactly for the deployments that need issuance most.
+    ///
+    /// An empty list is an error rather than "derive from the sites": a mistake that would
+    /// otherwise become an ACME request for an empty identifier set.
+    #[serde(default)]
+    pub domains: Vec<String>,
+
+    /// A contact address for the account, e.g. `mailto:ops@example.com`.
+    ///
+    /// Optional in the protocol — Let's Encrypt does not require one — and **strongly recommended**
+    /// here, because it is the only channel a CA has for warning that renewals are failing for this
+    /// account. A deployment with no contact finds out from an expired certificate.
+    #[serde(default)]
+    pub contact: Vec<String>,
+
+    /// Where the account and issued certificates are cached.
+    ///
+    /// Relative paths resolve against the config file's directory, the same rule `certificate` and
+    /// `key` follow (and deliberately **not** `document_root`'s rule, which is relative to the
+    /// process's working directory).
+    ///
+    /// Not optional in effect: the engine requires a cache, because without one every restart
+    /// re-issues and the rate limits are per-week. The default sits beside the configuration file,
+    /// which is where an operator looks for it.
+    #[serde(default = "default_acme_cache")]
+    pub cache: PathBuf,
+}
+
+/// Which ACME authority to use.
+///
+/// A named enum rather than a `bool`, and the reason is the consequence of getting it wrong: a real
+/// certificate for a name somebody owns, at a rate limit that is per-week and per-account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Authority {
+    /// Let's Encrypt staging: the real protocol, certificates no browser trusts, and generous
+    /// limits. The default.
+    #[default]
+    Staging,
+    /// Let's Encrypt production. Reached only by naming it.
+    Production,
+}
+
+impl Authority {
+    /// The name as it is written in configuration, for logs and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Authority::Staging => "staging",
+            Authority::Production => "production",
+        }
+    }
+}
+
+/// The default ACME cache directory, beside the configuration file.
+fn default_acme_cache() -> PathBuf {
+    PathBuf::from("acme-cache")
+}
+
+/// Validate one ACME domain name.
+///
+/// Stricter than `validate_host_pattern` on purpose, because the two rules are about different
+/// things. A *host pattern* may be a wildcard (`*.example.com`) and is matched against a `Host`
+/// header, port and all. An ACME *identifier* is a name that goes on a certificate, so:
+///
+/// - a wildcard is refused, because TLS-ALPN-01 cannot validate one (RFC 8737 requires the
+///   identifier to equal the SNI name, and `*.example.com` is not an SNI name a client sends) and
+///   the crate's flat domain list could not express one anyway;
+/// - a port is refused, because it is not part of a name;
+/// - an empty label is refused, because `a..b` is a typo that a CA rejects after a round trip.
+///
+/// The last is the reason this exists at all: every rule here is something the CA would reject
+/// *after* an order had been started, and an error that arrives before the network is free.
+fn validate_acme_domain(domain: &str) -> Result<()> {
+    if domain.is_empty() {
+        return Err(Error::Config(
+            "server.acme.domains contains an empty name".to_string(),
+        ));
+    }
+    if domain.starts_with("*.") || domain.contains('*') {
+        return Err(Error::Config(format!(
+            "server.acme.domains {domain:?} is a wildcard; the TLS-ALPN-01 challenge proves control \
+             of one exact name, so a wildcard cannot be validated this way — list the names \
+             individually, or use a DNS-01 client instead"
+        )));
+    }
+    if domain.contains(':') {
+        return Err(Error::Config(format!(
+            "server.acme.domains {domain:?} contains a port; a certificate names a host, not an \
+             address"
+        )));
+    }
+    if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
+        return Err(Error::Config(format!(
+            "server.acme.domains {domain:?} has an empty label; check the name"
+        )));
+    }
+    if !domain.contains('.') {
+        // Not fatal for a CA — a single-label name is valid in some setups — but it is a mistake
+        // in every deployment shape this server is for, and the failure it leads to (the CA cannot
+        // resolve it) arrives after a round trip.
+        return Err(Error::Config(format!(
+            "server.acme.domains {domain:?} has no dot; a certificate cannot be issued for a \
+             single-label name, so this is probably a typo"
+        )));
+    }
+    Ok(())
 }
 
 /// The lowest TLS protocol version accepted.
@@ -1108,7 +1263,9 @@ impl Config {
 
     /// Reject configurations that cannot work, with actionable messages.
     pub fn validate(&self) -> Result<()> {
-        if self.server.http.is_none() && self.server.fastcgi.is_none() && self.server.https.is_none()
+        if self.server.http.is_none()
+            && self.server.fastcgi.is_none()
+            && self.server.https.is_none()
         {
             return Err(Error::Config(
                 "no listener configured: set server.http, server.https and/or server.fastcgi"
@@ -1238,6 +1395,7 @@ impl Config {
         }
 
         self.validate_sites()?;
+        self.validate_acme()?;
 
         Ok(())
     }
@@ -1374,8 +1532,94 @@ impl Config {
         Ok(())
     }
 
-    /// Validate the site table: host patterns, duplicates, and per-site settings.
+    /// Validate `[server.acme]`, and the arrangement it has to agree with.
     ///
+    /// Every rule here exists because the alternative is a deployment that reports nothing and then
+    /// behaves in a way the file does not say. Two of them are about silence, which is the failure
+    /// mode ACME has that nothing else in this server does: issuance that never succeeds is
+    /// indistinguishable from issuance that is working, until a certificate expires.
+    fn validate_acme(&self) -> Result<()> {
+        let Some(acme) = &self.server.acme else {
+            return Ok(());
+        };
+
+        // ACME replaces the certificate a deployment *serves*, so there has to be one. A listener
+        // with nothing to serve fails every handshake that is not a challenge — hazard 56's
+        // sibling — and the answer is a fallback pair rather than an exception to the rule.
+        if self.server.tls.is_none() {
+            return Err(Error::Config(
+                "[server.acme] is set but [server.tls] is not; ACME replaces the certificate a \
+                 deployment serves, so name a fallback certificate and key — self-signed is fine \
+                 for a first issuance"
+                    .to_string(),
+            ));
+        }
+
+        // A TLS listener, for the same reason: TLS-ALPN-01 is validated on the TLS port, so a
+        // deployment with no TLS listener has nothing for the CA to connect to.
+        if self.server.http.is_none() && self.server.https.is_none() {
+            return Err(Error::Config(
+                "[server.acme] is set but no TLS listener is configured; the TLS-ALPN-01 challenge \
+                 is validated on the TLS port, so set server.http or server.https"
+                    .to_string(),
+            ));
+        }
+
+        if acme.domains.is_empty() {
+            return Err(Error::Config(
+                "server.acme.domains is empty, so there is nothing to issue for; list the names \
+                 the certificate must cover"
+                    .to_string(),
+            ));
+        }
+
+        for domain in &acme.domains {
+            validate_acme_domain(domain)?;
+        }
+
+        // Duplicates are not harmful to the order — the CA ignores them — but they are always a
+        // mistake, and the mistake they usually are is a copy-paste that left one name out. Saying
+        // so is cheaper than the operator discovering the missing name from a browser warning.
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        for (index, domain) in acme.domains.iter().enumerate() {
+            if let Some(first) = seen.insert(domain.as_str(), index) {
+                return Err(Error::Config(format!(
+                    "server.acme.domains lists {domain:?} twice (positions {first} and {index}); \
+                     the CA would ignore the repeat, so this is nearly always a name that was \
+                     meant to be here instead"
+                )));
+            }
+        }
+
+        for contact in &acme.contact {
+            // `mailto:` is the only scheme Let's Encrypt accepts, and a bare address — the mistake
+            // an operator makes because every other tool takes one — would be sent as an unknown
+            // URI scheme and rejected by the CA. Catching it here means the error names the fix.
+            if !contact.starts_with("mailto:") {
+                return Err(Error::Config(format!(
+                    "server.acme.contact {contact:?} must be a `mailto:` URI, e.g. \
+                     \"mailto:ops@example.com\""
+                )));
+            }
+            if contact.len() <= "mailto:".len() {
+                return Err(Error::Config(
+                    "server.acme.contact is an empty `mailto:` URI; give an address".to_string(),
+                ));
+            }
+        }
+
+        if acme.cache.as_os_str().is_empty() {
+            return Err(Error::Config(
+                "server.acme.cache is empty; name a directory, or remove the key to get the \
+                 default beside this file"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// The site table: host patterns, duplicates, and per-site settings.    ///
     /// Separate from `validate` only because it is long; the two are one rule set
     /// and are always called together.
     fn validate_sites(&self) -> Result<()> {
@@ -1736,6 +1980,259 @@ pub fn parse_listener(spec: &str) -> std::result::Result<Listener, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config with ACME, as a deployment would write it.
+    fn acme_config(acme_body: &str) -> Config {
+        let text = format!(
+            r#"
+[server]
+http = "0.0.0.0:443"
+document_root = "/srv/app"
+
+[server.tls]
+certificate = "fallback.crt"
+key = "fallback.key"
+
+[server.acme]
+{acme_body}
+"#
+        );
+        Config::from_toml(&text).expect("the fixture parses")
+    }
+
+    /// ACME is off unless the table is there, which is what keeps it additive.
+    ///
+    /// The claim the whole phase rests on: a deployment with no `[server.acme]` behaves exactly as
+    /// it did before the key existed. A default that turned it on — or a required key — would make
+    /// every existing configuration either change behaviour or fail to parse, and neither is
+    /// visible from the ACME tests themselves.
+    #[test]
+    fn acme_is_absent_until_the_table_is_written() {
+        let text = r#"
+[server]
+http = "0.0.0.0:443"
+document_root = "/srv/app"
+
+[server.tls]
+certificate = "fallback.crt"
+key = "fallback.key"
+"#;
+        let config = Config::from_toml(text).expect("an existing config still parses");
+        assert!(
+            config.server.acme.is_none(),
+            "ACME must be off when the table is absent, or it is not additive"
+        );
+        config.validate().expect("and it still validates");
+    }
+
+    /// Production must be named; everything else defaults to staging.
+    ///
+    /// The reason this is a test rather than a comment: getting it wrong issues a real certificate
+    /// for a name somebody owns, against a rate limit that is per-week and per-account.
+    #[test]
+    fn acme_defaults_to_staging_and_production_is_named() {
+        let default = acme_config(r#"domains = ["example.com"]"#);
+        assert_eq!(
+            default.server.acme.as_ref().expect("present").authority,
+            Authority::Staging,
+            "an authority that is not named must be staging"
+        );
+
+        let named = acme_config(
+            r#"
+authority = "production"
+domains = ["example.com"]
+"#,
+        );
+        assert_eq!(
+            named.server.acme.as_ref().expect("present").authority,
+            Authority::Production
+        );
+        assert_eq!(Authority::Production.as_str(), "production");
+        assert_eq!(Authority::default().as_str(), "staging");
+    }
+
+    /// An ACME table with no `[server.tls]` is refused, and the error names the fix.
+    ///
+    /// This is the answer to open decision §9.5, and the rule it keeps is the one the TLS layer is
+    /// built on: a listener with nothing to serve fails every handshake that is not a challenge.
+    /// The alternative — allowing a certificate-less TLS listener because ACME will provide one —
+    /// trades a startup error for a port that is up and refusing every client until an order
+    /// completes.
+    #[test]
+    fn acme_without_a_fallback_certificate_is_refused() {
+        let text = r#"
+[server]
+http = "0.0.0.0:443"
+document_root = "/srv/app"
+
+[server.acme]
+domains = ["example.com"]
+"#;
+        let config = Config::from_toml(text).expect("it parses");
+        let err = config
+            .validate()
+            .expect_err("ACME needs a fallback certificate");
+        let message = err.to_string();
+        assert!(
+            message.contains("[server.tls]") && message.contains("fallback"),
+            "the error must name the missing table and what to put in it: {message}"
+        );
+    }
+
+    /// Each domain rule fails on the thing it names, and the message says why.
+    ///
+    /// Table-driven because the rules are independent — one case per rule, each asserting the
+    /// *reason* rather than only that validation failed. A test that asserted "some error" for all
+    /// of them would pass against a single over-broad rule.
+    #[test]
+    fn an_acme_domain_that_cannot_be_validated_is_refused_with_its_reason() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                r#"domains = ["*.example.com"]"#,
+                &["wildcard", "TLS-ALPN-01"],
+            ),
+            (r#"domains = ["example.com:443"]"#, &["port"]),
+            (r#"domains = ["a..b.com"]"#, &["empty label"]),
+            (r#"domains = ["localhost"]"#, &["no dot"]),
+            (r#"domains = [""]"#, &["empty"]),
+        ];
+
+        for (body, expected) in cases {
+            let config = acme_config(body);
+            let err = config
+                .validate()
+                .expect_err(&format!("{body} must be refused"));
+            let message = err.to_string();
+            for fragment in *expected {
+                assert!(
+                    message.contains(fragment),
+                    "the error for {body} must mention {fragment:?}: {message}"
+                );
+            }
+        }
+
+        // And a valid list passes, so the rules above are not refusing everything.
+        acme_config(r#"domains = ["example.com", "www.example.com"]"#)
+            .validate()
+            .expect("a plain list of names must validate");
+    }
+
+    /// An empty domain list is refused rather than becoming an order for nothing.
+    #[test]
+    fn acme_with_no_domains_is_refused() {
+        let config = acme_config(r#"contact = ["mailto:ops@example.com"]"#);
+        let err = config.validate().expect_err("nothing to issue for");
+        assert!(
+            err.to_string().contains("domains is empty"),
+            "the error must name the key: {err}"
+        );
+    }
+
+    /// A duplicate name is refused, and the message points at the likely cause.
+    ///
+    /// The CA would ignore the repeat, so this is never *harmful* — which is exactly why it needs
+    /// catching: the mistake it usually represents is a name that was meant to be there instead.
+    #[test]
+    fn a_duplicate_acme_domain_is_refused_with_both_positions() {
+        let config = acme_config(r#"domains = ["example.com", "www.example.com", "example.com"]"#);
+        let err = config
+            .validate()
+            .expect_err("a duplicate name is a mistake");
+        let message = err.to_string();
+        assert!(
+            message.contains("twice") && message.contains("positions 0 and 2"),
+            "the error must say where the duplicate is, so the reader can find it: {message}"
+        );
+    }
+
+    /// A contact without `mailto:` is refused, because the CA would reject it after a round trip.
+    ///
+    /// The bare address is the mistake worth catching: every other tool takes `ops@example.com`, so
+    /// an operator will write that, and the CA would see an unknown URI scheme.
+    #[test]
+    fn an_acme_contact_must_be_a_mailto_uri() {
+        let bare = acme_config(
+            r#"
+domains = ["example.com"]
+contact = ["ops@example.com"]
+"#,
+        );
+        let err = bare
+            .validate()
+            .expect_err("a bare address is not a URI the CA accepts");
+        let message = err.to_string();
+        assert!(
+            message.contains("mailto:") && message.contains("ops@example.com"),
+            "the error must show the fix: {message}"
+        );
+
+        let empty = acme_config(
+            r#"
+domains = ["example.com"]
+contact = ["mailto:"]
+"#,
+        );
+        assert!(
+            empty.validate().is_err(),
+            "an empty mailto: URI must be refused"
+        );
+
+        // And a proper one passes, including several.
+        acme_config(
+            r#"
+domains = ["example.com"]
+contact = ["mailto:ops@example.com", "mailto:oncall@example.com"]
+"#,
+        )
+        .validate()
+        .expect("well-formed contacts must validate");
+    }
+
+    /// The cache defaults beside the configuration file rather than to a relative path a reader
+    /// cannot predict.
+    #[test]
+    fn the_acme_cache_defaults_to_a_named_directory() {
+        let config = acme_config(r#"domains = ["example.com"]"#);
+        let acme = config.server.acme.as_ref().expect("present");
+        assert_eq!(
+            acme.cache,
+            PathBuf::from("acme-cache"),
+            "the default must be a name an operator can find, not the working directory"
+        );
+        assert!(
+            !acme.cache.is_absolute(),
+            "a relative default is what makes it resolve against the config file, which is the \
+             rule `certificate` and `key` already follow"
+        );
+    }
+
+    /// An unknown key under `[server.acme]` is refused rather than ignored.
+    ///
+    /// `deny_unknown_fields` on the table, asserted here because the alternative is the failure
+    /// this project keeps refusing: a key that looks like it does something and does not. A typo
+    /// such as `domain = [...]` (singular) would otherwise leave `domains` empty — which is caught
+    /// too, but the error would name the wrong key.
+    #[test]
+    fn an_unknown_key_under_server_acme_is_refused() {
+        let text = r#"
+[server]
+http = "0.0.0.0:443"
+document_root = "/srv/app"
+
+[server.tls]
+certificate = "fallback.crt"
+key = "fallback.key"
+
+[server.acme]
+domain = ["example.com"]
+"#;
+        let err = Config::from_toml(text).expect_err("a misspelt key is not a key");
+        assert!(
+            err.to_string().contains("domain"),
+            "the error must name the key it did not recognise: {err}"
+        );
+    }
 
     #[test]
     fn parses_a_complete_config() {
@@ -2203,10 +2700,8 @@ backend = "app"
         assert_eq!(statics.max_multirange_bytes, 1024 * 1024);
 
         // And turning it off is one key.
-        let off = Config::from_toml(
-            "[server]\nhttp = \"127.0.0.1:8080\"\nstatic_files = false\n",
-        )
-        .expect("config parses");
+        let off = Config::from_toml("[server]\nhttp = \"127.0.0.1:8080\"\nstatic_files = false\n")
+            .expect("config parses");
         assert!(!off.server.statics().enabled);
     }
 
@@ -2224,7 +2719,10 @@ fastcgi = "127.0.0.1:9000"
             .expect("the default must not make a FastCGI-only config unshippable");
 
         // But an explicit request with no HTTP listener is a mistake worth reporting.
-        for written in ["static_files = true\n", "static_files = { enabled = true }\n"] {
+        for written in [
+            "static_files = true\n",
+            "static_files = { enabled = true }\n",
+        ] {
             let text = format!("[server]\nfastcgi = \"127.0.0.1:9000\"\n{written}");
             let config = Config::from_toml(&text).expect("config parses");
             let err = config.validate().expect_err("must fail");
@@ -2813,10 +3311,17 @@ key = "certs/default.key"
         config.validate().expect("a certificate and key are enough");
 
         let tls = config.server.tls.as_ref().expect("tls present");
-        assert_eq!(tls.min_version, MinTlsVersion::V1_2, "1.2 is the floor by default");
+        assert_eq!(
+            tls.min_version,
+            MinTlsVersion::V1_2,
+            "1.2 is the floor by default"
+        );
         assert_eq!(tls.alpn, ["h2", "http/1.1"], "http/1.1 must not be dropped");
         assert!(!tls.plain, "accepting cleartext on a TLS port is opt-in");
-        assert!(!config.server.redirect_to_https, "a redirect is a deployment's decision");
+        assert!(
+            !config.server.redirect_to_https,
+            "a redirect is a deployment's decision"
+        );
     }
 
     #[test]
@@ -2915,7 +3420,9 @@ key = "c.key"
         // a mistake though, because a client that cannot do h2 fails the handshake rather
         // than being served HTTP/1.1 — so it validates and the warning is the signal.
         let config = Config::from_toml(&tls_config(r#"alpn = ["h2"]"#)).expect("parses");
-        config.validate().expect("h2 alone is a deliberate choice, not an error");
+        config
+            .validate()
+            .expect("h2 alone is a deliberate choice, not an error");
     }
 
     #[test]
@@ -2957,7 +3464,9 @@ certificate = "shop.crt"
 key = "shop.key"
 "#;
         let config = Config::from_toml(text).expect("parses");
-        config.validate().expect("a per-site certificate is the SNI case");
+        config
+            .validate()
+            .expect("a per-site certificate is the SNI case");
 
         let site = config.sites.get("shop").expect("site present");
         assert_eq!(
@@ -3076,7 +3585,10 @@ redirect_to_https = true
         assert!(!bare.server.has_plaintext_listener());
 
         let tls_only = Config::from_toml(&tls_config("")).expect("parses");
-        assert!(!tls_only.server.has_plaintext_listener(), "h2-only TLS on http");
+        assert!(
+            !tls_only.server.has_plaintext_listener(),
+            "h2-only TLS on http"
+        );
 
         let tls_plain = Config::from_toml(&tls_config("plain = true")).expect("parses");
         assert!(tls_plain.server.has_plaintext_listener());
@@ -3107,6 +3619,8 @@ key = "c.key"
         )
         .expect("parses");
         assert!(!https_only.server.has_plaintext_listener(), "TLS only");
-        https_only.validate().expect("a TLS-only deployment is valid");
+        https_only
+            .validate()
+            .expect("a TLS-only deployment is valid");
     }
 }

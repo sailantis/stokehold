@@ -586,7 +586,7 @@ runtime; those are still pre-release, so this targets 0.23 stable.
 | `crates/volucer-worker` | The worker protocol: framed codec and message set over a worker's pipes |
 | `crates/volucer-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |
 | `crates/volucer-http` | The HTTP front-end: a `hyper` listener and the static file layer — the only async code in the project |
-| `crates/volucer-cli` | The `volucer` binary |
+| `crates/volucer` | The `volucer` binary — the crate is named `volucer` so `cargo install volucer` works |
 | `docs/plan.md` | The design and the phase plan |
 | `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements |
 
@@ -606,6 +606,32 @@ cargo fmt --all
 The FastCGI integration tests in `crates/volucer-fcgi/tests/php_cgi.rs` start a real
 `php-cgi -b` process and speak the protocol to it. They skip themselves, with a printed reason,
 when no `php-cgi` binary is on `PATH`.
+
+## Releasing
+
+The crates are not published yet. When they are, the order is **forced by the dependency graph**:
+a published crate cannot depend on a version that is not on crates.io yet, so the leaves go first.
+
+```bash
+cargo publish -p volucer-core
+cargo publish -p volucer-worker
+cargo publish -p volucer-fcgi
+cargo publish -p volucer-server
+cargo publish -p volucer-http
+cargo publish -p volucer        # the CLI, last: it depends on four of the above
+```
+
+Crate names are **flat** on crates.io even though the `sailantis` organization owns them — there
+is no `sailantis::volucer-core`. The `volucer-` prefix is what keeps the family together, and the
+CLI is the exception: its crate is named `volucer` so `cargo install volucer` works.
+
+The internal dependencies in the workspace root carry both a `version` and a `path`, which is
+required: `cargo publish` strips the `path` and resolves from crates.io, so a `path`-only
+dependency is rejected with *"all dependencies must have a version requirement specified"*. All
+six crates share `[workspace.package] version`, and they must be released together — a version
+bump that moves one crate but not its dependents breaks the chain. When publishing a new version,
+publish the leaves first and wait for the index to update before publishing the crates that depend
+on them.
 
 The worker protocol tests — `crates/volucer-worker/src/codec.rs` and
 `crates/volucer-worker/tests/wire_format.rs` — need no PHP. They drive the codec over an
@@ -641,7 +667,7 @@ the requested bytes, a 416 past the end, the `/assets` → `/assets/` redirect, 
 traversal, a precompressed variant, a 256 KiB file arriving whole — and, crucially, **502 for
 `/about`**, which is how the tests prove a path that names no file still reaches the application.
 
-`crates/volucer-cli/tests/serve.rs` is the end-to-end one: it runs the shipped `volucer`
+`crates/volucer/tests/serve.rs` is the end-to-end one: it runs the shipped `volucer`
 binary with both listeners configured on port 0, then drives it over HTTP *and* over FastCGI in
 the same process, which is what proves the two front-ends really do share one dispatcher. A second
 test in that file serves a static file and reaches PHP for a route through the same config and the

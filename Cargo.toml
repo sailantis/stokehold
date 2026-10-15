@@ -6,7 +6,7 @@ members = [
     "crates/volucer-fcgi",
     "crates/volucer-server",
     "crates/volucer-http",
-    "crates/volucer-cli",
+    "crates/volucer",
 ]
 
 [workspace.package]
@@ -16,12 +16,17 @@ rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/sailantis/volucer"
 
+# Crate names are flat on crates.io, even though an organization owns them, so the
+# `volucer-` prefix is what keeps the family together: `volucer-core`, `volucer-http`, ...
+# The exception is the CLI, which is named `volucer` itself so that `cargo install volucer`
+# works. Keep every entry here on the same version as `[workspace.package] version`:
+# a published crate cannot depend on a version that does not exist, so these move together.
 [workspace.dependencies]
-volucer-core = { path = "crates/volucer-core" }
-volucer-worker = { path = "crates/volucer-worker" }
-volucer-fcgi = { path = "crates/volucer-fcgi" }
-volucer-server = { path = "crates/volucer-server" }
-volucer-http = { path = "crates/volucer-http" }
+volucer-core = { version = "0.1.0", path = "crates/volucer-core" }
+volucer-worker = { version = "0.1.0", path = "crates/volucer-worker" }
+volucer-fcgi = { version = "0.1.0", path = "crates/volucer-fcgi" }
+volucer-server = { version = "0.1.0", path = "crates/volucer-server" }
+volucer-http = { version = "0.1.0", path = "crates/volucer-http" }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"

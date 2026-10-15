@@ -1482,7 +1482,7 @@ Phase 6 — front-ends
 18. `fastcgi-frontend` — **done**, in `crates/volucer-server/src/frontend/`. Accepts FastCGI
     from nginx, translates it into the same `Dispatcher` the HTTP front-end calls, and re-frames
     the response, with a pass-through fast path for a record it can forward unchanged. It is
-    wired in `volucer-cli`'s `serve` alongside the HTTP listener: the FastCGI listener owns the
+    wired in `volucer`'s `serve` alongside the HTTP listener: the FastCGI listener owns the
     calling thread while HTTP runs on its own, so both are served concurrently, and `serve` binds
     FastCGI first because binding is synchronous while the HTTP listener is not. `server.fastcgi`
     unset means disabled. `tests/frontend.rs` drives a real request through the whole chain and

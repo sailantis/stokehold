@@ -1,6 +1,7 @@
 [package]
-name = "volucer-cli"
-description = "The volucer command line interface"
+# Named `volucer`, not `volucer-cli`, so that `cargo install volucer` installs the server.
+name = "volucer"
+description = "A cross-platform PHP application server: persistent workers and FastCGI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1473,6 +1473,160 @@ fn one_sighup_reloads_a_certificate_and_a_site_together() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A reload must not throw away the certificate ACME issued.
+///
+/// The reloader rebuilds the certificate table with `SniResolver::refresh`, which is
+/// **whole-or-nothing**: it loads exactly the pairs the configuration names. That is the right
+/// shape for a reload — a set with one unreadable pair is refused entirely rather than half
+/// applied — but it has a consequence for a deployment that has `[server.acme]`: the issued
+/// certificate is not in the file, it is in the cache and in the running table, so a reload that
+/// rebuilt from the configuration alone would put the **fallback** self-signed pair back into
+/// service on a production host.
+///
+/// That is a silent regression, which is why it is pinned here rather than left to reasoning: the
+/// server keeps running, the port keeps answering, every other reload test stays green, and the
+/// symptom is a browser warning that appears weeks later — after the next `SIGHUP`, with the
+/// cause already attributed to something else.
+///
+/// The **control** matters as much as the assertion. A test that never had an issued certificate
+/// would pass against a reloader that did nothing at all, so the issued certificate is installed
+/// through the same in-memory seam an issuance uses and *asserted to be serving* before the signal
+/// is sent. What follows is then a statement about the reload and not about ACME being off: if the
+/// `[server.acme]` table were dropped from the config, the "before" assertion fails first.
+#[cfg(unix)]
+#[test]
+fn a_reload_keeps_the_certificate_that_was_issued() {
+    use rustls_acme::CertCache;
+
+    const SIGHUP: i32 = 1;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-acme-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let site = root.join("site");
+    std::fs::create_dir_all(&site).expect("create a document root");
+    std::fs::write(site.join("whoami.txt"), "here").expect("write the marker");
+    let certs = root.join("certs");
+    std::fs::create_dir_all(&certs).expect("create the certificate directory");
+
+    // The fallback. It is what a reload that rebuilt from the configuration alone would restore.
+    let fallback = rcgen::generate_simple_self_signed(vec!["example.test".to_string()])
+        .expect("generate the fallback certificate");
+    std::fs::write(certs.join("fallback.crt"), fallback.cert.pem()).expect("write the cert");
+    std::fs::write(
+        certs.join("fallback.key"),
+        fallback.key_pair.serialize_pem(),
+    )
+    .expect("write the key");
+    let fallback_der = fallback.cert.der().to_vec();
+
+    // The issued certificate, in the shape `rustls-acme` stores and hands over: a chain plus a key
+    // concatenated into one blob. It is written into the *cache* rather than the config, because
+    // that is where an issued certificate lives — the file the configuration names stays the
+    // self-signed pair, and that is the whole point of the assertion below.
+    let issued = rcgen::generate_simple_self_signed(vec!["example.test".to_string()])
+        .expect("generate the issued certificate");
+    let issued_blob = format!("{}{}", issued.cert.pem(), issued.key_pair.serialize_pem());
+    let issued_der = issued.cert.der().to_vec();
+    assert_ne!(
+        fallback_der, issued_der,
+        "the fixture must differ, or the assertion below is vacuous"
+    );
+
+    // The directory URL comes from **the same function `serve` calls**, so this cannot drift from
+    // what the engine looks for without the server and the test disagreeing about the authority.
+    // Staging, so even a bug that reached the network could not issue a real certificate.
+    let directory = volucer_acme::Authority::Staging.directory();
+    assert!(
+        directory.contains("staging"),
+        "the fixture must use staging: {directory}"
+    );
+
+    let cache_dir = root.join("acme-cache");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the cache write");
+    runtime.block_on(async {
+        rustls_acme::caches::DirCache::new(&cache_dir)
+            .store_cert(
+                &["example.test".to_string()],
+                directory,
+                issued_blob.as_bytes(),
+            )
+            .await
+            .expect("the cache is writable");
+    });
+
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {site}\n\n\
+         [server.tls]\ncertificate = \"certs/fallback.crt\"\nkey = \"certs/fallback.key\"\n\n\
+         [server.acme]\ndomains = [\"example.test\"]\ncontact = [\"mailto:ops@example.test\"]\n",
+        site = toml_string(&site.display().to_string()),
+    );
+    std::fs::write(&config_path, &config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the config asks for an http listener");
+
+    // The control: the cached certificate is serving *before* the signal. Without this the test
+    // would pass against a reloader that did nothing, and against one in a build where the engine
+    // was never wired up at all.
+    let before = tls_get(&address, "example.test", "/whoami.txt");
+    assert_eq!(
+        before.certificate, issued_der,
+        "the fixture must be serving the issued certificate before the reload, or the assertion \
+         after it is about nothing"
+    );
+
+    // The file is rewritten unchanged: the signal is the only thing that happens. A reload that
+    // finds the same configuration is the ordinary case an operator produces by hand.
+    std::fs::write(&config_path, &config).expect("rewrite the same config");
+    let Some(()) = signal(&server.child, SIGHUP) else {
+        eprintln!("skipping: could not signal the server");
+        return;
+    };
+
+    // Wait for the reload to have happened at all — the marker proves it, so the certificate
+    // assertion is not made against a server that has simply not reloaded yet.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut after = tls_get(&address, "example.test", "/whoami.txt");
+    while Instant::now() < deadline && after.body != "here" {
+        std::thread::sleep(Duration::from_millis(50));
+        after = tls_get(&address, "example.test", "/whoami.txt");
+    }
+    assert_eq!(after.body, "here", "the reload must have been applied");
+    // Give a reload that *would* drop the certificate the chance to do so: the site table and the
+    // certificate table are applied in sequence, sites first, so the certificate half lands last.
+    std::thread::sleep(Duration::from_millis(500));
+
+    after = tls_get(&address, "example.test", "/whoami.txt");
+    assert_ne!(
+        after.certificate, fallback_der,
+        "a reload restored the **fallback** certificate, so the one ACME issued is no longer being \
+         served — the deployment is back to a self-signed pair with no error and no log line, and \
+         only a browser warning would ever say so"
+    );
+    assert_eq!(
+        after.certificate, issued_der,
+        "a reload must keep the issued certificate serving"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// One TLS exchange: which certificate arrived, and what the request was answered with.
 ///
 /// Raw sockets and `rustls` directly, rather than a TLS client library, for the same reason the

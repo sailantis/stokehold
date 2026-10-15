@@ -684,6 +684,15 @@ consequence is a window of a few hundred microseconds in which the new document 
 under the previous certificate, so a script that watches the certificate immediately after the
 signal may see the old one once. Both are in effect when the reload has finished.
 
+**With `[server.acme]`, the certificate table is not rebuilt at all**, and that is a correctness
+rule rather than an optimisation. Rebuilding means loading exactly the pairs the configuration
+names, and an issued certificate is not named there — the configured pair is only the *fallback*. A
+reload that rebuilt the table would therefore put a self-signed certificate back into service on a
+host that has a real one, with nothing in the log to say so. The issued certificate is already in
+the table, because issuance installs it there, so the reload leaves it alone and only the sites
+change. If you are migrating a deployment *away* from ACME, remove `[server.acme]` and restart; the
+configuration's own pair then takes over on the next reload as before.
+
 > **A reload never stops the server.** That is worth stating because it was briefly untrue: the
 > `ctrlc` crate's `termination` feature registers `SIGHUP` and runs its *shutdown* callback for it,
 > so `kill -HUP` used to stop a running volucer rather than reload it. Signals are now handled per

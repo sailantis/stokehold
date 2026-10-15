@@ -1784,6 +1784,17 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
       `volucer/tests/serve.rs` also now parses the listener banner's address by first token, so the
       `(https)` suffix `serve` prints cannot leak into an address.
 
+    **A fourth gap, found later and not by this step's own reading** (hazard 71). The middle bullet
+    below claims the reloader's certificate half was unpinned and is now pinned. The second test does
+    pin it — for a deployment whose certificates are *named in the file*. For a deployment with
+    `[server.acme]` it was the opposite of pinned: the reload rebuilt the table from the
+    configuration, and an issued certificate is not in the configuration, so an ordinary `SIGHUP`
+    silently returned the deployment to its self-signed fallback. It took the ACME phase to create
+    the case, and the test that closes it (`a_reload_keeps_the_certificate_that_was_issued`) is
+    committed with the ACME work. The lesson is about the shape of the claim: "the certificate half
+    is reloaded" was tested, "the certificate half is reloaded *correctly for every way a
+    certificate can get there*" was not, and only the second is what an operator depends on.
+
 ### Phase — ACME issuance (steps 60–64)
 
 This phase has its own working plan (revision 2 of the reload/ACME plan), which is where the
@@ -3763,6 +3774,48 @@ implemented for" a type that appears identical to the reader, at a line where bo
 `rustls::server::ClientHello`. `crates/volucer-http/tests/one_rustls.rs` exists to turn that into one
 sentence, and this note is why the test is worth its lines: the confusing error is the *likely*
 outcome of a routine `cargo update`.
+
+### Hazard 71 — `SIGHUP` un-issues a certificate, and the tests all agreed it did not
+
+Found by running a question through the code rather than answering it from the summary, and it is
+the second time in this phase that a *missing* path was the defect (hazard 68 was the first).
+
+`Reloader::reload` rebuilt the certificate table with `SniResolver::refresh`, which loads exactly the
+pairs the **configuration** names. That is the right shape for a named deployment and the wrong one
+for an ACME deployment, because an issued certificate is not in the file: the configured pair is only
+the fallback. So the ordinary operator action — edit a site, `kill -HUP` — put the **self-signed
+fallback** back into service on a host that had a real certificate, with nothing in the log, and the
+only symptom a browser warning that appears afterwards and gets attributed to something else.
+
+Every existing test agreed it did not. `one_sighup_reloads_a_certificate_and_a_site_together` passes
+because it *is* a named deployment and the refresh is exactly what it should do.
+`an_acme_configured_server_serves_its_cached_certificate` passes because it never sends a signal. The
+gap is the intersection, and the phase's own "ACME is additive" control — the 39
+`tls.rs`/`frontend.rs` tests staying unchanged — could not see it either.
+
+The fix is to **skip** the rebuild when the serving resolver has an ACME challenge source, rather
+than to rebuild and then re-install from the cache. Both work while the cache read succeeds, but the
+second is a repair *after* the table has been wrong, and the moment the cache read fails is the
+moment a deployment is downgraded silently. Skipping makes the two halves unable to come apart: the
+table is already correct because issuance installs into it, so the reload only moves the sites.
+
+Two design details, both forced rather than chosen:
+
+- **The reloader asks the resolver, not the engine.** `Arc<Engine>` is not `Send`, because `AcmeState`
+  holds `Pin<Box<dyn Future + Send>>` (hazard 69's fact, met again from a new direction) — so the
+  engine cannot be held beside the reloader at all. `SniResolver::has_acme` is the question that
+  actually matters: not "is there an `[server.acme]` table" but "does the serving path consult an
+  ACME challenge source", which is a property of the object answering handshakes.
+- **The engine is moved into its thread rather than shared**, which is what keeps that `!Sync`
+  requirement from reaching the signal handler. The compiler refused the shared version, and the
+  refusal was the design correction.
+
+`a_reload_keeps_the_certificate_that_was_issued` (`volucer/tests/serve.rs`) pins it, with a **control**
+that matters as much as the assertion: it asserts the issued certificate is serving *before* the
+signal, so the test cannot pass against a reloader that does nothing, nor against a build where the
+engine was never wired up. Falsified by forcing the guard false: the fallback comes back and the
+test fails with the certificate it restored. The plan records the consequence for the operator too —
+migrating away from ACME needs a restart.
 
 ### What the live Pebble run established, and where it stopped
 

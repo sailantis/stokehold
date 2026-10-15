@@ -801,15 +801,9 @@ fn serve(
 
     println!("press Ctrl-C to stop");
 
-    // The engine runs on a thread of its own with a **current-thread** runtime, and that is not a
-    // preference: `AcmeState` holds `Pin<Box<dyn Future + Send>>` fields, so it is not `Sync` and
-    // its `run` future cannot be spawned onto the multi-threaded runtime the HTTP listener owns.
-    // A current-thread runtime has no such requirement, and one thread for a background task that
-    // does a network round trip every few weeks is not a cost worth designing around.
-    //
-    // The task is *not* joined at shutdown, deliberately: an interrupted order is retried on the
-    // next start and the cache is written per file, so there is nothing to flush, and waiting for a
-    // network round trip on Ctrl-C would make a stop take as long as an ACME request.
+    // The engine is moved **into** the thread, which is what keeps `Arc<Engine>` — and therefore
+    // `AcmeState`'s lack of `Sync` — out of the signal handler entirely. The reloader needs no
+    // handle to it: what it asks is the *resolver*, which is `Sync` because it has to be.
     if let Some(engine) = acme {
         std::thread::Builder::new()
             .name("acme".to_string())
@@ -956,6 +950,11 @@ struct Reloader {
     /// The one registry: the shared table and every front-end.
     registry: Arc<volucer_http::Registry>,
     /// The process's certificate table, when TLS is on, so a renewed PEM is picked up too.
+    ///
+    /// Also the reload's answer to "does ACME manage these certificates?": the composed resolver is
+    /// the thing that actually answers handshakes, so asking *it* rather than a second flag is what
+    /// keeps the reload's decision from drifting away from the serving path. The engine itself
+    /// cannot be held here — `AcmeState` is not `Sync`, so it cannot move into the signal thread.
     tls: Option<Arc<volucer_http::SniResolver>>,
 }
 
@@ -1010,7 +1009,29 @@ impl Reloader {
         // certificate that cannot be read leaves the *sites* reloaded and the certificates as they
         // were — one table refusing must not take the other with it, and both are whole-or-nothing
         // on their own.
-        if let Some(resolver) = &self.tls {
+        //
+        // When ACME manages this deployment's certificates the rebuild is **skipped, not followed
+        // by a repair**, because the issued certificate is not in the configuration at all: the
+        // configured pair is only the fallback, so rebuilding from the file puts a self-signed
+        // certificate back into service on a host that has a real one. Reading the cache back
+        // afterwards would only fix that while the read succeeds, so the moment it does not is the
+        // moment a deployment is downgraded with no error. The table is already correct, because
+        // issuance installs into it, so leaving it alone makes the two halves unable to come apart
+        // rather than repaired after they had.
+        //
+        // `has_acme` is asked of the resolver that answers handshakes rather than inferred from a
+        // `[server.acme]` table existing: the question is whether *the serving path* consults an ACME
+        // challenge source, which is a fact about this object and not about the file on disk.
+        if self
+            .tls
+            .as_ref()
+            .is_some_and(|resolver| resolver.has_acme())
+        {
+            tracing::info!(
+                "ACME manages this deployment's certificates: the sites changed and the issued \
+                 certificate stays in service"
+            );
+        } else if let Some(resolver) = &self.tls {
             match resolver.refresh(&volucer_http::CertificateSet::from_config(&config)) {
                 Ok(_) => tracing::info!("certificate table refreshed"),
                 Err(err) => {

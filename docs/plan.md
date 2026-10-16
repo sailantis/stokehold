@@ -2064,11 +2064,10 @@ the workflow is the same one, but it finally has an output, so it stops being de
     - **`cargo package --workspace` is a CI job now**, and it is the publish order's guard: a
       published crate cannot depend on a version that is not on crates.io yet, and `cargo package`
       verifies each crate in dependency order. It passes today for all eight crates.
-    - **`.github/` did not exist before this step** — 0 workflows, 0 tags, no release. The first
-      run of the workflow has not happened yet and cannot be run from here; the workflows are
-      linted with `actionlint` (clean), and everything that does not need a runner — the packaging
-      path, `cargo package`, `cargo clippy -D warnings`, `cargo fmt --check` — was run locally.
-      **The first green CI run is the remaining verification**, and it is a push away.
+    - **`.github/` did not exist before this step** — 0 workflows, 0 tags, no release. **The
+      workflow is green**, and its first run found two test failures the single-platform
+      development loop could not have (one a genuine macOS bug, one a port race). Hazard 75.
+      The release path is written but has never run, because it needs a tag.
 
 70. `volucer-cli-package` — the Composer channel, and its mechanism is not the obvious one.
     - **What `composer require spiral/roadrunner` actually does, verified rather than assumed:**
@@ -4250,6 +4249,39 @@ both tables, with the error message naming the edit that fixes it
 `enabled` reaching the four readers that had read "the table exists" as "something will issue" —
 `any_acme`, the `generated_sites` filter, `default_names`, and the `serve` scope loop — is what these
 two rules turned out to depend on, which is why they were worth doing in one change rather than three.
+
+### Hazard 75 — the matrix found a bug only macOS could find, and a flake that looked like one
+
+Step 69's whole argument was that a cross-platform claim nobody tests on three platforms is a
+hypothesis. The first run of the workflow repaid it immediately, with **two failures that are not
+the same kind of thing**:
+
+**macOS, and a genuine platform bug.** `is_running` in `worker_pool.rs` was
+`PathBuf::from(format!("/proc/{pid}")).exists()`. **`/proc` is Linux, not Unix** — macOS has no
+procfs, so the predicate was unconditionally `false` there, and
+`max_requests_zero_means_never_recycle` asserts the original worker is *still running*. It failed
+deterministically, for a reason with nothing to do with recycling. The sibling helper in
+`tests/pool.rs` already had the portable `kill -0` fallback; the second copy had been written
+without it. **Only the macOS job could have found this**: every other platform either has `/proc`
+or takes the `tasklist` arm, so a predicate that was always false was never exercised. This is the
+sharpest argument for the matrix in the file.
+
+**Linux, and a flake — which is a different finding, and worth naming as one.** `free_port` binds
+`:0`, reads the port and closes it, and the six tests in `php_cgi.rs` run in parallel in one binary,
+so two can be handed the same port. A test then connected to *another test's* `php-cgi`, which
+answered the readiness probe and dropped the connection as `ConnectionReset` — the process had
+already been killed by its owner's `Drop`, and `php-cgi` serves one connection at a time. It
+**passed on rerun**, which is what a port race looks like and not what a bug looks like.
+`volucer-server/tests/common/mod.rs` had already solved exactly this for the pool tests, with the
+diagnosis written beside it; `volucer-fcgi` had no such lock.
+
+**The general rule, and it is the third costume this project has seen it in: a test that cannot fail
+on the machine it runs on is not evidence.** Hazard 57 was a test asserting *nothing changed* that
+passed against a test that did nothing. Hazard 62 was a stub that reimplemented the thing under test,
+so the falsification proved the stub. This is the same defect with the platform supplying the
+blindness: the macOS predicate could not be true, and the Linux race could not be *reliably* false.
+Neither is visible from one machine — and note that `fmt`, `clippy` and `cargo package` were all run
+locally first and passed, so the local runs were not what caught this.
 
 ### What the live Pebble run established, and where it stopped
 

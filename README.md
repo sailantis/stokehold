@@ -197,20 +197,26 @@ configuration surface.
 
 ## Getting started
 
-Requires Rust 1.88+ (the number is enforced by CI against a real 1.88 toolchain, not asserted).
+Requires Rust 1.88+ (the number is checked by CI against a real 1.88 toolchain rather than asserted
+in the manifest alone). There is nothing else to install — no OpenSSL, no PHP to build against —
+but the build does need a C toolchain, NASM and CMake; see [Build prerequisites](#build-prerequisites).
 
 ```bash
 cargo build --release
 ```
 
-Or install a released binary, either way:
+Or install a release instead of building one. From crates.io:
 
 ```bash
-cargo install volucer                                    # builds from crates.io
+cargo install volucer
 ```
 
+Or from a prebuilt archive, which is published per target with a `.sha256` beside it:
+
 ```bash
-# or unpack a prebuilt archive, which is published per target with a checksum
+curl -LO https://github.com/sailantis/volucer/releases/latest/download/volucer-0.1.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/sailantis/volucer/releases/latest/download/volucer-0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum --check volucer-0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
 tar -xzf volucer-0.1.0-x86_64-unknown-linux-musl.tar.gz
 ```
 

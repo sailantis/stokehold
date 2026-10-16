@@ -645,6 +645,68 @@ pub struct ServerConfig {
     /// rather than a silently inert key.
     #[serde(default)]
     pub redirect_to_https: bool,
+
+    /// The access log. **Absent is what turns it off**, which is the default.
+    ///
+    /// Off by default on the same rule `static_files` follows: an existing deployment must not
+    /// be changed by upgrading. A table rather than a boolean because a path is required for it
+    /// to mean anything, and a bare `true` with no destination is the kind of two-statements-one-
+    /// thing the `[server.tls]` doc already refuses.
+    ///
+    /// This is deliberately **not** the diagnostic log. See `volucer-observe`'s `access_log`
+    /// module: an access log that shared a verbosity filter with diagnostics would be one
+    /// setting away from silence, and both directions are wrong — debugging a worker loud
+    /// floods it, and quieting the diagnostics erases the record of who requested what.
+    #[serde(default)]
+    pub access_log: Option<AccessLogConfig>,
+}
+
+/// The access log's destination and shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessLogConfig {
+    /// Where records are appended. Created if it does not exist.
+    ///
+    /// A relative path resolves against **the directory holding the config file**, the same rule
+    /// `[server.tls]`'s `certificate` follows and for the same reason: a log beside `volucer.toml`
+    /// is the case an operator means, and resolving it against wherever the process happened to
+    /// start is a footgun. `volucer check` prints the path it resolved.
+    pub path: PathBuf,
+
+    /// `"combined"` (nginx's shape plus two timings, the default) or `"json"`.
+    ///
+    /// Parsed strictly rather than defaulted on a typo: quietly choosing a format the operator did
+    /// not ask for produces a log their queries do not match, which is worse than refusing to
+    /// start.
+    #[serde(default)]
+    pub format: AccessLogFormat,
+
+    /// The header an inbound request id is adopted from, and echoed back on.
+    ///
+    /// Defaults to `X-Request-Id`, and **adopting is the default** because "one id across the
+    /// tiers" is the feature: a request id that changes at every hop cannot correlate a client's
+    /// log with ours. Set it to the empty string to always mint a fresh one, which is what nginx
+    /// does — `$request_id` is always its own. The value is validated as an identifier, and a
+    /// client's malformed one is replaced rather than refused; see `volucer-observe`.
+    #[serde(default = "default_request_id_header")]
+    pub request_id_header: String,
+}
+
+/// The header a request id is adopted from, unless a deployment says otherwise.
+fn default_request_id_header() -> String {
+    "X-Request-Id".to_string()
+}
+
+/// How an access-log record is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AccessLogFormat {
+    /// nginx's `combined` shape, with the request and origin timings appended.
+    #[default]
+    #[serde(rename = "combined")]
+    Combined,
+    /// One JSON object per line.
+    #[serde(rename = "json")]
+    Json,
 }
 
 /// The front controller used when neither the config nor the command line says.
@@ -1948,6 +2010,27 @@ impl Config {
 
         self.validate_tls()?;
 
+        // The access log's header must be a usable header name, and the check is here rather than
+        // in the front-end because a bad name is a configuration mistake: `hyper`'s `HeaderName`
+        // rejects a space or a colon, and a header that cannot be read or written would make the
+        // adoption silently never happen — which looks like "tracing does not work" rather than
+        // like a typo.
+        //
+        // The *path* is deliberately not checked here. A missing directory is reported once at
+        // startup by `AccessLog::open`, which is the only place that knows whether the file could
+        // actually be created — `Path::is_dir` here would be a second, weaker answer to the same
+        // question, and a warning that fires on a directory that exists but is not writable would
+        // teach an operator to ignore it.
+        if let Some(log) = &self.server.access_log {
+            if !log.request_id_header.is_empty() && !is_header_name(&log.request_id_header) {
+                return Err(Error::Config(format!(
+                    "server.access_log.request_id_header {:?} is not a valid header name; leave it \
+                     empty to always generate a request id instead of adopting one",
+                    log.request_id_header
+                )));
+            }
+        }
+
         for (name, backend) in &self.backends {
             self.validate_backend(name, backend)?;
         }
@@ -2587,6 +2670,48 @@ impl Config {
 /// characters outside letters, digits, `-` and `_`. A name that is *more* permissive than this
 /// would be accepted here and then fail rustls' own `ServerName` parse at startup, which reports
 /// the failure from a place that cannot say which key it came from.
+/// The access log's path, resolved against the directory holding the config file.
+///
+/// The same rule `[server.tls]`'s `certificate` follows, and stated once so `serve` and `check`
+/// cannot print different paths for one deployment — `check` reports what this returns.
+#[must_use]
+pub fn resolve_access_log_path(path: &Path, config_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir.join(path)
+    }
+}
+
+/// Whether `name` is a header name `hyper` will accept.
+///
+/// An RFC 9110 `token`: no spaces, no colons, no control characters, no non-ASCII. Checked here
+/// because `hyper` accepts a bad name at construction of a `HeaderName` only via `from_bytes`, which
+/// returns an error — and a caller that ignored it would silently never read or write the header.
+fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 fn is_dns_name(name: &str) -> bool {
     // A single trailing dot is a valid absolute name in DNS but rustls' `ServerName` refuses it,
     // and a certificate's SAN never carries it either, so refusing it here says so once.
@@ -5069,6 +5194,126 @@ redirect_to_https = true
         assert!(config.server.tls.is_none());
         assert!(config.server.https.is_none());
         assert!(!config.server.redirect_to_https);
+        // And the same control for the access log: **absent means off**, so an existing deployment
+        // is not changed by upgrading — the rule `static_files` states and this must not break.
+        assert!(config.server.access_log.is_none());
+    }
+
+    #[test]
+    fn an_access_log_table_parses_with_its_defaults() {
+        // The defaults are the interesting part: a deployment that writes only a path gets nginx's
+        // format and `X-Request-Id` adoption without asking, and both are what an operator expects.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.access_log]
+path = "/var/log/volucer/access.log"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("valid");
+        let log = config.server.access_log.expect("the table is present");
+        assert_eq!(log.path, PathBuf::from("/var/log/volucer/access.log"));
+        assert_eq!(log.format, AccessLogFormat::Combined);
+        assert_eq!(log.request_id_header, "X-Request-Id");
+    }
+
+    #[test]
+    fn an_access_log_path_resolves_against_the_config_directory() {
+        // The rule `[server.tls]`'s certificate follows, asserted rather than assumed: a relative
+        // path must not depend on where the process was started, or two deployments of one config
+        // log to different places.
+        let relative =
+            resolve_access_log_path(Path::new("logs/access.log"), Path::new("/etc/volucer"));
+        assert_eq!(relative, PathBuf::from("/etc/volucer/logs/access.log"));
+        // An absolute path is left alone, which is the case a systemd unit writes.
+        let absolute =
+            resolve_access_log_path(Path::new("/var/log/a.log"), Path::new("/etc/volucer"));
+        assert_eq!(absolute, PathBuf::from("/var/log/a.log"));
+    }
+
+    #[test]
+    fn an_empty_request_id_header_is_allowed_and_means_never_adopt() {
+        // The nginx behaviour, reachable by configuration rather than by a second boolean: an
+        // operator gets `$request_id`'s always-generate semantics by emptying one string.
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+
+[server.access_log]
+path = "access.log"
+request_id_header = ""
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config
+            .validate()
+            .expect("an empty header is a decision, not a mistake");
+        assert_eq!(
+            config.server.access_log.expect("present").request_id_header,
+            ""
+        );
+    }
+
+    #[test]
+    fn an_unusable_request_id_header_is_refused_by_name() {
+        // A header name with a space or colon is not a header: `hyper` would reject it at the point
+        // the front-end tried to use it, where the failure looks like "adoption silently never
+        // happens" rather than like a typo. Refused at load, with the key named.
+        for bad in ["X Request Id", "X-Request-Id:", "X-Request-Id ", "X\tId"] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.access_log]\npath = \"a.log\"\nrequest_id_header = \"{bad}\"\n"
+            );
+            let config = Config::from_toml(&text).expect("parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(
+                err.to_string().contains("request_id_header"),
+                "{bad:?} gave {err}"
+            );
+        }
+        // And a legal one passes, so the check is not refusing everything.
+        let text = "[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.access_log]\npath = \"a.log\"\nrequest_id_header = \"X-Trace-Id\"\n";
+        Config::from_toml(text)
+            .expect("parses")
+            .validate()
+            .expect("a legal header name");
+    }
+
+    #[test]
+    fn the_access_log_format_is_read_strictly() {
+        // A typo must be a parse error rather than a quiet fallback: an operator whose queries
+        // expect JSON and who got `combined` has a silently broken pipeline, which is worse than a
+        // refusal that names the key.
+        let good = "[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.access_log]\npath = \"a.log\"\nformat = \"json\"\n";
+        let config = Config::from_toml(good).expect("parses");
+        assert_eq!(
+            config.server.access_log.expect("present").format,
+            AccessLogFormat::Json
+        );
+        for bad in ["clf", "JSONL", "combined "] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.access_log]\npath = \"a.log\"\nformat = \"{bad}\"\n"
+            );
+            assert!(
+                Config::from_toml(&text).is_err(),
+                "{bad:?} was accepted as a format"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_inside_the_access_log_table_is_refused() {
+        // `deny_unknown_fields` on the new table, checked because it is what makes a typo like
+        // `pth` a startup error instead of a log that goes nowhere.
+        let text = "[server]\nhttp = \"127.0.0.1:8080\"\n\n[server.access_log]\npath = \"a.log\"\npth = \"typo\"\n";
+        assert!(Config::from_toml(text).is_err());
+    }
+
+    #[test]
+    fn a_bare_access_log_boolean_is_not_a_table_and_is_refused() {
+        // The `[server.tls]` rule: a table, not a flag. `access_log = true` would be a statement
+        // with no destination, and the two would be able to disagree.
+        let text = "[server]\nhttp = \"127.0.0.1:8080\"\naccess_log = true\n";
+        assert!(Config::from_toml(text).is_err());
     }
 
     #[test]

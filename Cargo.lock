@@ -1706,6 +1706,7 @@ dependencies = [
  "volucer-core",
  "volucer-fcgi",
  "volucer-http",
+ "volucer-observe",
  "volucer-server",
  "x509-parser",
 ]
@@ -1765,6 +1766,7 @@ dependencies = [
  "volucer-acme",
  "volucer-core",
  "volucer-fcgi",
+ "volucer-observe",
  "volucer-server",
  "volucer-upstream",
  "volucer-watch",
@@ -1776,6 +1778,7 @@ name = "volucer-observe"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "httpdate",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -1794,6 +1797,7 @@ dependencies = [
  "tracing",
  "volucer-core",
  "volucer-fcgi",
+ "volucer-observe",
  "volucer-upstream",
  "volucer-watch",
  "volucer-worker",

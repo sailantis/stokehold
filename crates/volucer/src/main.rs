@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
-use volucer_core::config::{Config, MinTlsVersion};
+use volucer_core::config::{resolve_access_log_path, AccessLogFormat, Config, MinTlsVersion};
 use volucer_core::php;
 use volucer_core::sites::Sites;
 use volucer_fcgi::cgi::Routing;
@@ -122,6 +122,47 @@ fn main() -> ExitCode {
     }
 }
 
+/// Build the process's observability handle from configuration.
+///
+/// **This is where "off by default" is decided, and it is the only place.** No `[server.access_log]`
+/// table produces [`Observability::disabled`], which writes nothing and — because the front-end
+/// checks [`Observability::is_enabled`] before building a record — does not allocate a request id's
+/// hex form either. A deployment that has not asked for logging therefore pays one branch per
+/// request, which is what makes the promise checkable rather than merely stated.
+///
+/// The path resolves against the config file's directory, the same rule `[server.tls]`'s
+/// `certificate` follows. A warning about a missing directory is **not** emitted here: `AccessLog`
+/// reports an unopenable file once at runtime, from the only place that knows whether the file could
+/// actually be created, and a second weaker check here would be a warning that fires on a directory
+/// that exists but is not writable — which teaches an operator to ignore it.
+fn build_observability(config: &Config, config_path: &Path) -> volucer_observe::Observability {
+    let Some(log) = &config.server.access_log else {
+        return volucer_observe::Observability::disabled();
+    };
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new(""));
+    let path = resolve_access_log_path(&log.path, config_dir);
+    let format = match log.format {
+        AccessLogFormat::Combined => volucer_observe::access_log::Format::Combined,
+        AccessLogFormat::Json => volucer_observe::access_log::Format::Json,
+    };
+    // An empty header means "never adopt", which is nginx's `$request_id` behaviour and is reachable
+    // by emptying one string rather than by a second boolean that could disagree with this one.
+    let header = match log.request_id_header.trim() {
+        "" => None,
+        name => Some(name.to_string()),
+    };
+    tracing::info!(
+        path = %path.display(),
+        format = ?log.format,
+        adopt = header.as_deref().unwrap_or("(never)"),
+        "access logging enabled"
+    );
+    volucer_observe::Observability::new(
+        volucer_observe::access_log::AccessLog::open(&path, format),
+        header,
+    )
+}
+
 /// `version` prints what is running, and what that build can do.
 ///
 /// The PHP floor is here because it is a build fact an operator has to be able
@@ -144,6 +185,12 @@ fn version() {
     // is printed. Saying "TLS-ALPN-01" rather than "ACME" matters: it is the one challenge this
     // build can perform, and an operator comparing against another server needs to know that.
     println!("  certificates:     ACME (RFC 8555), the tls-alpn-01 challenge");
+    // The access log and trace propagation are advertised as *available*, exactly as ACME is:
+    // whether either is in use is a property of the configuration, and `check` is where a
+    // deployment's own answer is printed. Saying "traceparent" by name matters because it is the
+    // W3C header a client or an nginx in front would send, and an operator comparing against
+    // another server needs to know which spelling this one reads.
+    println!("  observability:    access log (combined or json), W3C tracecontext");
 }
 
 fn init_tracing(verbosity: u8) {
@@ -648,6 +695,16 @@ fn serve(
         (*sites).clone(),
     )));
 
+    // **One observability handle for the whole process**, built before any listener binds.
+    //
+    // One, not one per listener, and for the reason the site table is one: a deployment behind nginx
+    // runs both front-ends, so two access logs would put one application's requests in two files
+    // depending on which protocol received them, and two id sources would make the same request
+    // carry different ids on the two hops. Building it here is also what makes "off by default"
+    // true — `Observability::disabled` is what a config without `[server.access_log]` produces, and
+    // every path below then costs one `is_enabled` check per request.
+    let observe = Arc::new(build_observability(&config, path));
+
     // The FastCGI listener binds first, because binding is synchronous here while
     // the HTTP listener needs a runtime — and an occupied port should be reported
     // before the runtime is built.
@@ -658,7 +715,8 @@ fn serve(
                 Arc::clone(&dispatcher),
                 Arc::clone(&registry),
                 Limits { max_connections },
-            )?;
+            )?
+            .with_observability(Arc::clone(&observe));
             println!("  fastcgi:          {}", listener.local_addr()?);
             Some(listener)
         }
@@ -887,7 +945,8 @@ fn serve(
     // it. Built per listener because the resolver is `Some` for a TLS listener and `None` for a
     // plaintext one, which is what keeps a plaintext listener from carrying TLS state at all.
     let handles_for = |speaks_tls: bool| {
-        let handles = volucer_http::ReloadHandles::new(Arc::clone(&registry));
+        let handles = volucer_http::ReloadHandles::new(Arc::clone(&registry))
+            .with_observability(Arc::clone(&observe));
         match (speaks_tls, &tls_state) {
             (true, Some(resolver)) => handles.with_tls(Arc::clone(resolver)),
             _ => handles,
@@ -1721,6 +1780,53 @@ fn check(
     let mut dirs = extra_php_dirs.to_vec();
     dirs.extend(php::default_search_dirs());
     let found = php::discover(&dirs)?;
+
+    // The access log, reported as the *path this deployment will actually use* rather than the one
+    // written in the file — the same rule the certificate paths follow, and the reason
+    // `resolve_access_log_path` is shared with `serve` instead of reimplemented here. The
+    // silent-reader rule from the upstream step applies: a key a deployment sets that no command
+    // reports is a key an operator cannot confirm.
+    match &config.server.access_log {
+        Some(log) => {
+            let resolved =
+                resolve_access_log_path(&log.path, path.parent().unwrap_or_else(|| Path::new("")));
+            println!("  access log:");
+            println!("    path:   {}", resolved.display());
+            println!(
+                "    format: {}",
+                match log.format {
+                    AccessLogFormat::Combined => "combined (nginx's shape, plus two timings)",
+                    AccessLogFormat::Json => "json (one object per line)",
+                }
+            );
+            println!(
+                "    request id: {}",
+                match log.request_id_header.trim() {
+                    "" => "always generated (adoption off)".to_string(),
+                    name => format!("adopt and echo {name}"),
+                }
+            );
+            // Reported rather than warned about, because serving without an access log is a valid
+            // outcome and the runtime already says so once — this is the *pre-start* answer, which
+            // is what `check` is for.
+            if let Some(parent) = resolved.parent() {
+                if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                    println!(
+                        "    note:   {} does not exist; requests will be served without an access \
+                         log until it does",
+                        parent.display()
+                    );
+                }
+            }
+        }
+        None => println!("  access log: none (server.access_log is unset)"),
+    }
+    // Trace propagation has no config key of its own and needs none: an inbound `traceparent` is
+    // always parsed and continued with a fresh span, and a missing or malformed one starts a new
+    // unsampled trace rather than failing. It is also always forwarded — `to_cgi` maps it to
+    // `HTTP_TRACEPARENT` and no strip list contains it — so PHP sees it without any key to set.
+    // Printed so an operator can confirm that without reading the source.
+    println!("  trace context: W3C traceparent is read, continued, and forwarded to backends");
 
     println!("  PHP binaries:");
     if found.is_empty() {

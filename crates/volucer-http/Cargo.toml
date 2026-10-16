@@ -15,6 +15,10 @@ volucer-watch.workspace = true
 # The HTTP front-end's other half: a request that goes to an origin instead of a backend. Only
 # this crate needs both, because it is the only place that knows which kind a route selected.
 volucer-upstream.workspace = true
+# The request id, the trace context and the access log. Both front-ends need it, and only this
+# crate and `volucer-server` depend on it — see the note in that crate's manifest for why the
+# decision is shared rather than per-listener.
+volucer-observe.workspace = true
 volucer-acme.workspace = true
 volucer-worker.workspace = true
 arc-swap.workspace = true

@@ -495,11 +495,23 @@ impl HttpResponse {
 }
 
 fn http_get(address: &str, path: &str) -> HttpResponse {
+    http_get_with(address, path, &[])
+}
+
+/// The same, with extra request headers — so a test can send the id this server adopts.
+fn http_get_with(address: &str, path: &str, extra: &[(&str, &str)]) -> HttpResponse {
     let mut stream = TcpStream::connect(address).expect("connect to the HTTP listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("a read timeout");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: example.test\r\n");
+    for (name, value) in extra {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("Connection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .expect("write the HTTP request");
@@ -2681,5 +2693,170 @@ fn an_acme_configured_server_serves_its_cached_certificate() {
     );
 
     drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **The assertion that the access log and the request id actually happen.**
+///
+/// Written as a request through `serve` rather than as a unit test of the formatter, for the reason
+/// hazard 68 states: the formatter, the config and the sink can each be perfect while the front-end
+/// never calls any of them, and the result looks exactly like a working deployment.
+///
+/// Three things are asserted from one server, because they are one feature:
+///
+/// 1. A client's `X-Request-Id` is **adopted verbatim** and echoed on the response, so the client can
+///    find its own id in this server's log.
+/// 2. A request without one gets a **32-character generated id**, which is nginx's `$request_id`
+///    shape.
+/// 3. Both appear in the log file, on **nginx-shaped lines**, with the status the client was given.
+///
+/// The ids are read back from the file rather than from the response, because the response could be
+/// right while the file says something else — and the file is what an operator greps.
+#[test]
+fn the_access_log_records_the_id_the_client_sees() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-access-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = "."
+static_files = false
+
+[server.access_log]
+path = "access.log"
+format = "combined"
+"#,
+    )
+    .expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server did not start with an access log configured");
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+
+    // A client that already has an id: it must come back unchanged, including the hyphens that make
+    // it a UUID rather than 32 hex characters **and including its letter case**. This is the case an
+    // implementation that re-rendered an adopted id would fail, and it is the whole point of
+    // adopting one — a normalised value is not findable in the client's own log.
+    //
+    // The uppercase hex is deliberate rather than incidental: a first version of this test used an
+    // all-lowercase UUID, and lowercasing the echo then passed it, so the assertion was proving
+    // nothing about verbatim-ness. A value that already matches its normalised form cannot test a
+    // normalisation.
+    let adopted = "3F2504E0-4f89-11D3-9A0C-0305E82C3301";
+    let answer = http_get_with(&address, "/one", &[("X-Request-Id", adopted)]);
+    assert_eq!(
+        answer.header("x-request-id"),
+        Some(adopted),
+        "an adopted id must be echoed verbatim: {answer:?}"
+    );
+
+    // A client with no id: one is minted, and it must be nginx's shape so one `awk` reads this log
+    // and an nginx log in front of it.
+    let answer = http_get(&address, "/two");
+    let generated = answer
+        .header("x-request-id")
+        .expect("an id is always echoed, including on an error")
+        .to_string();
+    assert_eq!(generated.len(), 32, "{generated:?} is not nginx's shape");
+    assert!(
+        generated.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{generated:?} is not hex"
+    );
+
+    // **Read the file, after the response.** The log is flushed per record, so both lines are on
+    // disk by now; if that flush were removed this test would fail intermittently, which is exactly
+    // the property a "log you can trust after a crash" claim needs.
+    let log = std::fs::read_to_string(root.join("access.log")).expect("the access log was written");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "one line per request: {log}");
+    assert!(
+        lines[0].contains(adopted),
+        "the adopted id is not in the log: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains(&generated),
+        "the generated id is not in the log: {}",
+        lines[1]
+    );
+    for (line, target) in lines.iter().zip(["/one", "/two"]) {
+        // nginx's field order, so a script written for nginx reads this. The timestamp is two
+        // tokens because `$time_local` includes the `+0000` offset, exactly as nginx's does.
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), 15, "field count of {line:?}");
+        assert_eq!(fields[0], "127.0.0.1", "the peer: {line:?}");
+        assert_eq!(fields[5], "\"GET", "the request begins: {line:?}");
+        assert_eq!(fields[6], target, "the target: {line:?}");
+        assert_eq!(fields[7], "HTTP/1.1\"", "the protocol: {line:?}");
+        // The status is what the *client* was given, so the log and the answer cannot disagree.
+        assert!(fields[8].parse::<u16>().is_ok(), "no status in {line:?}");
+        assert_eq!(
+            fields[13], "-",
+            "no origin, so a dash and not zero: {line:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A deployment with no `[server.access_log]` writes nothing and still serves.
+///
+/// The control for "off by default changes nothing", asserted as a request rather than as a config
+/// check: the file must not exist, and the response must not carry an id header — a deployment that
+/// did not ask for observability must not have it appear on its responses, because a client may act
+/// on one.
+#[test]
+fn no_access_log_config_means_no_log_file_and_no_id_header() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-no-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[server]
+http = "127.0.0.1:0"
+document_root = "."
+static_files = false
+"#,
+    )
+    .expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server did not start");
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+
+    let answer = http_get(&address, "/anything");
+    assert!(
+        answer.header("x-request-id").is_none(),
+        "an id was echoed on a deployment that never asked for one: {answer:?}"
+    );
+    assert!(
+        !root.join("access.log").exists(),
+        "a log file was created with no [server.access_log]"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -20,9 +20,11 @@
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use volucer_core::sites::Sites;
+use volucer_observe::access_log::Record;
+use volucer_observe::{Observability, RequestContext};
 use volucer_watch::{Registry, SharedState};
 
 use crate::dispatch::Dispatcher;
@@ -100,6 +102,13 @@ pub struct FastCgiListener {
     shutdown: Arc<AtomicBool>,
     stats: Arc<Stats>,
     limits: Limits,
+    /// Request identity and the access log, shared with the HTTP front-end.
+    ///
+    /// One `Arc` for the process rather than one per listener: a deployment behind nginx runs both
+    /// front-ends, and two access logs would mean one application's requests appear in two files
+    /// depending on which front-end received them. Defaults to disabled so every existing caller
+    /// and test is unchanged — the "off by default costs nothing" rule, made structural.
+    observe: Arc<volucer_observe::Observability>,
 }
 
 impl FastCgiListener {
@@ -155,7 +164,20 @@ impl FastCgiListener {
             shutdown: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Stats::default()),
             limits,
+            observe: Arc::new(volucer_observe::Observability::disabled()),
         })
+    }
+
+    /// The same listener with request identity and an access log.
+    ///
+    /// A builder rather than another argument on [`FastCgiListener::bind_registered`], because the
+    /// observability handle is a process-wide thing that only `serve` has: every existing caller
+    /// and every test constructs a listener without one, and those must keep compiling and keep
+    /// costing nothing.
+    #[must_use]
+    pub fn with_observability(mut self, observe: Arc<volucer_observe::Observability>) -> Self {
+        self.observe = observe;
+        self
     }
 
     /// The site table this listener serves from, shared with every other front-end.
@@ -221,6 +243,7 @@ impl FastCgiListener {
                     let stats = Arc::clone(&self.stats);
                     let shutdown = Arc::clone(&self.shutdown);
                     let max_connections = self.limits.max_connections;
+                    let observe = Arc::clone(&self.observe);
                     handlers.retain(|handle: &std::thread::JoinHandle<()>| !handle.is_finished());
                     handlers.push(std::thread::spawn(move || {
                         if let Err(err) = serve_connection(
@@ -230,6 +253,7 @@ impl FastCgiListener {
                             stats,
                             shutdown,
                             max_connections,
+                            observe,
                         ) {
                             tracing::debug!(%peer, %err, "connection ended");
                         }
@@ -273,6 +297,65 @@ impl ShutdownHandle {
     }
 }
 
+/// A request's CGI parameter, as text, if it is there and is valid UTF-8.
+///
+/// The environment is bytes, and a header value with an invalid byte is not a reason to refuse the
+/// request — it just cannot be a request id or a trace context, so `None` is the honest answer and
+/// the caller mints a fresh one.
+fn param<'a>(params: &'a [(Vec<u8>, Vec<u8>)], name: &[u8]) -> Option<&'a str> {
+    let (_, value) = params.iter().find(|(key, _)| key.as_slice() == name)?;
+    std::str::from_utf8(value).ok()
+}
+
+/// The status the client will see for a failed dispatch.
+///
+/// Read off the same classification the error response uses, so the log and the answer cannot
+/// disagree. `AllBusy` is a 503 because a full pool is temporary; the rest are a 502, which is what
+/// a gateway says when the thing behind it failed.
+fn server_error_status(err: &ServerError) -> u16 {
+    match err {
+        ServerError::AllBusy { .. } => 503,
+        _ => 502,
+    }
+}
+
+/// Write one access-log record for a request that arrived over FastCGI.
+///
+/// A free function rather than a method: it needs the request environment, the context and the
+/// elapsed time, none of which belong to the listener.
+///
+/// **`REMOTE_ADDR` here is nginx's address, not the client's**, and that is the correct thing to
+/// log: this listener's peer really is nginx, and nginx's own access log carries the real client.
+/// Writing the header nginx put in `X-Forwarded-For` instead would make this log assert a peer it
+/// never saw, which is the one thing a log must not do.
+fn record_fastcgi(
+    observe: &Observability,
+    context: &RequestContext,
+    request: &volucer_fcgi::Request,
+    status: u16,
+    bytes_sent: u64,
+    elapsed: std::time::Duration,
+) {
+    let params = request.params.as_slice();
+    let id = context.id.as_str();
+    observe.access_log().record(&Record {
+        id: &id,
+        method: param(params, b"REQUEST_METHOD").unwrap_or("-"),
+        target: param(params, b"REQUEST_URI").unwrap_or("-"),
+        protocol: param(params, b"SERVER_PROTOCOL").unwrap_or("-"),
+        peer: param(params, b"REMOTE_ADDR").and_then(|value| value.parse().ok()),
+        host: param(params, b"HTTP_HOST").or_else(|| param(params, b"SERVER_NAME")),
+        user_agent: param(params, b"HTTP_USER_AGENT"),
+        referer: param(params, b"HTTP_REFERER"),
+        status,
+        total_seconds: elapsed.as_secs_f64(),
+        // FastCGI has no separately-timed origin: the backend *is* the origin, and PHP's own
+        // duration arrives in the worker protocol's `END` frame rather than as a header here.
+        origin_seconds: None,
+        bytes_sent,
+    });
+}
+
 /// Serve requests on one connection until the peer closes or keep-alive ends.
 fn serve_connection(
     stream: std::net::TcpStream,
@@ -281,6 +364,7 @@ fn serve_connection(
     stats: Arc<Stats>,
     shutdown: Arc<AtomicBool>,
     max_connections: usize,
+    observe: Arc<volucer_observe::Observability>,
 ) -> Result<()> {
     // On Windows an accepted socket inherits the listener's non-blocking mode,
     // so this must be reset explicitly. Without it every read returns
@@ -372,6 +456,15 @@ fn serve_connection(
         // connection. That is what this line was written to fix, and the test pins it.
         let snapshot = sites.sites();
         let site = snapshot.resolve(host.as_deref());
+        // **Identity is resolved per request, here, on the request path.** nginx keeps its upstream
+        // alive, so the next request very often arrives on a connection accepted long before it; a
+        // per-connection id would give two requests the same id, which is worse than no id at all
+        // because it looks like correlation and is not.
+        let context = observe.begin(
+            param(request.params.as_slice(), b"HTTP_X_REQUEST_ID"),
+            param(request.params.as_slice(), b"HTTP_TRACEPARENT"),
+        );
+        let started = Instant::now();
         let response = dispatcher.dispatch_with_routes(&site.routes, &request);
         match response {
             Ok(response) => {
@@ -392,10 +485,39 @@ fn serve_connection(
                     &response.stderr,
                     keep_conn,
                 )?;
+                // **Logged after the answer is written, and that order is a decision.** A record
+                // written before the bytes leave would claim a delivery that a failed write then
+                // contradicts, and the write is the part that can fail. The status is the one the
+                // backend actually sent — the same `parse` this front-end relies on, so the log
+                // cannot disagree with what the client was told.
+                if observe.is_enabled() {
+                    let (status, _, body) = response.parse();
+                    record_fastcgi(
+                        &observe,
+                        &context,
+                        &request,
+                        status,
+                        body.len() as u64,
+                        started.elapsed(),
+                    );
+                }
             }
             Err(err) => {
                 stats.failed.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(%err, "dispatch failed");
+                // A failed request is logged too, and with the status the *client* will see. An
+                // access log that only records successes is the one an operator needs least: the
+                // 502s are why they are reading it.
+                if observe.is_enabled() {
+                    record_fastcgi(
+                        &observe,
+                        &context,
+                        &request,
+                        server_error_status(&err),
+                        0,
+                        started.elapsed(),
+                    );
+                }
                 fastcgi::write_error(
                     stream.get_mut(),
                     request_id,

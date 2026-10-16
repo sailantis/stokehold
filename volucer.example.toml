@@ -177,6 +177,44 @@ fastcgi = "127.0.0.1:9080"
 # max_multirange_bytes = 1048576   # a multi-range answer is buffered, so it is capped
 
 # ---------------------------------------------------------------------------
+# The access log: one line per completed request, written to its own file.
+#
+# Absent is OFF, and that is the default so an existing deployment is not changed
+# by upgrading. It is deliberately **not** the diagnostic log: an access log that
+# shared a verbosity filter with diagnostics would be one setting away from
+# silence — debugging a worker loud would flood it, and quieting the diagnostics
+# would erase the record of who requested what.
+#
+# A relative path resolves against the directory holding this file, the same rule
+# [server.tls]'s `certificate` follows. `volucer check` prints the path it
+# resolved. A missing directory is reported once at startup and requests are
+# served without the log — a lost log is not a reason to stop serving.
+# ---------------------------------------------------------------------------
+# [server.access_log]
+# path = "logs/access.log"
+# format = "combined"            # "combined" (nginx's shape + two timings) or "json"
+# request_id_header = "X-Request-Id"
+#   The header an inbound request id is adopted from, and echoed back on. Adopting
+#   is the default because "one id across the tiers" is the feature: a request id
+#   that changes at every hop cannot correlate a client's log with this one.
+#   Set it to "" to always generate a fresh one instead, which is what nginx does.
+#   A malformed value from a client is replaced rather than refused.
+#
+# The line is nginx's `combined` format with three fields appended, so a script
+# written for nginx keeps working and reads this too:
+#
+#   127.0.0.1 - - [16/Oct/2026:21:35:05 +0000] "GET /x HTTP/1.1" 200 21 "-" "curl/8" 0.012 0.004 3f2504e0...
+#                                                                                        ^     ^     ^
+#                                    whole request (includes the client's own upload) -----+     |     |
+#                                    to the origin's first byte, or "-" if there was none ------+     |
+#                                    the request id, exactly as the client sent it ------------------+
+#
+# Spaces, quotes, backslashes and newlines inside a header are escaped as
+# \x20, \x22, \x5C and \n, because the format is space-separated and line-based:
+# an unescaped space in a User-Agent would otherwise let a client write fields of
+# this log line.
+
+# ---------------------------------------------------------------------------
 # Persistent worker pool: the PHP process boots the application once and stays
 # resident. volucer talks to it over the child's stdin/stdout pipes using its
 # own framed protocol. State is NOT reset by PHP per request, so the

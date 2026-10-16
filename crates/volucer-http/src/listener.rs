@@ -28,12 +28,12 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper::header::{HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -240,6 +240,12 @@ struct FrontEnd {
     redirect_to_https: bool,
     /// The port a redirect should name, when it differs from this listener's own.
     https_port: Option<u16>,
+    /// Request identity and the access log, shared with the FastCGI front-end.
+    ///
+    /// One `Arc` for the process rather than one per listener, for the reason the site table is:
+    /// a deployment behind nginx runs both front-ends, and two access logs would mean the same
+    /// application's requests appear in two files depending on which front-end received them.
+    observe: Arc<volucer_observe::Observability>,
 }
 
 impl FrontEnd {
@@ -278,16 +284,35 @@ pub struct ReloadHandles {
     /// is what moves. It is `None` on a deployment with no `[server.tls]`, and a plaintext
     /// listener therefore carries no TLS state at all.
     pub tls: Option<Arc<crate::tls::SniResolver>>,
+    /// Request identity and the access log, shared by **every** front-end.
+    ///
+    /// Here rather than on the listener, and here rather than as another argument, because this
+    /// struct already means "what a front-end must be handed that a reload may also move". A
+    /// deployment behind nginx runs the HTTP listener *and* the FastCGI one, so a request id that
+    /// only one assigned, or an access log only one wrote, would make the same application's
+    /// requests appear differently depending on which front-end received them — the same
+    /// one-front-end-only failure the shared site table exists to prevent.
+    ///
+    /// Defaults to disabled, so `ReloadHandles::new` keeps costing nothing.
+    pub observe: Arc<volucer_observe::Observability>,
 }
 
 impl ReloadHandles {
-    /// Handles built around a site table, with no TLS.
+    /// Handles built around a site table, with no TLS and no observability.
     pub fn new(registry: Arc<Registry>) -> Self {
         ReloadHandles {
             shared: registry.shared().clone(),
             registry,
             tls: None,
+            observe: Arc::new(volucer_observe::Observability::disabled()),
         }
+    }
+
+    /// The same, with request identity and an access log.
+    #[must_use]
+    pub fn with_observability(mut self, observe: Arc<volucer_observe::Observability>) -> Self {
+        self.observe = observe;
+        self
     }
 
     /// The same, for a listener that speaks TLS.
@@ -748,6 +773,7 @@ impl HttpListener {
                 server_port: port,
                 redirect_to_https,
                 https_port: Some(https_port),
+                observe: Arc::clone(&handles.observe),
             }),
             tls: acceptor,
             accept_plain,
@@ -990,7 +1016,28 @@ async fn handle(
     remote_addr: String,
     cleartext: bool,
 ) -> Response<ResponseBody> {
-    match prepare(request, &front_end, remote_addr, cleartext).await {
+    // Identity first, before anything can fail. A request that is rejected, redirected or 404s
+    // still needs an id — those are precisely the requests an operator correlates against a
+    // client's report — so this is taken before `prepare`, not inside it.
+    let context = front_end.observe.begin(
+        header_str(request.headers(), volucer_observe::REQUEST_ID_HEADER),
+        header_str(request.headers(), volucer_observe::TRACEPARENT_HEADER),
+    );
+    let started = Instant::now();
+    // The request parts are needed for the record afterwards, so they are taken now rather than
+    // inside `prepare`: consuming the request there would leave nothing to log.
+    let method = request.method().as_str().to_owned();
+    let target = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
+    let protocol = format!("{:?}", request.version());
+    let host = header_str(request.headers(), "host").map(str::to_owned);
+    let user_agent = header_str(request.headers(), "user-agent").map(str::to_owned);
+    let referer = header_str(request.headers(), "referer").map(str::to_owned);
+    let peer: Option<std::net::IpAddr> = remote_addr.parse().ok();
+
+    let mut response = match prepare(request, &front_end, remote_addr, cleartext).await {
         Ok(response) => {
             front_end.stats.requests.fetch_add(1, Ordering::Relaxed);
             response
@@ -1000,7 +1047,55 @@ async fn handle(
             tracing::warn!(status = err.status(), %err, "http request failed");
             error_response(&err)
         }
+    };
+
+    // **The id is echoed on every answer, including error pages.** A client that sends an id and
+    // cannot find it on the response has no way to quote it, and an error is the case where they
+    // most need to. Written after the handler so it cannot be overwritten by a backend that
+    // happened to send its own.
+    if let Some(name) = front_end.observe.id_header() {
+        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+            if let Ok(value) = HeaderValue::from_str(&context.id.as_str()) {
+                response.headers_mut().insert(name, value);
+            }
+        }
     }
+
+    if front_end.observe.is_enabled() {
+        // The body's exact length when the body knows it, and `0` when it does not. A `Full<Bytes>`
+        // answer from a backend knows it; a streamed static file or an origin's `Incoming` does not,
+        // and the count only exists after the write. Wrapping every response body in a counter to
+        // get the real figure would put a task on the hot path for one log field, so this reports
+        // what is known and the README says which bodies report zero.
+        let bytes_sent = response.body().size_hint().exact().unwrap_or(0);
+        let id = context.id.as_str();
+        front_end
+            .observe
+            .access_log()
+            .record(&volucer_observe::access_log::Record {
+                id: &id,
+                method: &method,
+                target: &target,
+                protocol: &protocol,
+                peer,
+                host: host.as_deref(),
+                user_agent: user_agent.as_deref(),
+                referer: referer.as_deref(),
+                status: response.status().as_u16(),
+                total_seconds: started.elapsed().as_secs_f64(),
+                origin_seconds: None,
+                bytes_sent,
+            });
+    }
+    response
+}
+
+/// One request header as text, if it is present and is valid UTF-8.
+///
+/// A header with an invalid byte is not a reason to refuse the request: it simply cannot be a
+/// request id or a trace context, so `None` is the honest answer.
+fn header_str<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 /// The authority a redirect should name.

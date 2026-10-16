@@ -12,6 +12,11 @@ volucer-core.workspace = true
 volucer-fcgi.workspace = true
 volucer-worker.workspace = true
 volucer-watch.workspace = true
+# The request id, the trace context and the access log. Here rather than only in the HTTP
+# front-end because **both** front-ends must assign the same id and write the same log — a
+# deployment behind nginx runs both, and one of them logging differently is the defect the
+# shared reload state exists to prevent, one layer up.
+volucer-observe.workspace = true
 # The fourth backend kind. This crate already held hyper's *server* types indirectly through
 # `volucer-http`, but the client is what a pooled origin connection needs, and a backend is the
 # thing that owns a connection pool — so it belongs here rather than in the listener, which only

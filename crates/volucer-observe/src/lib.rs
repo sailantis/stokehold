@@ -46,6 +46,140 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod access_log;
 
+use std::time::Instant;
+
+/// Everything a front-end needs to identify and log a request, in one value.
+///
+/// **One value rather than arguments, because there are two front-ends.** The reload state is
+/// shared for exactly the same reason (`volucer-watch`): a request id that only one front-end
+/// assigned, or an access log only one of them wrote, would mean the same deployment logs one id
+/// for a direct request and a different one for the same request proxied through nginx. A type both
+/// listeners must be handed is harder to forget than a convention both are expected to follow.
+pub struct Observability {
+    access_log: access_log::AccessLog,
+    /// The header to adopt and echo, or `None` to always mint our own.
+    id_header: Option<String>,
+}
+
+impl Observability {
+    /// Build from an access log and an optional id header.
+    #[must_use]
+    pub fn new(access_log: access_log::AccessLog, id_header: Option<String>) -> Self {
+        Self {
+            access_log,
+            id_header,
+        }
+    }
+
+    /// The configuration with no logging at all, which is the default.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            access_log: access_log::AccessLog::disabled(),
+            // No header means no adoption *and* no echo: a deployment that has not asked for an id
+            // should not have one appear on its responses, because a client may act on it.
+            id_header: None,
+        }
+    }
+
+    /// The access log, for a caller that wants to check [`access_log::AccessLog::is_enabled`] or
+    /// flush at shutdown.
+    #[must_use]
+    pub fn access_log(&self) -> &access_log::AccessLog {
+        &self.access_log
+    }
+
+    /// The header name this server adopts and echoes, if any.
+    #[must_use]
+    pub fn id_header(&self) -> Option<&str> {
+        self.id_header.as_deref()
+    }
+
+    /// Whether anything will be recorded.
+    ///
+    /// A front-end uses this to skip the work — including the `Cow::Owned` a generated id
+    /// allocates — when the deployment has not asked for logging.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.access_log.is_enabled()
+    }
+
+    /// Resolve the identity of an inbound request.
+    ///
+    /// **The one place adoption, generation and trace continuation are decided.** Both front-ends
+    /// call this, so they cannot answer "which id is this request" differently.
+    ///
+    /// `client_id` and `client_traceparent` are the raw header values as they arrived, or `None`.
+    #[must_use]
+    pub fn begin(
+        &self,
+        client_id: Option<&str>,
+        client_traceparent: Option<&str>,
+    ) -> RequestContext {
+        // A value is only even considered when a header is configured: with none, the client cannot
+        // influence the id at all, which is the stricter default.
+        let id = match self.id_header {
+            Some(_) => client_id
+                .and_then(RequestId::parse)
+                .unwrap_or_else(RequestId::generate),
+            None => RequestId::generate(),
+        };
+        let trace = match client_traceparent.and_then(TraceContext::parse) {
+            // The client's trace, our own span — see `TraceContext::continuing`. Its sampling
+            // decision is respected rather than overridden: whether to record a trace is the
+            // originating service's call, and a proxy that flipped the bit would make every span
+            // downstream appear regardless of what the caller asked for.
+            Some(client) => TraceContext::continuing(client.trace_id(), client.sampled()),
+            // A new trace starts **unsampled**. This server's own log is written regardless of the
+            // flag — the two are independent, and tying our access log to a tracing concept would
+            // make it disappear when a sampler said so. Starting at `00` leaves the decision to the
+            // first service that actually collects spans, which is the only party that knows what
+            // it costs.
+            None => TraceContext::new(false),
+        };
+        RequestContext {
+            id,
+            trace,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Observability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Observability")
+            .field("access_log", &self.access_log)
+            .field("id_header", &self.id_header)
+            .finish()
+    }
+}
+
+/// A request's identity, resolved once at the top of whichever front-end received it.
+///
+/// The `Instant` is here rather than taken by the caller so that "when did this request start" has
+/// one answer — the same reason the id does. `Timing` in the FastCGI front-end already measured this
+/// for the HTTP front-end's equivalent, and this supersedes it by being shared.
+pub struct RequestContext {
+    /// The id to log and to echo.
+    pub id: RequestId,
+    /// The trace to propagate.
+    pub trace: TraceContext,
+    started: Instant,
+}
+
+impl RequestContext {
+    /// How long the request has taken so far, in seconds.
+    ///
+    /// Seconds as an `f64` rather than a `Duration`, because that is the unit both the text format
+    /// and the JSON format express and converting once here keeps the two formats from disagreeing
+    /// about rounding.
+    #[must_use]
+    pub fn elapsed_seconds(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+}
+
 /// The header an inbound request id is read from, and the one the response echoes.
 ///
 /// Lowercase, because HTTP/1.1 header names are case-insensitive and `hyper`'s `HeaderName` is
@@ -653,5 +787,93 @@ mod tests {
         fallback_fill(&mut second);
         assert_ne!(first, second, "the same nanosecond must not collide");
         assert_ne!(first, [0u8; 16]);
+    }
+
+    fn observing(header: Option<&str>) -> Observability {
+        Observability::new(
+            access_log::AccessLog::disabled(),
+            header.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn a_client_id_is_adopted_only_when_a_header_is_configured() {
+        // The stricter default, and the one that would be silently wrong the other way: with no
+        // header configured, a client's `X-Request-Id` must not influence the log at all. An
+        // implementation that read the header regardless would pass a test that only checked the
+        // configured case.
+        let configured = observing(Some(REQUEST_ID_HEADER));
+        assert_eq!(
+            configured.begin(Some("abc-123"), None).id.as_str(),
+            "abc-123"
+        );
+
+        let unconfigured = observing(None);
+        let resolved = unconfigured.begin(Some("abc-123"), None);
+        assert_ne!(resolved.id.as_str(), "abc-123", "the client had a say");
+        assert_eq!(
+            resolved.id.as_str().len(),
+            32,
+            "a minted id is nginx-shaped"
+        );
+    }
+
+    #[test]
+    fn a_refused_client_id_becomes_a_fresh_one_rather_than_an_error() {
+        // A malformed id is a new id, never a 400: the front-end must not be able to turn a
+        // client's bad header into a failed request, and this is where that is decided.
+        let observing = observing(Some(REQUEST_ID_HEADER));
+        for value in ["bad value", "", "a\nb"] {
+            let resolved = observing.begin(Some(value), None);
+            assert_eq!(resolved.id.as_str().len(), 32, "{value:?} was adopted");
+        }
+        // And an absent header is the same answer as a bad one.
+        assert_eq!(observing.begin(None, None).id.as_str().len(), 32);
+    }
+
+    #[test]
+    fn an_inbound_trace_is_continued_and_a_missing_one_starts_unsampled() {
+        // **Two decisions in one place, and both matter.** An inbound trace keeps its trace id and
+        // takes a new span id — a proxy that kept the span id too would make two hops claim to be
+        // one. And a request with no trace starts **unsampled**, so accepting a `traceparent` is
+        // not the same as being asked to record a trace.
+        let observing = observing(None);
+        let client = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let continued = observing.begin(None, Some(client));
+        assert_eq!(
+            continued.trace.trace_id_hex(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_ne!(continued.trace.span_id_hex(), "00f067aa0ba902b7");
+        assert!(
+            continued.trace.sampled(),
+            "the caller's decision was reversed"
+        );
+
+        let fresh = observing.begin(None, None);
+        assert!(
+            !fresh.trace.sampled(),
+            "a new trace must not claim to be recorded"
+        );
+        assert_ne!(fresh.trace.trace_id(), [0u8; 16]);
+
+        // A broken traceparent starts a fresh trace rather than failing — the same rule as the id.
+        let broken = observing.begin(None, Some("not-a-traceparent"));
+        assert!(!broken.trace.sampled());
+        assert_ne!(broken.trace.trace_id(), [0u8; 16]);
+    }
+
+    #[test]
+    fn the_clock_starts_at_begin() {
+        // The other half of "one answer per question": the id and the elapsed time are taken in the
+        // same call, so a front-end cannot log an id from before the work and a duration from after
+        // it. Asserted by waiting, because a zero duration would also pass an equality check.
+        let context = observing(None).begin(None, None);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            context.elapsed_seconds() >= 0.005,
+            "{}",
+            context.elapsed_seconds()
+        );
     }
 }

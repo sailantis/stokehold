@@ -306,9 +306,9 @@ const PHP_EXTENSIONS: [&[u8]; 3] = [b".php", b".php3", b".phtml"];
 
 /// Whether a byte slice ends with one of [`PHP_EXTENSIONS`], case-insensitively.
 fn php_extension_of(bytes: &[u8]) -> bool {
-    PHP_EXTENSIONS
-        .iter()
-        .any(|ext| bytes.len() >= ext.len() && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext))
+    PHP_EXTENSIONS.iter().any(|ext| {
+        bytes.len() >= ext.len() && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    })
 }
 
 /// Percent-decode a URL path.
@@ -692,7 +692,11 @@ mod tests {
             ..Routing::default()
         };
 
-        for path in ["/caf\u{e9}", "/\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", "/a\u{1f600}b"] {
+        for path in [
+            "/caf\u{e9}",
+            "/\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+            "/a\u{1f600}b",
+        ] {
             match route(path, &routing) {
                 Route::Script { script_name, .. } => assert_eq!(script_name, "/index.php"),
                 other => panic!("{path}: expected the front controller, got {other:?}"),

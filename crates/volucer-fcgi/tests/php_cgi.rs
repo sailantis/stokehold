@@ -108,7 +108,10 @@ impl PhpCgi {
             endpoint: Endpoint::Pipe(name),
         };
         if !server.wait_until_listening(Duration::from_secs(10)) {
-            panic!("php-cgi did not start listening on pipe {}", server.endpoint);
+            panic!(
+                "php-cgi did not start listening on pipe {}",
+                server.endpoint
+            );
         }
         Some(server)
     }
@@ -119,7 +122,11 @@ impl PhpCgi {
             if let Some(status) = self.child.try_wait().expect("poll php-cgi") {
                 panic!("php-cgi exited during startup with {status}");
             }
-            if self.endpoint.connect(Some(Duration::from_millis(250))).is_ok() {
+            if self
+                .endpoint
+                .connect(Some(Duration::from_millis(250)))
+                .is_ok()
+            {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -464,7 +471,10 @@ fn serves_a_script_over_a_named_pipe() {
         "body missing from the pipe response: {stdout:?}"
     );
     let (status, headers) = response.parse_status_headers();
-    assert_eq!(status, 200, "php-cgi defaults to 200 over a pipe too: {stdout:?}");
+    assert_eq!(
+        status, 200,
+        "php-cgi defaults to 200 over a pipe too: {stdout:?}"
+    );
     assert!(
         header(&headers, "Content-type").is_some(),
         "php-cgi sends a Content-type header over a pipe: {headers:?}"

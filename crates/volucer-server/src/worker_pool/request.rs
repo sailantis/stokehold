@@ -3,14 +3,12 @@
 //! which is why it is testable on its own, and why the borrowed path can be compared
 //! byte-for-byte against the owning one.
 
-
 use std::borrow::Cow;
 use volucer_fcgi::{NameValuePairs, Request};
 use volucer_worker::{BorrowedHeaders, Codec, Json, RequestHeader, RequestHeaderJson};
 
 #[cfg(test)]
 use super::params;
-
 
 /// A CGI parameter as a borrowed string, lossily for the same reason the owned path is.
 ///
@@ -357,165 +355,169 @@ fn header_name(cgi_suffix: &str) -> String {
     name
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-#[test]
-fn cgi_header_names_are_rebuilt_in_canonical_form() {
-    assert_eq!(header_name("ACCEPT_ENCODING"), "Accept-Encoding");
-    assert_eq!(header_name("HOST"), "Host");
-    assert_eq!(header_name("X_FORWARDED_FOR"), "X-Forwarded-For");
-    assert_eq!(header_name("USER_AGENT"), "User-Agent");
-}
-
-/// The stack-buffer rendering must agree with the owning one, name for name.
-///
-/// `render_http_header_name` exists so a request header's name is never heap-allocated, and it
-/// is a second implementation of what `header_name` does — which is exactly the kind of pair
-/// that drifts. It also has to answer `None` rather than truncate for a name it cannot render,
-/// because a silently shortened header name would reach the application as a different header.
-#[test]
-fn the_stack_buffer_rendering_agrees_with_the_owning_one() {
-    let names = [
-        "HTTP_",
-        "HTTP_HOST",
-        "HTTP_ACCEPT_ENCODING",
-        "HTTP_X_FORWARDED_FOR",
-        "HTTP_CONTENT_TYPE",
-        "HTTP_A",
-        "HTTP_A_B_C_D",
-        "HTTP_USER_AGENT",
-        // Already canonical, so the fold is a no-op.
-        "HTTP_Host",
-    ];
-    for name in names {
-        let suffix = name.strip_prefix("HTTP_").unwrap_or(name);
-        let mut stack = [0u8; HTTP_HEADER_NAME_CAPACITY];
-        let rendered = render_http_header_name(suffix, &mut stack)
-            .unwrap_or_else(|| panic!("{name} did not fit the stack buffer"));
-        assert_eq!(rendered, header_name(suffix), "{name}");
+    #[test]
+    fn cgi_header_names_are_rebuilt_in_canonical_form() {
+        assert_eq!(header_name("ACCEPT_ENCODING"), "Accept-Encoding");
+        assert_eq!(header_name("HOST"), "Host");
+        assert_eq!(header_name("X_FORWARDED_FOR"), "X-Forwarded-For");
+        assert_eq!(header_name("USER_AGENT"), "User-Agent");
     }
 
-    // A name that cannot fit is refused rather than truncated: the rendered name can never be
-    // longer than its suffix, so the capacity is the only limit.
-    let long = "A".repeat(HTTP_HEADER_NAME_CAPACITY + 1);
-    let mut stack = [0u8; HTTP_HEADER_NAME_CAPACITY];
-    assert!(render_http_header_name(&long, &mut stack).is_none());
+    /// The stack-buffer rendering must agree with the owning one, name for name.
+    ///
+    /// `render_http_header_name` exists so a request header's name is never heap-allocated, and it
+    /// is a second implementation of what `header_name` does — which is exactly the kind of pair
+    /// that drifts. It also has to answer `None` rather than truncate for a name it cannot render,
+    /// because a silently shortened header name would reach the application as a different header.
+    #[test]
+    fn the_stack_buffer_rendering_agrees_with_the_owning_one() {
+        let names = [
+            "HTTP_",
+            "HTTP_HOST",
+            "HTTP_ACCEPT_ENCODING",
+            "HTTP_X_FORWARDED_FOR",
+            "HTTP_CONTENT_TYPE",
+            "HTTP_A",
+            "HTTP_A_B_C_D",
+            "HTTP_USER_AGENT",
+            // Already canonical, so the fold is a no-op.
+            "HTTP_Host",
+        ];
+        for name in names {
+            let suffix = name.strip_prefix("HTTP_").unwrap_or(name);
+            let mut stack = [0u8; HTTP_HEADER_NAME_CAPACITY];
+            let rendered = render_http_header_name(suffix, &mut stack)
+                .unwrap_or_else(|| panic!("{name} did not fit the stack buffer"));
+            assert_eq!(rendered, header_name(suffix), "{name}");
+        }
 
-    // Non-ASCII would case-fold differently byte-wise than character-wise, so it goes to the
-    // owning path rather than being folded here.
-    let mut stack = [0u8; HTTP_HEADER_NAME_CAPACITY];
-    assert!(render_http_header_name("CAFÉ", &mut stack).is_none());
-}
+        // A name that cannot fit is refused rather than truncated: the rendered name can never be
+        // longer than its suffix, so the capacity is the only limit.
+        let long = "A".repeat(HTTP_HEADER_NAME_CAPACITY + 1);
+        let mut stack = [0u8; HTTP_HEADER_NAME_CAPACITY];
+        assert!(render_http_header_name(&long, &mut stack).is_none());
 
-#[test]
-fn a_request_header_is_translated_from_the_cgi_parameters() {
-    let request = Request {
-        params: params(&[
-            ("REQUEST_METHOD", "POST"),
-            ("REQUEST_URI", "/index.php/foo?x=1"),
-            ("SERVER_PROTOCOL", "HTTP/1.1"),
-            ("REMOTE_ADDR", "127.0.0.1"),
-            ("SCRIPT_FILENAME", "/srv/app/index.php"),
-            ("HTTP_HOST", "example.test"),
-            ("HTTP_ACCEPT_ENCODING", "gzip"),
-            ("CONTENT_TYPE", "application/json"),
-            ("CONTENT_LENGTH", "12"),
-            ("HTTPS", "on"),
-        ]),
-        body: Vec::new(),
-        keep_conn: true,
-    };
+        // Non-ASCII would case-fold differently byte-wise than character-wise, so it goes to the
+        // owning path rather than being folded here.
+        let mut stack = [0u8; HTTP_HEADER_NAME_CAPACITY];
+        assert!(render_http_header_name("CAFÉ", &mut stack).is_none());
+    }
 
-    let header = request_header(&request);
-    assert_eq!(header.method, "POST");
-    assert_eq!(header.uri, "/index.php/foo?x=1");
-    assert_eq!(header.protocol, "HTTP/1.1");
-    assert_eq!(header.remote_addr, "127.0.0.1");
-    assert_eq!(header.script_filename, "/srv/app/index.php");
-    assert!(header.https);
-    assert_eq!(
-        header.body_len, 0,
-        "the channel decides this, not the CGI env"
-    );
-    assert_eq!(header.header("host"), Some("example.test"));
-    assert_eq!(header.header("Accept-Encoding"), Some("gzip"));
-    assert_eq!(header.header("content-type"), Some("application/json"));
-    // `CONTENT_LENGTH` is the body's business, and the body is what says so.
-    assert_eq!(header.header("content-length"), None);
-}
-
-#[test]
-fn the_https_flag_needs_a_truthy_value() {
-    let off = Request {
-        params: params(&[("HTTPS", "off")]),
-        ..Request::default()
-    };
-    assert!(!request_header(&off).https);
-
-    let absent = Request::default();
-    assert!(!request_header(&absent).https);
-}
-
-/// The two translations of one request must put the same bytes on the wire.
-///
-/// The pool sends the borrowed one; `request_header` is the readable statement of what the
-/// frame contains. Two implementations of one protocol rule is how they drift, so this
-/// compares the encodings of the *whole* frame head — every field, not a selection — for
-/// environments chosen to cover the corners: no request headers, the ordinary set, a header
-/// whose value is not UTF-8, a variable that is not a request header at all, a bare `HTTP_`
-/// prefix, and `CONTENT_TYPE`, which keeps its CGI name.
-#[test]
-fn the_borrowed_translation_encodes_identically_to_the_owned_one() {
-    let environments: Vec<NameValuePairs> = vec![
-        // No request headers, so both paths are the fixed fields plus `CONTENT_TYPE`.
-        params(&[("REQUEST_METHOD", "POST"), ("CONTENT_TYPE", "application/json")]),
-        // The ordinary page: several headers, one with a multi-word name, one that is not
-        // a request header, and `CONTENT_TYPE` arriving in its CGI spelling.
-        params(&[
-            ("REQUEST_METHOD", "POST"),
-            ("REQUEST_URI", "/index.php/foo?x=1"),
-            ("SERVER_PROTOCOL", "HTTP/1.1"),
-            ("REMOTE_ADDR", "127.0.0.1"),
-            ("SCRIPT_FILENAME", "/srv/app/index.php"),
-            ("DOCUMENT_ROOT", "/srv/app"),
-            ("PATH_INFO", "/foo"),
-            ("HTTP_HOST", "example.test"),
-            ("HTTP_ACCEPT_ENCODING", "gzip, deflate"),
-            ("HTTP_X_FORWARDED_FOR", "10.0.0.1"),
-            ("CONTENT_TYPE", "application/json"),
-            ("CONTENT_LENGTH", "12"),
-        ]),
-        // Corners: a bare `HTTP_` prefix (which names nothing and must be dropped by both),
-        // a non-UTF-8 value (which both must render lossily the same way), and no
-        // `CONTENT_TYPE` at all.
-        vec![
-            (b"REQUEST_METHOD".to_vec(), b"GET".to_vec()),
-            (b"HTTP_".to_vec(), b"empty-name".to_vec()),
-            (b"HTTP_X_BYTES".to_vec(), vec![0x80, 0xff, b'x']),
-        ],
-    ];
-
-    for environment in environments {
+    #[test]
+    fn a_request_header_is_translated_from_the_cgi_parameters() {
         let request = Request {
-            params: environment,
-            body: b"a body".to_vec(),
+            params: params(&[
+                ("REQUEST_METHOD", "POST"),
+                ("REQUEST_URI", "/index.php/foo?x=1"),
+                ("SERVER_PROTOCOL", "HTTP/1.1"),
+                ("REMOTE_ADDR", "127.0.0.1"),
+                ("SCRIPT_FILENAME", "/srv/app/index.php"),
+                ("HTTP_HOST", "example.test"),
+                ("HTTP_ACCEPT_ENCODING", "gzip"),
+                ("CONTENT_TYPE", "application/json"),
+                ("CONTENT_LENGTH", "12"),
+                ("HTTPS", "on"),
+            ]),
+            body: Vec::new(),
             keep_conn: true,
         };
 
-        // `body_len` is zero on both: the channel stamps it in from the body it frames.
-        let owned = Json::encode(&request_header(&request).draft(0)).expect("encode");
-        let borrowed =
-            Json::encode(&borrowed_request(&request).draft()).expect("encode");
-
+        let header = request_header(&request);
+        assert_eq!(header.method, "POST");
+        assert_eq!(header.uri, "/index.php/foo?x=1");
+        assert_eq!(header.protocol, "HTTP/1.1");
+        assert_eq!(header.remote_addr, "127.0.0.1");
+        assert_eq!(header.script_filename, "/srv/app/index.php");
+        assert!(header.https);
         assert_eq!(
-            String::from_utf8_lossy(&borrowed),
-            String::from_utf8_lossy(&owned),
-            "the borrowed head must encode identically to the owned one"
+            header.body_len, 0,
+            "the channel decides this, not the CGI env"
         );
-        assert_eq!(borrowed, owned, "and byte for byte, not merely printed alike");
+        assert_eq!(header.header("host"), Some("example.test"));
+        assert_eq!(header.header("Accept-Encoding"), Some("gzip"));
+        assert_eq!(header.header("content-type"), Some("application/json"));
+        // `CONTENT_LENGTH` is the body's business, and the body is what says so.
+        assert_eq!(header.header("content-length"), None);
     }
-}
+
+    #[test]
+    fn the_https_flag_needs_a_truthy_value() {
+        let off = Request {
+            params: params(&[("HTTPS", "off")]),
+            ..Request::default()
+        };
+        assert!(!request_header(&off).https);
+
+        let absent = Request::default();
+        assert!(!request_header(&absent).https);
+    }
+
+    /// The two translations of one request must put the same bytes on the wire.
+    ///
+    /// The pool sends the borrowed one; `request_header` is the readable statement of what the
+    /// frame contains. Two implementations of one protocol rule is how they drift, so this
+    /// compares the encodings of the *whole* frame head — every field, not a selection — for
+    /// environments chosen to cover the corners: no request headers, the ordinary set, a header
+    /// whose value is not UTF-8, a variable that is not a request header at all, a bare `HTTP_`
+    /// prefix, and `CONTENT_TYPE`, which keeps its CGI name.
+    #[test]
+    fn the_borrowed_translation_encodes_identically_to_the_owned_one() {
+        let environments: Vec<NameValuePairs> = vec![
+            // No request headers, so both paths are the fixed fields plus `CONTENT_TYPE`.
+            params(&[
+                ("REQUEST_METHOD", "POST"),
+                ("CONTENT_TYPE", "application/json"),
+            ]),
+            // The ordinary page: several headers, one with a multi-word name, one that is not
+            // a request header, and `CONTENT_TYPE` arriving in its CGI spelling.
+            params(&[
+                ("REQUEST_METHOD", "POST"),
+                ("REQUEST_URI", "/index.php/foo?x=1"),
+                ("SERVER_PROTOCOL", "HTTP/1.1"),
+                ("REMOTE_ADDR", "127.0.0.1"),
+                ("SCRIPT_FILENAME", "/srv/app/index.php"),
+                ("DOCUMENT_ROOT", "/srv/app"),
+                ("PATH_INFO", "/foo"),
+                ("HTTP_HOST", "example.test"),
+                ("HTTP_ACCEPT_ENCODING", "gzip, deflate"),
+                ("HTTP_X_FORWARDED_FOR", "10.0.0.1"),
+                ("CONTENT_TYPE", "application/json"),
+                ("CONTENT_LENGTH", "12"),
+            ]),
+            // Corners: a bare `HTTP_` prefix (which names nothing and must be dropped by both),
+            // a non-UTF-8 value (which both must render lossily the same way), and no
+            // `CONTENT_TYPE` at all.
+            vec![
+                (b"REQUEST_METHOD".to_vec(), b"GET".to_vec()),
+                (b"HTTP_".to_vec(), b"empty-name".to_vec()),
+                (b"HTTP_X_BYTES".to_vec(), vec![0x80, 0xff, b'x']),
+            ],
+        ];
+
+        for environment in environments {
+            let request = Request {
+                params: environment,
+                body: b"a body".to_vec(),
+                keep_conn: true,
+            };
+
+            // `body_len` is zero on both: the channel stamps it in from the body it frames.
+            let owned = Json::encode(&request_header(&request).draft(0)).expect("encode");
+            let borrowed = Json::encode(&borrowed_request(&request).draft()).expect("encode");
+
+            assert_eq!(
+                String::from_utf8_lossy(&borrowed),
+                String::from_utf8_lossy(&owned),
+                "the borrowed head must encode identically to the owned one"
+            );
+            assert_eq!(
+                borrowed, owned,
+                "and byte for byte, not merely printed alike"
+            );
+        }
+    }
 }

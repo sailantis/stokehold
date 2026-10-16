@@ -54,9 +54,7 @@ fn the_request_fixture_in_the_specification_matches_the_writer() {
     // is a contract with a reader, not an illustration. The payload is deliberately the
     // smallest one with a non-zero checksum, because a zero checksum here could not tell a
     // working hash from a missing one.
-    let expected = concat!(
-        "02000000", "01", "03", "0000", "01000000", "aad07b29", "7b7d",
-    );
+    let expected = concat!("02000000", "01", "03", "0000", "01000000", "aad07b29", "7b7d",);
     assert_eq!(hex(&wire(MessageType::Request, 1, b"{}", 0)), expected);
     assert_eq!(crc32c(b"{}"), 0x297B_D0AA);
 }
@@ -280,8 +278,7 @@ fn the_hello_payload_is_the_documented_fields_in_the_documented_order() {
     })
     .unwrap();
     assert_eq!(
-        required,
-        br#"{"protocol_version":1,"no_checksum":false}"#,
+        required, br#"{"protocol_version":1,"no_checksum":false}"#,
         "the field names and order are the protocol"
     );
     assert_eq!(required.len(), 42);
@@ -305,10 +302,18 @@ fn a_hello_frame_matches_its_golden_bytes() {
     .unwrap();
     let expected_required = concat!(
         // payload_len 42, version 1, HELLO (1), flags 0, request_id 0, crc32c
-        "2a000000", "01", "01", "0000", "00000000", "96d7c823",
+        "2a000000",
+        "01",
+        "01",
+        "0000",
+        "00000000",
+        "96d7c823",
         "7b2270726f746f636f6c5f76657273696f6e223a312c226e6f5f636865636b73756d223a66616c73657d",
     );
-    assert_eq!(hex(&wire(MessageType::Hello, UNSOLICITED, &required, 0)), expected_required);
+    assert_eq!(
+        hex(&wire(MessageType::Hello, UNSOLICITED, &required, 0)),
+        expected_required
+    );
 
     // The optional form is the same frame with the `NO_CHECKSUM` flag raised and a zero
     // checksum field: the header keeps its 16 bytes and the payload only loses the `l` of
@@ -328,7 +333,12 @@ fn a_hello_frame_matches_its_golden_bytes() {
     assert_eq!(
         hex(&frame),
         concat!(
-            "29000000", "01", "01", "1000", "00000000", "00000000",
+            "29000000",
+            "01",
+            "01",
+            "1000",
+            "00000000",
+            "00000000",
             "7b2270726f746f636f6c5f76657273696f6e223a312c226e6f5f636865636b73756d223a747275657d",
         )
     );

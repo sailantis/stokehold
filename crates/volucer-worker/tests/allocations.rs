@@ -283,7 +283,6 @@ fn reading_a_reply_is_a_flat_cost_for_any_body_size() {
     }
 }
 
-
 #[test]
 fn a_warm_channel_does_not_pay_for_the_frame_buffer_again() {
     // The frame buffer belongs to the channel, so it is allocated once and reused by every
@@ -301,10 +300,14 @@ fn a_warm_channel_does_not_pay_for_the_frame_buffer_again() {
     let mut channel = WorkerChannel::new(Vec::new(), std::io::Cursor::new(wire));
 
     let (first, _) = allocations(|| {
-        channel.request_encoded(Vec::new(), b"", |_| {}).expect("the first reply");
+        channel
+            .request_encoded(Vec::new(), b"", |_| {})
+            .expect("the first reply");
     });
     let (second, _) = allocations(|| {
-        channel.request_encoded(Vec::new(), b"", |_| {}).expect("the second reply");
+        channel
+            .request_encoded(Vec::new(), b"", |_| {})
+            .expect("the second reply");
     });
 
     assert!(
@@ -339,7 +342,9 @@ fn a_body_larger_than_the_reserve_limit_still_reads_correctly() {
     let mut channel = WorkerChannel::new(Vec::new(), std::io::Cursor::new(bytes));
 
     let (count, _) = allocations(|| {
-        let response = channel.request_encoded(Vec::new(), b"", |_| {}).expect("reply");
+        let response = channel
+            .request_encoded(Vec::new(), b"", |_| {})
+            .expect("reply");
         assert_eq!(response.body.len(), body_len);
         assert!(response.body.iter().all(|byte| *byte == b'x'));
     });
@@ -350,4 +355,3 @@ fn a_body_larger_than_the_reserve_limit_still_reads_correctly() {
          should be logarithmic, and a per-frame buffer would be ~48"
     );
 }
-

@@ -218,9 +218,7 @@ pub fn write_response<W: Write>(
         // The application status is 0 because the backend already reported any
         // application-level outcome inside its response; the client sees that as the
         // `Status:` line.
-        out.extend_from_slice(
-            &record::Header::new(RecordType::EndRequest, request_id, 8).encode(),
-        );
+        out.extend_from_slice(&record::Header::new(RecordType::EndRequest, request_id, 8).encode());
         out.extend_from_slice(&end.encode());
     })?;
 
@@ -294,10 +292,14 @@ pub fn write_error<W: Write>(
 
     write_assembled(writer, |out| {
         record::append_records(out, RecordType::Stdout, request_id, body.as_bytes(), true);
-        record::append_records(out, RecordType::Stderr, request_id, message.as_bytes(), true);
-        out.extend_from_slice(
-            &record::Header::new(RecordType::EndRequest, request_id, 8).encode(),
+        record::append_records(
+            out,
+            RecordType::Stderr,
+            request_id,
+            message.as_bytes(),
+            true,
         );
+        out.extend_from_slice(&record::Header::new(RecordType::EndRequest, request_id, 8).encode());
         out.extend_from_slice(&end.encode());
     })?;
     Ok(())
@@ -391,11 +393,7 @@ impl Timing {
 
 /// Turn a backend response into the parts the front-end needs.
 pub fn split_response(response: &Response) -> (&[u8], &[u8], u16) {
-    (
-        &response.stdout,
-        &response.stderr,
-        volucer_fcgi::REQUEST_ID,
-    )
+    (&response.stdout, &response.stderr, volucer_fcgi::REQUEST_ID)
 }
 
 #[cfg(test)]

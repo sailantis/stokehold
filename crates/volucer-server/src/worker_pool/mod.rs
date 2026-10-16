@@ -71,35 +71,33 @@
 //! - [`request`] and [`response`] are the two pure translations, and neither
 //!   touches a process or a lock.
 
-
-pub use request::{BorrowedRequest, CgiHeader, RequestHeaderParams};
 pub use request::borrowed_request;
 pub use request::request_header;
+pub use request::{BorrowedRequest, CgiHeader, RequestHeaderParams};
 
-use std::process::{Child};
+use crate::error::{Result, ServerError};
+use crate::lifecycle::LifecycleGuard;
+use crate::pool::worker_count;
+use exchange::ChannelExchange;
+use handshake::{boot, Ready};
+use request::{encode_head, text_param};
+use response::render;
+use spec::Spec;
+use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
-use volucer_core::config::{WorkerConfig};
+use volucer_core::config::WorkerConfig;
 use volucer_fcgi::{Request, Response};
 use volucer_worker::codec::RequestStage;
 use volucer_worker::codec::WorkerResponse;
 use volucer_worker::{Control, HelloAck, MessageType, RequestHeaderJson, WorkerError, UNSOLICITED};
-use crate::error::{Result, ServerError};
-use crate::lifecycle::{LifecycleGuard};
-use crate::pool::worker_count;
-use exchange::{ChannelExchange};
-use handshake::{Ready, boot};
-use request::{encode_head, text_param};
-use response::{render};
-use spec::{Spec};
 
 mod exchange;
 mod handshake;
 mod request;
 mod response;
 mod spec;
-
 
 /// How long a single request may take before the worker is replaced.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1073,9 +1071,8 @@ impl Slot {
             // The control frame is unsolicited — no request id — and the
             // exchange thread will not return an answer, because nothing reads
             // it: the next thing to happen is the close below.
-            let payload =
-                <volucer_worker::Json as volucer_worker::Codec>::encode(&Control::Drain)
-                    .expect("a unit enum serializes");
+            let payload = <volucer_worker::Json as volucer_worker::Codec>::encode(&Control::Drain)
+                .expect("a unit enum serializes");
             let _ = exchange.send(MessageType::Control, UNSOLICITED, &payload, 0);
             exchange.close();
         }
@@ -1139,7 +1136,6 @@ pub(super) fn is_idempotent(request: &Request) -> bool {
     )
 }
 
-
 #[cfg(test)]
 use volucer_fcgi::NameValuePairs;
 #[cfg(test)]
@@ -1154,92 +1150,92 @@ pub(super) fn params(pairs: &[(&str, &str)]) -> NameValuePairs {
 mod tests {
     use super::*;
 
-/// The concurrency guarantee, stated as a type-level fact.
-///
-/// `WorkerPool` used to take `&mut self` on the request path, which meant the
-/// dispatcher had to hold a lock for the whole of `dispatch` and a pool of
-/// `n` workers served one request at a time — `workers` bought recycling but
-/// not parallelism. It now takes `&self`, with a lock per slot, so this
-/// compiles: a shared pool can be reached from several threads at once. If a
-/// future change reintroduces a pool-wide exclusive borrow, this test stops
-/// compiling, which is the earliest possible warning.
-#[test]
-fn a_pool_can_be_reached_from_several_threads_at_once() {
-    fn assert_shareable<T: Send + Sync>() {}
-    assert_shareable::<WorkerPool>();
-    assert_shareable::<crate::pool::CgiPool>();
+    /// The concurrency guarantee, stated as a type-level fact.
+    ///
+    /// `WorkerPool` used to take `&mut self` on the request path, which meant the
+    /// dispatcher had to hold a lock for the whole of `dispatch` and a pool of
+    /// `n` workers served one request at a time — `workers` bought recycling but
+    /// not parallelism. It now takes `&self`, with a lock per slot, so this
+    /// compiles: a shared pool can be reached from several threads at once. If a
+    /// future change reintroduces a pool-wide exclusive borrow, this test stops
+    /// compiling, which is the earliest possible warning.
+    #[test]
+    fn a_pool_can_be_reached_from_several_threads_at_once() {
+        fn assert_shareable<T: Send + Sync>() {}
+        assert_shareable::<WorkerPool>();
+        assert_shareable::<crate::pool::CgiPool>();
 
-    // The shape that matters: the same pool, through a shared reference, from
-    // more than one thread. `request` itself takes `&self` for the same
-    // reason.
-    fn reach_shared(pool: &WorkerPool) -> Vec<usize> {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| pool.len())).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        })
+        // The shape that matters: the same pool, through a shared reference, from
+        // more than one thread. `request` itself takes `&self` for the same
+        // reason.
+        fn reach_shared(pool: &WorkerPool) -> Vec<usize> {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4).map(|_| scope.spawn(|| pool.len())).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        }
+
+        let _ = reach_shared;
     }
 
-    let _ = reach_shared;
-}
+    /// The free list's two rules, which is where a fair queue is won or lost.
+    #[test]
+    fn a_free_slot_is_not_taken_from_a_request_that_is_waiting_for_it() {
+        let mut free = FreeSlots {
+            ids: vec![3, 2, 1, 0],
+            waiters: 0,
+        };
 
-/// The free list's two rules, which is where a fair queue is won or lost.
-#[test]
-fn a_free_slot_is_not_taken_from_a_request_that_is_waiting_for_it() {
-    let mut free = FreeSlots {
-        ids: vec![3, 2, 1, 0],
-        waiters: 0,
-    };
+        // An idle pool with no waiters: a new request takes a slot.
+        assert_eq!(free.take_available(), Some(0));
+        assert_eq!(free.ids, vec![3, 2, 1]);
 
-    // An idle pool with no waiters: a new request takes a slot.
-    assert_eq!(free.take_available(), Some(0));
-    assert_eq!(free.ids, vec![3, 2, 1]);
+        // With a request parked, a newcomer gets nothing even though slots *are* free. This is the
+        // barging rule: the parked request was woken for the next release, and handing that slot to
+        // an arrival instead would leave the parked one waiting for a slot it was already promised.
+        free.waiters = 1;
+        assert_eq!(free.take_available(), None);
+        assert_eq!(free.ids, vec![3, 2, 1], "nothing was taken");
 
-    // With a request parked, a newcomer gets nothing even though slots *are* free. This is the
-    // barging rule: the parked request was woken for the next release, and handing that slot to
-    // an arrival instead would leave the parked one waiting for a slot it was already promised.
-    free.waiters = 1;
-    assert_eq!(free.take_available(), None);
-    assert_eq!(free.ids, vec![3, 2, 1], "nothing was taken");
+        // The parked request takes it, and the rule lifts for the next arrival.
+        assert_eq!(free.take_woken(), Some(1));
+        free.waiters -= 1;
+        assert_eq!(free.take_available(), Some(2));
 
-    // The parked request takes it, and the rule lifts for the next arrival.
-    assert_eq!(free.take_woken(), Some(1));
-    free.waiters -= 1;
-    assert_eq!(free.take_available(), Some(2));
-
-    // A woken request can still find nothing, if the slot it was woken for went to another
-    // waiter first. That is why the queue loop re-checks rather than assuming a wake-up means a
-    // slot, and the last line is the state it must handle.
-    free.waiters = 2;
-    assert_eq!(free.take_woken(), Some(3));
-    assert_eq!(free.take_woken(), None);
-}
-
-/// The histogram's bucket edges, which is where a percentile can go wrong quietly.
-#[test]
-fn wait_buckets_are_monotonic_and_cover_the_range_a_wait_can_occupy() {
-    // Every bucket is reachable, so a wait of zero and a wait of a whole request are never
-    // counted together: below a microsecond is measurement noise and belongs in the first
-    // bucket, not in a discard the percentiles would then be computed without.
-    assert_eq!(wait_bucket(0), 0);
-    assert_eq!(wait_bucket(1), 0);
-    assert_eq!(wait_bucket(2), 1);
-    assert_eq!(wait_bucket(3), 1);
-    assert_eq!(wait_bucket(1_000), 9);
-    assert_ne!(wait_bucket(1_000), wait_bucket(2_000));
-
-    // Monotonic, so the cumulative walk in `slot_wait_percentile_us` cannot see a larger
-    // wait sorted into an earlier bucket and report a percentile that is too small.
-    let mut previous = 0;
-    for micros in 0..200_000u64 {
-        let bucket = wait_bucket(micros);
-        assert!(bucket >= previous, "{micros} us went backwards");
-        previous = bucket;
+        // A woken request can still find nothing, if the slot it was woken for went to another
+        // waiter first. That is why the queue loop re-checks rather than assuming a wake-up means a
+        // slot, and the last line is the state it must handle.
+        free.waiters = 2;
+        assert_eq!(free.take_woken(), Some(3));
+        assert_eq!(free.take_woken(), None);
     }
 
-    // A wait past the last edge must saturate rather than index out of the array, and the
-    // last edge is beyond the point at which the request timeout replaces the worker.
-    assert_eq!(wait_bucket(1_000_000), WAIT_BUCKETS - 1);
-    assert_eq!(wait_bucket(u64::MAX), WAIT_BUCKETS - 1);
-    assert!(bucket_upper_edge(WAIT_BUCKETS - 1) > 1_000_000);
-}
+    /// The histogram's bucket edges, which is where a percentile can go wrong quietly.
+    #[test]
+    fn wait_buckets_are_monotonic_and_cover_the_range_a_wait_can_occupy() {
+        // Every bucket is reachable, so a wait of zero and a wait of a whole request are never
+        // counted together: below a microsecond is measurement noise and belongs in the first
+        // bucket, not in a discard the percentiles would then be computed without.
+        assert_eq!(wait_bucket(0), 0);
+        assert_eq!(wait_bucket(1), 0);
+        assert_eq!(wait_bucket(2), 1);
+        assert_eq!(wait_bucket(3), 1);
+        assert_eq!(wait_bucket(1_000), 9);
+        assert_ne!(wait_bucket(1_000), wait_bucket(2_000));
+
+        // Monotonic, so the cumulative walk in `slot_wait_percentile_us` cannot see a larger
+        // wait sorted into an earlier bucket and report a percentile that is too small.
+        let mut previous = 0;
+        for micros in 0..200_000u64 {
+            let bucket = wait_bucket(micros);
+            assert!(bucket >= previous, "{micros} us went backwards");
+            previous = bucket;
+        }
+
+        // A wait past the last edge must saturate rather than index out of the array, and the
+        // last edge is beyond the point at which the request timeout replaces the worker.
+        assert_eq!(wait_bucket(1_000_000), WAIT_BUCKETS - 1);
+        assert_eq!(wait_bucket(u64::MAX), WAIT_BUCKETS - 1);
+        assert!(bucket_upper_edge(WAIT_BUCKETS - 1) > 1_000_000);
+    }
 }

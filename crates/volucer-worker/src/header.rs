@@ -696,7 +696,11 @@ mod tests {
             (MessageType::End, 1, Vec::new()),
             (MessageType::Body, 2, b"x".to_vec()),
             (MessageType::Response, 3, vec![b'{'; 300]),
-            (MessageType::Body, 4, vec![b'y'; crate::codec::MAX_BODY_CHUNK]),
+            (
+                MessageType::Body,
+                4,
+                vec![b'y'; crate::codec::MAX_BODY_CHUNK],
+            ),
             (MessageType::Log, 5, b"{\"level\":\"info\"}".to_vec()),
         ]
     }
@@ -822,8 +826,15 @@ mod tests {
         let header =
             Header::with_checksum(MessageType::Body, 1, payload, Checksum::Optional).unwrap();
         assert_ne!(header.flags & flags::NO_CHECKSUM, 0);
-        assert_eq!(header.checksum, 0, "the field is still written, but as zero");
-        assert_eq!(header.encode().len(), HEADER_LEN, "the header keeps its size");
+        assert_eq!(
+            header.checksum, 0,
+            "the field is still written, but as zero"
+        );
+        assert_eq!(
+            header.encode().len(),
+            HEADER_LEN,
+            "the header keeps its size"
+        );
     }
 
     #[test]
@@ -832,10 +843,9 @@ mod tests {
         let mut cursor = std::io::Cursor::new(wire_of(payload, Checksum::Optional));
 
         let mut buffer = Vec::new();
-        let (header, len) =
-            Header::read_into_with(&mut cursor, &mut buffer, Checksum::Optional)
-                .unwrap()
-                .expect("a frame");
+        let (header, len) = Header::read_into_with(&mut cursor, &mut buffer, Checksum::Optional)
+            .unwrap()
+            .expect("a frame");
         assert_eq!(header.message_type, MessageType::Body);
         assert_eq!(&buffer[..len], payload);
 
@@ -856,8 +866,9 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(wire);
         let mut buffer = Vec::new();
-        let (_, len) =
-            Header::read_into_with(&mut cursor, &mut buffer, Checksum::Optional).unwrap().unwrap();
+        let (_, len) = Header::read_into_with(&mut cursor, &mut buffer, Checksum::Optional)
+            .unwrap()
+            .unwrap();
         assert_ne!(&buffer[..len], b"the truth");
     }
 
@@ -884,9 +895,12 @@ mod tests {
         wire[payload_at] ^= 0xff;
 
         let mut buffer = Vec::new();
-        let err =
-            Header::read_into_with(&mut std::io::Cursor::new(&wire), &mut buffer, Checksum::Optional)
-                .unwrap_err();
+        let err = Header::read_into_with(
+            &mut std::io::Cursor::new(&wire),
+            &mut buffer,
+            Checksum::Optional,
+        )
+        .unwrap_err();
         assert!(matches!(err, WorkerError::ChecksumMismatch { .. }), "{err}");
     }
 

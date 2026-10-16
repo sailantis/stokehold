@@ -3,19 +3,17 @@
 //! drain thread. Everything that waits here has a deadline, and the deadline is
 //! enforced by killing the worker — see the note in [`super`].
 
-
+use super::exchange::{Channel, ChannelExchange};
+use super::spec::Spec;
+use crate::error::{Hint, Result, ServerError, SOCKET_WORKER_HINT};
+use crate::lifecycle::{configure_command, LifecycleGuard};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
-use volucer_core::config::{WORKER_SOCKET_ENV};
+use volucer_core::config::WORKER_SOCKET_ENV;
 use volucer_worker::{BoundedChannel, Checksum, HelloAck, WorkerError};
-use crate::error::{Hint, Result, ServerError, SOCKET_WORKER_HINT};
-use crate::lifecycle::{configure_command, LifecycleGuard};
-use super::exchange::{Channel, ChannelExchange};
-use super::spec::{Spec};
-
 
 /// How long a worker gets to complete the `HELLO` / `HELLO_ACK` handshake.
 ///
@@ -133,10 +131,12 @@ pub(super) fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Re
     let listener = if spec.transport.is_pipe() {
         None
     } else {
-        Some(TcpListener::bind(("127.0.0.1", 0)).map_err(|source| ServerError::Spawn {
-            binary: spec.binary.clone(),
-            source,
-        })?)
+        Some(
+            TcpListener::bind(("127.0.0.1", 0)).map_err(|source| ServerError::Spawn {
+                binary: spec.binary.clone(),
+                source,
+            })?,
+        )
     };
     let socket_address = match &listener {
         Some(listener) => Some(listener.local_addr().map_err(|source| ServerError::Spawn {
@@ -212,14 +212,15 @@ pub(super) fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Re
         // worker that never connects must fail here rather than hold startup for ever, and
         // it is bounded by the same budget the handshake gets.
         Some(listener) => {
-            let accepted = match accept_with_deadline(&listener, spec, &mut child, HANDSHAKE_TIMEOUT) {
-                Ok(stream) => stream,
-                Err(source) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(source);
-                }
-            };
+            let accepted =
+                match accept_with_deadline(&listener, spec, &mut child, HANDSHAKE_TIMEOUT) {
+                    Ok(stream) => stream,
+                    Err(source) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(source);
+                    }
+                };
             // The protocol is latency-sensitive and its frames are small; Nagle would
             // only add delay to a request that is written frame by frame.
             let _ = accepted.set_nodelay(true);
@@ -368,9 +369,9 @@ fn drain_stderr(backend: String, pid: u32, stderr: ChildStderr) {
 #[cfg(test)]
 use std::collections::BTreeMap;
 #[cfg(test)]
-use std::path::{PathBuf};
+use std::path::PathBuf;
 #[cfg(test)]
-use volucer_core::config::{WorkerTransport};
+use volucer_core::config::WorkerTransport;
 
 /// The pieces of a worker specification `boot` does not read.
 ///
@@ -391,105 +392,109 @@ fn bare_spec(transport: WorkerTransport) -> Spec {
 
 #[cfg(test)]
 mod tests {
-    use volucer_core::config::{WorkerTransport};
     use super::*;
+    use volucer_core::config::WorkerTransport;
 
-/// A socket-transport worker that never connects back fails startup, promptly.
-///
-/// `boot` originally called a bare `listener.accept()`, which has no deadline. A worker
-/// that connects to the wrong address therefore hung startup for ever with nothing
-/// logged, because no step in the sequence reports a *missing* connection. The test
-/// asserts the two things that make the difference visible: the error names the cause,
-/// and it arrives in about a second rather than never.
-///
-/// A short timeout is passed instead of the real 30 s handshake budget so the test stays
-/// fast; the deadline arithmetic is the same either way.
-#[test]
-fn a_socket_worker_that_never_connects_times_out_rather_than_hanging() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    // A process that has already exited, standing in for the worker that failed to
-    // connect — this is the case where waiting out the deadline would be the wrong
-    // answer, and the one `boot` must recognise by exit status.
-    let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-        .args(if cfg!(windows) {
-            vec!["/C", "exit 3"]
-        } else {
-            vec!["-c", "exit 3"]
-        })
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    /// A socket-transport worker that never connects back fails startup, promptly.
+    ///
+    /// `boot` originally called a bare `listener.accept()`, which has no deadline. A worker
+    /// that connects to the wrong address therefore hung startup for ever with nothing
+    /// logged, because no step in the sequence reports a *missing* connection. The test
+    /// asserts the two things that make the difference visible: the error names the cause,
+    /// and it arrives in about a second rather than never.
+    ///
+    /// A short timeout is passed instead of the real 30 s handshake budget so the test stays
+    /// fast; the deadline arithmetic is the same either way.
+    #[test]
+    fn a_socket_worker_that_never_connects_times_out_rather_than_hanging() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // A process that has already exited, standing in for the worker that failed to
+        // connect — this is the case where waiting out the deadline would be the wrong
+        // answer, and the one `boot` must recognise by exit status.
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit 3"]
+            } else {
+                vec!["-c", "exit 3"]
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
 
-    let started = Instant::now();
-    let err = accept_with_deadline(
-        &listener,
-        &bare_spec(WorkerTransport::Socket),
-        &mut child,
-        Duration::from_secs(5),
-    )
-    .expect_err("a listener nobody connects to must not succeed");
-    let elapsed = started.elapsed();
+        let started = Instant::now();
+        let err = accept_with_deadline(
+            &listener,
+            &bare_spec(WorkerTransport::Socket),
+            &mut child,
+            Duration::from_secs(5),
+        )
+        .expect_err("a listener nobody connects to must not succeed");
+        let elapsed = started.elapsed();
 
-    let _ = child.kill();
-    let _ = child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
 
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "the failure must be reported as soon as the worker is known to be gone, \
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the failure must be reported as soon as the worker is known to be gone, \
          not after the full budget: took {elapsed:?}"
-    );
-    assert!(
-        matches!(err, ServerError::StartupExited { .. }),
-        "a worker that exited cannot connect, so its exit status is the useful part: {err:?}"
-    );
-    assert!(
-        err.to_string().contains("php"),
-        "the error names the binary that failed: {err}"
-    );
-}
-
-/// The timeout path itself: a live worker that never dials back.
-#[test]
-fn a_live_socket_worker_that_never_connects_hits_the_startup_timeout() {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-
-    // Long enough to outlive the deadline below, and silent on both streams.
-    let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
-        .args(if cfg!(windows) {
-            vec!["/C", "ping -n 6 127.0.0.1 >NUL"]
-        } else {
-            vec!["5"]
-        })
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-
-    let err = accept_with_deadline(
-        &listener,
-        &bare_spec(WorkerTransport::Socket),
-        &mut child,
-        Duration::from_millis(200),
-    )
-    .expect_err("a live worker that never connects must not hold startup for ever");
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    match err {
-        ServerError::StartupTimeout {
-            address: found,
-            timeout,
-            ..
-        } => {
-            assert_eq!(found, address.to_string(), "the error names the address waited on");
-            assert_eq!(timeout, Duration::from_millis(200));
-        }
-        other => panic!("expected a startup timeout, got {other:?}"),
+        );
+        assert!(
+            matches!(err, ServerError::StartupExited { .. }),
+            "a worker that exited cannot connect, so its exit status is the useful part: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("php"),
+            "the error names the binary that failed: {err}"
+        );
     }
-}
+
+    /// The timeout path itself: a live worker that never dials back.
+    #[test]
+    fn a_live_socket_worker_that_never_connects_hits_the_startup_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        // Long enough to outlive the deadline below, and silent on both streams.
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+            .args(if cfg!(windows) {
+                vec!["/C", "ping -n 6 127.0.0.1 >NUL"]
+            } else {
+                vec!["5"]
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let err = accept_with_deadline(
+            &listener,
+            &bare_spec(WorkerTransport::Socket),
+            &mut child,
+            Duration::from_millis(200),
+        )
+        .expect_err("a live worker that never connects must not hold startup for ever");
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        match err {
+            ServerError::StartupTimeout {
+                address: found,
+                timeout,
+                ..
+            } => {
+                assert_eq!(
+                    found,
+                    address.to_string(),
+                    "the error names the address waited on"
+                );
+                assert_eq!(timeout, Duration::from_millis(200));
+            }
+            other => panic!("expected a startup timeout, got {other:?}"),
+        }
+    }
 }

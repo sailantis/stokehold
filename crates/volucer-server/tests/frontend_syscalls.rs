@@ -185,7 +185,10 @@ fn reading_one_request_does_not_enter_the_kernel_once_per_field() {
     let one_record = unbuffered_reads(&pairs, 0);
     let twelve_records = unbuffered_reads(&pairs, 1);
 
-    assert_eq!(one_record, 7, "one record: begin, params, terminator, two stdin");
+    assert_eq!(
+        one_record, 7,
+        "one record: begin, params, terminator, two stdin"
+    );
     // 39, not 40: an unbuffered reader's total depends on how the environment's byte length falls
     // across record boundaries, and `SERVER_SOFTWARE` above is this project's own name. Renaming
     // the project shortened it by two bytes and moved one record boundary, so this total is tied to
@@ -234,7 +237,11 @@ fn writing_a_response_does_not_write_a_field_at_a_time() {
         let mut out = Vec::new();
         push_record(&mut out, RecordType::Stdout, stdout);
         push_record(&mut out, RecordType::Stdout, b"");
-        push_record(&mut out, RecordType::EndRequest, &EndRequest::complete().encode());
+        push_record(
+            &mut out,
+            RecordType::EndRequest,
+            &EndRequest::complete().encode(),
+        );
         out
     };
     assert_eq!(
@@ -296,7 +303,10 @@ fn a_large_response_body_is_written_in_records_not_in_one_call() {
     let large = records_for(300 * 1024);
 
     // A 12 KB page is one data record plus its terminator, plus END_REQUEST.
-    assert_eq!(small, 3, "12 KB fits in one record, its terminator, and END_REQUEST");
+    assert_eq!(
+        small, 3,
+        "12 KB fits in one record, its terminator, and END_REQUEST"
+    );
     assert!(
         large > small,
         "a body past MAX_CONTENT_LEN must be split across records, not silently truncated: \
@@ -309,8 +319,7 @@ fn a_large_response_body_is_written_in_records_not_in_one_call() {
     // small segments on a socket with `TCP_NODELAY` set.
     let mut big = Counting::default();
     count_start();
-    write_response(&mut big, 1, &vec![b'x'; 300 * 1024], b"", true)
-        .expect("a writable response");
+    write_response(&mut big, 1, &vec![b'x'; 300 * 1024], b"", true).expect("a writable response");
     assert_eq!(
         WRITES.with(Cell::get),
         1,
@@ -338,7 +347,8 @@ fn the_backend_response_is_relayed_without_re_parsing_it() {
 
     // Skip the 8-byte record header: what follows is the backend's bytes, unchanged.
     assert_eq!(
-        &transport.out[volucer_fcgi::protocol::HEADER_LEN..volucer_fcgi::protocol::HEADER_LEN + stdout.len()],
+        &transport.out
+            [volucer_fcgi::protocol::HEADER_LEN..volucer_fcgi::protocol::HEADER_LEN + stdout.len()],
         stdout,
         "the backend's payload must reach the wire verbatim"
     );

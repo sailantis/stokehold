@@ -486,7 +486,10 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
         // mutably to write the frame while the buffer is in hand.
         let mut payload = std::mem::take(&mut self.payload);
         payload.clear();
-        let head = RequestHeaderJson { body_len: body.len() as u64, ..head };
+        let head = RequestHeaderJson {
+            body_len: body.len() as u64,
+            ..head
+        };
 
         let mut outcome = Json::encode_into(&mut payload, &head);
         if outcome.is_ok() {
@@ -1106,9 +1109,8 @@ mod tests {
 
         let mut channel = WorkerChannel::new(ClosedWriter, std::io::Cursor::new(Vec::new()));
         let mut stages = Vec::new();
-        let result = channel.request_staged(&RequestHeader::default(), &body, |stage| {
-            stages.push(stage)
-        });
+        let result =
+            channel.request_staged(&RequestHeader::default(), &body, |stage| stages.push(stage));
 
         assert!(result.is_err(), "a write to a closed pipe must fail");
         assert_eq!(
@@ -1467,10 +1469,11 @@ mod tests {
                 ..HelloAck::default()
             },
         );
-        script
-            .head(1, 200, 2)
-            .body(1, b"ok", true)
-            .json(MessageType::End, 1, &RequestEnd::default());
+        script.head(1, 200, 2).body(1, b"ok", true).json(
+            MessageType::End,
+            1,
+            &RequestEnd::default(),
+        );
         script
     }
 
@@ -1581,7 +1584,9 @@ mod tests {
             body_len: 2,
         })
         .unwrap();
-        script.bytes.extend(unchecked(MessageType::Response, 1, &head, 0));
+        script
+            .bytes
+            .extend(unchecked(MessageType::Response, 1, &head, 0));
         script
             .bytes
             .extend(unchecked(MessageType::Body, 1, b"ok", flags::LAST));

@@ -336,7 +336,10 @@ mod tests {
         let client = TcpStream::connect(addr).expect("connect");
         let (server, _) = listener.accept().expect("accept");
 
-        for (name, fd) in [("client", client.as_raw_fd()), ("server", server.as_raw_fd())] {
+        for (name, fd) in [
+            ("client", client.as_raw_fd()),
+            ("server", server.as_raw_fd()),
+        ] {
             let one: libc::c_int = 1;
             // SAFETY: both descriptors are open for the duration of the call, and
             // `TCP_QUICKACK` takes an `int` argument, which is what is passed.

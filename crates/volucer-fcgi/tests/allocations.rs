@@ -113,7 +113,10 @@ fn parsing_a_response_allocates_the_header_list_and_nothing_else() {
     // One allocation: the `Vec` of borrowed header pairs. Its capacity is
     // `head.len() / 16`, so the bytes counted are that vector's storage — not the
     // 12 KB body, which is never copied.
-    assert_eq!(count, 1, "the parse should allocate once, for the header list");
+    assert_eq!(
+        count, 1,
+        "the parse should allocate once, for the header list"
+    );
     assert!(
         bytes < 1024,
         "the header list is a few hundred bytes, not the payload: {bytes}"
@@ -314,8 +317,7 @@ fn matching_a_forbidden_extension_does_not_scale_with_the_configured_count() {
     let twenty = match_cost(20);
 
     assert_eq!(
-        one,
-        0,
+        one, 0,
         "a forbidden match needs no allocation at all: the path is not copied and neither \
          is the extension"
     );
@@ -690,7 +692,8 @@ fn the_fastcgi_read_count_does_not_grow_with_the_number_of_records() {
     fn reads_for_stdout(stdout: &[u8], records: usize) -> usize {
         let mut reply = Vec::new();
         for chunk in stdout.chunks(stdout.len().div_ceil(records)) {
-            let header = volucer_fcgi::Header::new(volucer_fcgi::RecordType::Stdout, 1, chunk.len() as u16);
+            let header =
+                volucer_fcgi::Header::new(volucer_fcgi::RecordType::Stdout, 1, chunk.len() as u16);
             reply.extend_from_slice(&header.encode());
             reply.extend_from_slice(chunk);
             reply.extend(std::iter::repeat_n(0u8, header.padding_length as usize));

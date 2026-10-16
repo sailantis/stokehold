@@ -147,14 +147,11 @@ impl SlotAddress {
     fn endpoint(&self, bind_host: &str) -> Result<Endpoint> {
         match self {
             SlotAddress::Port(port) => Ok(Endpoint::Tcp(format!("{bind_host}:{port}"))),
-            SlotAddress::Socket(path) => {
-                Endpoint::parse(&format!("unix:{}", path.display())).map_err(|source| {
-                    ServerError::Misconfigured {
-                        backend: "spawn_cgi".to_string(),
-                        reason: format!("{} cannot be a unix socket here: {source}", path.display()),
-                    }
-                })
-            }
+            SlotAddress::Socket(path) => Endpoint::parse(&format!("unix:{}", path.display()))
+                .map_err(|source| ServerError::Misconfigured {
+                    backend: "spawn_cgi".to_string(),
+                    reason: format!("{} cannot be a unix socket here: {source}", path.display()),
+                }),
             #[cfg(windows)]
             SlotAddress::Pipe(name) => Ok(Endpoint::Pipe(name.display().to_string())),
         }
@@ -171,9 +168,7 @@ fn slot_address_of(endpoint: &Endpoint) -> SlotAddress {
         Endpoint::Tcp(spec) => SlotAddress::Port(
             spec.rsplit_once(':')
                 .and_then(|(_, port)| port.parse().ok())
-                .unwrap_or_else(|| {
-                    panic!("a TCP endpoint always carries a port, got {spec:?}")
-                }),
+                .unwrap_or_else(|| panic!("a TCP endpoint always carries a port, got {spec:?}")),
         ),
         #[cfg(windows)]
         Endpoint::Pipe(name) => SlotAddress::Pipe(PathBuf::from(name)),
@@ -236,10 +231,7 @@ impl CgiPool {
                 Some(prefix) => {
                     let path = volucer_core::config::cgi_socket_path(prefix, index);
                     #[cfg(windows)]
-                    if path
-                        .to_str()
-                        .is_some_and(|p| p.starts_with(r"\\.\pipe\"))
-                    {
+                    if path.to_str().is_some_and(|p| p.starts_with(r"\\.\pipe\")) {
                         SlotAddress::Pipe(path)
                     } else {
                         SlotAddress::Socket(path)
@@ -581,7 +573,11 @@ fn wait_until_listening(slot: &mut Slot, binary: &Path, timeout: Duration) -> Re
             Ok(None) => {}
             Err(source) => return Err(ServerError::Io(source)),
         }
-        if slot.endpoint.connect(Some(Duration::from_millis(250))).is_ok() {
+        if slot
+            .endpoint
+            .connect(Some(Duration::from_millis(250)))
+            .is_ok()
+        {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -610,7 +606,8 @@ mod tests {
         let port = SlotAddress::Port(19_001);
         assert_eq!(port.bind_argument("127.0.0.1"), "127.0.0.1:19001");
         assert_eq!(
-            port.endpoint("127.0.0.1").expect("a port is always an endpoint"),
+            port.endpoint("127.0.0.1")
+                .expect("a port is always an endpoint"),
             Endpoint::Tcp("127.0.0.1:19001".to_string())
         );
 
@@ -629,7 +626,9 @@ mod tests {
     fn a_unix_slot_address_resolves_to_a_unix_endpoint() {
         let socket = SlotAddress::Socket(PathBuf::from("/run/volucer/cgi.0.sock"));
         assert_eq!(
-            socket.endpoint("127.0.0.1").expect("unix sockets exist here"),
+            socket
+                .endpoint("127.0.0.1")
+                .expect("unix sockets exist here"),
             Endpoint::Unix("/run/volucer/cgi.0.sock".to_string())
         );
     }
@@ -655,7 +654,8 @@ mod tests {
             "php-cgi takes the pipe name verbatim, not `host:port`"
         );
         assert_eq!(
-            pipe.endpoint("127.0.0.1").expect("a pipe is always an endpoint"),
+            pipe.endpoint("127.0.0.1")
+                .expect("a pipe is always an endpoint"),
             Endpoint::Pipe(r"\\.\pipe\volucer-cgi.0".to_string())
         );
         // And the round trip has to come back to the same place, or a recycled slot
@@ -672,7 +672,9 @@ mod tests {
         // is how recycling and restart bind the same place again. If that
         // reconstruction drifts, a recycled slot silently moves.
         let port = SlotAddress::Port(19_444);
-        let endpoint = port.endpoint("127.0.0.1").expect("a port is always reachable");
+        let endpoint = port
+            .endpoint("127.0.0.1")
+            .expect("a port is always reachable");
         match slot_address_of(&endpoint) {
             SlotAddress::Port(recovered) => assert_eq!(recovered, 19_444),
             SlotAddress::Socket(path) => panic!("expected a port, got {path:?}"),
@@ -685,7 +687,9 @@ mod tests {
     #[test]
     fn a_unix_slot_address_round_trips_through_an_endpoint() {
         let socket = SlotAddress::Socket(PathBuf::from("/run/volucer/cgi.3.sock"));
-        let endpoint = socket.endpoint("127.0.0.1").expect("unix sockets exist here");
+        let endpoint = socket
+            .endpoint("127.0.0.1")
+            .expect("unix sockets exist here");
         match slot_address_of(&endpoint) {
             SlotAddress::Socket(recovered) => {
                 assert_eq!(recovered, PathBuf::from("/run/volucer/cgi.3.sock"));

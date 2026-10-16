@@ -3,13 +3,11 @@
 //! phrase table. **Pure**, and deliberately the only place the translation happens,
 //! so both front-ends stay identical.
 
-
-use std::time::{Duration};
+use std::time::Duration;
 use volucer_fcgi::protocol::ProtocolStatus;
 use volucer_fcgi::{EndRequest, Response};
 use volucer_worker::codec::WorkerResponse;
-use volucer_worker::{LogRecord};
-
+use volucer_worker::LogRecord;
 
 /// Turn a worker response into what the rest of volucer expects.
 ///
@@ -117,79 +115,78 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use volucer_worker::codec::WorkerResponse;
     use super::*;
-    use volucer_worker::{ResponseHead};
+    use volucer_worker::codec::WorkerResponse;
+    use volucer_worker::ResponseHead;
 
-#[test]
-fn a_response_is_rendered_as_a_status_header_block() {
-    let response = WorkerResponse {
-        head: ResponseHead {
-            status: 404,
-            headers: vec![
-                ("Content-Type".to_string(), "text/plain".to_string()),
-                ("Set-Cookie".to_string(), "a=1".to_string()),
-                ("Set-Cookie".to_string(), "b=2".to_string()),
-            ],
-            body_len: 9,
-        },
-        body: b"not found".to_vec(),
-        end: volucer_worker::RequestEnd {
-            app_status: 1,
-            peak_memory_bytes: 4096,
-            duration_us: 250,
-            keep_alive: false,
-        },
-        logs: vec![LogRecord {
-            level: "warning".to_string(),
-            message: "something happened".to_string(),
-            request_id: 1,
-        }],
-        metrics: Vec::new(),
-    };
+    #[test]
+    fn a_response_is_rendered_as_a_status_header_block() {
+        let response = WorkerResponse {
+            head: ResponseHead {
+                status: 404,
+                headers: vec![
+                    ("Content-Type".to_string(), "text/plain".to_string()),
+                    ("Set-Cookie".to_string(), "a=1".to_string()),
+                    ("Set-Cookie".to_string(), "b=2".to_string()),
+                ],
+                body_len: 9,
+            },
+            body: b"not found".to_vec(),
+            end: volucer_worker::RequestEnd {
+                app_status: 1,
+                peak_memory_bytes: 4096,
+                duration_us: 250,
+                keep_alive: false,
+            },
+            logs: vec![LogRecord {
+                level: "warning".to_string(),
+                message: "something happened".to_string(),
+                request_id: 1,
+            }],
+            metrics: Vec::new(),
+        };
 
-    let rendered = render(response, Duration::from_millis(3));
-    assert_eq!(
+        let rendered = render(response, Duration::from_millis(3));
+        assert_eq!(
         rendered.stdout,
         b"Status: 404 Not Found\r\nContent-Type: text/plain\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nnot found"
     );
-    assert_eq!(rendered.app_status(), Some(1));
-    assert!(rendered.check_protocol().is_ok());
-    assert_eq!(
-        rendered.stderr, b"[warning] something happened\n",
-        "telemetry has to reach somewhere a developer looks"
-    );
-    // A worker that asked to be recycled does not make the backend unusable:
-    // the pool replaces it.
-    assert!(rendered.keep_conn);
-}
+        assert_eq!(rendered.app_status(), Some(1));
+        assert!(rendered.check_protocol().is_ok());
+        assert_eq!(
+            rendered.stderr, b"[warning] something happened\n",
+            "telemetry has to reach somewhere a developer looks"
+        );
+        // A worker that asked to be recycled does not make the backend unusable:
+        // the pool replaces it.
+        assert!(rendered.keep_conn);
+    }
 
-#[test]
-fn a_worker_with_no_telemetry_produces_no_stderr() {
-    assert!(render(WorkerResponse::default(), Duration::ZERO)
-        .stderr
-        .is_empty());
-}
+    #[test]
+    fn a_worker_with_no_telemetry_produces_no_stderr() {
+        assert!(render(WorkerResponse::default(), Duration::ZERO)
+            .stderr
+            .is_empty());
+    }
 
-#[test]
-fn a_negative_application_status_is_clamped_rather_than_wrapped() {
-    let mut response = WorkerResponse::default();
-    response.end.app_status = -1;
-    assert_eq!(render(response, Duration::ZERO).app_status(), Some(0));
-}
+    #[test]
+    fn a_negative_application_status_is_clamped_rather_than_wrapped() {
+        let mut response = WorkerResponse::default();
+        response.end.app_status = -1;
+        assert_eq!(render(response, Duration::ZERO).app_status(), Some(0));
+    }
 
-#[test]
-fn an_unknown_status_has_no_reason_phrase() {
-    assert_eq!(reason_phrase(200), "OK");
-    assert_eq!(reason_phrase(500), "Internal Server Error");
-    assert_eq!(reason_phrase(599), "");
-    let mut response = WorkerResponse::default();
-    response.head.status = 599;
-    assert!(render(response, Duration::ZERO)
-        .stdout
-        .starts_with(b"Status: 599 \r\n"));
-}
+    #[test]
+    fn an_unknown_status_has_no_reason_phrase() {
+        assert_eq!(reason_phrase(200), "OK");
+        assert_eq!(reason_phrase(500), "Internal Server Error");
+        assert_eq!(reason_phrase(599), "");
+        let mut response = WorkerResponse::default();
+        response.head.status = 599;
+        assert!(render(response, Duration::ZERO)
+            .stdout
+            .starts_with(b"Status: 599 \r\n"));
+    }
 }

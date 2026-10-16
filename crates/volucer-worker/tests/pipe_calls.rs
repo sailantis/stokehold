@@ -152,7 +152,10 @@ fn a_full_response_is_read_in_one_syscall_and_not_one_per_field() {
     );
 
     let (writes, flushes, reads) = bounded();
-    assert_eq!(writes, 1, "the request's header and payload share one write");
+    assert_eq!(
+        writes, 1,
+        "the request's header and payload share one write"
+    );
     assert_eq!(flushes, 1, "one frame means one flush");
     assert_eq!(
         reads, 1,

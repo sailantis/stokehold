@@ -89,11 +89,9 @@ impl ClientPool {
             return Ok(client);
         }
 
-        volucer_fcgi::Client::connect(&self.endpoint, None).map_err(|source| {
-            ServerError::Worker {
-                backend: backend.to_string(),
-                source,
-            }
+        volucer_fcgi::Client::connect(&self.endpoint, None).map_err(|source| ServerError::Worker {
+            backend: backend.to_string(),
+            source,
         })
     }
 
@@ -279,12 +277,13 @@ impl Backend {
                         backend = %name,
                         "the backend closed a reused connection; reconnecting"
                     );
-                    client = volucer_fcgi::Client::connect(pool.endpoint(), None).map_err(
-                        |source| ServerError::Worker {
-                            backend: name.clone(),
-                            source,
-                        },
-                    )?;
+                    client =
+                        volucer_fcgi::Client::connect(pool.endpoint(), None).map_err(|source| {
+                            ServerError::Worker {
+                                backend: name.clone(),
+                                source,
+                            }
+                        })?;
                 }
                 Err(source) => {
                     return Err(ServerError::Worker {

@@ -201,10 +201,7 @@ fn a_socket_transport_pool_serves_the_same_bytes_as_a_pipe_one() {
         return;
     }
 
-    for (label, settings) in [
-        ("pipe", pipe_config(2)),
-        ("socket", socket_config(2)),
-    ] {
+    for (label, settings) in [("pipe", pipe_config(2)), ("socket", socket_config(2))] {
         let mut pool = WorkerPool::start(label, &settings)
             .unwrap_or_else(|err| panic!("the {label} pool starts: {err}"));
 
@@ -473,7 +470,10 @@ fn max_requests_zero_means_never_recycle_not_recycle_every_request() {
         original,
         "max_requests = 0 must mean never, not recycle after every request"
     );
-    assert!(is_running(original), "the worker should still be the original");
+    assert!(
+        is_running(original),
+        "the worker should still be the original"
+    );
 }
 
 #[test]
@@ -1193,7 +1193,8 @@ fn a_full_pool_refuses_rather_than_queueing_when_the_wait_is_none() {
     std::thread::scope(|scope| {
         // Hold the only slot.
         let holder = scope.spawn(|| {
-            pool.request(&get("/")).expect("the first request has a slot");
+            pool.request(&get("/"))
+                .expect("the first request has a slot");
         });
 
         // Wait until the slot is actually taken before asking for it, so this cannot pass by

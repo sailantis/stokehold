@@ -494,7 +494,10 @@ fn a_real_php_worker_agrees_to_skip_the_checksum_and_still_serves() {
     };
 
     let ack = worker.handshake();
-    assert!(ack.no_checksum, "a PHP worker that understood the option accepts it");
+    assert!(
+        ack.no_checksum,
+        "a PHP worker that understood the option accepts it"
+    );
     assert_eq!(
         worker.channel().checksum_policy(),
         volucer_worker::Checksum::Optional,
@@ -502,7 +505,10 @@ fn a_real_php_worker_agrees_to_skip_the_checksum_and_still_serves() {
     );
 
     let response = worker.get("/");
-    assert_eq!(response.head.status, 200, "the unchecked exchange still works");
+    assert_eq!(
+        response.head.status, 200,
+        "the unchecked exchange still works"
+    );
     assert!(
         !response.body.is_empty(),
         "and it still carries a body: {}",

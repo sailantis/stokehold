@@ -165,10 +165,7 @@ fn a_pool_bound_to_named_pipes_serves_the_same_bytes() {
         "a pipe pool binds no ports, got {:?}",
         pool.ports()
     );
-    let expected = vec![
-        format!("{prefix}.0"),
-        format!("{prefix}.1"),
-    ];
+    let expected = vec![format!("{prefix}.0"), format!("{prefix}.1")];
     let mut endpoints = pool.endpoints();
     endpoints.sort();
     assert_eq!(endpoints, expected, "each slot gets its own pipe");
@@ -233,7 +230,8 @@ fn a_dead_unix_socket_slot_is_replaced_on_the_same_path() {
 }
 
 #[test]
-fn starts_a_pool_and_serves_requests_through_every_slot() {    let _serial = serial();
+fn starts_a_pool_and_serves_requests_through_every_slot() {
+    let _serial = serial();
     let Some(binary) = find_php_cgi() else {
         eprintln!("skipping: no php-cgi on PATH");
         return;

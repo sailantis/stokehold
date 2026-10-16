@@ -179,7 +179,10 @@ pub fn parse_response<'a>(stdout: &'a [u8]) -> (u16, ParsedHeaders<'a>, &'a [u8]
             // inside the payload, so this cannot go out of range; `get` says so in
             // the type rather than leaving a panic path behind an invariant held in
             // another function.
-            (&stdout[..ends_at], stdout.get(ends_at + separator..).unwrap_or(&[]))
+            (
+                &stdout[..ends_at],
+                stdout.get(ends_at + separator..).unwrap_or(&[]),
+            )
         }
         // No blank line at all. The whole payload is read as the header block, which
         // is also why the body comes back empty: a real FastCGI response always
@@ -817,7 +820,10 @@ mod tests {
 
     #[test]
     fn the_body_is_split_off_with_either_separator() {
-        assert_eq!(split_response_body(b"Status: 200\r\nX-A: b\r\n\r\nbody"), b"body");
+        assert_eq!(
+            split_response_body(b"Status: 200\r\nX-A: b\r\n\r\nbody"),
+            b"body"
+        );
         assert_eq!(split_response_body(b"Status: 200\nX-A: b\n\nbody"), b"body");
         // Headers with an empty body, which is not the same case.
         assert_eq!(split_response_body(b"Status: 204\r\n\r\n"), b"");
@@ -863,8 +869,8 @@ mod tests {
         // replaced these bytes with U+FFFD inside a `String` whose *length* then
         // differed from the slice's - and the body offset was computed from that
         // String. Both halves have to survive a body like this.
-        let mut stdout = b"Status: 201 Created\r\nContent-Type: application/octet-stream\r\n\r\n"
-            .to_vec();
+        let mut stdout =
+            b"Status: 201 Created\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
         let body: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80, 0xC3, 0x28, 0x0D, 0x0A, 0x0D, 0x0A];
         stdout.extend_from_slice(&body);
 
@@ -893,7 +899,10 @@ mod tests {
         // The reason phrase is discarded, and both a tab and a run of spaces
         // separate it from the code the way `split_whitespace` did.
         assert_eq!(parse_response_headers(b"Status: 404\r\n\r\n").0, 404);
-        assert_eq!(parse_response_headers(b"Status: 404 Not Found\r\n\r\n").0, 404);
+        assert_eq!(
+            parse_response_headers(b"Status: 404 Not Found\r\n\r\n").0,
+            404
+        );
         assert_eq!(parse_response_headers(b"Status:\t500\tboom\r\n\r\n").0, 500);
         assert_eq!(parse_response_headers(b"Status:   201   \r\n\r\n").0, 201);
         assert_eq!(parse_response_headers(b"Status:404\r\n\r\n").0, 404);

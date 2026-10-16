@@ -381,7 +381,8 @@ mod tests {
                 append_records(&mut appended, record_type, 7, &content, terminate);
 
                 assert_eq!(
-                    appended, written,
+                    appended,
+                    written,
                     "record_type {record_type:?}, {} bytes, terminate={terminate}",
                     content.len()
                 );

@@ -21,9 +21,7 @@ use std::cell::Cell;
 
 use volucer_fcgi::{NameValuePairs, Request};
 use volucer_server::worker_pool::{borrowed_request, request_header};
-use volucer_worker::{
-    Codec, Header, Json, MessageType, RequestEnd, ResponseHead, WorkerChannel,
-};
+use volucer_worker::{Codec, Header, Json, MessageType, RequestEnd, ResponseHead, WorkerChannel};
 
 thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };

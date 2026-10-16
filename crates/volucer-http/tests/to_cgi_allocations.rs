@@ -42,10 +42,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::PathBuf;
 
+use hyper::Request;
 use volucer_fcgi::cgi::{build_params_for, route};
 use volucer_fcgi::{RequestInfo, Routing};
 use volucer_http::to_cgi;
-use hyper::Request;
 
 thread_local! {
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
@@ -156,17 +156,25 @@ fn the_wall_clock_cost_of_a_realistic_request_is_reported_and_loosely_bounded() 
     let parts = parts(REALISTIC_HEADERS);
     let routing = routing();
     for _ in 0..200 {
-        std::hint::black_box(to_cgi(&parts, Vec::new(), &routing, 8080, "10.0.0.5").expect("routes"));
+        std::hint::black_box(
+            to_cgi(&parts, Vec::new(), &routing, 8080, "10.0.0.5").expect("routes"),
+        );
     }
 
     const ITERATIONS: u32 = 20_000;
     let started = std::time::Instant::now();
     for _ in 0..ITERATIONS {
-        std::hint::black_box(to_cgi(&parts, Vec::new(), &routing, 8080, "10.0.0.5").expect("routes"));
+        std::hint::black_box(
+            to_cgi(&parts, Vec::new(), &routing, 8080, "10.0.0.5").expect("routes"),
+        );
     }
     let each = started.elapsed().as_nanos() as f64 / f64::from(ITERATIONS);
 
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     println!(
         "to_cgi ({profile}): {each:.0} ns per translation for {} headers, empty body",
         BROWSER_HEADERS + REALISTIC_HEADERS
@@ -261,7 +269,12 @@ fn building_request_info_is_a_small_share_of_the_translation() {
 
     let info = |parts: &hyper::http::request::Parts| RequestInfo {
         method: parts.method.as_str().to_string(),
-        uri: parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string(),
+        uri: parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+            .to_string(),
         query_string: parts.uri.query().unwrap_or("").to_string(),
         protocol: "HTTP/1.1".to_string(),
         headers: parts
@@ -281,12 +294,18 @@ fn building_request_info_is_a_small_share_of_the_translation() {
         https: false,
     };
 
-    const ITERATIONS: u32 = if cfg!(debug_assertions) { 20_000 } else { 200_000 };
+    const ITERATIONS: u32 = if cfg!(debug_assertions) {
+        20_000
+    } else {
+        200_000
+    };
 
     let measure = |extra: usize| -> (f64, f64, f64) {
         let parts = parts(extra);
         for _ in 0..200 {
-            std::hint::black_box(build_params_for(&info(&parts), &routing, &route).expect("params"));
+            std::hint::black_box(
+                build_params_for(&info(&parts), &routing, &route).expect("params"),
+            );
         }
 
         let started = std::time::Instant::now();

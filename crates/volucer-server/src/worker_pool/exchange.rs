@@ -3,13 +3,11 @@
 //! read with no portable timeout still has one. This is the fix for the
 //! per-request thread cost; see [`ChannelExchange`].
 
-
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::time::{Duration};
+use std::time::Duration;
 use volucer_worker::codec::RequestStage;
 use volucer_worker::codec::WorkerResponse;
 use volucer_worker::{BoundedChannel, MessageType, WorkerError};
-
 
 /// Both directions of one worker's pipes, buffered.
 ///
@@ -32,7 +30,8 @@ pub(super) enum Exchange {
     /// that is what `borrowed_request` is for — and a borrow cannot travel to this thread, because
     /// on a timeout the thread outlives the call that made it. So the pool serializes the head and
     /// sends the bytes, and the worker cannot tell which side of the boundary encoded them.
-    Request { head: Vec<u8>, body: Vec<u8> },    /// Send one frame from an already-encoded payload.
+    Request { head: Vec<u8>, body: Vec<u8> },
+    /// Send one frame from an already-encoded payload.
     Send {
         message_type: MessageType,
         request_id: u32,
@@ -134,7 +133,10 @@ impl ChannelExchange {
                 // The receiver is gone only if the caller dropped this exchange,
                 // which happens on a timeout. Then the answer is dropped with the
                 // thread — the caller has already decided not to wait.
-                if answer_tx.send(result.map_err(|source| (stage, source))).is_err() {
+                if answer_tx
+                    .send(result.map_err(|source| (stage, source)))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -179,9 +181,7 @@ impl ChannelExchange {
             // the thread misbehaving rather than a protocol condition.
             Ok(None) => Err((
                 RequestStage::Reading,
-                WorkerError::Closed(
-                    "the exchange thread answered without a response".to_string(),
-                ),
+                WorkerError::Closed("the exchange thread answered without a response".to_string()),
             )),
             Err(failure) => Err(failure),
         }
@@ -209,7 +209,10 @@ impl ChannelExchange {
             extra_flags,
         };
 
-        match self.round_trip(exchange, Duration::from_secs(1)).map_err(|(_, source)| source)? {
+        match self
+            .round_trip(exchange, Duration::from_secs(1))
+            .map_err(|(_, source)| source)?
+        {
             // `Send` writes a frame and reads nothing, so its answer carries no
             // response and never can.
             None => Ok(()),
@@ -271,14 +274,14 @@ impl ChannelExchange {
             // Timed out. The thread is blocked in a read on this worker, so the
             // caller has to kill the worker: that is what makes the read return so
             // the thread can exit and drop the pipes.
-            Err(RecvTimeoutError::Timeout) => Err((RequestStage::Reading, WorkerError::Timeout(timeout))),
+            Err(RecvTimeoutError::Timeout) => {
+                Err((RequestStage::Reading, WorkerError::Timeout(timeout)))
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 self.ended = true;
                 Err((
                     RequestStage::Reading,
-                    WorkerError::Closed(
-                        "the exchange thread ended without answering".to_string(),
-                    ),
+                    WorkerError::Closed("the exchange thread ended without answering".to_string()),
                 ))
             }
         }

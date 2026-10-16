@@ -236,6 +236,19 @@ fn destination(origin: &Origin, path_and_query: &hyper::Uri) -> Result<hyper::Ur
     })
 }
 
+/// Box an inbound request body for the client, without reading any of it.
+///
+/// `Incoming` carries `hyper::Error`, and the client wants one body type for every request so that
+/// the pool and the protocol state machines stay non-generic — so the error is mapped, which for a
+/// caller is the same question it always asks about a body: did the connection fail.
+///
+/// Deliberately **not** `BodyExt::boxed`: that produces `BoxBody<Bytes, hyper::Error>`, a different
+/// type from [`UpstreamBody`], and `BoxBody` requires `Sync` — which the body a `h2` connection
+/// hands out is not.
+pub fn incoming_body(body: hyper::body::Incoming) -> UpstreamBody {
+    BodyExt::map_err(body, std::io::Error::other).boxed_unsync()
+}
+
 /// Read a whole body into memory.
 ///
 /// Offered for tests and for a caller that has decided to buffer: it is *not* what the streaming

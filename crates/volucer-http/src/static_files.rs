@@ -35,7 +35,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Body;
 use hyper::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, ALLOW, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH,
@@ -783,7 +783,7 @@ async fn stream_body(path: &Path, offset: u64, length: u64) -> Result<ResponseBo
             .map_err(|err| HttpError::BadGateway(err.to_string()))?;
     }
 
-    Ok(BoxBody::new(FileBody {
+    Ok(UnsyncBoxBody::new(FileBody {
         file,
         remaining: length,
     }))

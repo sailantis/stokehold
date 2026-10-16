@@ -8,7 +8,7 @@
 //! disguise for a broken test.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,7 +53,7 @@ impl Seen {
 /// HTTP/1.1 client that reuses a connection would otherwise interleave two requests' bytes in the
 /// fixture's view, and the test would be about the fixture rather than about the proxy.
 struct TestOrigin {
-    address: SocketAddr,
+    address: std::net::SocketAddr,
     seen: Receiver<Seen>,
     shutdown: Arc<Mutex<bool>>,
 }
@@ -200,7 +200,7 @@ async fn exchange(
     client: &UpstreamClient<Empty<Bytes>>,
     headers: hyper::HeaderMap,
     path: &str,
-    peer: Option<SocketAddr>,
+    peer: Option<IpAddr>,
     cleartext: bool,
 ) -> volucer_upstream::UpstreamResponse {
     let request = volucer_upstream::prepare_request(
@@ -217,8 +217,11 @@ async fn exchange(
 }
 
 /// The peer address the front-end would report for a request.
-fn peer() -> Option<SocketAddr> {
-    Some("203.0.113.7:51234".parse().expect("an address"))
+fn peer() -> Option<IpAddr> {
+    // An address with no port, which is what a listener reports and all `X-Forwarded-For` carries.
+    // The port in the old fixture was never forwarded, so it was a value the test set and nothing
+    // read.
+    Some("203.0.113.7".parse().expect("an address"))
 }
 
 #[tokio::test]

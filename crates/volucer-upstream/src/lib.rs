@@ -32,7 +32,9 @@ pub mod error;
 pub mod origin;
 pub mod translate;
 
-pub use client::{UpstreamBody, UpstreamClient, UpstreamRequest, UpstreamResponse};
+pub use client::{
+    collect, incoming_body, UpstreamBody, UpstreamClient, UpstreamRequest, UpstreamResponse,
+};
 pub use error::{Result, UpstreamError};
 pub use origin::{Origin, UpstreamTls};
 pub use translate::{prepare_request, translate_response};

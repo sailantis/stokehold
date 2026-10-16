@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, HOST};
@@ -53,13 +53,21 @@ use crate::static_files;
 /// a stream, so the two have to meet somewhere. Boxing is that meeting point: one
 /// allocation per response, against a static file that would otherwise have to be
 /// buffered whole to be expressible.
-pub type ResponseBody = BoxBody<Bytes, std::io::Error>;
+///
+/// **`Unsync`, and that is the whole point of the name.** The upstream path's body is
+/// `hyper::body::Incoming`, which wraps `h2::RecvStream` and is therefore `Send` but **not**
+/// `Sync`; `BoxBody` requires both, so an origin's response could not be expressed in it at
+/// all. `hyper`'s server is what makes the looser bound the right one rather than a
+/// compromise: it accepts any `B: Body + 'static` with no `Send` or `Sync`, and every
+/// existing producer here — a few bytes, a `FileBody` — is `Send` regardless. So this is
+/// one word, and the alternative would be two response types for no gain.
+pub type ResponseBody = UnsyncBoxBody<Bytes, std::io::Error>;
 
 /// A body made of bytes that are already in memory.
 pub fn body_of(bytes: Bytes) -> ResponseBody {
     Full::new(bytes)
         .map_err(|never: std::convert::Infallible| match never {})
-        .boxed()
+        .boxed_unsync()
 }
 
 /// How long an idle keep-alive connection may sit before it is closed.
@@ -1103,16 +1111,26 @@ async fn prepare(
         return Err(HttpError::NotFound(parts.uri.path().to_string()));
     }
 
+    let route = volucer_core::config::select_route(&site.routes, host, parts.uri.path());
+    let backend = route
+        .map(|route| route.backend.clone())
+        .unwrap_or_else(|| front_end.dispatcher.default_backend().to_string());
+
+    // The one branch between the two request paths, and it is here rather than inside the
+    // dispatcher on purpose: every other backend is a blocking process on a pipe, so making the
+    // dispatcher's *type* async to accommodate the one that is not would drag `spawn_blocking`
+    // into the type system of all four.
+    //
+    // It is *before* `read_body`, which is the whole difference between the paths: the CGI body
+    // has to be a `Vec` because the environment carries its length, and an origin's must not be
+    // touched at all.
+    if front_end.dispatcher.is_upstream(&backend) {
+        return upstream(front_end, &backend, parts, body, &remote_addr, cleartext).await;
+    }
+
     let body = read_body(body, front_end.limits.max_body_bytes).await?;
 
     // A route that proves its pattern names a script may skip the router's own `stat`:
-    // `php-cgi` checks existence itself, and the extension guard is already satisfied by
-    // the pattern. See `RouteConfig::skip_stat` for why that is a static property of the
-    // configuration rather than something to decide per request.
-    let route = {
-        let path = parts.uri.path();
-        volucer_core::config::select_route(&site.routes, host, path)
-    };
     let skips_stat = route.is_some_and(|route| {
         volucer_core::config::skip_stat(route, front_end.dispatcher.interprets_path(&route.backend))
     });
@@ -1122,15 +1140,17 @@ async fn prepare(
     // off the runtime's threads.
     let front_end = Arc::clone(front_end);
     let routing = routing.clone();
+    let routes = site.routes.clone();
     let blocking = tokio::task::spawn_blocking(move || {
         let cgi_request = if skips_stat {
             to_cgi_routed(&parts, body, &routing, front_end.server_port, &remote_addr)?
         } else {
             to_cgi(&parts, body, &routing, front_end.server_port, &remote_addr)?
         };
+        // The site's own table, so the routing decision above and the dispatch agree.
         front_end
             .dispatcher
-            .dispatch(&cgi_request)
+            .dispatch_with_routes(&routes, &cgi_request)
             .map_err(map_server_error)
     });
 
@@ -1148,6 +1168,68 @@ async fn prepare(
     }
 
     from_cgi(response)
+}
+
+/// Send a request to an HTTP origin and turn its answer into this front-end's response.
+///
+/// **Nothing here blocks and nothing is buffered.** The request body is `Incoming`, passed straight
+/// through to the client, and the response body comes back unread — which is what makes a large
+/// upload, a streamed download and an SSE feed work without a byte of either being held. The CGI
+/// path is the opposite on both counts by necessity, so the two must not share a body type and do
+/// not.
+///
+/// The body cap is deliberately *not* applied. An upstream is strictly more capable than worker
+/// mode, and a reverse proxy silently imposing a limit its own client never set is a bug report
+/// waiting; the limit to configure is the origin's. That is a real change in this server's exposure
+/// and it is stated in the README beside the limit rather than only here.
+async fn upstream(
+    front_end: &Arc<FrontEnd>,
+    backend: &str,
+    parts: hyper::http::request::Parts,
+    body: Incoming,
+    remote_addr: &str,
+    cleartext: bool,
+) -> Result<Response<ResponseBody>> {
+    let uri = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().parse::<hyper::Uri>())
+        .unwrap_or_else(|| "/".parse())
+        .map_err(|err| HttpError::BadRequest(format!("the request path is not a URI: {err}")))?;
+
+    // The listener carries the peer's *address* — `remote_addr` is an IP with no port, and the
+    // port of an incoming connection is not part of what this header carries anyway.
+    let peer = remote_addr.parse::<std::net::IpAddr>().ok();
+    let request = volucer_upstream::prepare_request(
+        parts.headers,
+        parts.method,
+        uri,
+        parts.version,
+        // Boxed as the *upstream* crate's body type, not `http_body_util::BodyExt::boxed`, which
+        // would give `BoxBody<Bytes, hyper::Error>` — a different type from the one the dispatcher's
+        // client accepts, and one that could not be `Sync` anyway.
+        volucer_upstream::incoming_body(body),
+        peer,
+        cleartext,
+    );
+
+    let answer = front_end
+        .dispatcher
+        .dispatch_upstream(backend, request)
+        .await
+        .map_err(map_server_error)?;
+
+    let answer = volucer_upstream::translate_response(answer);
+
+    let mut outgoing = Response::builder().status(answer.status);
+    if let Some(headers) = outgoing.headers_mut() {
+        *headers = answer.headers;
+    }
+    // `UnsyncBoxBody` is the reason this needs no conversion: an origin's body is exactly what the
+    // response type is now.
+    outgoing
+        .body(answer.body)
+        .map_err(|err| HttpError::BadGateway(err.to_string()))
 }
 
 /// Read the request body, refusing anything over the limit.

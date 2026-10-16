@@ -1766,6 +1766,7 @@ dependencies = [
  "volucer-core",
  "volucer-fcgi",
  "volucer-server",
+ "volucer-upstream",
  "volucer-watch",
  "volucer-worker",
 ]

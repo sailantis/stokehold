@@ -77,7 +77,7 @@ pub fn prepare_request<B>(
     uri: Uri,
     version: Version,
     body: B,
-    peer: Option<std::net::SocketAddr>,
+    peer: Option<std::net::IpAddr>,
     cleartext: bool,
 ) -> UpstreamRequest<B> {
     // Read before filtering: `Connection: X-Private` says `X-Private` is hop-local *for this
@@ -88,7 +88,10 @@ pub fn prepare_request<B>(
         .filter(|name| !never_forwarded(name))
         .collect();
 
-    let forwarded_for = peer.map(|peer| peer.ip().to_string());
+    // An address, not a `SocketAddr`: the port of an *incoming* connection is not part of what
+    // `X-Forwarded-For` carries, and a caller that has only the peer's address (which is what a
+    // listener reports) must not have to invent one to satisfy this signature.
+    let forwarded_for = peer.map(|peer| peer.to_string());
     let forwarded_host = headers
         .get(HOST)
         .and_then(|host| host.to_str().ok())
@@ -179,10 +182,12 @@ mod tests {
     use super::*;
     use http_body_util::{BodyExt, Empty};
     use hyper::header::{CONNECTION, EXPECT, TRANSFER_ENCODING, UPGRADE};
-    use std::net::SocketAddr;
+    use std::net::IpAddr;
 
-    fn peer() -> Option<SocketAddr> {
-        Some("203.0.113.7:51234".parse().expect("an address"))
+    fn peer() -> Option<IpAddr> {
+        // An address with no port, which is what a listener reports and all `X-Forwarded-For`
+        // carries.
+        Some("203.0.113.7".parse().expect("an address"))
     }
 
     fn request(headers: HeaderMap) -> UpstreamRequest<Empty<bytes::Bytes>> {

@@ -12,6 +12,9 @@ volucer-core.workspace = true
 volucer-fcgi.workspace = true
 volucer-server.workspace = true
 volucer-watch.workspace = true
+# The HTTP front-end's other half: a request that goes to an origin instead of a backend. Only
+# this crate needs both, because it is the only place that knows which kind a route selected.
+volucer-upstream.workspace = true
 volucer-acme.workspace = true
 volucer-worker.workspace = true
 arc-swap.workspace = true

@@ -1252,10 +1252,13 @@ backend = "node"
         "an upstream owns its own request scope, and neither of the two older answers is true \
          of it: {text}"
     );
-    // And the one thing `check` must never do: call a configuration good that `serve` will refuse.
+    // And the line that existed while this build could not serve an upstream is gone. It is
+    // asserted as *absent* rather than deleted from the test, because "check tells the operator
+    // nothing about a capability it has" is the property, and a later change that reintroduced a
+    // permanent warning would be the same mistake in the other direction.
     assert!(
-        text.contains("not served yet"),
-        "`check` must not answer \"configuration OK\" for a kind this build refuses to serve: {text}"
+        !text.contains("not served yet"),
+        "an upstream is served now, so `check` must not warn about it: {text}"
     );
 
     // 2. `/api` skips the stat, `/legacy` does not — the contrast is what makes this a test of
@@ -1287,21 +1290,150 @@ backend = "node"
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A configuration this build can check but cannot serve says so in both places.
+/// A test HTTP origin: a stdlib listener that records what it received.
 ///
-/// The assertion is that `check` and `serve` tell the *same* story: an operator who reads
-/// "configuration OK" and then gets a refusal at startup has two accounts to reconcile, and the
-/// only honest version is for `check` to have said it first. Both read one flag (`SERVES_UPSTREAM`)
-/// and one message function, so this test is what keeps them from drifting apart — and what will
-/// notice when the flag flips in the commit that adds the request path, at which point the whole
-/// test becomes vacuous and should be removed with it.
+/// Deliberately not a Node or a Python process. It has to be able to answer slowly, to send two
+/// headers with one name, and to misbehave on demand — and it must need no interpreter on the host,
+/// which is the same reasoning that put the packaging into scripts so it could be tested without a
+/// tag. It also means this test runs on a machine with no PHP at all.
+struct TestOrigin {
+    address: String,
+    received: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TestOrigin {
+    /// Start an origin that answers every request with `response`.
+    ///
+    /// `response` is written verbatim after the request is read, so a test controls the status,
+    /// the headers — including two with the same name — and the body.
+    fn start(response: &'static str) -> Self {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind an origin on a free port");
+        let address = listener.local_addr().expect("address").to_string();
+        // A read timeout, so a connection the client keeps alive does not hold this thread for
+        // ever when the test ends.
+        listener.set_nonblocking(false).expect("blocking accepts");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let seen = std::sync::Arc::clone(&received);
+        let stopped = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                // One request per connection, then close: the client's pool handles that, and a
+                // test origin that tried to speak keep-alive would be another thing to get right.
+                let raw = read_one_request(&mut stream);
+                seen.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(raw);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        TestOrigin {
+            address,
+            received,
+            stop,
+        }
+    }
+
+    fn origin_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    /// Everything the origin received, as one blob per request.
+    fn requests(&self) -> Vec<String> {
+        self.received
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|raw| String::from_utf8_lossy(raw).into_owned())
+            .collect()
+    }
+
+    /// The first request, as text.
+    fn first_request(&self) -> String {
+        self.requests()
+            .into_iter()
+            .next()
+            .expect("the origin received a request")
+    }
+}
+
+impl Drop for TestOrigin {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Unblock the accept by connecting once more, so the thread notices the flag.
+        let _ = std::net::TcpStream::connect(&self.address);
+    }
+}
+
+/// Read one HTTP request, headers and all, without knowing its length in advance.
+///
+/// `Content-Length` is honoured so a POST's body is captured — a test that asserted the body
+/// arrived would otherwise be asserting on the head alone.
+fn read_one_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+        let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+        let expected = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if raw.len() >= head_end + 4 + expected {
+            break;
+        }
+    }
+    raw
+}
+
+/// **The assertion that step 68 was for.** A request through `serve` reaches a real HTTP origin,
+/// and the origin's answer reaches the client.
+///
+/// Everything before this test proved a *component*: the crate's client, the config's parser, the
+/// enum's arm. None of them could pass a request through the server, and the plan's own hazard 68 is
+/// the reason this is written as a request rather than as a unit assertion — five ACME steps shipped
+/// green while `serve` never constructed an `Engine` at all, so nothing issued anything. A build
+/// where the client exists and the front-end never calls it looks exactly like a working one.
+///
+/// The origin is a real socket and a real HTTP conversation, so this covers the branch, the
+/// translation, the header rules and the status, end to end.
 #[test]
-fn an_unserved_upstream_is_reported_by_check_and_refused_by_serve() {
+fn serve_reaches_an_http_origin_and_relays_its_answer() {
     let Some(binary) = volucer_binary() else {
         eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
         return;
     };
-    let root = std::env::temp_dir().join(format!("volucer-unserved-{}", std::process::id()));
+    let origin = TestOrigin::start(
+        "HTTP/1.1 203 Non-Authoritative Information\r\n\
+         X-Origin: node-app\r\n\
+         Set-Cookie: a=1\r\n\
+         Set-Cookie: b=2\r\n\
+         Content-Length: 11\r\n\
+         \r\n\
+         hello there",
+    );
+    let root = std::env::temp_dir().join(format!("volucer-upstream-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create the root");
 
@@ -1312,47 +1444,196 @@ fn an_unserved_upstream_is_reported_by_check_and_refused_by_serve() {
             r#"
 default_backend = "node"
 [server]
-http = "127.0.0.1:8080"
+http = "127.0.0.1:0"
 document_root = {root}
 [backends.node]
 kind = "upstream"
-origin = "http://127.0.0.1:3000"
+origin = {origin}
+"#,
+            root = toml_string(&root.display().to_string()),
+            origin = toml_string(&origin.origin_url()),
+        ),
+    )
+    .expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server did not start with an upstream backend configured");
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the configuration asked for an HTTP listener");
+
+    let answer = http_get(&address, "/api/things?id=7");
+    assert_eq!(
+        answer.status, 203,
+        "the origin's status must reach the client unchanged: {answer:?}"
+    );
+    assert_eq!(answer.text(), "hello there");
+    assert_eq!(
+        answer.header("x-origin"),
+        Some("node-app"),
+        "the origin's own header must cross: {answer:?}"
+    );
+    // Two `Set-Cookie` headers are two cookies. A proxy that joined them — as the CGI path does,
+    // because the environment has one value per name — would silently break a session.
+    let cookies: Vec<&String> = answer
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(cookies.len(), 2, "both cookies must survive: {answer:?}");
+
+    // And what the *origin* saw. This is the half a status assertion cannot make: the path and
+    // query it received, the `Host` the client sent, and the forwarding headers.
+    let request = origin.first_request();
+    assert!(
+        request.starts_with("GET /api/things?id=7 "),
+        "the path and query must reach the origin intact: {request:?}"
+    );
+    assert!(
+        request.to_ascii_lowercase().contains("host: example.test"),
+        "the client's own Host is the identity the origin routes on: {request:?}"
+    );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("x-forwarded-for: 127.0.0.1"),
+        "the peer must be forwarded: {request:?}"
+    );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("x-forwarded-proto: http"),
+        "the hop's scheme comes from the socket, not from a header: {request:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A POST body reaches an origin, and its length is re-derived rather than forwarded.
+///
+/// The second half is the framing rule: the outgoing `Content-Length` is the body's, not the
+/// client's claim, and a stale length is how a proxy desynchronises a connection.
+#[test]
+fn a_request_body_reaches_an_origin_with_the_right_length() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let origin = TestOrigin::start("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let root = std::env::temp_dir().join(format!("volucer-upstream-post-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:0"
+document_root = {root}
+[backends.node]
+kind = "upstream"
+origin = {origin}
+"#,
+            root = toml_string(&root.display().to_string()),
+            origin = toml_string(&origin.origin_url()),
+        ),
+    )
+    .expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server did not start");
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("an HTTP listener was configured");
+
+    let body = "name=volucer&x=%20";
+    let mut stream = TcpStream::connect(&address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+    let request = format!(
+        "POST /submit HTTP/1.1\r\nHost: example.test\r\nContent-Type: \
+         application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+
+    assert!(
+        String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"),
+        "the origin's answer must come back: {:?}",
+        String::from_utf8_lossy(&raw)
+    );
+
+    let seen = origin.first_request();
+    assert!(
+        seen.ends_with(body),
+        "the body must reach the origin byte for byte: {seen:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An origin that is not there is a 502, and one that never answers is a 504.
+///
+/// The statuses the CGI path already produces, asserted for the new path so "one error rule, two
+/// request paths" is a fact rather than an intention. The two are different answers on purpose: an
+/// origin that refused the connection was never serving, while one that accepted it and stayed
+/// silent is a deadline — and an operator fixes those two differently.
+#[test]
+fn an_unreachable_origin_is_a_502_and_a_silent_one_is_a_504() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-upstream-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    // A port nothing listens on: bind one and let it go.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let closed_port = closed.local_addr().expect("address").port();
+    drop(closed);
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:0"
+document_root = {root}
+[backends.node]
+kind = "upstream"
+origin = "http://127.0.0.1:{closed_port}"
 "#,
             root = toml_string(&root.display().to_string()),
         ),
     )
     .expect("write the config");
 
-    let check = Command::new(&binary)
-        .arg("check")
-        .arg("--config")
-        .arg(&config_path)
-        .output()
-        .expect("the check command runs");
-    let check_text = String::from_utf8_lossy(&check.stdout);
-    assert!(check.status.success(), "{check:?}");
-    assert!(
-        check_text.contains("not served yet"),
-        "`check` must warn before `serve` refuses: {check_text}"
-    );
+    let Some(server) = Server::start(&binary, &config_path) else {
+        panic!("the server did not start");
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("an HTTP listener was configured");
 
-    // `serve` fails, and its message names the backend and repeats the reason — not merely
-    // "misconfigured", which would send an operator looking for a typo in a file that is valid.
-    let serve = Command::new(&binary)
-        .arg("serve")
-        .arg("--config")
-        .arg(&config_path)
-        .output()
-        .expect("the serve command runs");
-    assert!(
-        !serve.status.success(),
-        "serve must refuse an unserved kind"
-    );
-    let serve_text = String::from_utf8_lossy(&serve.stderr);
-    assert!(serve_text.contains("node"), "{serve_text}");
-    assert!(
-        serve_text.contains("no request path"),
-        "the refusal must say why, and match what `check` printed: {serve_text}"
+    let answer = http_get(&address, "/");
+    assert_eq!(
+        answer.status, 502,
+        "an origin nothing is listening on is a bad gateway, not a client error: {answer:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

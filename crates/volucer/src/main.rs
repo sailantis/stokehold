@@ -224,13 +224,75 @@ fn resolve_tls_path(path: &Path, config_path: &Path) -> PathBuf {
     }
 }
 
+/// One ACME table: the deployment's, or a site's.
+///
+/// Collected before any engine is built, because the engines and the resolver that carries their
+/// challenge sources are mutually dependent: every engine needs the cell the composed resolver will
+/// be installed into, and the composed resolver needs every engine's challenge source. Gathering the
+/// scopes first is what breaks that cycle without a lock on any path that matters.
+#[derive(Debug, Clone)]
+struct AcmeScope {
+    /// How this table is named in logs — `server.acme`, or the site name.
+    label: String,
+    /// The names to issue for, already resolved.
+    domains: Vec<String>,
+    /// Which authority.
+    authority: volucer_core::config::Authority,
+    /// The cache directory, already absolute.
+    cache: PathBuf,
+    /// `Some(site)` when this is a site's own table. The site name is what scopes its challenge
+    /// source, since a validation handshake carries only an SNI name.
+    site: Option<String>,
+    /// Whether the deployment's contact list is empty, for the one warning worth emitting.
+    contact_missing: bool,
+}
+
+/// A cache directory, absolute.
+///
+/// Relative to the **config file's** directory, like `certificate` and `key` and deliberately unlike
+/// `document_root`. Resolved once here rather than at each use so `check` and `serve` cannot disagree
+/// about where the account and certificates live.
+fn acme_cache(config_dir: &Path, cache: &Path) -> PathBuf {
+    match cache.is_absolute() {
+        true => cache.to_path_buf(),
+        false => config_dir.join(cache),
+    }
+}
+
+/// The ACME engine's view of which authority to talk to.
+fn acme_authority(authority: volucer_core::config::Authority) -> volucer_acme::Authority {
+    match authority {
+        volucer_core::config::Authority::Staging => volucer_acme::Authority::Staging,
+        volucer_core::config::Authority::Production => volucer_acme::Authority::Production,
+    }
+}
+
 /// Absolute certificate and key for the server's own TLS settings.
+///
+/// `None` when the pair is stated only partly, which `Config::validate` refuses, or when it is left
+/// out entirely so a placeholder is generated — in which case there is no path to resolve and
+/// `check` reports the generation rather than a file.
 fn resolved_server_tls(config: &Config, config_path: &Path) -> Option<TlsPaths> {
     let tls = config.server.tls.as_ref()?;
+    let certificate = tls.certificate.as_ref()?;
+    let key = tls.key.as_ref()?;
     Some(TlsPaths {
-        certificate: resolve_tls_path(&tls.certificate, config_path),
-        key: resolve_tls_path(&tls.key, config_path),
+        certificate: resolve_tls_path(certificate, config_path),
+        key: resolve_tls_path(key, config_path),
     })
+}
+
+/// Absolute certificate and key for the server's own TLS settings, when they are generated.
+///
+/// The distinction `check` has to make: a pair that is absent is not a mistake, it is a
+/// placeholder — and saying "certificate: (generated)" is the difference between an operator
+/// knowing issuance is wired up and wondering where their certificate went.
+fn server_tls_is_generated(config: &Config) -> bool {
+    config
+        .server
+        .tls
+        .as_ref()
+        .is_some_and(|tls| tls.certificate.is_none() && tls.key.is_none())
 }
 
 /// Resolved certificate and key paths.
@@ -246,11 +308,13 @@ fn resolved_site_tls(config: &Config, config_path: &Path) -> Vec<(String, TlsPat
         .iter()
         .filter_map(|(name, site)| {
             let tls = site.tls.as_ref()?;
+            let certificate = tls.certificate.as_ref()?;
+            let key = tls.key.as_ref()?;
             Some((
                 name.clone(),
                 TlsPaths {
-                    certificate: resolve_tls_path(&tls.certificate, config_path),
-                    key: resolve_tls_path(&tls.key, config_path),
+                    certificate: resolve_tls_path(certificate, config_path),
+                    key: resolve_tls_path(key, config_path),
                 },
             ))
         })
@@ -335,6 +399,12 @@ impl CertificateLifetime {
 /// it after startup, and the only read is on an issuance, which happens seconds or weeks later.
 struct ResolverSink {
     resolver: Arc<std::sync::OnceLock<Arc<volucer_http::SniResolver>>>,
+    /// Whether what this sink installs should become the **default** certificate.
+    ///
+    /// True for the deployment's own table, false for a site's — see
+    /// [`SniResolver::install_issued`]. A site's engine must not make its certificate answer for
+    /// names it was not issued for, which the default entry does.
+    takes_default: bool,
 }
 
 impl volucer_acme::CertificateSink for ResolverSink {
@@ -355,7 +425,7 @@ impl volucer_acme::CertificateSink for ResolverSink {
         // number of certificates followed by exactly one key, and "first is the cert, second is
         // the key" would break the moment a chain had an intermediate.
         let (cert_pem, key_pem) = split_pem_pair(pem);
-        match resolver.install_issued(cert_pem, key_pem, domains) {
+        match resolver.install_issued(cert_pem, key_pem, domains, self.takes_default) {
             Ok(replaced) => {
                 tracing::info!(
                     domains = ?domains,
@@ -633,95 +703,143 @@ fn serve(
         false => None,
     };
 
-    // The ACME engine, when configured. Built *before* the listeners bind, because a challenge
-    // handshake can arrive as soon as a port is open, so the challenge source has to be composed
-    // into the resolver already.
+    // The ACME engines, when configured: one for the deployment's table and one per site that has
+    // its own. All built *before* the listeners bind, because a challenge handshake can arrive as
+    // soon as a port is open, so every challenge source has to be composed into the resolver already.
     //
-    // The resolver arrives through a cell: the resolver is composed with the engine's challenge
-    // source, so the engine must exist first, and the engine needs somewhere to install what it
-    // issues. See [`ResolverSink`].
-    let (tls_state, acme) = match (&config.server.acme, tls_state) {
-        (Some(acme), Some(resolver)) => {
-            let cache = match acme.cache.is_absolute() {
-                true => acme.cache.clone(),
-                false => config_dir.join(&acme.cache),
-            };
-            let cell = Arc::new(std::sync::OnceLock::new());
-            let engine = volucer_acme::Engine::new(
-                acme.domains.clone(),
-                match acme.authority {
-                    volucer_core::config::Authority::Staging => volucer_acme::Authority::Staging,
-                    volucer_core::config::Authority::Production => {
-                        volucer_acme::Authority::Production
-                    }
-                },
-                cache,
-                Arc::new(ResolverSink {
-                    resolver: Arc::clone(&cell),
-                }),
-            )
-            .map_err(|err| ServerError::Listener {
-                reason: err.to_string(),
-            })?;
+    // One engine per table rather than one with several domain sets, because each has its **own
+    // order and its own account** — and because `rustls-acme` keeps one challenge at a time per
+    // state, so one state for two orders would have the second challenge overwrite the first.
+    //
+    // Each engine needs somewhere to install what it issues, and every one of those places has to be
+    // the **one** table the listeners serve from — otherwise a certificate reaches one port and not
+    // another. So all the cells are collected first and filled once the composed resolver exists;
+    // and the composition happens once, at the end, because building it per site would drop the
+    // earlier sites' challenge sources.
+    let mut scopes: Vec<AcmeScope> = Vec::new();
+    if let Some(acme) = &config.server.acme {
+        let contact_missing = acme.contact.is_empty();
+        scopes.push(AcmeScope {
+            label: "server.acme".to_string(),
+            domains: acme.domains.clone(),
+            authority: acme.authority,
+            cache: acme_cache(config_dir, &acme.cache),
+            site: None,
+            contact_missing,
+        });
+    }
+    for (name, site) in &config.sites {
+        let Some(site_acme) = &site.acme else {
+            continue;
+        };
+        let (names, _dropped) = site_acme.resolve_domains(&site.hosts);
+        scopes.push(AcmeScope {
+            label: name.to_string(),
+            domains: names,
+            authority: site_acme.resolved_authority(&config.server.acme),
+            cache: acme_cache(config_dir, &site_acme.resolved_cache(&config.server.acme)),
+            site: Some(name.clone()),
+            contact_missing: site_acme.resolved_contact(&config.server.acme).is_empty(),
+        });
+    }
 
-            // The challenge source is composed in **before** any port is bound, and only for a
-            // challenge handshake — `SniResolver::resolve` consults it behind an exact `acme-tls/1`
-            // ALPN match, so a normal handshake is answered by the site table exactly as it was.
-            //
-            // The resolver object is rebuilt rather than mutated, because the ACME field is set at
-            // construction and the table behind it is what moves. The *table* is shared into the
-            // new resolver, so an installation through the cell and a reload through the old handle
-            // both reach the same place.
-            let composed = Arc::new(
-                volucer_http::SniResolver::from_shared(resolver.table(), resolver.config_dir())
-                    .with_acme(Arc::new(engine.challenge_source())),
-            );
-            if cell.set(Arc::clone(&composed)).is_err() {
-                return Err(ServerError::Listener {
-                    reason: "the ACME sink could not be wired to the serving resolver".to_string(),
-                });
-            }
+    let mut cells: Vec<Arc<std::sync::OnceLock<Arc<volucer_http::SniResolver>>>> = Vec::new();
+    let mut acme: Vec<volucer_acme::Engine> = Vec::new();
+    for scope in &scopes {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let engine = volucer_acme::Engine::new(
+            scope.domains.clone(),
+            acme_authority(scope.authority),
+            scope.cache.clone(),
+            Arc::new(ResolverSink {
+                resolver: Arc::clone(&cell),
+                takes_default: scope.site.is_none(),
+            }),
+        )
+        .map_err(|err| ServerError::Listener {
+            reason: err.to_string(),
+        })?;
+        cells.push(cell);
+        acme.push(engine);
+    }
 
-            println!("  acme:             {}", acme.domains.join(", "));
-            println!("    authority:      {}", acme.authority.as_str());
-            if acme.contact.is_empty() {
-                tracing::warn!(
-                    "no server.acme.contact is set, so the CA has no way to warn this deployment \
-                     that renewals are failing; `volucer check` reports the days left instead"
+    // The challenge sources are composed in **before** any port is bound, and each only answers a
+    // challenge handshake — `SniResolver::resolve` consults them behind an exact `acme-tls/1` ALPN
+    // match, so a normal handshake is answered by the site table exactly as it was.
+    //
+    // The resolver object is rebuilt rather than mutated, because the ACME field is set at
+    // construction. The *table* is shared into the new resolver, so an installation through a cell
+    // and a reload through the old handle both reach the same place — which is why one cell per
+    // engine still means one table.
+    let tls_state = match tls_state {
+        Some(resolver) if !acme.is_empty() => {
+            let mut composed =
+                volucer_http::SniResolver::from_shared(resolver.table(), resolver.config_dir());
+            for (scope, engine) in scopes.iter().zip(&acme) {
+                composed = match &scope.site {
+                    None => composed.with_acme(Arc::new(engine.challenge_source())),
+                    Some(site) => composed
+                        .with_site_acme(site.clone(), Arc::new(engine.site_challenge_source(site))),
+                };
+                println!(
+                    "  acme:             ({}) {}",
+                    scope.label,
+                    scope.domains.join(", ")
                 );
+                println!("    authority:      {}", scope.authority.as_str());
             }
-            (Some(composed), Some(engine))
+            let composed = Arc::new(composed);
+            for cell in &cells {
+                if cell.set(Arc::clone(&composed)).is_err() {
+                    return Err(ServerError::Listener {
+                        reason: "the ACME sink could not be wired to the serving resolver"
+                            .to_string(),
+                    });
+                }
+            }
+            for scope in &scopes {
+                if scope.site.is_none() && scope.contact_missing {
+                    tracing::warn!(
+                        "no server.acme.contact is set, so the CA has no way to warn this \
+                         deployment that renewals are failing; `volucer check` reports the days \
+                         left instead"
+                    );
+                }
+            }
+            Some(composed)
         }
-        (Some(_), None) => {
-            // Validation refuses this, so reaching it means the two rules have come apart.
+        // ACME configured and no TLS: validation refuses this, so reaching it means the two rules
+        // have come apart.
+        other if !acme.is_empty() => {
+            let _ = other;
             return Err(ServerError::Listener {
-                reason: "[server.acme] needs [server.tls]: ACME replaces the certificate being \
-                         served, so name a fallback pair"
+                reason: "[server.acme] needs [server.tls]: the TLS-ALPN-01 challenge is validated \
+                         on the TLS port"
                     .to_string(),
             });
         }
-        (None, other) => (other, None),
+        other => other,
     };
 
     // The cached certificate is installed before anything is bound, so a restart serves it from the
     // first handshake rather than from whenever the state's own first poll completes. Blocking here
     // is deliberate: it is one file read, and a listener that accepted a handshake before it
-    // finished would be presenting the fallback certificate to a client that should have had the
-    // issued one.
-    // The cached certificate is installed before anything is bound, so a restart serves it from the
-    // first handshake rather than from whenever the state's own first poll completes. Blocking here
-    // is deliberate: it is one file read, and a listener that accepted a handshake before it
-    // finished would be presenting the fallback certificate to a client that should have had the
-    // issued one.
+    // finished would be presenting the placeholder to a client that should have had the issued one.
     //
     // `run` installs it too, and the two are not redundant: a renewal has to reach the table months
     // after startup, and that is the event path. This one is what makes the *window before the first
     // poll* serve the issued certificate — the engine's own `load_cert` step is asynchronous, and
     // `serve` does not wait for it.
-    if let Some(engine) = &acme {
-        let installed = futures::executor::block_on(engine.install_cached());
-        if installed {
-            tracing::info!("the cached certificate is serving before any port was bound");
+    //
+    // Every engine is drained in turn, and the order does not matter: each installs for **its own**
+    // names, and `install_issued` is a partial update that leaves every other entry alone. So a
+    // deployment with a table per site ends up serving all of them, whatever the order.
+    for engine in &acme {
+        if futures::executor::block_on(engine.install_cached()) {
+            tracing::info!(
+                domains = ?engine.domains(),
+                "the cached certificate is serving before any port was bound"
+            );
         }
     }
 
@@ -801,10 +919,10 @@ fn serve(
 
     println!("press Ctrl-C to stop");
 
-    // The engine is moved **into** the thread, which is what keeps `Arc<Engine>` — and therefore
-    // `AcmeState`'s lack of `Sync` — out of the signal handler entirely. The reloader needs no
-    // handle to it: what it asks is the *resolver*, which is `Sync` because it has to be.
-    if let Some(engine) = acme {
+    // Each engine is moved **into** a thread of its own, which is what keeps `Arc<Engine>` — and
+    // therefore `AcmeState`'s lack of `Sync` — out of the signal handler entirely. The reloader needs
+    // no handle to any of them: what it asks is the *resolver*, which is `Sync` because it has to be.
+    for engine in acme {
         std::thread::Builder::new()
             .name("acme".to_string())
             .spawn(move || {
@@ -1010,28 +1128,13 @@ impl Reloader {
         // were — one table refusing must not take the other with it, and both are whole-or-nothing
         // on their own.
         //
-        // When ACME manages this deployment's certificates the rebuild is **skipped, not followed
-        // by a repair**, because the issued certificate is not in the configuration at all: the
-        // configured pair is only the fallback, so rebuilding from the file puts a self-signed
-        // certificate back into service on a host that has a real one. Reading the cache back
-        // afterwards would only fix that while the read succeeds, so the moment it does not is the
-        // moment a deployment is downgraded with no error. The table is already correct, because
-        // issuance installs into it, so leaving it alone makes the two halves unable to come apart
-        // rather than repaired after they had.
-        //
-        // `has_acme` is asked of the resolver that answers handshakes rather than inferred from a
-        // `[server.acme]` table existing: the question is whether *the serving path* consults an ACME
-        // challenge source, which is a fact about this object and not about the file on disk.
-        if self
-            .tls
-            .as_ref()
-            .is_some_and(|resolver| resolver.has_acme())
-        {
-            tracing::info!(
-                "ACME manages this deployment's certificates: the sites changed and the issued \
-                 certificate stays in service"
-            );
-        } else if let Some(resolver) = &self.tls {
+        // This runs even when ACME manages some of the deployment's certificates, and the **merge
+        // inside `refresh`** is what makes that safe. It used to be skipped, because a rebuild from
+        // the configuration alone would replace an issued certificate with a placeholder (hazard 71);
+        // now the rebuild keeps what was issued and re-reads what is named. Skipping would have been
+        // simpler and wrong in the other direction: a site's own `[sites.x.tls]` PEM *is* in the
+        // configuration, and a renewal of it has to be picked up.
+        if let Some(resolver) = &self.tls {
             match resolver.refresh(&volucer_http::CertificateSet::from_config(&config)) {
                 Ok(_) => tracing::info!("certificate table refreshed"),
                 Err(err) => {
@@ -1228,8 +1331,13 @@ fn check(
     // assumed because a certificate path is the one setting whose *file* the reader cannot
     // see from the config: `certs/a.crt` is relative to this file, not to wherever the
     // process started.
-    match resolved_server_tls(&config, path) {
-        Some(server_tls) => {
+    //
+    // A pair left out prints `(generated)` rather than nothing: it is a configuration an operator
+    // chose, and the difference between "I forgot the certificate" and "it will be generated until
+    // ACME issues" is the difference between a bug report and the intended behaviour.
+    let generated_tls = server_tls_is_generated(&config);
+    match (resolved_server_tls(&config, path), generated_tls) {
+        (Some(server_tls), _) => {
             let tls = config
                 .server
                 .tls
@@ -1258,7 +1366,31 @@ fn check(
                 println!("    redirect_to_https: true");
             }
         }
-        None => println!("  tls:              (disabled)"),
+        (None, true) => {
+            let tls = config
+                .server
+                .tls
+                .as_ref()
+                .expect("generated implies present");
+            println!("  tls:");
+            println!(
+                "    certificate:      (generated in memory: no pair is named, so a self-signed \
+                 placeholder is made for the names this deployment answers to and replaced when \
+                 ACME issues)"
+            );
+            println!(
+                "    min version:      {}",
+                match tls.min_version {
+                    MinTlsVersion::V1_2 => "1.2",
+                    MinTlsVersion::V1_3 => "1.3",
+                }
+            );
+            println!("    alpn:             {}", tls.alpn.join(", "));
+            if config.server.redirect_to_https {
+                println!("    redirect_to_https: true");
+            }
+        }
+        (None, false) => println!("  tls:              (disabled)"),
     }
     // A site's certificate is printed only when the site states one, for the same reason the
     // site table prints only stated keys: listing the inherited value per site would read as
@@ -1327,6 +1459,51 @@ fn check(
             }
         }
         None => println!("  acme:             (disabled)"),
+    }
+
+    // Each site's own table, reported with everything it *inherits* made explicit. A site that omits
+    // `authority`, `contact` or `cache` gets the deployment's, and printing only what the file says
+    // would leave the reader unable to tell "inherited staging" from "defaulted staging" — the same
+    // reason the site table prints only keys a site states, one layer down.
+    for (name, site) in &config.sites {
+        let Some(site_acme) = &site.acme else {
+            continue;
+        };
+        let (names, dropped) = site_acme.resolve_domains(&site.hosts);
+        let authority = site_acme.resolved_authority(&config.server.acme);
+        println!("  acme ({name}):");
+        println!("    authority:        {}", authority.as_str());
+        if authority == volucer_core::config::Authority::Production {
+            println!("      PRODUCTION:     real certificates, against per-week rate limits");
+        }
+        println!(
+            "    domains:          {}{}",
+            names.join(", "),
+            match site_acme.domains.is_empty() {
+                true => " (derived from this site's hosts)",
+                false => "",
+            }
+        );
+        if site_acme.domains.is_empty() && !dropped.is_empty() {
+            println!(
+                "      wildcards left out: {} — a certificate name cannot be one, so this site \
+                 answers to {} that the certificate will not cover",
+                dropped.join(", "),
+                match dropped.len() {
+                    1 => "a name",
+                    _ => "names",
+                }
+            );
+        }
+        let contact = site_acme.resolved_contact(&config.server.acme);
+        match contact.is_empty() {
+            true => println!(
+                "    contact:          (none: the CA has no way to warn you that renewals are failing)"
+            ),
+            false => println!("    contact:          {}", contact.join(", ")),
+        }
+        let cache = resolve_tls_path(&site_acme.resolved_cache(&config.server.acme), path);
+        println!("    cache:            {}", cache.display());
     }
 
     println!("  document root: {}", document_root.display());

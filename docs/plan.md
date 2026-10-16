@@ -1832,12 +1832,16 @@ claims turned out to understate.
     `CertCacheStore` (which is the renewal reaching the serving table without a restart — the
     deliverable of the whole phase). Falsified by disabling the second call.
 63. `acme-config` — **done.** `[server.acme]` as a table rather than a flag, with `Authority` an
-    enum so production must be named. **Open decision §9.5 is answered *no*:** a `[server.tls]`-less
-    ACME listener stays refused, because a listener with nothing to serve fails every handshake that
-    is not a challenge — hazard 56's sibling — so `[server.tls]` remains the required *fallback* and
-    ACME changes which certificate is served. `domains` is stated rather than derived from
-    `[sites.*].hosts`, because a wildcard host pattern cannot go on a certificate and TLS-ALPN-01
-    cannot validate one. Nine tests, each failing on the thing its own message names.
+    enum so production must be named. **Open decision §9.5 was answered *no* here and is *reversed* by
+    step 67** — see hazard 72. The reasoning that was wrong: "*a listener with nothing to serve fails
+    every handshake that is not a challenge, so `[server.tls]` must name a fallback pair*". The first
+    half is true and the conclusion does not follow — the invariant is that the listener has
+    *something* to present, and **generating** one satisfies it. Requiring the operator to hand-make a
+    certificate that is replaced moments later was a proxy for the invariant, and the proxy cost work
+    for no safety. `domains` is stated rather than derived from `[sites.*].hosts` **in this table**,
+    because a wildcard host pattern cannot go on a certificate and TLS-ALPN-01 cannot validate one —
+    a rule step 67 keeps for the deployment-wide table and relaxes per site, where derivation is both
+    safe and what an operator expects. Nine tests, each failing on the thing its own message names.
 64. `acme-cli` — **done.** `check` reports the authority, the names, the contact, the resolved
     cache path, whether a certificate has ever been cached, and **the days left on each certificate
     being served** — which is the direct mitigation for this feature's failure mode, silence. A
@@ -1886,6 +1890,49 @@ claims turned out to understate.
     The wiring also needed one table behind two names (`SniResolver::from_shared`) and the engine on a
     thread of its own with a current-thread runtime, because `AcmeState` is not `Sync`. Both are
     hazards 69 and 70.
+67. `acme-optional-and-per-site` — **done, and it reverses step 63's answer to §9.5 and adds a
+    certificate per vhost.** Three changes with one theme: *the configuration should say what the
+    deployment means, not what the implementation needs.*
+
+    - **`certificate`/`key` are optional** when an ACME table will replace them. The placeholder is
+      generated **in memory** (`rcgen`, promoted from a dev-dependency) for the names of the scope that
+      needs it, and never written down — it is replaced, so a private key on disk for it would be a
+      liability with no benefit. Validation refuses an absent pair with no ACME, which is what keeps
+      the rule from being "generate and forget": the failure it prevents is a listener that looks
+      healthy and is trusted by nobody, with the error moved from startup to the client's browser.
+      Hazard 72.
+    - **`[sites.<name>.acme]`**: a site's own order, account and certificate, inheriting `authority`,
+      `contact` and `cache` from the deployment. One cache directory is safe and one account is
+      *shared* — `DirCache` names a certificate `cached_cert_{hash(domains, directory)}` and an account
+      `cached_account_{hash(contact, directory)}`, so distinct domain sets never collide and matching
+      contacts need no work to share. Two sites with *different* contacts silently create two accounts,
+      which is why the derivation is documented rather than left to be discovered.
+    - **`domains` may be omitted on a site**, and is then derived from its `hosts` with every wildcard
+      dropped and reported. A derivation that leaves nothing is an error naming the wildcards, not an
+      empty order. The deployment-wide table keeps `domains` required: deriving across a whole
+      deployment is exactly where a wildcard host bites.
+
+    **Two real defects came out of falsifying this, both in the plumbing rather than the config:**
+
+    - `install_issued` always installed as the **default** entry, and the default answers every name
+      with no entry of its own. So one site's certificate answered for the whole deployment — a wrong
+      certificate on a name nobody asked about, whose only symptom would be *another* site's browser
+      warning. Fixed with an explicit `takes_default`, true only for the deployment's own table.
+    - `default_names` preferred `[server.acme].domains` only after listing every site's hosts, so the
+      deployment's placeholder was named for a site's hosts whenever ACME was on. Reordered to prefer
+      the ACME names outright and to skip sites that have their own table.
+
+    The test that found them, `a_site_with_its_own_acme_serves_a_placeholder_for_its_own_names`, is the
+    one the earlier draft of it could not have been: an unpatched cache leaves **both** certificates
+    as placeholders, so a test that only compares certificates to each other cannot tell which of the
+    two scopes is wrong. It now writes a certificate into the site's own cache and asserts the site
+    serves it **and** that the deployment's name does not. Falsified by forcing `takes_default` true,
+    which fails on the second assertion alone.
+
+    `check` gained a per-site ACME block with everything inherited made explicit, because printing only
+    what the file states would leave an operator unable to tell inherited staging from defaulted
+    staging. `volucer check` against the documented example was run rather than assumed, and its
+    wildcard warning fires on the config the README recommends.
 
 ## 7. Testing strategy
 
@@ -3816,6 +3863,41 @@ signal, so the test cannot pass against a reloader that does nothing, nor agains
 engine was never wired up. Falsified by forcing the guard false: the fallback comes back and the
 test fails with the certificate it restored. The plan records the consequence for the operator too —
 migrating away from ACME needs a restart.
+
+### Hazard 72 — requiring a certificate the operator did not need was a proxy for the invariant
+
+Open decision §9.5 asked *"is a `[server.tls]`-less ACME-managed listener allowed?"* and `acme-config`
+answered **no**, with this reasoning: a listener with nothing to serve fails every handshake that is
+not a challenge, so name a fallback pair. The first half is true. The conclusion does not follow.
+
+The invariant that matters is that the listener has **something to present**. Naming a self-signed
+pair satisfies it, and so does generating one — and the second asks the operator for nothing. The
+question the decision answered was about the *table*, and the question an operator has is about the
+*work*: "why do I hand-make a certificate the point of which is to be replaced?" Requiring one was a
+proxy for the invariant, and the proxy cost a step, a file and a private key on disk that nothing ever
+trusted.
+
+The reversal is not "no certificate is needed" — it is "**no certificate has to be named**". The
+refusal that replaces the old one is narrower and better aimed: an absent pair with no ACME table is
+still an error, because then nothing will ever replace it, and what the deployment would run is a
+listener that looks healthy and is trusted by nobody. That is hazard 56's failure with the error moved
+from startup to the client's browser, which is strictly worse.
+
+Two design notes worth keeping:
+
+- **In memory, not to a file.** A generated pair that is never written down means there is no cleanup,
+  no path to get wrong, and no private key in a backup for a certificate nothing ever trusted. The one
+  thing a file would add is the ability to inspect it, and `volucer check` prints that the placeholder
+  is generated rather than showing a path — which is the honest form of the same information.
+- **A generated certificate needs names.** A certificate with no SAN is one no client accepts, so the
+  placeholder carries the scope's names: `[server.acme].domains` when there is one (literally "what
+  this certificate must cover"), else the hosts of every site that has no ACME table of its own. The
+  first version got this second case wrong and gave the deployment's placeholder a *site's* hosts —
+  found by writing the test, not by reading the code.
+
+The rule generalises past this decision: **when a requirement exists to protect an invariant, check
+that the requirement is the invariant.** "Name a certificate" and "have a certificate" are the same
+sentence only as long as nobody can generate one.
 
 ### What the live Pebble run established, and where it stopped
 

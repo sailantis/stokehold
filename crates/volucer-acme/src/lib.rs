@@ -57,6 +57,19 @@ pub trait ChallengeSource: std::fmt::Debug + Send + Sync {
     /// The challenge certificate for this handshake, when it is a challenge for a name the state
     /// is currently validating.
     fn challenge_cert(&self, hello: ClientHello<'_>) -> Option<ChallengeCert>;
+
+    /// The **site** this handshake's challenge belongs to, when the source can tell.
+    ///
+    /// Needed once one deployment can have several ACME tables: a challenge arrives as a bare TLS
+    /// handshake, before any request, so the SNI name is the only thing that says *which* site's
+    /// order it validates. `None` means "unscoped" — the source answers for the whole server, which
+    /// is the correct reading when there is one table for the deployment.
+    ///
+    /// The answer is a site *name* rather than a hostname because a site is the unit the resolver
+    /// already resolves by, and because several hosts can belong to one order.
+    fn site_for(&self, _hello: &ClientHello<'_>) -> Option<&str> {
+        None
+    }
 }
 
 /// The ACME resolver, wrapped so it can only ever answer a challenge handshake.
@@ -100,6 +113,34 @@ impl ChallengeSource for ChallengeResolver {
         // somebody else's challenge certificate.
         use rustls::server::ResolvesServerCert;
         self.inner.resolve(hello)
+    }
+}
+
+/// A [`ChallengeResolver`] that answers for **one site** and says so.
+///
+/// The same resolver, with the site name attached so [`ChallengeSource::site_for`] can be answered.
+/// Needed because one deployment can have several ACME tables and a validation handshake carries
+/// only an SNI name: without the name, the resolver would have to try every table and could answer a
+/// challenge for one site's order with another site's — which `rustls-acme` prevents only by refusing
+/// a name it is not validating, so the mismatch would surface as a failed handshake rather than as
+/// the configuration error it is.
+#[derive(Debug)]
+pub struct ScopedChallengeResolver {
+    site: String,
+    inner: ChallengeResolver,
+}
+
+impl ChallengeSource for ScopedChallengeResolver {
+    fn is_challenge(&self, hello: &ClientHello<'_>) -> bool {
+        self.inner.is_challenge(hello)
+    }
+
+    fn challenge_cert(&self, hello: ClientHello<'_>) -> Option<ChallengeCert> {
+        self.inner.challenge_cert(hello)
+    }
+
+    fn site_for(&self, _hello: &ClientHello<'_>) -> Option<&str> {
+        Some(&self.site)
     }
 }
 
@@ -259,6 +300,19 @@ impl Engine {
     /// [`ChallengeResolver`], which cannot answer a normal handshake.
     pub fn challenge_source(&self) -> ChallengeResolver {
         ChallengeResolver::new(self.state.resolver())
+    }
+
+    /// The challenge source for **one site's** orders.
+    ///
+    /// Same resolver, wrapped with the site's name so [`ChallengeSource::site_for`] can tell the
+    /// deployment's table from a site's. A deployment can have several tables at once — one per vhost
+    /// with its own `[sites.<name>.acme]` — and a validation handshake carries only an SNI name, so
+    /// the name is the only thing that says which order a challenge belongs to.
+    pub fn site_challenge_source(&self, site: impl Into<String>) -> ScopedChallengeResolver {
+        ScopedChallengeResolver {
+            site: site.into(),
+            inner: ChallengeResolver::new(self.state.resolver()),
+        }
     }
 
     /// Install the cached certificate, if there is one.

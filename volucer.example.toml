@@ -83,10 +83,15 @@ fastcgi = "127.0.0.1:9080"
 # Automatic certificates (ACME, RFC 8555). The presence of `[server.acme]` is
 # what turns it on, and a deployment without it behaves exactly as before.
 #
-# `[server.tls]` stays REQUIRED even with ACME: it is the fallback certificate
-# served until an order completes, so a first deployment names a self-signed pair
-# and issuance replaces it. An issued certificate reaches the running server
-# without a restart -- the next handshake presents it.
+# `[server.tls]` is still what turns TLS on, but its certificate and key may be
+# LEFT OUT when ACME is configured: a self-signed placeholder is then generated in
+# memory for the names in `domains` and replaced by the first issuance. Nothing is
+# written to disk — the placeholder is never trusted, so a private key for it would
+# be a liability with no benefit. Naming no pair and configuring no ACME is an
+# error, so a deployment cannot serve a placeholder for ever by omission.
+#
+# An issued certificate reaches the running server without a restart — the next
+# handshake presents it.
 #
 # Only `tls-alpn-01` is used, so the certificate is validated on the TLS port and
 # no :80 is needed. That port must be publicly reachable and the names must
@@ -94,6 +99,9 @@ fastcgi = "127.0.0.1:9080"
 #
 # `authority` defaults to staging on purpose: a production account has per-week
 # rate limits, and a first deployment should spend its mistakes on staging.
+# Let's Encrypt is the only authority reachable from here; ZeroSSL and Google
+# Trust Services need External Account Binding, which this does not send.
+#
 # `volucer check` prints the authority, the names, whether a certificate has ever
 # been cached, and the days left on each one -- because the failure mode here is
 # silence, and an expired certificate is its only symptom.
@@ -104,6 +112,30 @@ fastcgi = "127.0.0.1:9080"
 # contact = ["mailto:ops@example.com"]           # the CA's only way to warn you
 # authority = "staging"                          # or "production"; staging default
 # cache = "acme-cache"                           # relative to this file
+
+# ---------------------------------------------------------------------------
+# A site's own certificate, issued for its own names. What a deployment with
+# several unrelated hostnames wants: several certificates rather than one
+# covering all of them.
+#
+# `domains` may be LEFT OUT, and is then derived from this site's `hosts` --
+# with every wildcard dropped, and dropped ones logged, because `*.corp` is a
+# host pattern and a certificate name cannot be one. Nothing left over is an
+# error, not an empty order.
+#
+# `authority`, `contact` and `cache` may also be left out; omitting them inherits
+# the deployment's, which keeps several sites' certificates in one directory and
+# their orders on ONE account when the contact and authority match.
+#
+# A site that names its own [sites.corp.tls] is left alone: naming a certificate
+# is a decision not to have one issued, so stating both is refused.
+# ---------------------------------------------------------------------------
+# [sites.corp]
+# hosts = ["corp.internal", "*.corp.internal"]
+# document_root = "/srv/corp"
+#
+# [sites.corp.acme]
+# domains = ["corp.internal"]   # or omit to derive from hosts
 
 # ---------------------------------------------------------------------------
 # Static files, served from the document root without waking PHP at all. This is

@@ -28,6 +28,9 @@ tokio-rustls.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 rustls-acme.workspace = true
+# For the generated placeholder a `[server.tls]` without a certificate gets. A real dependency
+# rather than a dev one because the *server* generates it, not a test.
+rcgen = "0.13"
 
 [dev-dependencies]
 rcgen = "0.13"

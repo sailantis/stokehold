@@ -101,6 +101,18 @@ pub struct SiteConfig {
     /// [`SiteTlsConfig`].
     #[serde(default)]
     pub tls: Option<SiteTlsConfig>,
+
+    /// This site's certificates, obtained automatically.
+    ///
+    /// Absent inherits `[server.acme]`, which means the deployment's certificate covers this site's
+    /// hosts too. Naming a table here gives the site its **own** certificate, for its own names,
+    /// which is what a deployment with several unrelated hostnames wants — one certificate per
+    /// hostname rather than one covering all of them.
+    ///
+    /// A site that states its own [`tls`](SiteConfig::tls) is left alone: naming a certificate is a
+    /// decision not to have one issued, and honouring both would mean the site had two answers.
+    #[serde(default)]
+    pub acme: Option<SiteAcmeConfig>,
 }
 
 /// What a deployment serves.
@@ -701,14 +713,29 @@ impl ServerConfig {
 /// the process's working directory). A certificate beside `volucer.toml` is the common
 /// case, and resolving it against wherever the process happened to start would be a footgun
 /// with a security consequence. `volucer check` prints the path it resolved.
+///
+/// **Both keys may be left out when an ACME authority will issue** — see [`AcmeConfig`]. The server
+/// then generates a self-signed pair in memory for the first handshakes, and issuance replaces it.
+/// The pair is not written to disk: it is a placeholder, so there is nothing to clean up and no
+/// private key lying around for a certificate nothing ever trusted.
+///
+/// Absent is *only* allowed together with ACME, because otherwise the server would have nothing to
+/// present and every handshake that is not an ACME challenge would fail — the mistake hazard 56 was
+/// about, and the reason this table exists rather than an `enabled` flag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// PEM certificate chain, leaf first.
-    pub certificate: PathBuf,
+    ///
+    /// Absent means "generate one", which requires an ACME authority to replace it.
+    #[serde(default)]
+    pub certificate: Option<PathBuf>,
 
     /// PEM private key (PKCS#8, PKCS#1 or SEC1).
-    pub key: PathBuf,
+    ///
+    /// Absent means "generate one", which requires an ACME authority to replace it.
+    #[serde(default)]
+    pub key: Option<PathBuf>,
 
     /// Lowest protocol version accepted: `"1.2"` (the default) or `"1.3"`.
     ///
@@ -749,14 +776,19 @@ pub struct TlsConfig {
 /// and `plain` are properties of the socket the connection arrived on, so a per-site value
 /// would describe something the socket does not do — setting one is an error rather than a
 /// silently ignored key.
+///
+/// Both keys may be left out when the site has its own `[sites.<name>.acme]`, for the same reason
+/// [`TlsConfig`] allows it: what is generated in memory is replaced by what is issued.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SiteTlsConfig {
     /// PEM certificate chain for this site's hosts, leaf first.
-    pub certificate: PathBuf,
+    #[serde(default)]
+    pub certificate: Option<PathBuf>,
 
     /// PEM private key for this site's hosts.
-    pub key: PathBuf,
+    #[serde(default)]
+    pub key: Option<PathBuf>,
 }
 
 /// `[server.acme]`: obtain this deployment's certificates automatically (RFC 8555).
@@ -772,16 +804,25 @@ pub struct SiteTlsConfig {
 ///
 /// # What it needs from `[server.tls]`
 ///
-/// A **fallback certificate**: `[server.tls].certificate` and `.key` stay required, and an issued
-/// certificate replaces what is served once it exists. This is the answer to open decision §9.5 —
-/// *"is a `[server.tls]`-less ACME-managed listener allowed?"* — and it is **no**, deliberately,
-/// for the reason the whole TLS layer is built on: a listener with nothing to serve fails every
-/// handshake that is not a challenge, and "the port is up and every client gets a handshake error"
-/// is hazard 56's sibling. A deployment that has never issued names a self-signed pair as the
-/// fallback; the first issuance replaces it without a restart.
+/// A **certificate to serve until an order completes** — and `[server.tls].certificate`/`.key` may
+/// be left out for that, in which case one is generated in memory and never written down. This
+/// replaces the earlier answer to open decision §9.5, which required the *operator* to name a
+/// self-signed pair; see hazard 72. The invariant — a TLS listener needs something to present — is
+/// what matters, and generating satisfies it without asking for work that is thrown away moments
+/// later. The pair is a placeholder, so making it durable would leave a private key on disk for a
+/// certificate nothing ever trusted.
 ///
 /// So ACME does not contradict "a TLS listener needs a certificate" — it changes *which*
 /// certificate, which is precisely what the reload phase made replaceable.
+///
+/// # Why this type is separate from [`SiteAcmeConfig`]
+///
+/// The global table's `domains` is **required** and a site's is **optional**, and that difference is
+/// the whole reason there are two types. Deriving names from a site's `hosts` is what an operator
+/// expects and is safe within one site; deriving across a whole deployment is exactly where a
+/// wildcard host bites, because a wildcard cannot be a certificate name. One type with a
+/// conditional rule would make "is `domains` allowed to be empty?" depend on where the table
+/// appeared, which is the kind of rule a reader has to be told rather than see.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
@@ -795,10 +836,11 @@ pub struct AcmeConfig {
 
     /// The names to issue for.
     ///
-    /// Stated rather than derived from `[sites.*].hosts`, because the two are different questions: a
-    /// site's hosts say which requests it answers, and this says which names the certificate must
-    /// *cover*. A wildcard host pattern cannot be a name on a certificate, so deriving would be
-    /// wrong exactly for the deployments that need issuance most.
+    /// **Required here, and stated rather than derived.** The deployment-wide table covers hosts
+    /// from several sites, and a site's hosts may be a wildcard pattern, which cannot be a name on a
+    /// certificate — so a derivation that looked safe for one site would be wrong exactly for the
+    /// deployments that need issuance most. A site's own table *may* omit this and derive from its
+    /// own `hosts`; see [`SiteAcmeConfig::domains`].
     ///
     /// An empty list is an error rather than "derive from the sites": a mistake that would
     /// otherwise become an ACME request for an empty identifier set.
@@ -810,6 +852,11 @@ pub struct AcmeConfig {
     /// Optional in the protocol — Let's Encrypt does not require one — and **strongly recommended**
     /// here, because it is the only channel a CA has for warning that renewals are failing for this
     /// account. A deployment with no contact finds out from an expired certificate.
+    ///
+    /// This is also what the account is keyed by: `rustls-acme`'s directory cache names the account
+    /// file after a hash of the contact list and the directory URL, so two tables that list the same
+    /// contacts on the same authority **share one account**, and two that differ create two. The
+    /// second is invisible in the configuration, so it is reported at startup.
     #[serde(default)]
     pub contact: Vec<String>,
 
@@ -824,6 +871,169 @@ pub struct AcmeConfig {
     /// which is where an operator looks for it.
     #[serde(default = "default_acme_cache")]
     pub cache: PathBuf,
+}
+
+/// `[sites.<name>.acme]`: this site's certificates, obtained automatically.
+///
+/// The same table as [`AcmeConfig`] with one difference and one addition:
+///
+/// - `authority`, `contact` and `cache` are all **optional**, so a site inherits the deployment's
+///   values and states only what is its own. Inheriting the cache is what makes the account shared:
+///   the account file is keyed by contact and authority, not by site.
+/// - `domains` may be **omitted**, in which case it is derived from the site's own
+///   [`hosts`](SiteConfig::hosts), dropping any wildcard pattern.
+///
+/// The site's certificate **replaces** the deployment's for the hosts it names. A site that states
+/// its own [`tls`](SiteConfig::tls) is left alone entirely — naming a certificate is a decision not
+/// to have one issued.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SiteAcmeConfig {
+    /// Which authority to talk to; absent inherits `[server.acme]`.
+    #[serde(default)]
+    pub authority: Option<Authority>,
+
+    /// The names to issue for; absent or empty derives them from this site's `hosts`.
+    ///
+    /// Deriving drops every wildcard pattern, because `*.example.com` cannot appear on a
+    /// certificate — the CA offers `dns-01` for that and this server does not speak it. What is
+    /// dropped is **logged at startup**, since a certificate that does not cover a name the site
+    /// answers to is a browser warning waiting for someone to notice.
+    ///
+    /// A derivation that leaves nothing is an **error** rather than an empty order, and the error
+    /// quotes the wildcards and says to list the real names.
+    #[serde(default)]
+    pub domains: Vec<String>,
+
+    /// A contact address for the account; absent inherits `[server.acme]`.
+    #[serde(default)]
+    pub contact: Option<Vec<String>>,
+
+    /// Where the account and issued certificates are cached; absent inherits `[server.acme]`.
+    #[serde(default)]
+    pub cache: Option<PathBuf>,
+}
+
+impl SiteAcmeConfig {
+    /// The names to issue for: the site's own, or derived from its hosts.
+    ///
+    /// Returns the names and the wildcard patterns that were dropped, so a caller can report them
+    /// rather than let the omission pass unmentioned.
+    pub fn resolve_domains(&self, hosts: &[String]) -> (Vec<String>, Vec<String>) {
+        if !self.domains.is_empty() {
+            return (self.domains.clone(), Vec::new());
+        }
+        let mut names = Vec::new();
+        let mut dropped = Vec::new();
+        for host in hosts {
+            // A wildcard is a *pattern*, not a name, and `validate_acme_domain` refuses it. Split
+            // rather than filtered, so the caller can say which ones were left out.
+            if host.contains('*') {
+                dropped.push(host.clone());
+                continue;
+            }
+            if !names.contains(host) {
+                names.push(host.clone());
+            }
+        }
+        (names, dropped)
+    }
+
+    /// This site's contact list: its own, or the deployment's.
+    ///
+    /// Inheriting rather than defaulting is deliberate, and it is what makes the **account**
+    /// shared: `rustls-acme` names the account file after a hash of the contact list and the
+    /// directory URL, so a site that inherits creates no second account.
+    pub fn resolved_contact<'a>(&'a self, global: &'a Option<AcmeConfig>) -> &'a [String] {
+        match &self.contact {
+            Some(contact) => contact,
+            None => global.as_ref().map_or(&[], |acme| acme.contact.as_slice()),
+        }
+    }
+
+    /// This site's cache directory: its own, or the deployment's.
+    ///
+    /// Inheriting is what lets several sites' certificates live in one directory. The file names
+    /// are hashes of `(domains, directory_url)` for a certificate and `(contact, directory_url)`
+    /// for the account, so two sites never collide on a certificate and *do* share an account when
+    /// their contacts match.
+    pub fn resolved_cache(&self, global: &Option<AcmeConfig>) -> PathBuf {
+        match &self.cache {
+            Some(cache) => cache.clone(),
+            None => global
+                .as_ref()
+                .map_or_else(default_acme_cache, |acme| acme.cache.clone()),
+        }
+    }
+
+    /// This site's authority: its own, or the deployment's.
+    pub fn resolved_authority(&self, global: &Option<AcmeConfig>) -> Authority {
+        match self.authority {
+            Some(authority) => authority,
+            None => global
+                .as_ref()
+                .map_or(Authority::default(), |acme| acme.authority),
+        }
+    }
+}
+
+/// The rules every ACME table shares, whoever wrote it.
+///
+/// Factored out so the deployment's table and a site's table cannot drift: the names, the contact
+/// format and the cache are the same questions in both, and the errors name the table they belong
+/// to through `label`.
+fn validate_acme_table(
+    label: &str,
+    domains: &[String],
+    contact: &[String],
+    cache: &Path,
+) -> Result<()> {
+    for domain in domains {
+        validate_acme_domain(domain).map_err(|err| match err {
+            Error::Config(message) => Error::Config(message.replace("server.acme", label)),
+            other => other,
+        })?;
+    }
+
+    // Duplicates are not harmful to the order — the CA ignores them — but they are always a
+    // mistake, and the mistake they usually are is a copy-paste that left one name out. Saying so
+    // is cheaper than the operator discovering the missing name from a browser warning.
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (index, domain) in domains.iter().enumerate() {
+        if let Some(first) = seen.insert(domain.as_str(), index) {
+            return Err(Error::Config(format!(
+                "{label}.domains lists {domain:?} twice (positions {first} and {index}); the CA \
+                 would ignore the repeat, so this is nearly always a name that was meant to be \
+                 here instead"
+            )));
+        }
+    }
+
+    for address in contact {
+        // `mailto:` is the only scheme Let's Encrypt accepts, and a bare address — the mistake an
+        // operator makes because every other tool takes one — would be sent as an unknown URI
+        // scheme and rejected by the CA. Catching it here means the error names the fix.
+        if !address.starts_with("mailto:") {
+            return Err(Error::Config(format!(
+                "{label}.contact {address:?} must be a `mailto:` URI, e.g. \
+                 \"mailto:ops@example.com\""
+            )));
+        }
+        if address.len() <= "mailto:".len() {
+            return Err(Error::Config(format!(
+                "{label}.contact is an empty `mailto:` URI; give an address"
+            )));
+        }
+    }
+
+    if cache.as_os_str().is_empty() {
+        return Err(Error::Config(format!(
+            "{label}.cache is empty; name a directory, or remove the key to get the default \
+             beside this file"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Which ACME authority to use.
@@ -1439,15 +1649,41 @@ impl Config {
             return Ok(());
         };
 
-        if tls.certificate.as_os_str().is_empty() {
-            return Err(Error::Config(
-                "server.tls.certificate is empty; name the PEM file".to_string(),
-            ));
-        }
-        if tls.key.as_os_str().is_empty() {
-            return Err(Error::Config(
-                "server.tls.key is empty; name the PEM file".to_string(),
-            ));
+        // Every TLS key is a *pair*, and a pair with one half is a mistake rather than a partial
+        // configuration: the other half has no meaning and the failure would be a missing file
+        // named by a key the operator thought they had filled in. Absent **both** is the ACME case
+        // and is checked against `validate_acme` below, because whether "generate one" is allowed
+        // depends on something this function cannot see on its own.
+        match (&tls.certificate, &tls.key) {
+            (Some(certificate), Some(key)) => {
+                if certificate.as_os_str().is_empty() {
+                    return Err(Error::Config(
+                        "server.tls.certificate is empty; name the PEM file".to_string(),
+                    ));
+                }
+                if key.as_os_str().is_empty() {
+                    return Err(Error::Config(
+                        "server.tls.key is empty; name the PEM file".to_string(),
+                    ));
+                }
+            }
+            (None, None) => {}
+            (Some(_), None) => {
+                return Err(Error::Config(
+                    "server.tls.certificate is set but server.tls.key is not; name both, or \
+                     leave both out to have a placeholder generated (which needs [server.acme] \
+                     to replace it)"
+                        .to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::Config(
+                    "server.tls.key is set but server.tls.certificate is not; name both, or \
+                     leave both out to have a placeholder generated (which needs [server.acme] \
+                     to replace it)"
+                        .to_string(),
+                ));
+            }
         }
 
         for protocol in &tls.alpn {
@@ -1503,18 +1739,37 @@ impl Config {
         // is claimed before any request exists. Anything else here would describe something the
         // socket does not do, so it is refused rather than ignored.
         for (name, site) in &self.sites {
-            let Some(site_tls) = &site.tls else { continue };
-            if site_tls.certificate.as_os_str().is_empty() {
-                return Err(Error::Config(format!(
-                    "sites.{name}.tls.certificate is empty; name the PEM file, or remove the \
-                     table to inherit [server.tls]"
-                )));
-            }
-            if site_tls.key.as_os_str().is_empty() {
-                return Err(Error::Config(format!(
-                    "sites.{name}.tls.key is empty; name the PEM file, or remove the table to \
-                     inherit [server.tls]"
-                )));
+            let Some(names) = &site.tls else { continue };
+            match (&names.certificate, &names.key) {
+                (Some(certificate), Some(key)) => {
+                    if certificate.as_os_str().is_empty() {
+                        return Err(Error::Config(format!(
+                            "sites.{name}.tls.certificate is empty; name the PEM file, or remove \
+                             the table to inherit [server.tls]"
+                        )));
+                    }
+                    if key.as_os_str().is_empty() {
+                        return Err(Error::Config(format!(
+                            "sites.{name}.tls.key is empty; name the PEM file, or remove the \
+                             table to inherit [server.tls]"
+                        )));
+                    }
+                }
+                (None, None) => {}
+                (Some(_), None) => {
+                    return Err(Error::Config(format!(
+                        "sites.{name}.tls.certificate is set but sites.{name}.tls.key is not; \
+                         name both, or leave both out to have a placeholder generated (which \
+                         needs an ACME table for this site to replace it)"
+                    )));
+                }
+                (None, Some(_)) => {
+                    return Err(Error::Config(format!(
+                        "sites.{name}.tls.key is set but sites.{name}.tls.certificate is not; \
+                         name both, or leave both out to have a placeholder generated (which \
+                         needs an ACME table for this site to replace it)"
+                    )));
+                }
             }
         }
 
@@ -1538,82 +1793,108 @@ impl Config {
     /// behaves in a way the file does not say. Two of them are about silence, which is the failure
     /// mode ACME has that nothing else in this server does: issuance that never succeeds is
     /// indistinguishable from issuance that is working, until a certificate expires.
+    /// Validate the ACME tables — the deployment's and each site's — and the arrangement they have
+    /// to agree with.
+    ///
+    /// Every rule here exists because the alternative is a deployment that reports nothing and then
+    /// behaves in a way the file does not say. Two of them are about silence, which is the failure
+    /// mode ACME has that nothing else in this server does: issuance that never succeeds is
+    /// indistinguishable from issuance that is working, until a certificate expires.
     fn validate_acme(&self) -> Result<()> {
-        let Some(acme) = &self.server.acme else {
-            return Ok(());
-        };
+        let any_acme = self.server.acme.is_some() || self.sites.values().any(|s| s.acme.is_some());
 
-        // ACME replaces the certificate a deployment *serves*, so there has to be one. A listener
-        // with nothing to serve fails every handshake that is not a challenge — hazard 56's
-        // sibling — and the answer is a fallback pair rather than an exception to the rule.
-        if self.server.tls.is_none() {
+        // TLS has to be on at all, because TLS-ALPN-01 is validated on the TLS port: with no
+        // `[server.tls]` there is no TLS listener for the CA to connect to. This holds for a
+        // site-level table too, since a per-site certificate is still presented by the server's
+        // listener.
+        if any_acme && self.server.tls.is_none() {
             return Err(Error::Config(
-                "[server.acme] is set but [server.tls] is not; ACME replaces the certificate a \
-                 deployment serves, so name a fallback certificate and key — self-signed is fine \
-                 for a first issuance"
+                "an ACME table is set but [server.tls] is not; the TLS-ALPN-01 challenge is \
+                 validated on the TLS port, so add [server.tls] (its certificate and key may be \
+                 left out, and one will be generated)"
                     .to_string(),
             ));
         }
 
-        // A TLS listener, for the same reason: TLS-ALPN-01 is validated on the TLS port, so a
-        // deployment with no TLS listener has nothing for the CA to connect to.
-        if self.server.http.is_none() && self.server.https.is_none() {
-            return Err(Error::Config(
-                "[server.acme] is set but no TLS listener is configured; the TLS-ALPN-01 challenge \
-                 is validated on the TLS port, so set server.http or server.https"
-                    .to_string(),
-            ));
-        }
-
-        if acme.domains.is_empty() {
-            return Err(Error::Config(
-                "server.acme.domains is empty, so there is nothing to issue for; list the names \
-                 the certificate must cover"
-                    .to_string(),
-            ));
-        }
-
-        for domain in &acme.domains {
-            validate_acme_domain(domain)?;
-        }
-
-        // Duplicates are not harmful to the order — the CA ignores them — but they are always a
-        // mistake, and the mistake they usually are is a copy-paste that left one name out. Saying
-        // so is cheaper than the operator discovering the missing name from a browser warning.
-        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-        for (index, domain) in acme.domains.iter().enumerate() {
-            if let Some(first) = seen.insert(domain.as_str(), index) {
-                return Err(Error::Config(format!(
-                    "server.acme.domains lists {domain:?} twice (positions {first} and {index}); \
-                     the CA would ignore the repeat, so this is nearly always a name that was \
-                     meant to be here instead"
-                )));
+        // A **generated** placeholder is only honest when something will replace it. Without that,
+        // a listener with nothing to serve fails every handshake that is not a challenge — hazard
+        // 56's sibling — and the failure appears at connect time rather than at startup.
+        if !any_acme {
+            if let Some(tls) = &self.server.tls {
+                if tls.certificate.is_none() && tls.key.is_none() {
+                    return Err(Error::Config(
+                        "server.tls.certificate and server.tls.key are both absent, and no ACME \
+                         table will issue a certificate to replace a generated one; name a pair, \
+                         or add [server.acme]"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
-        for contact in &acme.contact {
-            // `mailto:` is the only scheme Let's Encrypt accepts, and a bare address — the mistake
-            // an operator makes because every other tool takes one — would be sent as an unknown
-            // URI scheme and rejected by the CA. Catching it here means the error names the fix.
-            if !contact.starts_with("mailto:") {
-                return Err(Error::Config(format!(
-                    "server.acme.contact {contact:?} must be a `mailto:` URI, e.g. \
-                     \"mailto:ops@example.com\""
-                )));
-            }
-            if contact.len() <= "mailto:".len() {
+        if let Some(acme) = &self.server.acme {
+            if acme.domains.is_empty() {
                 return Err(Error::Config(
-                    "server.acme.contact is an empty `mailto:` URI; give an address".to_string(),
+                    "server.acme.domains is empty, so there is nothing to issue for; list the \
+                     names the certificate must cover"
+                        .to_string(),
                 ));
             }
+            validate_acme_table("server.acme", &acme.domains, &acme.contact, &acme.cache)?;
         }
 
-        if acme.cache.as_os_str().is_empty() {
-            return Err(Error::Config(
-                "server.acme.cache is empty; name a directory, or remove the key to get the \
-                 default beside this file"
-                    .to_string(),
-            ));
+        for (name, site) in &self.sites {
+            let Some(acme) = &site.acme else { continue };
+            let label = format!("sites.{name}.acme");
+
+            // A site that names its own certificate has decided not to have one issued. Honouring
+            // both would mean the site had two answers to one question and the file could not say
+            // which — so this is refused rather than silently resolved in one direction. An
+            // *absent* pair beside a site ACME table is the point of the feature; half a pair is
+            // still half a pair, and `validate_tls` reports that.
+            let names_its_own = site
+                .tls
+                .as_ref()
+                .is_some_and(|tls| tls.certificate.is_some() && tls.key.is_some());
+            if names_its_own {
+                return Err(Error::Config(format!(
+                    "{label} is set together with sites.{name}.tls, which names a certificate; a \
+                     site's own certificate and an issued one are two answers to one question, so \
+                     remove one of them"
+                )));
+            }
+
+            let (names, dropped) = acme.resolve_domains(&site.hosts);
+            if names.is_empty() {
+                // The derivation found nothing it could put on a certificate. Reported with the
+                // patterns that were left out, because "which names did I lose?" is the operator's
+                // next question and the answer belongs in this message rather than in a log line.
+                return Err(Error::Config(format!(
+                    "{label} has no domains and none of sites.{name}.hosts can go on a certificate \
+                     ({}); a wildcard cannot be a certificate name, so list the real names in \
+                     {label}.domains",
+                    dropped.join(", ")
+                )));
+            }
+            for pattern in &dropped {
+                // Logged rather than an error: the certificate simply does not cover that pattern,
+                // which the operator may well have intended. It is worth saying out loud because
+                // the symptom is a browser warning on a name this site answers to.
+                tracing::warn!(
+                    site = name,
+                    pattern = pattern.as_str(),
+                    "this site's ACME table derives its domains from hosts, and a wildcard cannot \
+                     be a certificate name: the site answers to that pattern and the certificate \
+                     will not cover it"
+                );
+            }
+            let cache = acme.resolved_cache(&self.server.acme);
+            validate_acme_table(
+                &label,
+                &names,
+                acme.resolved_contact(&self.server.acme),
+                &cache,
+            )?;
         }
 
         Ok(())
@@ -2054,29 +2335,270 @@ domains = ["example.com"]
 
     /// An ACME table with no `[server.tls]` is refused, and the error names the fix.
     ///
-    /// This is the answer to open decision §9.5, and the rule it keeps is the one the TLS layer is
-    /// built on: a listener with nothing to serve fails every handshake that is not a challenge.
-    /// The alternative — allowing a certificate-less TLS listener because ACME will provide one —
-    /// trades a startup error for a port that is up and refusing every client until an order
-    /// completes.
+    /// A certificate-less ACME deployment is **allowed**, and this is the reversal.
+    ///
+    /// The earlier answer to open decision §9.5 was "no": name a fallback pair. That answered the
+    /// literal question and required the operator to hand-make a certificate that is replaced
+    /// moments later — hazard 72. What is actually needed is that the listener has *something* to
+    /// present, and generating one satisfies that without asking for work that is thrown away.
+    ///
+    /// Asserted here rather than left to `serve`, because the interesting part is not that a
+    /// placeholder is generated but that the configuration is *accepted*: the refusal this replaces
+    /// was the only thing standing between an operator and a one-line ACME config.
     #[test]
-    fn acme_without_a_fallback_certificate_is_refused() {
+    fn acme_needs_no_named_certificate_because_one_is_generated() {
         let text = r#"
 [server]
 http = "0.0.0.0:443"
 document_root = "/srv/app"
 
+[server.tls]
+
 [server.acme]
 domains = ["example.com"]
 "#;
         let config = Config::from_toml(text).expect("it parses");
-        let err = config
+        config
             .validate()
-            .expect_err("ACME needs a fallback certificate");
+            .expect("a pair that is generated is all the listener needs");
+
+        let tls = config.server.tls.as_ref().expect("[server.tls] is present");
+        assert!(
+            tls.certificate.is_none() && tls.key.is_none(),
+            "the point of the case is that neither is named"
+        );
+    }
+
+    /// A site's `domains` may be left out, and then it follows the site's `hosts` — without the
+    /// wildcard, which cannot go on a certificate.
+    ///
+    /// The answer to "one is writing host and the other domain": they are not the same thing, so
+    /// rather than renaming either, the site's table *derives* from the one an operator has already
+    /// written. The wildcard is the whole reason this is a rule rather than a default — `*.x` is a
+    /// host pattern, and a CA has no `dns-01` here, so it must be dropped **and** reported.
+    #[test]
+    fn a_site_domain_list_is_derived_from_its_hosts_without_the_wildcard() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[sites.corp]
+hosts = ["corp.internal", "*.corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config
+            .validate()
+            .expect("a derivation that leaves a real name is valid");
+        let site = config.sites.get("corp").expect("site present");
+        let acme = site.acme.as_ref().expect("the site has its own table");
+        let (names, dropped) = acme.resolve_domains(&site.hosts);
+        assert_eq!(
+            names,
+            vec!["corp.internal".to_string()],
+            "the exact name is kept and the wildcard is not"
+        );
+        assert_eq!(
+            dropped,
+            vec!["*.corp.internal".to_string()],
+            "what was left out is named, because the certificate will not cover it"
+        );
+    }
+
+    /// A derivation that leaves nothing is an **error**, not an empty order.
+    ///
+    /// The case that makes the rule worth having: a site whose hosts are all wildcards has no name
+    /// that can go on a certificate, and the alternative — silently issuing for an empty identifier
+    /// set — is an ACME request for nothing at all, reported by the CA in wording that names no site.
+    #[test]
+    fn a_site_whose_hosts_are_all_wildcards_must_state_its_domains() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[sites.corp]
+hosts = ["*.corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("nothing can be issued for");
         let message = err.to_string();
         assert!(
-            message.contains("[server.tls]") && message.contains("fallback"),
-            "the error must name the missing table and what to put in it: {message}"
+            message.contains("*.corp.internal") && message.contains("sites.corp.acme.domains"),
+            "the error must name the wildcard and where to put the real names: {message}"
+        );
+    }
+
+    /// A site's table inherits the deployment's contact and cache, which is what shares the account.
+    ///
+    /// `rustls-acme` names the account file after a hash of the contact list and the directory URL, so
+    /// inheriting is not tidiness: it is the difference between one account for the deployment and
+    /// one per site. The cache is where the certificate files live, and inheriting keeps them in one
+    /// directory — safe because a certificate's file name hashes its own domain set.
+    #[test]
+    fn a_site_inherits_the_contact_and_cache_so_the_account_is_shared() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[server.acme]
+domains = ["example.com"]
+contact = ["mailto:ops@example.com"]
+cache = "shared-cache"
+
+[sites.corp]
+hosts = ["corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+domains = ["corp.internal"]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config
+            .validate()
+            .expect("a site that inherits the contact is valid");
+
+        let site = config.sites.get("corp").expect("site present");
+        let acme = site.acme.as_ref().expect("site table");
+        assert_eq!(
+            acme.resolved_contact(&config.server.acme),
+            ["mailto:ops@example.com"],
+            "the contact is inherited, which is what makes the account shared"
+        );
+        assert_eq!(
+            acme.resolved_cache(&config.server.acme),
+            PathBuf::from("shared-cache"),
+            "the cache is inherited, so several sites' certificates live in one directory"
+        );
+        assert_eq!(
+            acme.resolved_authority(&config.server.acme),
+            Authority::Staging,
+            "and the authority, since a site has no reason to differ by default"
+        );
+    }
+
+    /// A site may override what it must, and only that.
+    #[test]
+    fn a_site_may_state_its_own_authority_and_contact() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[server.acme]
+domains = ["example.com"]
+contact = ["mailto:ops@example.com"]
+
+[sites.corp]
+hosts = ["corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+domains = ["corp.internal"]
+contact = ["mailto:corp@example.com"]
+authority = "production"
+cache = "corp-cache"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("a site may override all three");
+
+        let site = config.sites.get("corp").expect("site present");
+        let acme = site.acme.as_ref().expect("site table");
+        assert_eq!(
+            acme.resolved_contact(&config.server.acme),
+            ["mailto:corp@example.com"]
+        );
+        assert_eq!(
+            acme.resolved_cache(&config.server.acme),
+            PathBuf::from("corp-cache")
+        );
+        assert_eq!(
+            acme.resolved_authority(&config.server.acme),
+            Authority::Production
+        );
+    }
+
+    /// A site's own `domains` is used as written, and nothing is reported as dropped.
+    #[test]
+    fn a_site_that_states_its_domains_keeps_them_verbatim() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[sites.corp]
+hosts = ["corp.internal", "www.corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+domains = ["corp.internal"]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("valid");
+
+        let site = config.sites.get("corp").expect("site present");
+        let acme = site.acme.as_ref().expect("site table");
+        let (names, dropped) = acme.resolve_domains(&site.hosts);
+        assert_eq!(names, vec!["corp.internal".to_string()]);
+        assert!(
+            dropped.is_empty(),
+            "nothing was derived, so nothing was left out"
+        );
+    }
+
+    /// A site's derived names are held to the same rules as a stated list.
+    ///
+    /// The point of factoring the rules: a derivation that produced a name the CA would refuse must
+    /// fail here, naming the site's table, and not only in the deployment-wide case. A single-label
+    /// host is the example because it is a *legal* `hosts` entry and an illegal certificate name —
+    /// so this is exactly the gap between the two words the derivation has to bridge.
+    #[test]
+    fn a_derived_name_is_checked_like_a_stated_one() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[server.acme]
+domains = ["example.com"]
+
+[sites.corp]
+hosts = ["corp"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("a single-label name cannot be issued for");
+        let message = err.to_string();
+        assert!(
+            message.contains("sites.corp.acme"),
+            "the error must name the site's table, not the deployment's: {message}"
+        );
+        assert!(
+            message.contains("no dot"),
+            "and it must be the certificate rule that fired, not the host rule: {message}"
         );
     }
 
@@ -3325,10 +3847,11 @@ key = "certs/default.key"
     }
 
     #[test]
-    fn a_tls_table_missing_a_key_is_refused_rather_than_defaulted() {
-        // `deny_unknown_fields` plus a required field means the *absence* of `key` is
-        // caught by serde, before any of `validate_tls` runs. That is the right layer —
-        // a table that says "TLS on" but names no key cannot be given a sensible default.
+    fn a_half_a_certificate_pair_is_refused_rather_than_defaulted() {
+        // Both keys are optional now, so the *absence* of `key` no longer fails to parse — it has to
+        // be caught by validation instead. That is the right layer for the half-pair case either
+        // way: "TLS on, a certificate, no key" is a table an operator very nearly finished, and the
+        // error has to say which half is missing rather than that some field is required.
         let text = r#"
 [server]
 http = "127.0.0.1:443"
@@ -3336,8 +3859,71 @@ http = "127.0.0.1:443"
 [server.tls]
 certificate = "certs/default.crt"
 "#;
-        let err = Config::from_toml(text).expect_err("a key is required");
-        assert!(err.to_string().contains("key"), "{err}");
+        let config = Config::from_toml(text).expect("both keys are optional, so this parses");
+        let err = config.validate().expect_err("half a pair is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("server.tls.key") && message.contains("name both"),
+            "the error must name the missing half and the two ways out: {message}"
+        );
+    }
+
+    /// A generated placeholder is only allowed when something will replace it.
+    ///
+    /// The rule that makes the optional pair safe rather than convenient. Without it, a
+    /// `[server.tls]` with no certificate and no ACME table would start, generate one, and serve a
+    /// self-signed certificate for ever — a listener that looks healthy and is trusted by nobody,
+    /// which is hazard 56's failure with the error moved from startup to the client's browser.
+    #[test]
+    fn a_pair_left_out_needs_an_acme_table_to_replace_it() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("nothing would replace a generated placeholder");
+        let message = err.to_string();
+        assert!(
+            message.contains("server.tls.certificate") && message.contains("[server.acme]"),
+            "the error must name what is absent and what would make it legal: {message}"
+        );
+    }
+
+    /// A site's own certificate and an issued one are two answers to one question.
+    #[test]
+    fn a_site_cannot_both_name_a_certificate_and_ask_for_one() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+certificate = "certs/default.crt"
+key = "certs/default.key"
+
+[sites.corp]
+hosts = ["corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.tls]
+certificate = "certs/corp.crt"
+key = "certs/corp.key"
+
+[sites.corp.acme]
+domains = ["corp.internal"]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("two answers to one question");
+        let message = err.to_string();
+        assert!(
+            message.contains("sites.corp.acme") && message.contains("sites.corp.tls"),
+            "the error must name both tables so the reader knows which to remove: {message}"
+        );
     }
 
     #[test]
@@ -3470,7 +4056,7 @@ key = "shop.key"
 
         let site = config.sites.get("shop").expect("site present");
         assert_eq!(
-            site.tls.as_ref().map(|t| t.certificate.as_path()),
+            site.tls.as_ref().and_then(|t| t.certificate.as_deref()),
             Some(Path::new("shop.crt")),
             "the site states its own certificate"
         );

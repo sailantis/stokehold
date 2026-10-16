@@ -572,9 +572,8 @@ Opt in with a `[server.acme]` table. Without one, nothing about the server chang
 http = "0.0.0.0:443"           # the TLS port the challenge is validated on
 document_root = "/srv/app"
 
-[server.tls]                    # still required: this is the *fallback* certificate
-certificate = "certs/fallback.crt"
-key = "certs/fallback.key"
+[server.tls]                    # no certificate or key: one is generated in memory
+                                # and replaced by the first issuance
 
 [server.acme]
 domains = ["example.com", "www.example.com"]
@@ -583,12 +582,19 @@ contact = ["mailto:ops@example.com"]
 # cache = "acme-cache"          # relative to this file
 ```
 
+`[server.tls]` stays required — it is what turns TLS on — but its `certificate` and `key` may be
+**left out entirely** when ACME is configured. A self-signed placeholder is then generated **in
+memory** for the names in `domains`, and the first issuance replaces it. Nothing is written to disk:
+the placeholder is never trusted, so a private key on disk for it would be a liability with no
+benefit. A pair that is not named and no ACME table is an error, so a deployment cannot end up
+serving a placeholder for ever by omission.
+
 An issued certificate **replaces the one being served, without a restart** — the reload mechanism
 does the work, and the next handshake gets the new certificate. That is also why `[server.tls]` is
 still required rather than optional: a TLS listener with nothing to serve fails every handshake that
-is not a challenge, so a first deployment names a self-signed pair and issuance replaces it. Making
-the certificate a *file* and reloading the *file* is the slower loop with more ways to fail, so the
-issued bytes go straight into the resolver in memory.
+is not a challenge, so either name a pair or let ACME provide one. Making the certificate a *file*
+and reloading the *file* is the slower loop with more ways to fail, so the issued bytes go straight
+into the resolver in memory.
 
 **Only the `tls-alpn-01` challenge is used**, and not by preference: `http-01` serves
 `/.well-known/acme-challenge/<token>`, a path this server's own static layer refuses because it
@@ -616,6 +622,54 @@ serves, and the only symptom is a certificate that expires weeks later. So `chec
 authority, the names, whether a certificate has ever been cached, and the days left on each
 certificate being served — and shouts when the authority is production. A deployment with no
 `contact` is also called out: it is the only channel the CA has to warn that renewals are failing.
+
+### One certificate per site
+
+A deployment serving unrelated hostnames wants a certificate per hostname, not one covering all of
+them. A site's own table gets its own order, account and certificate:
+
+```toml
+[server]
+http = "0.0.0.0:443"
+document_root = "/srv/default"
+
+[server.tls]
+
+[server.acme]
+domains = ["example.com", "www.example.com"]
+contact = ["mailto:ops@example.com"]
+
+[sites.corp]
+hosts         = ["corp.internal", "*.corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+# domains omitted: derived from this site's hosts
+```
+
+`domains` may be left out, and then it is **derived from the site's `hosts`** — with every wildcard
+dropped, and dropped ones logged, because `*.corp.internal` is a host *pattern* and a certificate
+name cannot be one. If nothing is left, that is an error naming the wildcards, rather than an ACME
+request for an empty set. `authority`, `contact` and `cache` are all optional too; omitting them
+inherits the deployment's, which is what keeps several sites' certificates in one cache directory
+and their orders on **one account** when the contact and authority match.
+
+The site's certificate **replaces** the deployment's for that site's hosts only, and a site that
+names its own `[sites.corp.tls]` is left alone entirely — naming a certificate is a decision not to
+have one issued, so stating both is refused rather than silently resolved.
+
+|  | where it goes |
+|---|---|
+| a deployment with one certificate for everything | `[server.acme]` |
+| a certificate per vhost | `[sites.<name>.acme]`, inheriting the contact and cache |
+| a certificate an operator manages by hand | `[sites.<name>.tls]`, or `[server.tls]` |
+
+**The provider is Let's Encrypt, and it is the only one that works today.** `authority` is an enum,
+not a URL, so production has to be named rather than typed by accident — and the reason there are
+two variants rather than a free-form string is that a real certificate at per-week limits is the
+consequence of a typo. ZeroSSL and Google Trust Services are not reachable from here: both require
+**External Account Binding**, which `rustls-acme` 0.15's account registration does not send. The
+seam for a third authority exists (`Authority` in `volucer-acme`), but it needs EAB support first.
 
 
 That was written from reading the code, and for a while the plan said so: it was the one claim in
@@ -684,14 +738,15 @@ consequence is a window of a few hundred microseconds in which the new document 
 under the previous certificate, so a script that watches the certificate immediately after the
 signal may see the old one once. Both are in effect when the reload has finished.
 
-**With `[server.acme]`, the certificate table is not rebuilt at all**, and that is a correctness
-rule rather than an optimisation. Rebuilding means loading exactly the pairs the configuration
-names, and an issued certificate is not named there — the configured pair is only the *fallback*. A
-reload that rebuilt the table would therefore put a self-signed certificate back into service on a
-host that has a real one, with nothing in the log to say so. The issued certificate is already in
-the table, because issuance installs it there, so the reload leaves it alone and only the sites
-change. If you are migrating a deployment *away* from ACME, remove `[server.acme]` and restart; the
-configuration's own pair then takes over on the next reload as before.
+**With `[server.acme]`, an issued certificate is carried across a reload** rather than rebuilt from
+the configuration, and the reload now **merges the two populations** instead of choosing between them.
+It used to skip the certificate rebuild entirely whenever ACME was configured, which was right for an
+issued certificate and wrong for a hand-managed one: a site's `[sites.x.tls]` PEM *is* in the
+configuration, and skipping meant a renewal of it was never picked up. Now the table is rebuilt from
+the file and every certificate that was issued is re-registered over it, so a renewed PEM is read
+*and* an issued certificate stays in service. A name the configuration says nothing about keeps the
+certificate it had. If you are migrating a deployment *away* from ACME, remove `[server.acme]` and
+restart.
 
 > **A reload never stops the server.** That is worth stating because it was briefly untrue: the
 > `ctrlc` crate's `termination` feature registers `SIGHUP` and runs its *shutdown* callback for it,

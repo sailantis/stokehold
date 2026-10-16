@@ -1,7 +1,7 @@
 //! TLS, driven by a real client against a real listener.
 //!
 //! A handshake cannot be asserted from the server side alone: what matters is what the *client*
-//! receives — which certificate was presented, and which protocol ALPN selected. So these tests
+//! receives â€” which certificate was presented, and which protocol ALPN selected. So these tests
 //! start a listener, connect with `rustls` as a client, and read the answer.
 //!
 //! Certificates are generated at test time rather than committed, because a committed key is a
@@ -28,7 +28,7 @@ impl Cert {
     /// Generate a self-signed pair for `name` in its own directory.
     ///
     /// Its own directory because the config file is written beside the certificates, which is
-    /// how a relative path is meant to resolve — so the test exercises that rule rather than
+    /// how a relative path is meant to resolve â€” so the test exercises that rule rather than
     /// working around it.
     fn new(label: &str, name: &str) -> Self {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -148,7 +148,7 @@ async fn start_keeping(
 /// Start a listener around a resolver the caller built, for the composition tests.
 ///
 /// Distinct from [`start`] because that one builds its resolver from the configuration, and the
-/// ACME dispatch is a question about *which* resolver answers — so the resolver has to be the
+/// ACME dispatch is a question about *which* resolver answers â€” so the resolver has to be the
 /// caller's.
 async fn start_with_resolver(
     config: Config,
@@ -198,7 +198,7 @@ struct Seen {
 async fn fetch(addr: SocketAddr, server_name: &str, alpn: &[&str]) -> Seen {
     use rustls::pki_types::ServerName;
 
-    // A self-signed certificate is in no root store, so the verifier is replaced wholesale —
+    // A self-signed certificate is in no root store, so the verifier is replaced wholesale â€”
     // and the assertion is about *which* certificate arrived, not whether a chain validates,
     // so the certificate is compared byte for byte instead. `dangerous()` comes first in the
     // builder because it *replaces* the root-store step rather than following it.
@@ -254,7 +254,7 @@ async fn fetch_cleartext(addr: SocketAddr) -> Option<Vec<u8>> {
     fetch_cleartext_with_host(addr, "test").await
 }
 
-/// [`fetch_cleartext`], with a chosen `Host` header — which the redirect case needs, because the
+/// [`fetch_cleartext`], with a chosen `Host` header â€” which the redirect case needs, because the
 /// redirect is built from the host the client asked for.
 async fn fetch_cleartext_with_host(addr: SocketAddr, host: &str) -> Option<Vec<u8>> {
     let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
@@ -394,7 +394,7 @@ key = "certs/shop.key"
 
 #[tokio::test]
 async fn alpn_negotiates_http2_then_http11() {
-    // ALPN is how a browser reaches HTTP/2, and it arrives with TLS — so this is also the first
+    // ALPN is how a browser reaches HTTP/2, and it arrives with TLS â€” so this is also the first
     // HTTP/2 negotiation test in the repository.
     let cert = Cert::new("alpn", "example.test");
     let config = write_config(&cert, "");
@@ -485,7 +485,7 @@ async fn a_redirect_does_not_turn_a_plaintext_listener_into_a_tls_port() {
 
 #[tokio::test]
 async fn redirect_to_https_answers_cleartext_with_a_301() {
-    // The redirect must name the https port, not the port the request arrived on — otherwise it
+    // The redirect must name the https port, not the port the request arrived on â€” otherwise it
     // sends the client back to the plaintext port it just used, which is a loop.
     let cert = Cert::new("redirect", "example.test");
     let config = write_config(&cert, "plain = true");
@@ -525,7 +525,7 @@ async fn redirect_to_https_answers_cleartext_with_a_301() {
 #[tokio::test]
 async fn redirect_on_the_default_port_leaves_it_out_of_the_location() {
     // `:443` in a URL is noise, so a bare authority is what a client should be sent. The
-    // listener cannot bind 443 without privileges, so the port is supplied directly — which is
+    // listener cannot bind 443 without privileges, so the port is supplied directly â€” which is
     // also the shape a split :80/:443 deployment uses, where `https_port` is what matters.
     let cert = Cert::new("redirect443", "example.test");
     let config = write_config(&cert, "plain = true");
@@ -628,7 +628,7 @@ async fn start_redirecting_to(
 /// A client that knows the server speaks h2 opens with this exact byte sequence and then an
 /// empty SETTINGS frame; the server must answer with SETTINGS of its own. Asserted on the frame
 /// *type* byte rather than its contents, because the contents are `hyper`'s business and change
-/// between versions — what a caller of this server needs is that HTTP/2 is real rather than only
+/// between versions â€” what a caller of this server needs is that HTTP/2 is real rather than only
 /// negotiated.
 async fn preface_over_tls(addr: SocketAddr, server_name: &str) -> Option<u8> {
     use rustls::pki_types::ServerName;
@@ -666,8 +666,8 @@ async fn preface_over_tls(addr: SocketAddr, server_name: &str) -> Option<u8> {
 #[tokio::test]
 async fn a_certificate_that_cannot_load_fails_before_the_port_is_bound() {
     // The claim this pins, and why it is a test: the doc on `bind_with_tls` said "a certificate
-    // that cannot load fails this call — before the port is bound", and the code bound the port
-    // first. Only a *precedence* observation can tell the two orders apart — a call that binds
+    // that cannot load fails this call â€” before the port is bound", and the code bound the port
+    // first. Only a *precedence* observation can tell the two orders apart â€” a call that binds
     // and then fails still returns the TLS error, and a call that checks the certificate first
     // returns the same error, so asserting on the error alone proves nothing.
     //
@@ -740,8 +740,8 @@ key = "certs/absent.key"
 ///
 /// This is the property ACME depends on and the reason TLS was made replaceable at all: an
 /// issuance happens while the process is running, and the very next client that connects has to
-/// get the new certificate. Asserted the way a client sees it — the *same* address, the *same*
-/// listener, a byte-different certificate after the swap — rather than by inspecting the table
+/// get the new certificate. Asserted the way a client sees it â€” the *same* address, the *same*
+/// listener, a byte-different certificate after the swap â€” rather than by inspecting the table
 /// that was installed.
 #[tokio::test]
 async fn a_certificate_reload_is_presented_on_the_next_handshake() {
@@ -760,7 +760,7 @@ async fn a_certificate_reload_is_presented_on_the_next_handshake() {
 
     // Replace the pair on disk, which is what a renewal does, and reload. The *file* is what
     // changed, so this also pins that a reload re-reads rather than reusing what it loaded at
-    // startup — the mistake that would make an operator's renewal appear to do nothing.
+    // startup â€” the mistake that would make an operator's renewal appear to do nothing.
     cert.add("server", "example.test");
     let renewed_der = der_of(&cert.dir().join("certs/server.crt"));
     assert_ne!(
@@ -774,10 +774,12 @@ async fn a_certificate_reload_is_presented_on_the_next_handshake() {
     let replaced = resolver
         .refresh(&CertificateSet {
             server: Some(ServerCertificate {
-                certificate: "certs/server.crt".into(),
-                key: "certs/server.key".into(),
+                names: vec!["example.test".to_string()],
+                certificate: Some("certs/server.crt".into()),
+                key: Some("certs/server.key".into()),
             }),
             sites: Vec::new(),
+            generated_sites: Vec::new(),
         })
         .expect("the renewed pair loads");
 
@@ -795,13 +797,13 @@ async fn a_certificate_reload_is_presented_on_the_next_handshake() {
     );
 }
 
-/// A reload whose certificate cannot load installs **nothing** — neither half of the table.
+/// A reload whose certificate cannot load installs **nothing** â€” neither half of the table.
 ///
 /// The whole-or-nothing rule, at the level that matters. A half-applied table is worse than a
 /// refused one: the names it dropped fail every handshake, and the failure looks like a network
 /// problem rather than like a bad file. The set below names a perfectly good *server* pair and
 /// an unreadable *site* pair, so a refresh that loaded what it could and reported what it could
-/// not would install the server certificate and lose a site — and this test would see both.
+/// not would install the server certificate and lose a site â€” and this test would see both.
 ///
 /// That shape is deliberate rather than incidental: a test whose only assertion is that nothing
 /// changed passes just as well against a `refresh` that does nothing at all. Naming a good
@@ -852,8 +854,9 @@ key = "certs/shop.key"
         .refresh(&CertificateSet {
             // Valid, and must still not be installed.
             server: Some(ServerCertificate {
-                certificate: "certs/renewed.crt".into(),
-                key: "certs/renewed.key".into(),
+                names: vec!["example.test".to_string()],
+                certificate: Some("certs/renewed.crt".into()),
+                key: Some("certs/renewed.key".into()),
             }),
             sites: vec![SiteCertificate {
                 name: "shop".into(),
@@ -863,6 +866,7 @@ key = "certs/shop.key"
                     key: "certs/absent.key".into(),
                 },
             }],
+            generated_sites: Vec::new(),
         })
         .expect_err("one unreadable certificate must refuse the set");
 
@@ -907,8 +911,8 @@ async fn an_in_memory_certificate_needs_no_file_and_no_config() {
     );
     // The listener is built around a resolver that already holds its certificate: **no
     // certificate file is read here at all**, because `bind_with_resolver` takes the table the
-    // caller built. That is what lets a deployment whose certificate does not exist yet — the
-    // ACME case — bind its port and start accepting.
+    // caller built. That is what lets a deployment whose certificate does not exist yet â€” the
+    // ACME case â€” bind its port and start accepting.
     let registry = Arc::new(volucer_http::Registry::new(volucer_http::SharedState::new(
         Sites::from_config(&config, cert.dir()),
     )));
@@ -967,7 +971,7 @@ async fn an_in_memory_certificate_needs_no_file_and_no_config() {
 ///
 /// The common failure in practice: a renewal wrote a file this process cannot read. Worth its
 /// own case because the message is what an operator acts on, and because it is the failure a
-/// first issuance produces — with the site table empty, which is a different shape from the
+/// first issuance produces â€” with the site table empty, which is a different shape from the
 /// test above.
 #[tokio::test]
 async fn a_server_certificate_that_cannot_load_names_the_layer() {
@@ -989,10 +993,12 @@ async fn a_server_certificate_that_cannot_load_names_the_layer() {
     let err = resolver
         .refresh(&CertificateSet {
             server: Some(ServerCertificate {
-                certificate: "certs/absent.crt".into(),
-                key: "certs/absent.key".into(),
+                names: vec!["example.test".to_string()],
+                certificate: Some("certs/absent.crt".into()),
+                key: Some("certs/absent.key".into()),
             }),
             sites: Vec::new(),
+            generated_sites: Vec::new(),
         })
         .expect_err("a certificate that is not there must not be installed");
 
@@ -1011,8 +1017,8 @@ async fn a_server_certificate_that_cannot_load_names_the_layer() {
 
 /// A listener with no TLS has no resolver at all, and still reloads its sites.
 ///
-/// The TLS-off invariant is the thing this front-end's design note is about — *"the whole of
-/// the cost when TLS is off: no accept wrapping, no peek, no TLS type built"* — and making
+/// The TLS-off invariant is the thing this front-end's design note is about â€” *"the whole of
+/// the cost when TLS is off: no accept wrapping, no peek, no TLS type built"* â€” and making
 /// certificates replaceable is exactly the kind of change that could smuggle a TLS value onto a
 /// plaintext deployment. The assertion is the absence, which is what a handshake path cannot
 /// have: `resolver()` is `None`, so there is no table to load and no branch to take.
@@ -1137,8 +1143,8 @@ async fn alpn_h2_negotiates_a_real_http_2_connection() {
 /// The wrapper is available and carries the restricted trait, not `ResolvesServerCert`.
 ///
 /// An *absence* cannot be asserted in a passing test, so what is checked is what exists: the type
-/// is constructible and implements `ChallengeSource`. The stronger property — that no public path
-/// in `volucer-acme` hands out something implementing `ResolvesServerCert` — is enforced at the
+/// is constructible and implements `ChallengeSource`. The stronger property â€” that no public path
+/// in `volucer-acme` hands out something implementing `ResolvesServerCert` â€” is enforced at the
 /// composition site, where `SniResolver::with_acme` takes a `ChallengeSource` and the dispatch
 /// order in `SniResolver::resolve` is asserted by
 /// `the_acme_source_answers_only_an_exact_challenge_handshake`.
@@ -1160,7 +1166,7 @@ fn the_acme_resolver_is_only_available_as_a_challenge_source() {
 /// and happened to agree".
 ///
 /// The middle case is the one worth the trouble. A client offering `h2` *and* `acme-tls/1` together
-/// is **not** a validation attempt — `is_tls_alpn_challenge` is an exact match on the ALPN list, so
+/// is **not** a validation attempt â€” `is_tls_alpn_challenge` is an exact match on the ALPN list, so
 /// a client appending the challenge protocol to a normal offer must take the normal path. A naive
 /// "does the offer contain `acme-tls/1`" would hand that client a validation certificate.
 #[tokio::test]
@@ -1174,7 +1180,7 @@ async fn the_acme_source_answers_only_an_exact_challenge_handshake() {
     ///
     /// Delegating rather than implementing the check itself is the point. A stub that decided
     /// "is this a challenge?" on its own would make this test pass against any dispatch logic at
-    /// all: the falsification run — replacing rustls-acme's exact match with a substring check —
+    /// all: the falsification run â€” replacing rustls-acme's exact match with a substring check â€”
     /// **passed** while the stub owned the decision. So `is_challenge` goes through the real
     /// `ChallengeResolver`, which is where `is_tls_alpn_challenge`'s exact-match rule lives, and the
     /// recording is only the observation.
@@ -1184,7 +1190,7 @@ async fn the_acme_source_answers_only_an_exact_challenge_handshake() {
         real: volucer_acme::ChallengeResolver,
         /// Every ALPN offer the gate saw, in order.
         saw_alpn: Mutex<Vec<Vec<Vec<u8>>>>,
-        /// How often the certificate was asked for — the second half of the decision, so a gate
+        /// How often the certificate was asked for â€” the second half of the decision, so a gate
         /// that said "challenge" and was then not consulted would be visible.
         answered: AtomicUsize,
     }
@@ -1219,7 +1225,7 @@ async fn the_acme_source_answers_only_an_exact_challenge_handshake() {
         real: volucer_acme::ChallengeResolver::new(
             // The resolver an `AcmeState` hands out, from an `AcmeConfig` with no cache and no
             // account. Nothing here reaches the network: this only needs a resolver whose
-            // challenge data is empty, so its answer is `None` for every name — which is what makes
+            // challenge data is empty, so its answer is `None` for every name â€” which is what makes
             // "the site table answered" the observable rather than "the ACME state happened to have
             // a certificate".
             rustls_acme::AcmeConfig::<std::convert::Infallible, std::convert::Infallible>::new([
@@ -1246,7 +1252,7 @@ async fn the_acme_source_answers_only_an_exact_challenge_handshake() {
     let addr = start_with_resolver(config, cert.dir(), resolver).await;
 
     // A normal handshake: offered `h2`, `http/1.1`, and the source refused it, so the site table
-    // answered. This is the claim — a normal client gets the site certificate and never reaches
+    // answered. This is the claim â€” a normal client gets the site certificate and never reaches
     // the ACME source's certificate path.
     let plain = fetch(addr, "example.test", &["h2", "http/1.1"]).await;
     assert_eq!(
@@ -1260,7 +1266,7 @@ async fn the_acme_source_answers_only_an_exact_challenge_handshake() {
     );
 
     // The combination: `h2` **and** `acme-tls/1`. Not a validation, by the exact-match rule, so it
-    // must also be the site table's — and this is where a substring check would go wrong.
+    // must also be the site table's â€” and this is where a substring check would go wrong.
     let mixed = fetch(addr, "example.test", &["h2", "acme-tls/1"]).await;
     assert_eq!(
         mixed.certificate, site_der,
@@ -1297,7 +1303,7 @@ async fn the_acme_source_answers_only_an_exact_challenge_handshake() {
 ///
 /// The seam an ACME issuance goes through, and the two claims worth separating:
 ///
-/// 1. A certificate loaded from PEM *text* is served on the next handshake, on the same listener —
+/// 1. A certificate loaded from PEM *text* is served on the next handshake, on the same listener â€”
 ///    the "without a restart" property, which is the deliverable of the whole ACME phase.
 /// 2. Installing one issued certificate **does not drop the others**. A deployment can serve several
 ///    sites from a per-site table plus a fallback, and a renewal of one name must leave them alone.
@@ -1337,7 +1343,7 @@ key = "certs/other.key"
         "and the per-site certificate"
     );
 
-    // The issued pair, as PEM text — the shape `rustls-acme` produces.
+    // The issued pair, as PEM text â€” the shape `rustls-acme` produces.
     let issued = rcgen::generate_simple_self_signed(vec!["renewed.test".to_string()])
         .expect("generate the issued certificate");
     let issued_pem = issued.cert.pem();
@@ -1353,6 +1359,7 @@ key = "certs/other.key"
             issued_pem.as_bytes(),
             issued_key.as_bytes(),
             &["renewed.test".to_string()],
+            true,
         )
         .expect("an issued certificate installs");
 
@@ -1389,17 +1396,12 @@ key = "certs/other.key"
 /// A certificate pair on disk, loaded the way the resolver loads them.
 ///
 /// Through `load_certified` rather than `CertifiedKey::from_der`, so a test that installs a
-/// certificate in memory uses the same code path a config-driven reload does — a test that
+/// certificate in memory uses the same code path a config-driven reload does â€” a test that
 /// hand-rolled the pairing could pass while the real one was broken.
 fn load_pair(dir: &Path, file: &str) -> volucer_http::tls::LoadedCert {
     volucer_http::tls::load_certified(
-        &volucer_core::config::TlsConfig {
-            certificate: format!("certs/{file}.crt").into(),
-            key: format!("certs/{file}.key").into(),
-            min_version: volucer_core::config::MinTlsVersion::default(),
-            alpn: Vec::new(),
-            plain: false,
-        },
+        Path::new(&format!("certs/{file}.crt")),
+        Path::new(&format!("certs/{file}.key")),
         dir,
         "test",
     )

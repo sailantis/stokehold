@@ -52,7 +52,11 @@ pub fn inspect(config: &Config, document_root: &Path) -> Vec<Warning> {
 /// `config_path` is `None` when the caller has no file (a config built in a test), in which
 /// case a relative TLS path is reported as written — the same answer `Path::parent` gives for
 /// a bare filename, and better than inventing a directory.
-pub fn inspect_with(config: &Config, document_root: &Path, config_path: Option<&Path>) -> Vec<Warning> {
+pub fn inspect_with(
+    config: &Config,
+    document_root: &Path,
+    config_path: Option<&Path>,
+) -> Vec<Warning> {
     let mut warnings = Vec::new();
 
     if !document_root.exists() {
@@ -180,30 +184,34 @@ pub fn inspect_tls_with(config: &Config, config_path: Option<&Path>, warnings: &
         }
     };
 
-    let certificate = resolve(&tls.certificate);
-    let key = resolve(&tls.key);
-    check_pem(
-        &format!("server.tls.certificate {}", certificate.display()),
-        &certificate,
-        "certificate",
-        warnings,
-    );
-    check_pem(
-        &format!("server.tls.key {}", key.display()),
-        &key,
-        "private key",
-        warnings,
-    );
+    // A pair that is left out is *generated*, so there is no file to check and reporting a missing
+    // path would name one the operator never wrote. Only a stated path is inspected.
+    if let (Some(certificate), Some(key)) = (&tls.certificate, &tls.key) {
+        let certificate = resolve(certificate);
+        let key = resolve(key);
+        check_pem(
+            &format!("server.tls.certificate {}", certificate.display()),
+            &certificate,
+            "certificate",
+            warnings,
+        );
+        check_pem(
+            &format!("server.tls.key {}", key.display()),
+            &key,
+            "private key",
+            warnings,
+        );
+    }
 
     for (name, site) in &config.sites {
         let Some(site_tls) = &site.tls else { continue };
-        let certificate = resolve(&site_tls.certificate);
-        let key = resolve(&site_tls.key);
+        let (Some(certificate), Some(key)) = (&site_tls.certificate, &site_tls.key) else {
+            continue;
+        };
+        let certificate = resolve(certificate);
+        let key = resolve(key);
         check_pem(
-            &format!(
-                "sites.{name}.tls.certificate {}",
-                certificate.display()
-            ),
+            &format!("sites.{name}.tls.certificate {}", certificate.display()),
             &certificate,
             "certificate",
             warnings,
@@ -619,7 +627,11 @@ key = "{key}"
         std::fs::write(root.path().join("c.key"), PEM).expect("write key");
 
         let config = tls_config("c.crt", "c.key");
-        let warnings = inspect_with(&config, root.path(), Some(&root.path().join("volucer.toml")));
+        let warnings = inspect_with(
+            &config,
+            root.path(),
+            Some(&root.path().join("volucer.toml")),
+        );
         assert_eq!(tls_warnings(&warnings).len(), 0, "{warnings:?}");
     }
 
@@ -656,12 +668,22 @@ key = "{key}"
         std::fs::write(root.path().join("c.key"), PEM).expect("write key");
 
         let config = tls_config("c.crt", "c.key");
-        let warnings = inspect_with(&config, root.path(), Some(&root.path().join("volucer.toml")));
+        let warnings = inspect_with(
+            &config,
+            root.path(),
+            Some(&root.path().join("volucer.toml")),
+        );
         let tls = tls_warnings(&warnings);
         assert_eq!(tls.len(), 1, "{warnings:?}");
-        assert!(tls[0].message.contains("does not look like PEM"), "{warnings:?}");
         assert!(
-            tls[0].hint.as_deref().is_some_and(|h| h.contains("-----BEGIN")),
+            tls[0].message.contains("does not look like PEM"),
+            "{warnings:?}"
+        );
+        assert!(
+            tls[0]
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("-----BEGIN")),
             "the hint should name what PEM means: {warnings:?}"
         );
     }
@@ -689,15 +711,25 @@ certificate = "shop.crt"
 key = "shop.key"
 "#;
         let config = Config::from_toml(text).expect("parses");
-        let warnings = inspect_with(&config, root.path(), Some(&root.path().join("volucer.toml")));
+        let warnings = inspect_with(
+            &config,
+            root.path(),
+            Some(&root.path().join("volucer.toml")),
+        );
 
         // The server's pair is present, the site's is not — so exactly the site's two are
         // reported, and the server's absence of a warning is what proves the check is
         // looking at the right pair rather than reporting everything.
         let tls = tls_warnings(&warnings);
         assert_eq!(tls.len(), 2, "{warnings:?}");
-        assert!(tls[0].message.contains("sites.shop.tls.certificate"), "{warnings:?}");
-        assert!(tls[1].message.contains("sites.shop.tls.key"), "{warnings:?}");
+        assert!(
+            tls[0].message.contains("sites.shop.tls.certificate"),
+            "{warnings:?}"
+        );
+        assert!(
+            tls[1].message.contains("sites.shop.tls.key"),
+            "{warnings:?}"
+        );
     }
 
     #[test]

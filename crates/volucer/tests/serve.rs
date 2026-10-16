@@ -1627,6 +1627,266 @@ fn a_reload_keeps_the_certificate_that_was_issued() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A reload still re-reads a **named** certificate, even with a site's own ACME table in play.
+///
+/// The complement of `a_reload_keeps_the_certificate_that_was_issued`, and it exists because the first
+/// fix for hazard 71 was *too* blunt: it skipped the certificate rebuild whenever any ACME table was
+/// configured, which kept the issued certificate but stranded every named one. A site's `[sites.x.tls]`
+/// PEM is in the configuration and an operator can renew it by hand, so a reload has to re-read it —
+/// and the two populations have to be merged rather than chosen between.
+///
+/// Both facts are asserted in one test because they are one behaviour from either side: the *issued*
+/// certificate survives, and the *renewed* one is picked up. A merge that did only one of them passes
+/// half of this and fails the other.
+#[cfg(unix)]
+#[test]
+fn a_reload_picks_up_a_renewed_named_certificate_while_issuance_stays() {
+    use rustls_acme::CertCache;
+
+    const SIGHUP: i32 = 1;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-acme-merge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = root.join("app");
+    let corp = root.join("corp");
+    for dir in [&app, &corp] {
+        std::fs::create_dir_all(dir).expect("create a document root");
+    }
+    std::fs::write(app.join("whoami.txt"), "app").expect("write the marker");
+    std::fs::write(corp.join("whoami.txt"), "corp").expect("write the marker");
+
+    let certs = root.join("certs");
+    std::fs::create_dir_all(&certs).expect("create the certificate directory");
+    let write_pair = |file: &str, name: &str| -> Vec<u8> {
+        let generated = rcgen::generate_simple_self_signed(vec![name.to_string()])
+            .expect("generate a certificate");
+        std::fs::write(certs.join(format!("{file}.crt")), generated.cert.pem())
+            .expect("write the certificate");
+        std::fs::write(
+            certs.join(format!("{file}.key")),
+            generated.key_pair.serialize_pem(),
+        )
+        .expect("write the key");
+        generated.cert.der().to_vec()
+    };
+    // The site's own, hand-managed certificate, which the reload will be asked to re-read.
+    let named_before = write_pair("corp", "corp.test");
+    let named_after = write_pair("renewed", "corp.test");
+    assert_ne!(
+        named_before, named_after,
+        "the fixture must generate a different certificate, or the reload assertion is vacuous"
+    );
+
+    // The issued one, written into the cache under the site's ACME domains — which is why this site
+    // cannot also name a pair: `Config::validate` refuses both, so the site's *named* pair is on the
+    // deployment instead and the issued one is the site's.
+    let issued = rcgen::generate_simple_self_signed(vec!["corp.test".to_string()])
+        .expect("generate the issued certificate");
+    let issued_blob = format!("{}{}", issued.cert.pem(), issued.key_pair.serialize_pem());
+    let issued_der = issued.cert.der().to_vec();
+    let shared_cache = root.join("acme-cache");
+    let directory = volucer_acme::Authority::Staging.directory();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the cache write");
+    runtime.block_on(async {
+        rustls_acme::caches::DirCache::new(&shared_cache)
+            .store_cert(
+                &["corp.test".to_string()],
+                directory,
+                issued_blob.as_bytes(),
+            )
+            .await
+            .expect("the cache is writable");
+    });
+
+    let config_path = root.join("volucer.toml");
+    // The deployment names a pair, so `sites.corp` may have its own ACME table; and the site's own
+    // name is served by the issued certificate from the start.
+    let config_for = |fallback: &str| {
+        format!(
+            "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {app}\n\n\
+             [server.tls]\ncertificate = \"certs/{fallback}.crt\"\nkey = \"certs/{fallback}.key\"\n\n\
+             [sites.corp]\nhosts = [\"corp.test\"]\ndocument_root = {corp}\n\n\
+             [sites.corp.acme]\ndomains = [\"corp.test\"]\n",
+            app = toml_string(&app.display().to_string()),
+            corp = toml_string(&corp.display().to_string()),
+        )
+    };
+    std::fs::write(&config_path, config_for("corp")).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the config asks for an http listener");
+
+    let before = tls_get(&address, "corp.test", "/whoami.txt");
+    assert_eq!(
+        before.certificate, issued_der,
+        "the issued certificate must be serving before the reload, or the survival assertion after \
+         it is about nothing"
+    );
+
+    // Point the deployment's *named* pair at the renewed file and signal. The site's issued
+    // certificate is not in the configuration at all, so this is exactly the change a rebuild could
+    // pick up while dropping it — or skip while stranding the renewal.
+    std::fs::write(&config_path, config_for("renewed")).expect("write the config");
+    let Some(()) = signal(&server.child, SIGHUP) else {
+        eprintln!("skipping: could not signal the server");
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(700));
+
+    let after = tls_get(&address, "corp.test", "/whoami.txt");
+    assert_eq!(
+        after.certificate, issued_der,
+        "the issued certificate must survive a reload that re-reads the configuration; a \
+         placeholder or a named pair here means the reload dropped what the site's order produced"
+    );
+    assert_eq!(
+        after.body, "corp",
+        "and the site must still be served, so the table was rebuilt rather than emptied"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A site with its **own** ACME table serves a placeholder for its own names until issuance.
+///
+/// The end-to-end assertion for the per-site wiring, and the same reasoning as the cached-certificate
+/// test: without starting the binary nothing can see that the site's engine was built at all — which
+/// is hazard 68's lesson, where five steps were committed and green while `[server.acme]` issued
+/// something nothing served.
+///
+/// What this pins is the **placeholder's names**, and it is the interesting half: a site whose
+/// certificate is generated must be served a certificate that covers *its* hosts, not the
+/// deployment's default. A generated certificate with the server's names would fail its handshake
+/// with a name mismatch — a TLS error, blamed on the client — while every unit test passed.
+///
+/// No network, no cache, no account: the placeholder is made before any port is bound. The authority
+/// is staging, so even a bug that reached out could not issue a real certificate.
+#[cfg(unix)]
+#[test]
+fn a_site_with_its_own_acme_serves_a_placeholder_for_its_own_names() {
+    use rustls_acme::CertCache;
+
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-acme-site-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = root.join("app");
+    let corp = root.join("corp");
+    for dir in [&app, &corp] {
+        std::fs::create_dir_all(dir).expect("create a document root");
+    }
+    std::fs::write(app.join("whoami.txt"), "app").expect("write the marker");
+    std::fs::write(corp.join("whoami.txt"), "corp").expect("write the marker");
+
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {app}\n\n\
+         [server.tls]\n\n\
+         [server.acme]\ndomains = [\"app.test\"]\ncontact = [\"mailto:ops@test\"]\n\n\
+         [sites.corp]\nhosts = [\"corp.test\"]\ndocument_root = {corp}\n\n\
+         [sites.corp.acme]\n",
+        app = toml_string(&app.display().to_string()),
+        corp = toml_string(&corp.display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    // A site's engine reads the **site's** cache, which is the only thing that proves a per-site
+    // engine exists and is pointed at the right place. A certificate is written into the shared cache
+    // under the site's own domains, so a build that built no site engine keeps serving the placeholder
+    // and fails here — the hazard-68 shape, where every part works and nothing uses them.
+    let issued = rcgen::generate_simple_self_signed(vec!["corp.test".to_string()])
+        .expect("generate the issued certificate");
+    let issued_blob = format!("{}{}", issued.cert.pem(), issued.key_pair.serialize_pem());
+    let issued_der = issued.cert.der().to_vec();
+    let shared_cache = root.join("acme-cache");
+    let directory = volucer_acme::Authority::Staging.directory();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the cache write");
+    runtime.block_on(async {
+        rustls_acme::caches::DirCache::new(&shared_cache)
+            .store_cert(
+                &["corp.test".to_string()],
+                directory,
+                issued_blob.as_bytes(),
+            )
+            .await
+            .expect("the cache is writable");
+    });
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+    let address = server
+        .http_address
+        .clone()
+        .expect("the config asks for an http listener");
+
+    // Both sites answer, and each gets a certificate — which is the point of the optional pair: no
+    // file was named anywhere in that config, and both listeners completed a handshake.
+    let app_seen = tls_get(&address, "app.test", "/whoami.txt");
+    assert_eq!(app_seen.body, "app", "the deployment's site answers");
+    let corp_seen = tls_get(&address, "corp.test", "/whoami.txt");
+    assert_eq!(
+        corp_seen.body, "corp",
+        "the site with its own table answers"
+    );
+
+    assert_eq!(
+        corp_seen.certificate, issued_der,
+        "the site's own engine must read the site's cache and serve what it holds; a placeholder \
+         here means no engine was built for the site's table, so its order would never be served"
+    );
+    assert_ne!(
+        app_seen.certificate, issued_der,
+        "and that certificate must not reach the deployment's names, which belong to its own order"
+    );
+    // The DER holds a DNS SAN as the ASCII name, so the names are checkable without a parser.
+    let names = |der: &[u8]| -> Vec<String> {
+        ["app.test", "corp.test"]
+            .iter()
+            .filter(|name| {
+                der.windows(name.len())
+                    .any(|window| window == name.as_bytes())
+            })
+            .map(|name| name.to_string())
+            .collect()
+    };
+    assert_eq!(
+        names(&app_seen.certificate),
+        vec!["app.test".to_string()],
+        "the deployment's certificate must name only the deployment's domains"
+    );
+    assert_eq!(
+        names(&corp_seen.certificate),
+        vec!["corp.test".to_string()],
+        "the site's certificate must name the site's own hosts, not the deployment's domains"
+    );
+
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// One TLS exchange: which certificate arrived, and what the request was answered with.
 ///
 /// Raw sockets and `rustls` directly, rather than a TLS client library, for the same reason the

@@ -80,8 +80,9 @@ fastcgi = "127.0.0.1:9080"
 # key = "certs/shop.key"
 
 # ---------------------------------------------------------------------------
-# Automatic certificates (ACME, RFC 8555). The presence of `[server.acme]` is
-# what turns it on, and a deployment without it behaves exactly as before.
+# Automatic certificates (ACME, RFC 8555). An `[server.acme]` table with
+# `enabled = true` (the default) is what turns it on, and a deployment without
+# one behaves exactly as before.
 #
 # `[server.tls]` is still what turns TLS on, but its certificate and key may be
 # LEFT OUT when ACME is configured: a self-signed placeholder is then generated in
@@ -89,6 +90,16 @@ fastcgi = "127.0.0.1:9080"
 # written to disk — the placeholder is never trusted, so a private key for it would
 # be a liability with no benefit. Naming no pair and configuring no ACME is an
 # error, so a deployment cannot serve a placeholder for ever by omission.
+#
+# `enabled = false` keeps the table and its settings and issues nothing, which is
+# how you stage a contact or park an order without deleting anything:
+#
+#     [server.acme]
+#     enabled = false
+#     contact = ["mailto:ops@example.com"]    # staged, and used by every site
+#     authority = "production"                # that inherits it
+#
+# A disabled table may leave `domains` out entirely, since it orders nothing.
 #
 # An issued certificate reaches the running server without a restart — the next
 # handshake presents it.
@@ -107,6 +118,7 @@ fastcgi = "127.0.0.1:9080"
 # silence, and an expired certificate is its only symptom.
 # ---------------------------------------------------------------------------
 # [server.acme]
+# enabled = true                                # false = settings only, issue nothing
 # domains = ["example.com", "www.example.com"]   # stated, not derived from sites:
 #                                                # this is what the cert must COVER
 # contact = ["mailto:ops@example.com"]           # the CA's only way to warn you
@@ -125,16 +137,29 @@ fastcgi = "127.0.0.1:9080"
 #
 # `authority`, `contact` and `cache` may also be left out; omitting them inherits
 # the deployment's, which keeps several sites' certificates in one directory and
-# their orders on ONE account when the contact and authority match.
+# their orders on ONE account when the contact matches. `contact` is what the
+# account is keyed by, so it is the setting to share deliberately rather than to
+# repeat.
 #
-# A site that names its own [sites.corp.tls] is left alone: naming a certificate
-# is a decision not to have one issued, so stating both is refused.
+# `enabled = false` stops this site ordering while keeping its settings, and is
+# NOT inherited from `[server.acme]`: turning the deployment's orders off must not
+# silence the sites, which are the deployments that have several orders.
+#
+# A site may also name its own [sites.corp.tls] pair *and* have a table here. The
+# named pair serves until the order replaces it — the same rule as `[server.tls]`
+# plus `[server.acme]`, and how a deployment migrates from a certificate issued
+# elsewhere.
+#
+# A name must belong to ONE table. Listing it in both this and `[server.acme]` is
+# refused, naming both: the deployment's challenge source answers a validation
+# handshake first, so the site's order could never succeed.
 # ---------------------------------------------------------------------------
 # [sites.corp]
 # hosts = ["corp.internal", "*.corp.internal"]
 # document_root = "/srv/corp"
 #
 # [sites.corp.acme]
+# enabled = true                # false = keep these settings, order nothing
 # domains = ["corp.internal"]   # or omit to derive from hosts
 
 # ---------------------------------------------------------------------------

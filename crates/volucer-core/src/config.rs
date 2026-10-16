@@ -826,6 +826,32 @@ pub struct SiteTlsConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
+    /// Whether this table issues at all.
+    ///
+    /// Defaults to `true`, so a table that does not mention it means what it always meant. `false`
+    /// makes the table **defaults only**: its `authority`, `contact` and `cache` still apply to
+    /// every site that inherits them, and nothing is ordered for `domains`.
+    ///
+    /// # Why a key rather than deleting the table
+    ///
+    /// Removing the table is how a deployment turns ACME off, and it is not always what an operator
+    /// wants: staging a contact and an authority, or parking an order during an incident, would mean
+    /// deleting settings that have to be typed back correctly afterwards. A key that says "not now"
+    /// leaves them in place.
+    ///
+    /// # Why it is not inherited
+    ///
+    /// A site's `enabled` is its own. If a site inherited `false`, turning the deployment's orders
+    /// off would silently stop every site's too — and the sites are the ones with unrelated
+    /// hostnames, which is exactly the deployment that has more than one order. So an operator who
+    /// wants silence everywhere says so wherever it is wanted.
+    ///
+    /// A **disabled server table still issues for a site that asks**, because a site's table is its
+    /// own order and its own account; the deployment's `enabled` is a statement about the
+    /// deployment's names, not about the deployment's settings.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     /// Which authority to talk to.
     ///
     /// Defaults to staging, and production must be named. The reason is a rate limit as much as a
@@ -889,6 +915,14 @@ pub struct AcmeConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SiteAcmeConfig {
+    /// Whether this site's table issues; absent means `true`.
+    ///
+    /// **Not inherited from `[server.acme]`**, which is the one place this table departs from the
+    /// usual rule; see [`AcmeConfig::enabled`]. `false` keeps the table and its settings and issues
+    /// nothing for this site, so the site falls back to the deployment's certificate.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
     /// Which authority to talk to; absent inherits `[server.acme]`.
     #[serde(default)]
     pub authority: Option<Authority>,
@@ -915,6 +949,25 @@ pub struct SiteAcmeConfig {
 }
 
 impl SiteAcmeConfig {
+    /// Whether this table's settings are honoured at all.
+    ///
+    /// Separate from [`SiteAcmeConfig::issues`] because the two are different questions: a disabled
+    /// site still **inherits** the deployment's `authority` and `cache` for its own use, and only
+    /// stops ordering. Conflating them would make `enabled = false` mean "ignore this table", which
+    /// is what deleting it means.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Whether this site orders a certificate of its own.
+    ///
+    /// Also false when the site names its own certificate — see [`SiteConfig::tls`] — because naming
+    /// one is a decision not to have one issued. `Config::validate` refuses the two together, so a
+    /// deployment cannot reach that state, but the readers downstream do not have to know that.
+    pub fn issues(&self) -> bool {
+        self.is_enabled()
+    }
+
     /// The names to issue for: the site's own, or derived from its hosts.
     ///
     /// Returns the names and the wildcard patterns that were dropped, so a caller can report them
@@ -1801,7 +1854,24 @@ impl Config {
     /// mode ACME has that nothing else in this server does: issuance that never succeeds is
     /// indistinguishable from issuance that is working, until a certificate expires.
     fn validate_acme(&self) -> Result<()> {
-        let any_acme = self.server.acme.is_some() || self.sites.values().any(|s| s.acme.is_some());
+        // "Will something be issued" rather than "is a table present": `enabled = false` keeps a
+        // table for its settings, and every reader below has to agree that it issues nothing. The
+        // difference is not cosmetic — a disabled table that still counted would demand a
+        // `[server.tls]` for a deployment that never orders, and would suppress the error for an
+        // absent pair that nothing will replace.
+        let server_issues = self.server.acme.as_ref().is_some_and(|acme| acme.enabled);
+        let site_issues: Vec<(&String, &SiteConfig, &SiteAcmeConfig)> = self
+            .sites
+            .iter()
+            .filter_map(|(name, site)| {
+                let acme = site.acme.as_ref()?;
+                match acme.issues() {
+                    true => Some((name, site, acme)),
+                    false => None,
+                }
+            })
+            .collect();
+        let any_acme = server_issues || !site_issues.is_empty();
 
         // TLS has to be on at all, because TLS-ALPN-01 is validated on the TLS port: with no
         // `[server.tls]` there is no TLS listener for the CA to connect to. This holds for a
@@ -1833,35 +1903,50 @@ impl Config {
         }
 
         if let Some(acme) = &self.server.acme {
-            if acme.domains.is_empty() {
+            // Validated even when disabled, because the settings are still in force: a site that
+            // inherits them inherits into a table that has to be well formed, and a bad `cache` or
+            // `contact` would be reported at whatever point the site finally used it. The domains
+            // rule is the exception — a disabled table issues for nothing, so an empty list is not
+            // an error there, and refusing it would make "turn it off" impossible to write for a
+            // deployment that never stated any.
+            if acme.enabled && acme.domains.is_empty() {
                 return Err(Error::Config(
                     "server.acme.domains is empty, so there is nothing to issue for; list the \
-                     names the certificate must cover"
+                     names the certificate must cover, or set server.acme.enabled = false"
                         .to_string(),
                 ));
             }
-            validate_acme_table("server.acme", &acme.domains, &acme.contact, &acme.cache)?;
+            if acme.enabled {
+                validate_acme_table("server.acme", &acme.domains, &acme.contact, &acme.cache)?;
+            }
+        }
+
+        let mut claimed_names: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(acme) = &self.server.acme {
+            if acme.enabled {
+                for domain in &acme.domains {
+                    claimed_names.insert(domain.clone(), "server.acme".to_string());
+                }
+            }
         }
 
         for (name, site) in &self.sites {
             let Some(acme) = &site.acme else { continue };
             let label = format!("sites.{name}.acme");
 
-            // A site that names its own certificate has decided not to have one issued. Honouring
-            // both would mean the site had two answers to one question and the file could not say
-            // which — so this is refused rather than silently resolved in one direction. An
-            // *absent* pair beside a site ACME table is the point of the feature; half a pair is
-            // still half a pair, and `validate_tls` reports that.
-            let names_its_own = site
-                .tls
-                .as_ref()
-                .is_some_and(|tls| tls.certificate.is_some() && tls.key.is_some());
-            if names_its_own {
-                return Err(Error::Config(format!(
-                    "{label} is set together with sites.{name}.tls, which names a certificate; a \
-                     site's own certificate and an issued one are two answers to one question, so \
-                     remove one of them"
-                )));
+            // A site that names its own certificate has decided not to have one issued, so it
+            // orders nothing and there is no second answer to refuse. Mechanically the two already
+            // work together: `CertificateSet` gives such a site no generated placeholder, and an
+            // issued certificate overwrites the named entry for the names it covers. Naming a pair
+            // *and* asking for one is therefore how a deployment migrates from a certificate
+            // another authority issued, serving it until ACME replaces it — which is exactly what
+            // `[server.tls]` plus `[server.acme]` has always allowed. The two levels agree.
+            //
+            // An *absent* pair beside a site ACME table is the other half of the feature: the site
+            // starts on a generated placeholder. Half a pair is still half a pair, and
+            // `validate_tls` reports that.
+            if !acme.issues() {
+                continue;
             }
 
             let (names, dropped) = acme.resolve_domains(&site.hosts);
@@ -1895,6 +1980,26 @@ impl Config {
                 acme.resolved_contact(&self.server.acme),
                 &cache,
             )?;
+
+            // A name claimed by two ACME tables cannot be issued twice, and the failure it leads to
+            // is invisible. A validation handshake carries only the SNI name, so the deployment's
+            // source answers first and returns the *deployment's* challenge certificate — whose
+            // `acmeIdentifier` commits to the deployment's key authorization while the site's
+            // server is being asked for the site's. The site's order then fails validation on every
+            // attempt, and all it can do is retry.
+            //
+            // Refused rather than warned about because a warning here is indistinguishable from the
+            // noise of a first deployment, and because the two ways out are both one edit: drop the
+            // name from the deployment's list, or state the site's names so they no longer overlap.
+            for domain in &names {
+                if let Some(other) = claimed_names.insert(domain.clone(), label.clone()) {
+                    return Err(Error::Config(format!(
+                        "{domain:?} is issued for by both {other} and {label}; one name belongs to \
+                         one order, so remove it from one of them (a site that states its own \
+                         `domains` no longer overlaps the deployment's)"
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -3894,9 +3999,18 @@ document_root = "/srv/app"
         );
     }
 
-    /// A site's own certificate and an issued one are two answers to one question.
+    /// A site's own certificate beside an ACME table is **allowed**, matching the server level.
+    ///
+    /// This reverses the rule this test used to pin. The two levels disagreed: `[server.tls]` with a
+    /// pair plus `[server.acme]` was accepted, while the same shape at site level was refused as "two
+    /// answers to one question". But it is not two answers — it is one answer now and another when the
+    /// order completes, which is what the machinery already does: `CertificateSet` gives such a site
+    /// no generated placeholder, and an issued certificate overwrites the named entry for the names it
+    /// covers. It is also how a deployment migrates from a certificate issued elsewhere, which the
+    /// server level has always allowed. The rule that should hold at both levels is the absence of an
+    /// ACME table, not the absence of a certificate.
     #[test]
-    fn a_site_cannot_both_name_a_certificate_and_ask_for_one() {
+    fn a_site_may_name_a_certificate_and_ask_for_one_at_the_same_time() {
         let text = r#"
 [server]
 http = "127.0.0.1:443"
@@ -3918,11 +4032,312 @@ key = "certs/corp.key"
 domains = ["corp.internal"]
 "#;
         let config = Config::from_toml(text).expect("parses");
-        let err = config.validate().expect_err("two answers to one question");
+        config.validate().expect(
+            "the named pair serves until the order replaces it, as it does at server level",
+        );
+    }
+
+    /// A site that names a certificate with no ACME table beside it is not an order, and must be real.
+    ///
+    /// The half of the old rule that survives: the refusal was never about the pair, it was about the
+    /// pair being mistaken for an order. With a table present the pair is a placeholder-to-be-replaced;
+    /// without one it is the certificate, and has to exist.
+    #[test]
+    fn a_site_that_names_a_certificate_without_acme_is_not_an_order() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+certificate = "certs/default.crt"
+key = "certs/default.key"
+
+[sites.corp]
+hosts = ["corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.tls]
+certificate = "certs/corp.crt"
+key = "certs/corp.key"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config
+            .validate()
+            .expect("a site with its own pair and no ACME table is an ordinary deployment");
+        assert!(
+            config.sites["corp"].acme.is_none(),
+            "which is to say: no order is built for it"
+        );
+    }
+
+    /// A **disabled** site table does not count as something that will replace a generated
+    /// placeholder.
+    ///
+    /// The invariant from hazard 72 has to reach `enabled`, or it is a hole: a deployment would be
+    /// allowed to leave the pair out on the strength of a table that orders nothing, and then serve a
+    /// self-signed certificate for ever — the port up, every handshake completing, and no client
+    /// trusting any of them.
+    #[test]
+    fn a_disabled_site_table_cannot_replace_a_generated_placeholder() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[sites.corp]
+hosts = ["corp.example.com"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+enabled = false
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("a table that issues nothing replaces nothing");
         let message = err.to_string();
         assert!(
-            message.contains("sites.corp.acme") && message.contains("sites.corp.tls"),
-            "the error must name both tables so the reader knows which to remove: {message}"
+            message.contains("server.tls.certificate"),
+            "the error must name what is absent: {message}"
+        );
+    }
+
+    /// A name in two ACME tables is refused, naming both.
+    ///
+    /// The failure this prevents cannot be seen in the configuration and cannot be recovered from at
+    /// runtime. A validation handshake carries only the SNI name, so the deployment's challenge source
+    /// answers first — with a challenge certificate whose `acmeIdentifier` commits to the
+    /// *deployment's* key authorization, while the CA is asking this server for the *site's*. The
+    /// site's order fails validation on every attempt and can only retry.
+    #[test]
+    fn a_name_issued_for_by_two_tables_is_refused_naming_both() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[server.acme]
+domains = ["corp.internal", "example.com"]
+contact = ["mailto:ops@example.com"]
+
+[sites.corp]
+hosts = ["corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("one name belongs to one order");
+        let message = err.to_string();
+        assert!(
+            message.contains("server.acme") && message.contains("sites.corp.acme"),
+            "the error must name both tables, so the reader knows which to edit: {message}"
+        );
+        assert!(
+            message.contains("corp.internal"),
+            "and the name they both claim: {message}"
+        );
+    }
+
+    /// A site that states its own `domains` is the way out of that refusal, and it works.
+    ///
+    /// Nothing changed in the derivation to achieve this — stating the names was always a complete
+    /// replacement rather than a merge. The point of the test is that the *refusal* is escapable by
+    /// the edit the error message suggests, which is what makes it a good error rather than a wall.
+    #[test]
+    fn a_site_that_states_its_own_domains_no_longer_overlaps_the_deployment() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[server.acme]
+domains = ["corp.internal", "example.com"]
+contact = ["mailto:ops@example.com"]
+
+[sites.corp]
+hosts = ["corp.internal"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+domains = ["corp.example.com"]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config
+            .validate()
+            .expect("the site asks for a name the deployment does not");
+    }
+
+    /// A deployment-wide table that only stages settings issues nothing, so an empty `domains` is
+    /// legal on it — and a site's table still issues.
+    #[test]
+    fn a_disabled_server_table_is_defaults_only() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[server.acme]
+enabled = false
+contact = ["mailto:ops@example.com"]
+authority = "production"
+
+[sites.corp]
+hosts = ["corp.example.com"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config
+            .validate()
+            .expect("a disabled table stages contact and authority without ordering");
+
+        let server = config.server.acme.as_ref().expect("the table is kept");
+        assert!(
+            server.domains.is_empty(),
+            "and it names no domains, since it issues for none"
+        );
+        assert!(
+            !server.enabled,
+            "the switch is what makes the empty list legal rather than an error"
+        );
+
+        // The site still issues — the flag is not inherited — and it inherits the *settings*.
+        let site = config.sites["corp"].acme.as_ref().expect("site table");
+        assert!(
+            site.issues(),
+            "a disabled deployment does not silence a site"
+        );
+        assert_eq!(
+            site.resolved_authority(&config.server.acme),
+            Authority::Production,
+            "but the deployment's authority is still what the site talks to"
+        );
+        assert_eq!(
+            site.resolved_contact(&config.server.acme),
+            ["mailto:ops@example.com"],
+            "and its contact, which is what puts several sites on one account"
+        );
+    }
+
+    /// A disabled site table keeps its settings and orders nothing.
+    #[test]
+    fn a_disabled_site_table_stops_the_order_and_keeps_the_settings() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+certificate = "certs/default.crt"
+key = "certs/default.key"
+
+[sites.corp]
+hosts = ["corp.example.com"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+enabled = false
+domains = ["corp.example.com"]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config
+            .validate()
+            .expect("a disabled site table is not an order, so nothing has to replace anything");
+
+        let site = config.sites["corp"]
+            .acme
+            .as_ref()
+            .expect("the table is kept");
+        assert!(!site.issues(), "nothing is ordered");
+        let (names, _) = site.resolve_domains(&config.sites["corp"].hosts);
+        assert_eq!(
+            names,
+            ["corp.example.com"],
+            "and the settings are still there, which is the point of a switch over a deletion"
+        );
+    }
+
+    /// `enabled` is not inherited, and that is the rule rather than an oversight.
+    ///
+    /// A site that inherited `false` would go quiet when the *deployment's* orders were turned off,
+    /// and the deployments with several unrelated hostnames — the ones with several orders — are
+    /// exactly the ones that cannot afford it. So the flag is per table, and silence has to be said
+    /// where it is wanted.
+    #[test]
+    fn a_disabled_server_table_does_not_silence_a_site() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[server.acme]
+enabled = false
+
+[sites.corp]
+hosts = ["corp.example.com"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("the site is still an order");
+
+        assert!(
+            !config.server.acme.as_ref().expect("table").enabled,
+            "the deployment is off"
+        );
+        assert!(
+            config.sites["corp"].acme.as_ref().expect("table").issues(),
+            "and the site is not, because the flag belongs to the table that states it"
+        );
+    }
+
+    /// A disabled table with a *bad* setting is still refused, because a site may inherit it.
+    ///
+    /// The settings do not stop being in force when ordering does: a site that omits `contact` gets
+    /// the deployment's, and an account registered with a malformed one fails at the CA after a round
+    /// trip. So the format checks run either way, and only the `domains` rule is skipped.
+    #[test]
+    fn a_disabled_table_still_has_its_settings_checked() {
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+document_root = "/srv/app"
+
+[server.tls]
+
+[server.acme]
+enabled = false
+contact = ["ops@example.com"]
+
+[sites.corp]
+hosts = ["corp.example.com"]
+document_root = "/srv/corp"
+
+[sites.corp.acme]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("a bare address would be sent as an unknown URI scheme");
+        assert!(
+            err.to_string().contains("mailto:"),
+            "the error must name the fix: {err}"
         );
     }
 

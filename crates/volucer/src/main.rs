@@ -243,6 +243,13 @@ struct AcmeScope {
     /// `Some(site)` when this is a site's own table. The site name is what scopes its challenge
     /// source, since a validation handshake carries only an SNI name.
     site: Option<String>,
+    /// The contact list this scope registers, already resolved against the deployment's.
+    ///
+    /// Empty is allowed and reported: a CA with no contact has no way to warn that this account's
+    /// renewals are failing, which is the failure this feature is most prone to. What it is *not* is
+    /// invisible — it is also what the account file is named after, so two scopes that share it
+    /// share an account and two that differ do not.
+    contact: Vec<String>,
     /// Whether the deployment's contact list is empty, for the one warning worth emitting.
     contact_missing: bool,
 }
@@ -718,28 +725,40 @@ fn serve(
     // earlier sites' challenge sources.
     let mut scopes: Vec<AcmeScope> = Vec::new();
     if let Some(acme) = &config.server.acme {
-        let contact_missing = acme.contact.is_empty();
-        scopes.push(AcmeScope {
-            label: "server.acme".to_string(),
-            domains: acme.domains.clone(),
-            authority: acme.authority,
-            cache: acme_cache(config_dir, &acme.cache),
-            site: None,
-            contact_missing,
-        });
+        if acme.enabled {
+            let contact_missing = acme.contact.is_empty();
+            scopes.push(AcmeScope {
+                label: "server.acme".to_string(),
+                domains: acme.domains.clone(),
+                authority: acme.authority,
+                cache: acme_cache(config_dir, &acme.cache),
+                site: None,
+                contact: acme.contact.clone(),
+                contact_missing,
+            });
+        }
     }
     for (name, site) in &config.sites {
         let Some(site_acme) = &site.acme else {
             continue;
         };
+        // A table that is turned off, or that sits beside a certificate the site names itself,
+        // orders nothing — and must not, because either one means the site is served by the
+        // deployment's certificate or by the pair it named. Building an engine anyway would start
+        // an order nobody asked for, against a per-week rate limit.
+        if !site_acme.issues() {
+            continue;
+        }
         let (names, _dropped) = site_acme.resolve_domains(&site.hosts);
+        let contact = site_acme.resolved_contact(&config.server.acme).to_vec();
         scopes.push(AcmeScope {
             label: name.to_string(),
             domains: names,
             authority: site_acme.resolved_authority(&config.server.acme),
             cache: acme_cache(config_dir, &site_acme.resolved_cache(&config.server.acme)),
             site: Some(name.clone()),
-            contact_missing: site_acme.resolved_contact(&config.server.acme).is_empty(),
+            contact_missing: contact.is_empty(),
+            contact,
         });
     }
 
@@ -751,6 +770,7 @@ fn serve(
             scope.domains.clone(),
             acme_authority(scope.authority),
             scope.cache.clone(),
+            scope.contact.clone(),
             Arc::new(ResolverSink {
                 resolver: Arc::clone(&cell),
                 takes_default: scope.site.is_none(),
@@ -1406,11 +1426,27 @@ fn check(
     match &config.server.acme {
         Some(acme) => {
             println!("  acme:");
+            println!("    enabled:          {}", acme.enabled);
+            if !acme.enabled {
+                println!(
+                    "      DISABLED:       settings only; nothing is ordered. Every site that \
+                     inherits them still issues."
+                );
+            }
             println!("    authority:        {}", acme.authority.as_str());
             if acme.authority == volucer_core::config::Authority::Production {
                 println!("      PRODUCTION:     real certificates, against per-week rate limits");
             }
-            println!("    domains:          {}", acme.domains.join(", "));
+            match (acme.domains.is_empty(), acme.enabled) {
+                // The empty list is legal only here, so it is explained rather than printed as a
+                // blank — an operator who turned the table off and one who forgot `domains` would
+                // otherwise see the same output for opposite situations.
+                (true, false) => {
+                    println!("    domains:          (none: a disabled table issues for nothing)")
+                }
+                (true, true) => println!("    domains:          (none)"),
+                (false, _) => println!("    domains:          {}", acme.domains.join(", ")),
+            }
             match acme.contact.is_empty() {
                 true => println!(
                     "    contact:          (none: the CA has no way to warn you that renewals are \
@@ -1472,6 +1508,13 @@ fn check(
         let (names, dropped) = site_acme.resolve_domains(&site.hosts);
         let authority = site_acme.resolved_authority(&config.server.acme);
         println!("  acme ({name}):");
+        println!("    enabled:          {}", site_acme.issues());
+        if !site_acme.issues() {
+            println!(
+                "      DISABLED:       this site orders nothing and is served by the \
+                 deployment's certificate"
+            );
+        }
         println!("    authority:        {}", authority.as_str());
         if authority == volucer_core::config::Authority::Production {
             println!("      PRODUCTION:     real certificates, against per-week rate limits");

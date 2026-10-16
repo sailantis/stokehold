@@ -576,18 +576,25 @@ document_root = "/srv/app"
                                 # and replaced by the first issuance
 
 [server.acme]
+enabled = true                 # false = keep these settings, order nothing
 domains = ["example.com", "www.example.com"]
 contact = ["mailto:ops@example.com"]
 # authority = "production"      # staging by default; see below
 # cache = "acme-cache"          # relative to this file
 ```
 
+`enabled` and the presence of a table are two statements rather than one, and the reason is the
+thing a boolean cannot express: *"keep these settings and do not use them yet"*. Removing the table
+is how you turn ACME off, and it throws away a contact and an authority that would have to be
+retyped correctly afterwards.
+
 `[server.tls]` stays required — it is what turns TLS on — but its `certificate` and `key` may be
 **left out entirely** when ACME is configured. A self-signed placeholder is then generated **in
 memory** for the names in `domains`, and the first issuance replaces it. Nothing is written to disk:
 the placeholder is never trusted, so a private key on disk for it would be a liability with no
-benefit. A pair that is not named and no ACME table is an error, so a deployment cannot end up
-serving a placeholder for ever by omission.
+benefit. A pair that is not named and no ACME table that **issues** is an error, so a deployment
+cannot end up serving a placeholder for ever by omission — including by setting the only table it
+has to `enabled = false`.
 
 An issued certificate **replaces the one being served, without a restart** — the reload mechanism
 does the work, and the next handshake gets the new certificate. That is also why `[server.tls]` is
@@ -606,6 +613,22 @@ machine behind a NAT, and it puts DNS API credentials on the web server.
 **Staging is the default and production must be named.** A production account has per-week rate
 limits, and a first deployment that reached production by omission would spend them on its own
 mistakes. Staging runs the real protocol and issues certificates no browser trusts.
+
+`enabled = false` keeps the table and its settings and issues nothing. Two things it is for:
+
+```toml
+[server.acme]
+enabled = false                  # defaults only: stage these, order nothing
+contact = ["mailto:ops@example.com"]
+authority = "production"
+```
+
+- **Staging settings** for sites that inherit them, or **parking an order** during an incident,
+  without deleting values that would have to be retyped correctly afterwards. A disabled table may
+  leave `domains` out entirely, since it orders nothing.
+- It is **not inherited** from `[server.acme]` to a site. Turning the deployment's orders off must
+  not silence the sites, because the deployments with several unrelated hostnames are exactly the
+  ones with several orders. Silence is said where it is wanted.
 
 An issued certificate is cached, and a **restart with a valid cached certificate serves it
 immediately and spends no rate limit** — the cache is a directory beside the configuration file
@@ -652,17 +675,33 @@ dropped, and dropped ones logged, because `*.corp.internal` is a host *pattern* 
 name cannot be one. If nothing is left, that is an error naming the wildcards, rather than an ACME
 request for an empty set. `authority`, `contact` and `cache` are all optional too; omitting them
 inherits the deployment's, which is what keeps several sites' certificates in one cache directory
-and their orders on **one account** when the contact and authority match.
+and their orders on **one account** when the contact matches.
 
-The site's certificate **replaces** the deployment's for that site's hosts only, and a site that
-names its own `[sites.corp.tls]` is left alone entirely — naming a certificate is a decision not to
-have one issued, so stating both is refused rather than silently resolved.
+**`contact` is what the account is keyed by** — `rustls-acme` names the account file after a hash of
+the contact list and the directory URL — so it decides which scopes *share* an account, and Let's
+Encrypt's rate limits are per account. Omitting it to inherit is therefore not just convenience:
+two sites that each repeat the same contact get one account, and two that differ get two. The
+second is invisible in the configuration, so the account count is worth understanding before
+giving sites their own.
+
+The site's certificate **replaces** the deployment's for that site's hosts only. A site may also
+name its own `[sites.corp.tls]` pair *and* have a table here: the named pair serves until the order
+replaces it, which is the same rule `[server.tls]` plus `[server.acme]` already follows, and how a
+deployment migrates from a certificate issued elsewhere.
+
+**A name belongs to one table.** Listing it in both this and `[server.acme]` is refused, naming
+both tables. It would not work: a validation handshake carries only the SNI name, so the
+deployment's challenge source answers first — with a challenge certificate committing to the
+*deployment's* key authorization while the CA is asking this server for the site's — and the
+site's order could then never succeed. The way out is the edit the error suggests: drop the name
+from the deployment's list, or state the site's names so they no longer overlap.
 
 |  | where it goes |
 |---|---|
 | a deployment with one certificate for everything | `[server.acme]` |
 | a certificate per vhost | `[sites.<name>.acme]`, inheriting the contact and cache |
 | a certificate an operator manages by hand | `[sites.<name>.tls]`, or `[server.tls]` |
+| settings that are staged but must not issue | `enabled = false` on either table |
 
 **The provider is Let's Encrypt, and it is the only one that works today.** `authority` is an enum,
 not a URL, so production has to be named rather than typed by accident — and the reason there are

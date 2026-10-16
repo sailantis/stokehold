@@ -3899,6 +3899,100 @@ The rule generalises past this decision: **when a requirement exists to protect 
 that the requirement is the invariant.** "Name a certificate" and "have a certificate" are the same
 sentence only as long as nobody can generate one.
 
+### Hazard 73 — the rule was enforced on the file and not on the account
+
+Three independent reviews of the ACME configuration ended at the same complaint: *"presence of an
+empty table as a boolean switch is an anti-pattern; make the mode explicit."* The diagnosis was right
+and the proposed cure was wrong, and finding out why turned up a worse bug that none of them was
+looking for.
+
+**What the three proposals had in common, and why it does not hold here.** They wanted
+`mode = "acme" | "manual" | "off"` — or `tls = "acme"` — as one setting per site, with the second going
+further: *"a missing `tls` table = site over HTTP only."* That last one is not a preference this
+server can honour. There is **one listener and one `rustls::ServerConfig`**; a site cannot be
+plaintext while its neighbour on the same port is TLS. The types already say so — `SiteTlsConfig`
+holds only `certificate` and `key`, while `min_version`, `alpn` and `plain` are `TlsConfig`-only
+because they are a property of the socket. So `mode = "off"` reads as a per-vhost protocol choice and
+can only mean something else: at server level it is self-contradictory (TLS-off is written by removing
+the table, and "no certificate" is illegal since a listener must present something), and at site
+level it can only mean "no certificate of my own".
+
+Two smaller findings from testing the proposals rather than reasoning about them: a scalar cannot
+coexist with the table of the same name (`duplicate key 'acme' in table 'sites.corp'` — TOML rejects it
+before serde, so `acme = true` is not an alias you can add, it is one you must choose), and
+`key_type` has nothing behind it (`rustls-acme` hardcodes ECDSA P-256 for both the account key and the
+certificate key — grepped, not assumed).
+
+**What was wrong was narrower than "the table is a bad switch".** One question the layout genuinely
+left implicit: *how do I keep these settings and stop ordering?* Deleting the table is the only
+answer today, and it throws away a contact and an authority. So `enabled: bool = true` was added to
+both tables. It is not inherited from `[server.acme]` to a site, deliberately: a site that inherited
+`false` would go quiet when the *deployment's* orders were turned off, and the deployments with
+several unrelated hostnames — the ones with several orders — are exactly the ones that cannot afford
+it. The switch also gave the layout its missing defaults-only table: `[server.acme] enabled = false`
+stages a contact and an authority for every site that inherits them, without issuing for the
+deployment's own names (whose list may then be left out, since it orders nothing).
+
+**The bug underneath, which is the part worth remembering.** Checking whether "inheriting the
+contact" actually shared an account, the account file was the hash of the *empty* list:
+`cached_account_Z_J1BlIxQlHarXbwEhQdM8n3KQ9PjrsKAGp_AtOUqQQ`, where the configured
+`mailto:ops@example.com` hashes to `cached_account_Bf6HANfw_u1_Q1RQbUQq0mtYHJb9KL6LfXJkTJuy2GA`.
+`Engine::new` never called `.contact(...)`. Four consequences, all of them silent:
+
+- Let's Encrypt never received a contact address, so **the CA had no channel to warn that renewals
+  were failing** — the failure this feature is most prone to, and the reason `check` prints
+  `(none: the CA has no way to warn you that renewals are failing)`. It printed that beside a
+  `contact` key the operator had filled in.
+- The documented account-sharing rule was wrong in both directions: `[]` is constant, so every scope
+  on one authority hashed to *one* account and "two tables whose contacts differ create two accounts"
+  described the impossible.
+- Site inheritance of `contact` was inheritance-to-nothing, so the layout question above was partly
+  being answered about a setting that did nothing.
+- **No test noticed**, because `contact` appeared only in fixture strings. The key was validated,
+  documented, printed, and inert.
+
+Falsified the honest way rather than by assertion: `two_contacts_produce_two_accounts` starts one
+server with a deployment table and a site table carrying *different* contacts into one cache, and
+asserts two account files appear. The account file is written on the engine's first poll
+(`state.rs:417`, `store_account` before any network call), so the test needs no CA — which is also
+what explained an earlier probe where three scopes produced one file. Removing `.contact(...)` made
+it fail in 45 s with one file; restoring it made it pass in 0.4 s.
+
+**The general rule, and it is a sharper one than hazard 72's.** Hazard 72 said: when a requirement
+protects an invariant, check the requirement *is* the invariant. This is its sibling: **a setting that
+is read by the code that reports it is not thereby honoured.** `check` printed `contact` because the
+*configuration* had it, and the account was registered without it — the two paths never met. A
+validation that reads a field and a consumer that uses it are different things, and only a test that
+observes the consumer can tell them apart.
+
+### Two rules that were one rule at one level and another at the other
+
+Found while checking the same ground, and fixed in the same change.
+
+**A named pair beside an ACME table.** `[server.tls]` with a certificate and key *plus*
+`[server.acme]` was accepted; the same shape at site level was refused as *"two answers to one
+question"*. It is not two answers — it is one now and another when the order completes, which is what
+the machinery already does (`generated_sites` gives such a site no placeholder, and `install_issued`
+overwrites the named entry for the names it covers). The server-level behaviour is also the migration
+path from a certificate issued elsewhere, which a site-level deployment has just as much need of.
+The site-level refusal was the wrong half of the pair, so it was removed and the levels now agree:
+`a_site_may_name_a_certificate_and_ask_for_one_at_the_same_time` pins it, and
+`a_site_that_names_a_certificate_without_acme_is_not_an_order` keeps the half that survives — with no
+table there is no order, so the pair is the certificate and must be real.
+
+**One name, two tables.** A name in both `[server.acme].domains` and a site's derived list was
+accepted, and could never converge: a validation handshake carries only the SNI name, so the
+deployment's challenge source answers first — with a challenge certificate committing to the
+*deployment's* key authorization while the CA is asking this server for the site's. The site's order
+failed validation on every retry, and the log said only that a step had failed. Now refused, naming
+both tables, with the error message naming the edit that fixes it
+(`a_name_issued_for_by_two_tables_is_refused_naming_both`, and
+`a_site_that_states_its_own_domains_no_longer_overlaps_the_deployment` for the way out).
+
+`enabled` reaching the four readers that had read "the table exists" as "something will issue" —
+`any_acme`, the `generated_sites` filter, `default_names`, and the `serve` scope loop — is what these
+two rules turned out to depend on, which is why they were worth doing in one change rather than three.
+
 ### What the live Pebble run established, and where it stopped
 
 `acme-verify`'s plan asked for offline issuance against **Pebble**. Pebble was built and run here

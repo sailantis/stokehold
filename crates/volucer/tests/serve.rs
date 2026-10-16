@@ -1887,6 +1887,122 @@ fn a_site_with_its_own_acme_serves_a_placeholder_for_its_own_names() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The contact a scope registers must reach the account, and the account files prove it.
+///
+/// `contact` is not decoration. It is the only channel a CA has for warning that renewals are failing
+/// for an account — and Let's Encrypt's rate limits are per *account*, so it is also what decides which
+/// account two scopes share. `rustls-acme` derives the account file name from
+/// `sha256(contact + directory_url)`, so the files that appear are a direct read of what was sent.
+///
+/// This is the test that would have caught `Engine::new` dropping `contact` on the floor. With the
+/// contact dropped every scope registers the **empty** list, so every scope hashes to one name and
+/// exactly one account file appears however many contacts are configured — which is what the bug did,
+/// while `check` printed `(none: the CA has no way to warn you…)` beside a `contact` key the operator
+/// had filled in.
+///
+/// The assertion is on the *count* rather than on a hash, so nothing here re-implements the
+/// dependency's file-naming scheme: two tables with two different contacts must produce two account
+/// files. That is the documented behaviour, and it is exactly what the bug broke.
+#[cfg(unix)]
+#[test]
+fn two_contacts_produce_two_accounts() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("volucer-acme-contact-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app = root.join("app");
+    let corp = root.join("corp");
+    for dir in [&app, &corp] {
+        std::fs::create_dir_all(dir).expect("create a document root");
+    }
+    std::fs::write(app.join("whoami.txt"), "app").expect("write the marker");
+    std::fs::write(corp.join("whoami.txt"), "corp").expect("write the marker");
+
+    // Two tables, two contacts, one cache directory — so both accounts land where this test can count
+    // them. The site deliberately states no `domains`, deriving them, because the derived path is the
+    // one a real deployment uses.
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\ndocument_root = {app}\n\n\
+         [server.tls]\n\n\
+         [server.acme]\ndomains = [\"app.example.test\"]\ncontact = [\"mailto:ops@example.test\"]\n\n\
+         [sites.corp]\nhosts = [\"corp.example.test\"]\ndocument_root = {corp}\n\n\
+         [sites.corp.acme]\ncontact = [\"mailto:other@example.test\"]\n",
+        app = toml_string(&app.display().to_string()),
+        corp = toml_string(&corp.display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let Some(server) = Server::start(&binary, &config_path) else {
+        eprintln!("skipping: the server did not start");
+        return;
+    };
+
+    // The account is registered before the order, and the file is written then, so what this waits for
+    // is arrival at the directory rather than issuance — which on this host is as far as a first
+    // deployment gets anyway. An account that never appears means the CA was unreachable, and that is
+    // a skip: the test cannot distinguish "no contact" from "no network" by looking at an empty
+    // directory, which is why it waits rather than polling once.
+    let accounts = wait_for_accounts(&root.join("acme-cache"), 2);
+    drop(server);
+
+    match accounts.len() {
+        0 => {
+            eprintln!(
+                "skipping: no account file appeared, so this host could not reach the ACME directory"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        1 => panic!(
+            "one account file for two different contacts: the contact never reached the account, so \
+             both scopes registered the empty list and now share one account — which is the bug this \
+             test exists for. `check` would still print the contact, and the CA would have no way to \
+             warn about either scope"
+        ),
+        _ => {}
+    }
+    assert_eq!(
+        accounts.len(),
+        2,
+        "two tables with two contacts must register two accounts, not {}: {accounts:?}",
+        accounts.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Wait until at least `want` ACME account files exist, and return the distinct names.
+///
+/// Bounded, because an account that never appears means the CA was unreachable on this host — a skip,
+/// not a failure. Returns whatever it found rather than `Option`, so the caller can tell the three
+/// cases apart: none (no network), one (the bug), or two (correct).
+#[cfg(unix)]
+fn wait_for_accounts(cache: &Path, want: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut seen: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        seen.clear();
+        if let Ok(entries) = std::fs::read_dir(cache) {
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("cached_account_") && !seen.contains(&name) {
+                    seen.push(name);
+                }
+            }
+        }
+        if seen.len() >= want {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    seen.sort();
+    seen
+}
+
 /// One TLS exchange: which certificate arrived, and what the request was answered with.
 ///
 /// Raw sockets and `rustls` directly, rather than a TLS client library, for the same reason the

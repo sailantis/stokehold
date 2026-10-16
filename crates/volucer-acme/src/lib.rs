@@ -258,10 +258,16 @@ impl Engine {
     /// `cache_dir` is required rather than optional, and that is a rate-limit decision rather than
     /// a tidiness one: without a cache every restart re-issues, and Let's Encrypt's limits are
     /// per-week and per-account.
+    ///
+    /// `contact` is passed through to the account registration. It is not decoration: it is the only
+    /// channel a CA has for warning that renewals are failing for this account, and `rustls-acme`
+    /// names the account file after a hash of it — so it is also what decides **which** account a
+    /// scope uses, and two scopes with the same contact share one.
     pub fn new(
         domains: Vec<String>,
         authority: Authority,
         cache_dir: impl Into<PathBuf>,
+        contact: Vec<String>,
         sink: Arc<dyn CertificateSink>,
     ) -> Result<Self, AcmeError> {
         if domains.is_empty() {
@@ -269,6 +275,7 @@ impl Engine {
         }
         let cache_dir = cache_dir.into();
         let config = rustls_acme::AcmeConfig::new(domains.clone())
+            .contact(contact)
             .cache(rustls_acme::caches::DirCache::new(cache_dir.clone()))
             // The directory is named explicitly even for staging, because the default is a
             // `pub(crate)` field a caller cannot read — so relying on it would mean not being able
@@ -541,6 +548,7 @@ mod tests {
             vec!["example.test".to_string()],
             Authority::Staging,
             &dir,
+            Vec::new(),
             Arc::clone(&sink) as Arc<dyn CertificateSink>,
         )
         .expect("an engine for one name");
@@ -577,6 +585,7 @@ mod tests {
             vec!["example.test".to_string()],
             Authority::Staging,
             &dir,
+            Vec::new(),
             Arc::clone(&sink2) as Arc<dyn CertificateSink>,
         )
         .expect("an engine for one name");
@@ -607,6 +616,7 @@ mod tests {
             vec!["example.test".to_string()],
             Authority::Staging,
             &dir,
+            Vec::new(),
             Arc::new(Refusing),
         )
         .expect("an engine for one name");
@@ -642,6 +652,7 @@ mod tests {
             vec!["example.test".to_string()],
             Authority::Staging,
             &dir,
+            Vec::new(),
             Arc::clone(&sink) as Arc<dyn CertificateSink>,
         )
         .expect("an engine for one name");
@@ -696,7 +707,7 @@ mod tests {
     #[test]
     fn an_engine_needs_at_least_one_name() {
         let sink = Arc::new(Recording::default()) as Arc<dyn CertificateSink>;
-        match Engine::new(Vec::new(), Authority::Staging, ".", sink) {
+        match Engine::new(Vec::new(), Authority::Staging, ".", Vec::new(), sink) {
             Ok(_) => panic!("no names is not a usable engine, and must be refused"),
             Err(err) => assert!(
                 err.to_string().contains("at least one name"),

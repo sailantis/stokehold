@@ -39,7 +39,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
-use volucer_core::config::{Config, MinTlsVersion};
+use volucer_core::config::{Config, MinTlsVersion, SiteAcmeConfig};
 use volucer_core::hostmap::HostMap;
 
 use volucer_acme::ChallengeSource;
@@ -303,13 +303,10 @@ impl CertificateSet {
                 .iter()
                 .filter(|(_, site)| {
                     // A site with its own ACME table and no *named* pair gets a placeholder. A site
-                    // that names one has decided against issuing, and `Config::validate` refuses
-                    // both at once.
-                    site.acme.is_some()
-                        && !site
-                            .tls
-                            .as_ref()
-                            .is_some_and(|tls| tls.certificate.is_some() && tls.key.is_some())
+                    // that names one serves it until an order replaces it, and a table that is
+                    // turned off issues nothing to replace a placeholder with — so in both cases the
+                    // site is covered by the deployment's certificate and needs none of its own.
+                    site.acme.as_ref().is_some_and(SiteAcmeConfig::issues)
                 })
                 .map(|(name, site)| GeneratedSite {
                     name: name.clone(),
@@ -767,7 +764,7 @@ fn default_names(config: &Config) -> Vec<String> {
     // cover", so the placeholder answers to the same names the order will ask for and the swap is
     // invisible to a client.
     if let Some(acme) = &config.server.acme {
-        if !acme.domains.is_empty() {
+        if acme.enabled && !acme.domains.is_empty() {
             return acme.domains.clone();
         }
     }
@@ -775,8 +772,9 @@ fn default_names(config: &Config) -> Vec<String> {
     for site in config.sites.values() {
         // A site with its own ACME table is covered by its **own** generated certificate, so its hosts
         // do not belong here — and putting them here would have the deployment placeholder answering
-        // for a name whose order belongs to a site.
-        if site.acme.is_some() {
+        // for a name whose order belongs to a site. A table that is turned off issues nothing, so
+        // that site *is* covered by the deployment's placeholder and its hosts belong here after all.
+        if site.acme.as_ref().is_some_and(SiteAcmeConfig::issues) {
             continue;
         }
         for host in &site.hosts {
@@ -790,6 +788,7 @@ fn default_names(config: &Config) -> Vec<String> {
     }
     names
 }
+
 /// Install the process-wide crypto provider, once.
 ///
 /// rustls 0.23 leaves the provider to the crate features but only *installs* it lazily, and
@@ -1073,5 +1072,104 @@ key = "certs/default.key"
         assert!(message.contains("server.tls"), "{message}");
         assert!(message.contains("certs"), "{message}");
         assert!(message.contains("default.crt"), "{message}");
+    }
+
+    /// A deployment-wide table that issues nothing must not name the placeholder's SANs.
+    ///
+    /// `default_names` answers "what must this generated certificate cover" by reading
+    /// `[server.acme].domains` — the same list the order will ask for, so the placeholder and the
+    /// issued certificate answer to the same names and the swap is invisible to a client. But a
+    /// *disabled* table orders nothing, so its `domains` are not what this certificate will be
+    /// replaced by, and using them would put names on the placeholder that the deployment is not
+    /// asking for — including, in the `enabled = false` case the switch exists for, none at all.
+    #[test]
+    fn a_disabled_table_does_not_name_the_generated_certificate() {
+        let (dir, _) = fixture("enabled-names");
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+
+[server.tls]
+
+[server.acme]
+enabled = false
+domains = ["never-asked-for.example"]
+
+[sites.app]
+hosts = ["app.example"]
+document_root = "/srv/app"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        // Validation refuses an absent pair with nothing to replace it — which is the point of the
+        // switch, and `a_disabled_site_table_cannot_replace_a_generated_placeholder` in
+        // `volucer-core` pins it. The table is only kept here to observe `default_names`.
+        assert_eq!(
+            default_names(&config),
+            vec!["app.example".to_string()],
+            "a disabled table's domains must not reach the placeholder, so the site's hosts do"
+        );
+
+        // And with the table enabled they do, which is the behaviour that must not regress.
+        let text = &text.replace("enabled = false", "enabled = true");
+        let config = Config::from_toml(text).expect("parses");
+        assert_eq!(
+            default_names(&config),
+            vec!["never-asked-for.example".to_string()],
+            "an enabled table's domains are what the order will ask for, so they are the SANs"
+        );
+        drop(dir);
+    }
+
+    /// A site whose table is turned off is covered by the deployment's certificate, so it gets no
+    /// placeholder of its own.
+    ///
+    /// The other half of the same rule, and the one with a visible consequence: `generated_sites`
+    /// gives a site a generated pair whose SANs are *its* hosts, so that the certificate its own
+    /// order produces replaces it for exactly those. A site that orders nothing has no such order
+    /// coming, so a placeholder for it would sit there for ever, unchallenged by the deployment's
+    /// issuer — and, worse, would be registered under names the deployment's order does cover.
+    #[test]
+    fn a_disabled_site_table_gets_no_placeholder_of_its_own() {
+        let (_, _) = fixture("enabled-placeholders");
+        let text = r#"
+[server]
+http = "127.0.0.1:443"
+
+[server.tls]
+
+[server.acme]
+domains = ["deployment.example"]
+contact = ["mailto:ops@example.com"]
+
+[sites.app]
+hosts = ["app.example"]
+document_root = "/srv/app"
+
+[sites.app.acme]
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let set = CertificateSet::from_config(&config);
+        assert_eq!(
+            set.generated_sites
+                .iter()
+                .map(|site| site.name.as_str())
+                .collect::<Vec<_>>(),
+            ["app"],
+            "an enabled site table is what earns it a placeholder"
+        );
+
+        let text = &text.replace("[sites.app.acme]", "[sites.app.acme]\nenabled = false");
+        let config = Config::from_toml(text).expect("parses");
+        let set = CertificateSet::from_config(&config);
+        assert!(
+            set.generated_sites.is_empty(),
+            "a table that issues nothing gets nothing generated, and the deployment's \
+             certificate covers the site instead: {:?}",
+            set.generated_sites
+        );
+        assert!(
+            set.sites.is_empty(),
+            "and it names no pair of its own, so it contributes no entry at all"
+        );
     }
 }

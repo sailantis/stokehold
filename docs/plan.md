@@ -1512,11 +1512,15 @@ Phase 6 — front-ends
     filesystem rather than the file — is the document root there, is the front controller actually
     present, is a discovered PHP below the worker floor — reported as warnings rather than errors,
     because a document root that does not exist yet is a normal thing to check. Reload was
-    deliberately **not** built: see open decision 5.
+    deliberately **not** built at the time: see open decision 5 — **built later as steps 53–59.**
 
 Phase 7 — packaging
 22. `packaging-ci` — release artifacts per target, systemd unit, Windows service notes, CI
-    matrix, README and docs.
+    matrix, README and docs. **Deferred to Phase 10 on a stated reason rather than an oversight:**
+    the prerequisites had already changed once mid-flight (Rust → Rust + C toolchain + NASM + CMake,
+    hazard 54) and packaging written before that settled would have been written twice. They have
+    now settled — the last TLS consumer is `rustls-acme` — so this is step 69 plus the Composer
+    channel in step 70.
 23. `bench-harness` — load generator plus comparison against nginx+php-fpm, RoadRunner and
     php-cgi, to state realistic expectations rather than claims.
 
@@ -1594,11 +1598,23 @@ Later, and deliberately not part of Phase 8:
     one repository each. Nothing blocks them: `HelloAck` carries a free-form `runtime` and the
     handshake checks the *protocol* version, not the language, so a non-PHP worker handshakes
     today. What each needs is its own answer to "how does this process report its RSS", because
-    the recycling contract is otherwise silently unenforced.
+    the recycling contract is otherwise silently unenforced. **Order changed after step 68 was
+    written:** `script-extensions` (38) comes *first*, and the first client should be **Go**, which
+    is the one language that is also a measurement — RoadRunner is a Go worker server, so a Go
+    client compares the two on the same runtime with no language confound.
 38. `script-extensions` — make "what counts as a script" configurable per site instead of the
     hardcoded `[".php", ".php3", ".phtml"]`. Required before a non-PHP worker can serve `.py` or
     `.rb`: `path_suffix` can *route* such a path, but `has_php_extension` decides what resolves as a
-    script, so today `/foo.rb` reaches the front controller as `PATH_INFO` instead.
+    script, so today `/foo.rb` reaches the front controller as `PATH_INFO` instead. **It is step
+    37's prerequisite and must land first.** There are **three** hardcoded lists, and the third is a
+    security rule rather than a routing one: `cgi::has_php_extension`
+    (`crates/volucer-fcgi/src/cgi.rs:208`) and its `PHP_EXTENSIONS` table (`:305`), the mirror in
+    `is_script_extension` (`crates/volucer-core/src/config.rs:518`) — which exists because two lists
+    of "what is a script" must not be able to disagree — and the static layer's refusal to serve a
+    script from disk (`crates/volucer-http/src/static_files.rs:235`), whose comment says why:
+    serving `index.php` from disk *"sends its source to the client"*. Widening the first two without
+    the third turns every newly-routable extension into a source disclosure, so the three move
+    together or the step is not done.
 39. `plugin-abis` — only if a real need appears. RoadRunner's "plugins" are statically linked Go
     packages resolved by a compile-time DI container (`container/plugins.go`; there is no
     `plugin.Open` anywhere), so the enum backend kind stays the extension point.
@@ -1663,6 +1679,11 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     (C toolchain + NASM + CMake), and there is no `.github`, no CI, no release artifact and no
     systemd unit, so "it builds everywhere" is verified only by hand on one host. The prerequisite
     list just grew from "Rust" to "Rust + C toolchain + NASM + CMake".
+
+    **Expanded into Phase 10, and step 69 there is the reason.** The matrix was written as a
+    verification chore, which is why it kept being deferred; once packaging is a *deliverable*, the
+    same workflow has an output to produce and a reason to exist. It is not superseded — it is
+    step 69, and it is no longer last.
 52. `tls-acme` — **24b.** `rustls-acme`, whose default and recommended mechanism is TLS-ALPN-01 and
     needs no second port. The plaintext listener this phase adds is what HTTP-01 would need, so
     that option is open rather than blocked.
@@ -1934,6 +1955,158 @@ claims turned out to understate.
     staging. `volucer check` against the documented example was run rather than assumed, and its
     wildcard warning fires on the config the README recommends.
 
+Phase 10 — being deployable, and being reachable from an application
+
+Two questions arrived together and they are not the same question: *can a PHP developer install
+this*, and *can a runtime that already owns its HTTP loop use it*. The first is packaging and
+frameworks; the second is a new backend kind. They are ordered here so each one stands on
+something that exists.
+
+**The ordering is forced, and it is the phase's one real constraint.** `framework-bridges` (step
+72) is not *technically* blocked by packaging — a bridge is a Composer package that talks to the
+worker protocol, and the protocol is done. It is blocked *practically*: a bridge whose README says
+"point your configuration at the `volucer` binary" is unusable when there is no released binary to
+point at. So 68 → 69 → 70 → 71 → 72.
+
+**Phase 7's deferral is honoured, not reversed.** Packaging was pushed last on the reasoning that
+the prerequisites were still moving and would make the work be done twice. That reasoning was
+right, and it is why `ci-build-matrix` is now step 69 of this phase rather than a chore before it:
+the workflow is the same one, but it finally has an output, so it stops being deferrable.
+
+68. `upstream-backend` — `kind = "upstream"`, and it is a second request path rather than a fourth
+    arm of the existing one.
+    - **It cannot reuse the CGI representation, and that is the whole reason this is a step of its
+      own.** Every backend today is reached through one shape: `Request { params:
+      Vec<(Vec<u8>, Vec<u8>)>, body }`, built by `to_cgi`. That shape *is* CGI, and it loses exactly
+      what an HTTP upstream must preserve. Headers are flattened to `HTTP_*` (case destroyed,
+      duplicates joined), the request line is three environment variables, and the body is a
+      buffered `Vec<u8>` behind `max_body_bytes` (32 MiB). A `dispatch_to` that took an
+      `IncomingRequest` could not express any of it. So: a parallel path, and a `Request`-shaped
+      abstraction only if a third shape ever appears.
+    - **The two front-ends behave differently, and the difference is not a bug to be evened out.**
+      The FastCGI front-end already speaks CGI — that is what nginx sends it — so it has nothing to
+      translate *from* and an upstream backend reaches it as a request with `params` already
+      present. The HTTP front-end is where the translation happens. Step 68 wires the HTTP path.
+    - **Bodies must stream, in both directions, or the step has not achieved its purpose.** This is
+      the substantial work and it is not optional: `ResponseBody` is `Full<Bytes>`, `read_body`
+      collects the entire upload before dispatch, and both are deliberate — `body_len` is
+      authoritative in the worker protocol so that "a short body is *detected* rather than hanging".
+      Those reasons are about *framed* protocols and do not apply to HTTP, so streaming is added for
+      this backend rather than everywhere. Without it the runtime cannot do SSE, long polling, or
+      WebSockets, which is most of the reason to choose an async runtime at all; with it, an
+      upstream is *strictly more capable* than worker mode for those workloads.
+    - **WebSockets are the expensive part and are separable.** Streaming responses need
+      `hyper`'s body plumbing; an upgrade needs the `Connection`/`Upgrade` dance as well. Order them:
+      streaming first (it is what SSE and long-polling need and it is testable with a slow body),
+      and treat a WebSocket upgrade as its own decision rather than assuming it comes along.
+    - **What it does not do:** nothing about `workers`, `command`, or the worker protocol changes.
+      An upstream is a backend *kind* beside the other three, chosen per site or per route, and a
+      deployment that does not configure one behaves identically.
+    - **Verification:** with no upstream configured, `tests/tls.rs`, `tests/frontend.rs` and
+      `tests/external.rs` are unchanged — that is the "additive" control, the same one ACME used.
+      Then one real upstream (a stdlib HTTP server that answers slowly) with (a) a response that
+      arrives in pieces and reaches the client in pieces, (b) a header whose case survives the
+      round trip, (c) a duplicated request header that arrives twice, (d) a body larger than
+      `max_body_bytes` that is refused or streamed rather than truncated. (a)–(d) each fail against
+      the current code by construction, which is what makes them tests rather than demonstrations.
+
+69. `release-artifacts` — **this is `ci-build-matrix`, kept as one step and given a purpose.**
+    - A build and test workflow for Linux/macOS/Windows, and the three prerequisites it exists to
+      pin: Rust 1.85, a C toolchain + NASM + CMake (`aws-lc-rs`, hazard 54).
+    - Tagged releases producing per-target archives — `volucer-<version>-<os>-<arch>.tar.gz` /
+      `.zip`, the same shape RoadRunner publishes — each with a **checksum file**, and a
+      **`cargo build` from a clean checkout** asserted, since a published crate cannot depend on a
+      version that is not on crates.io yet and the publish order of the seven crates is a real
+      constraint rather than a detail.
+    - Docker images (`glibc` and `musl`), a systemd unit, and Windows service notes. The systemd
+      unit is the one that matters most: `SIGHUP` reload is only useful if an operator can wire it
+      to `ExecReload=`.
+    - **`.github/` does not exist yet** — 0 workflows, 0 tags, no release. Nothing is releaseable
+      today, which is also why every downstream step in this phase is genuinely blocked.
+    - **The measurement belongs here too, and it is not decoration.** A release that has never been
+      installed on a clean machine is a hypothesis. `cargo install volucer` and the archive path
+      are each run once on a host without the source checkout, and the result written down.
+
+70. `volucer-cli-package` — the Composer channel, and its mechanism is not the obvious one.
+    - **What `composer require spiral/roadrunner` actually does, verified rather than assumed:**
+      nothing. The `composer.json` at that repository's root is `"type": "metapackage"` with no
+      `require`, no `bin` and no `autoload` — `composer require` downloads metadata and not one byte
+      of the Go binary. The binary arrives a second way, through `spiral/roadrunner-cli`, which
+      declares `"bin": ["bin/rr"]` and whose `rr get-binary` fetches a platform-matched archive from
+      GitHub Releases (`internal/dload` + `symfony/http-client` + `react/async`). The obvious
+      alternative does not exist: `spiral/roadrunner-binary` 404s on Packagist. So the downloader CLI
+      *is* the mechanism, and a metapackage alone would give a PHP developer nothing runnable.
+    - **Therefore:** a new repository `volucer/volucer-cli`, `"bin": ["bin/volucer"]`, `composer
+      require volucer/volucer-cli` then `vendor/bin/volucer get-binary`. **It has to be its own
+      repository for the same reason the SDK does** — Composer needs `composer.json` at the root, and
+      the Rust workspace is at the root of this one.
+    - The downloader must verify the checksum it just downloaded, and must fail with an actionable
+      message when a platform has no asset rather than leaving a zero-byte file. RoadRunner's own
+      script treats both cases explicitly, which is the shape to copy.
+    - **A second channel is worth having for the same audience:** a `sailantis/volucer`
+      metapackage that carries the *config* documentation and the version compatibility table — the
+      thing a developer reads before installing — while the CLI carries the binary. Two names is a
+      real cost and it is the cost RoadRunner pays; it is worth paying only if the docs and the
+      downloader genuinely do not belong together.
+    - **Not chosen: a PHP extension.** FrankenPHP's model embeds PHP in the server, which is the
+      design hazard 53 priced and this project rejected on grounds of isolation.
+
+71. `sdk-session-helper` — small, and a prerequisite for the next step rather than tidying.
+    - `docs/worker-protocol.md` currently tells an adapter author where the session handoff lives:
+      *"Both adapters share one implementation of this, `Azera\Http\WorkerSession` in
+      `sailantis/azera-framework`, which is where a third one should look first."* For a **public**
+      SDK that is backwards — it points a third-party author at one vendor's framework to find a
+      helper for a protocol that has nothing to do with that framework.
+    - Move the two halves — read the session id from the request and write `Set-Cookie` on the
+      response, with the between-requests reset — into `sailantis/volucer-worker`, where the rest of
+      the worker contract already lives. The framework adapters then depend on the SDK instead of
+      each other.
+    - **Why it is a step and not a note:** the failure it prevents is silent. `session_id()`
+      outlives the request in a long-lived process, so a client arriving with no cookie inherits the
+      *previous* client's session — which passes every test that sends no cookie.
+
+72. `framework-bridges` — a package per framework, and the work is per-framework state reset rather
+    than the protocol.
+    - **The protocol half is already written.** `sailantis/volucer-worker` is the SDK and
+      `example/worker.php` is a working worker; `azera-volucer`'s `VolucerHttpWorker` is the
+      reference shape — translate the request, run the framework's router and dispatcher, read the
+      response through its getters, then reset per-request state. A bridge is that class with a
+      different kernel underneath.
+    - **The acceptance criterion is the reset, not the routing.** PHP assumes a fresh process per
+      request; a worker breaks that assumption, and each framework repairs it differently. Symfony
+      reboots the kernel between requests; Laravel has Octane's application factory and its flush
+      listeners; Spiral was written for RoadRunner and fits closest. "It serves a request" is not
+      the bar — *two consecutive requests that must not see each other's state* is.
+    - **Laravel has a wall, and it should be recorded before anyone promises it.** Octane's
+      engine list is hardcoded in `StartCommand` (`match ($server) { 'swoole' => …, 'roadrunner' =>
+      …, 'frankenphp' => …, default => invalidServer(…) }`), so `--server=volucer` is an upstream
+      pull request, not something a package can add. The standalone-bridge path is what
+      `baldinof/roadrunner-bundle` did for Symfony — a third-party bundle needing no upstream
+      change — and the same is available here.
+    - **Candidate order by cost, not by popularity:** Spiral (closest fit), Symfony (a bundle, no
+      upstream change), Laravel (bridge now, upstream PR as a separate decision), then
+      Slim/Mezzio/custom PSR-15 (thin, and validates the SDK against a framework with no
+      boot-cost story to protect).
+    - **Verification is per bridge and behavioural:** the framework's own test that two requests do
+      not see each other's state, run *through the worker*; and the SDK's own tests unchanged, since
+      the SDK is what a bridge must not need to patch.
+
+**What this phase does not do.** No PHP extension (FrankenPHP's model, priced by hazard 53 and
+rejected for isolation). No multiplexed FastCGI — the specification has it (§1: *"the protocol
+multiplexes a single transport connection between several independent FastCGI requests"*, and the
+`request_id` is a `u16`) but no provider implements it, so a consumer would have to be written as
+well as a producer. No HTTP/3, no `prefork-optional`, no `rpc-sidechannel`.
+
+**Why the multiplexing refusal is written down rather than left implicit:** it is the question an
+async-runtime user asks first, and the answer that satisfies them is not multiplexing. An async
+runtime does not lack the *ability* to handle concurrent requests — `Node`'s event loop is the whole
+point of choosing it — and one request per connection, of which `volucer` opens as many as there are
+requests in flight (hazard 22: 3,916 → 27,657 rps at concurrency 32), already gives it that. What
+worker mode actually withholds from such a runtime is a streaming response, and `upstream` is where
+that is fixed. The `node-fastcgi` package is the proof that this is not a gap in the design: it
+describes itself as a "near drop-in replacement for `node`'s `http` module", i.e. it too serves one
+request per connection.
+
 ## 7. Testing strategy
 
 - **Codec unit tests** first, against the specification's own examples, plus byte-exact
@@ -1963,8 +2136,8 @@ claims turned out to understate.
    for v1? — **Answered: in scope, as its own routing layer above the backends, off by default.**
    See step 20 and the Static files section of the README.
 5. **Configuration reload.** Re-reading `volucer.toml` on `SIGHUP` without dropping a connection
-   is the obvious next thing an operator asks for, and it is **now being built** — steps 53–58
-   above, after TLS. The original reason it was deferred still holds and is why it is tiered
+   is the obvious next thing an operator asks for, and it is **built** — steps 53–59 above, after
+   TLS. The original reason it was deferred still holds and is why it is tiered
    rather than wholesale: only part of the file can be reloaded in place. Listeners are bound,
    backends are running processes with live pipes, and both front-ends hold the dispatcher behind
    a handle. So the line is drawn deliberately, and the rule is that **everything behind a
@@ -2038,9 +2211,10 @@ do I read the state of the work from the other machine".** Nothing important liv
 folder, and nothing here needs the chat to interpret. The four places to look, in order:
 
 1. **This section** — the current build, the open decisions, and the list of what is built.
-2. **The step list above** (Phase 0–7) — which steps are done; steps 18, 19, 20 and 21 carry a
+2. **The step list above** (Phase 0–10) — which steps are done; steps 18, 19, 20 and 21 carry a
    **done** marker and the rest say what is still open. Step 18 was implemented long before the
-   plan said so; that marker is now corrected.
+   plan said so; that marker is now corrected. Phase 10 (steps 68–72) is packaging and reachability
+   and is entirely unbuilt, which is the plan's honest state rather than a gap in it.
 3. **"What actually works today"** below — the same question asked of a running binary, per
    capability, with the probe that established it. This is the section that answers "does it do
    HTTP/2 / SSL yet" without reading code.
@@ -2112,7 +2286,9 @@ and 27 and 28 are recorded findings rather than open questions. What is left is 
 1. **Default backend out of the box** — open decision 1.
 2. **msgpack behind the codec boundary** — open decision 2, deferred pending a profile.
 3. **Configuration reload on `SIGHUP`** — open decision 5, *deliberately not built*, with the
-   three options and the reason a half-reload is worse than none.
+   three options and the reason a half-reload is worse than none. **Answered and built: steps
+   53–59.** It is kept in this list because the list is a record of what was open, and struck
+   through rather than deleted for the same reason the hazards are.
 4. **The rename** — a product decision, above.
 5. **The re-run** — the five arms against current `main`, above.
 6. **The worker pool's tail** — hazard 52, **fixed and measured** (`e2b031e`). The cause was
@@ -3182,7 +3358,7 @@ installed, and the failure surfaces much later as a CMake error from inside `aws
 the machine or user PATH matched `NASM`; the directory had to be added by hand. The build
 prerequisites for this project are therefore now **Rust + a C toolchain + NASM + CMake**, not
 "Rust", and that is a real change to what a fresh checkout needs. It is why `ci-build-matrix`
-(step 52) should exist before the cross-platform claim is made.
+(step 51, now step 69 in Phase 10) should exist before the cross-platform claim is made.
 
 **Version decision, also measured rather than assumed.** The Rustls 0.24 line moves providers out of
 the main crate into `rustls-aws-lc-rs` / `rustls-ring`, selected by an explicit runtime install

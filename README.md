@@ -1,6 +1,6 @@
-# volucer
+![Volcucer](docs/images/volucer-logo-text.svg)
 
-A cross-platform PHP application server.
+A cross-platform application server.
 
 `volucer` runs PHP applications in two modes from a single Rust binary:
 
@@ -29,6 +29,12 @@ supervises it for you.
 > `php-fpm` would. The CLI is complete: `serve`, `check` and `version`, with the document root and
 > front controller configurable in the file rather than only on a command line. TLS and HTTP/3 are
 > not there yet; see [docs/plan.md](docs/plan.md) for the phase order.
+>
+> **What is *not* built yet, in one place**, because "not there yet" is too vague to plan against:
+> TLS **is** built (both certificate/key and ACME, steps 42–50 and 60–67) and `SIGHUP` reload **is**
+> built (steps 53–59); what is missing is everything that makes the server *reachable* — release
+> artifacts, a Composer channel, framework bridges, and an HTTP `upstream` backend for runtimes that
+> already own their HTTP loop. Those are steps 68–72, Phase 10, and they are the current frontier.
 >
 > **The async boundary.** `volucer-http` is the only place with a `tokio` runtime, because
 > `hyper` needs one. Every backend stays blocking, and the dispatcher is reached only through
@@ -64,17 +70,24 @@ itself. Several `Host` names can be served from one process, each with its own d
 
 ## Backends
 
-| `kind` | What it is | Per-request reset | Platforms |
-| --- | --- | --- | --- |
-| `worker` | Persistent PHP process speaking volucer's framed protocol over pipes | No — the application clears its own request scope | all |
-| `external` | An already-running `php-fpm` (systemd-managed) | Yes, by php-fpm's SAPI | Linux, macOS |
-| `spawn_cgi` | N `php-cgi` processes on N ports | Yes, by php-cgi's SAPI | all, **required on Windows** |
+| `kind`      | What it is                                                           | Per-request reset                                 | Platforms                    |
+| ----------- | -------------------------------------------------------------------- | ------------------------------------------------- | ---------------------------- |
+| `worker`    | Persistent PHP process speaking volucer's framed protocol over pipes | No — the application clears its own request scope | all                          |
+| `external`  | An already-running `php-fpm` (systemd-managed)                       | Yes, by php-fpm's SAPI                            | Linux, macOS                 |
+| `spawn_cgi` | N `php-cgi` processes on N ports                                     | Yes, by php-cgi's SAPI                            | all, **required on Windows** |
 
 A fourth kind, `spawn_fpm`, was accepted by the parser and refused at startup — `version`
 advertised it while `Backend::from_config` rejected it. It is **gone** rather than implemented:
 php-fpm already does pool management, `pm.max_requests` recycling, multi-pool tenancy and graceful
 reload better than a supervisor we would write, and `external` attaches to the php-fpm that
 systemd already runs. A file still carrying `kind = "spawn_fpm"` is now rejected by name.
+
+A planned fourth kind, **`upstream`**, is not built — a real HTTP reverse proxy for runtimes that
+already own their HTTP loop (Node, ASGI, Go, and anything wanting SSE or WebSockets). It is *not* a
+fourth arm of the table above: every backend today is reached through a CGI environment, which
+flattens headers to `HTTP_*` and buffers the body, and an HTTP upstream needs the opposite. See
+Phase 10 in [docs/plan.md](docs/plan.md) for why it is a second request path rather than a new
+`kind` in the existing one.
 
 `spawn_cgi` is implemented: the pool starts the processes, assigns ports, health-checks each
 slot, restarts one that died, and recycles on `max_requests` — the equivalent of php-fpm's
@@ -96,13 +109,13 @@ escapes a quote or another backslash, so a Windows path needs no doubling. Each 
 handshaken, and kept resident; `stderr` is drained on its own thread so a chatty application
 cannot fill a pipe and block; and a worker is replaced when it asks to be (`keep_alive = false`),
 when it reaches `max_requests`, or when the peak RSS it reports exceeds `memory_limit_mb`. Every
-wait has a deadline, enforced by killing the worker — the process *is* the cancellation token,
+wait has a deadline, enforced by killing the worker — the process _is_ the cancellation token,
 because a pipe read has no portable timeout. A failed request is deliberately **not** retried,
 unlike the FastCGI backends: a worker failure can happen after the application ran.
 
 `checksum = "optional"` turns off the protocol's per-frame CRC-32C. The default is `"required"`,
 which is what every earlier release did, so omitting the line changes nothing. When it is
-`"optional"` the server *offers* the option in its `HELLO`, and only stops verifying if the worker
+`"optional"` the server _offers_ the option in its `HELLO`, and only stops verifying if the worker
 answers in its `HELLO_ACK` that it agrees — an SDK that predates the field omits it, which decodes
 as "no", and the pair stays checked. The handshake itself is always checksummed, in both
 directions, because it is the exchange that carries the agreement. Setting it is worth about what
@@ -163,7 +176,7 @@ rather than a path.
 A `spawn_cgi` pool talks to its `php-cgi` processes over loopback TCP by default. `socket` moves
 it off the loopback stack, and what that setting means depends on the platform: a unix socket
 path on Linux and macOS, and a **named pipe** on Windows, because that is what `php-cgi -b` binds
-there. Both are a *prefix* — each slot appends its index, so `\\.\pipe\volucer-cgi` gives slot 0
+there. Both are a _prefix_ — each slot appends its index, so `\\.\pipe\volucer-cgi` gives slot 0
 the pipe `\\.\pipe\volucer-cgi.0`. The pipe is the faster of the two transports on Windows: a
 4 KiB request measures ~168 µs over a pipe against ~211 µs over loopback TCP.
 
@@ -246,7 +259,7 @@ should be the one that takes effect.
 `front_controller` is what keeps a framework working: a path that names no file under the document
 root is given to this script with `PATH_INFO` set, instead of answering 404. Pass an empty
 `--front-controller ''` to serve only real `.php` files, which matches nginx's `location ~ \.php$`
-behaviour. That form is a *flag* and not a config value, deliberately: TOML cannot tell an empty
+behaviour. That form is a _flag_ and not a config value, deliberately: TOML cannot tell an empty
 string from an absent key, so writing `front_controller = ""` in the file is rejected with a
 message saying so rather than being given a meaning of its own.
 
@@ -298,7 +311,7 @@ does, so it is refused.
 
 ### Several PHP entry points
 
-`.php` files are resolved to real scripts, so `path_suffix = ".php"` sends *every* PHP entry point
+`.php` files are resolved to real scripts, so `path_suffix = ".php"` sends _every_ PHP entry point
 to one backend — the usual answer for a project with more than one front controller:
 
 ```toml
@@ -445,20 +458,20 @@ from becoming a way to read a file.
 
 With it enabled, `volucer` serves:
 
-| Feature | Detail |
-| --- | --- |
-| Content types | A table of what a web build contains; anything unknown is `application/octet-stream` |
-| Validators | `ETag` (length + mtime) and `Last-Modified`, with 304s for `If-None-Match` / `If-Modified-Since` |
-| Ranges | `bytes=0-99`, `bytes=100-`, `bytes=-500`, several at once, 416 for a range past the end, `If-Range` |
-| Precompressed | `file.br` then `file.gz` when the client asked — opt-in, and only when the file exists |
-| Directory indexes | `index.html`, with a 301 from `/docs` to `/docs/` |
-| Caching | One `Cache-Control` for everything, because a per-extension guess goes stale silently |
-| Refusals | Dotfiles answer 404, and a `..` segment answers 403 rather than being clamped |
-| Scripts | A `.php`/`.php3`/`.phtml` path is never served from disk, so its source cannot be disclosed |
+| Feature           | Detail                                                                                              |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
+| Content types     | A table of what a web build contains; anything unknown is `application/octet-stream`                |
+| Validators        | `ETag` (length + mtime) and `Last-Modified`, with 304s for `If-None-Match` / `If-Modified-Since`    |
+| Ranges            | `bytes=0-99`, `bytes=100-`, `bytes=-500`, several at once, 416 for a range past the end, `If-Range` |
+| Precompressed     | `file.br` then `file.gz` when the client asked — opt-in, and only when the file exists              |
+| Directory indexes | `index.html`, with a 301 from `/docs` to `/docs/`                                                   |
+| Caching           | One `Cache-Control` for everything, because a per-extension guess goes stale silently               |
+| Refusals          | Dotfiles answer 404, and a `..` segment answers 403 rather than being clamped                       |
+| Scripts           | A `.php`/`.php3`/`.phtml` path is never served from disk, so its source cannot be disclosed         |
 
 Serving a file costs no PHP worker and no `spawn_blocking`: path resolution is one blocking
-`stat`, and the bytes stream through `tokio::fs` in 64 KiB blocks with a *content-length* frame, so
-hyper frames the response without chunked encoding. Zero-copy (`sendfile`) is *not* used — that
+`stat`, and the bytes stream through `tokio::fs` in 64 KiB blocks with a _content-length_ frame, so
+hyper frames the response without chunked encoding. Zero-copy (`sendfile`) is _not_ used — that
 would be a Unix-only second code path — so a large file is copied per block. See
 [the module docs](crates/volucer-http/src/static_files.rs) for what is deliberately absent.
 
@@ -491,16 +504,16 @@ prints the path it resolved.
 All three shapes work. `http` always keeps its name and meaning, so no existing configuration
 changes behaviour.
 
-| Shape | Configuration |
-| --- | --- |
-| Cleartext only | `http = "...:8080"`, no `[server.tls]` — **unchanged from before** |
-| TLS only | `http = "...:443"` + `[server.tls]` |
-| **Both on one port** | `[server.tls].plain = true` |
-| Both, conventional ports | `http = "...:80"` and `https = "...:443"` |
+| Shape                    | Configuration                                                      |
+| ------------------------ | ------------------------------------------------------------------ |
+| Cleartext only           | `http = "...:8080"`, no `[server.tls]` — **unchanged from before** |
+| TLS only                 | `http = "...:443"` + `[server.tls]`                                |
+| **Both on one port**     | `[server.tls].plain = true`                                        |
+| Both, conventional ports | `http = "...:80"` and `https = "...:443"`                          |
 
 **One port carrying both** works by looking at the first byte: a TLS record always begins with
 `0x16`, and a plaintext request begins an ASCII method letter. This is what nginx's `ssl_preread`
-does, and it costs one `peek` per *connection* — never per request, because the protocol is decided
+does, and it costs one `peek` per _connection_ — never per request, because the protocol is decided
 once and then the connection is one path or the other.
 
 It is a **detection, not a downgrade**: a client that offers TLS and fails the handshake still
@@ -541,6 +554,7 @@ protocols, and a redirect on the TLS half would send the client back to where it
 — an infinite loop. The decision is per connection for exactly that reason.
 
 ### Per-site certificates (SNI)
+
 ```toml
 [sites.shop.tls]
 certificate = "certs/shop.crt"
@@ -548,13 +562,13 @@ key = "certs/shop.key"
 ```
 
 Only `certificate` and `key` can be per site. The name is claimed in the TLS handshake, before any
-request exists, so a per-site table can only be about *which certificate is presented* —
+request exists, so a per-site table can only be about _which certificate is presented_ —
 `min_version`, `alpn` and `plain` describe the socket, and setting one per site is an error rather
 than a key that does nothing.
 
 Certificates are selected by **SNI**, not by the `Host` header: exact name, then the longest `*.`
 wildcard, then the server's certificate, using the same matching rule as [Sites](#sites). The two
-*should* agree but need not — a client may claim one name in the handshake and another in the
+_should_ agree but need not — a client may claim one name in the handshake and another in the
 request. That is not an error: the certificate for the claimed name is presented, and the request
 is then served by whatever site its `Host` selects.
 
@@ -584,7 +598,7 @@ contact = ["mailto:ops@example.com"]
 ```
 
 `enabled` and the presence of a table are two statements rather than one, and the reason is the
-thing a boolean cannot express: *"keep these settings and do not use them yet"*. Removing the table
+thing a boolean cannot express: _"keep these settings and do not use them yet"_. Removing the table
 is how you turn ACME off, and it throws away a contact and an authority that would have to be
 retyped correctly afterwards.
 
@@ -599,8 +613,8 @@ has to `enabled = false`.
 An issued certificate **replaces the one being served, without a restart** — the reload mechanism
 does the work, and the next handshake gets the new certificate. That is also why `[server.tls]` is
 still required rather than optional: a TLS listener with nothing to serve fails every handshake that
-is not a challenge, so either name a pair or let ACME provide one. Making the certificate a *file*
-and reloading the *file* is the slower loop with more ways to fail, so the issued bytes go straight
+is not a challenge, so either name a pair or let ACME provide one. Making the certificate a _file_
+and reloading the _file_ is the slower loop with more ways to fail, so the issued bytes go straight
 into the resolver in memory.
 
 **Only the `tls-alpn-01` challenge is used**, and not by preference: `http-01` serves
@@ -671,37 +685,37 @@ document_root = "/srv/corp"
 ```
 
 `domains` may be left out, and then it is **derived from the site's `hosts`** — with every wildcard
-dropped, and dropped ones logged, because `*.corp.internal` is a host *pattern* and a certificate
+dropped, and dropped ones logged, because `*.corp.internal` is a host _pattern_ and a certificate
 name cannot be one. If nothing is left, that is an error naming the wildcards, rather than an ACME
 request for an empty set. `authority`, `contact` and `cache` are all optional too; omitting them
 inherits the deployment's, which is what keeps several sites' certificates in one cache directory
 and their orders on **one account** when the contact matches.
 
 **`contact` is what the account is keyed by** — `rustls-acme` names the account file after a hash of
-the contact list and the directory URL — so it decides which scopes *share* an account, and Let's
+the contact list and the directory URL — so it decides which scopes _share_ an account, and Let's
 Encrypt's rate limits are per account. Omitting it to inherit is therefore not just convenience:
 two sites that each repeat the same contact get one account, and two that differ get two. The
 second is invisible in the configuration, so the account count is worth understanding before
 giving sites their own.
 
 The site's certificate **replaces** the deployment's for that site's hosts only. A site may also
-name its own `[sites.corp.tls]` pair *and* have a table here: the named pair serves until the order
+name its own `[sites.corp.tls]` pair _and_ have a table here: the named pair serves until the order
 replaces it, which is the same rule `[server.tls]` plus `[server.acme]` already follows, and how a
 deployment migrates from a certificate issued elsewhere.
 
 **A name belongs to one table.** Listing it in both this and `[server.acme]` is refused, naming
 both tables. It would not work: a validation handshake carries only the SNI name, so the
 deployment's challenge source answers first — with a challenge certificate committing to the
-*deployment's* key authorization while the CA is asking this server for the site's — and the
+_deployment's_ key authorization while the CA is asking this server for the site's — and the
 site's order could then never succeed. The way out is the edit the error suggests: drop the name
 from the deployment's list, or state the site's names so they no longer overlap.
 
-|  | where it goes |
-|---|---|
-| a deployment with one certificate for everything | `[server.acme]` |
-| a certificate per vhost | `[sites.<name>.acme]`, inheriting the contact and cache |
-| a certificate an operator manages by hand | `[sites.<name>.tls]`, or `[server.tls]` |
-| settings that are staged but must not issue | `enabled = false` on either table |
+|                                                  | where it goes                                           |
+| ------------------------------------------------ | ------------------------------------------------------- |
+| a deployment with one certificate for everything | `[server.acme]`                                         |
+| a certificate per vhost                          | `[sites.<name>.acme]`, inheriting the contact and cache |
+| a certificate an operator manages by hand        | `[sites.<name>.tls]`, or `[server.tls]`                 |
+| settings that are staged but must not issue      | `enabled = false` on either table                       |
 
 **The provider is Let's Encrypt, and it is the only one that works today.** `authority` is an enum,
 not a URL, so production has to be named rather than typed by accident — and the reason there are
@@ -709,7 +723,6 @@ two variants rather than a free-form string is that a real certificate at per-we
 consequence of a typo. ZeroSSL and Google Trust Services are not reachable from here: both require
 **External Account Binding**, which `rustls-acme` 0.15's account registration does not send. The
 seam for a third authority exists (`Authority` in `volucer-acme`), but it needs EAB support first.
-
 
 That was written from reading the code, and for a while the plan said so: it was the one claim in
 the TLS work that had not been measured. It has been now, as an interleaved A/B of **two binaries**
@@ -725,11 +738,11 @@ An interval containing zero is a null result, so the claim holds. The bound is t
 [`volucer-competition`](https://github.com/sailantis/volucer-competition) —
 `scripts/tls-off-ab.js`, `results/tls-off-ab.tsv` and `results/tls-off-ab-noise.tsv`.
 
-**What the comparison does and does not isolate.** The two builds differ by the TLS work *and* by
+**What the comparison does and does not isolate.** The two builds differ by the TLS work _and_ by
 whatever else landed in between, so this is not a pure TLS measurement. It is nevertheless a valid
 null for the sentence above, because that sentence is about the plaintext path before and after the
 TLS work — and the one per-request difference in the window, the `HostMap` extraction (`ba09e03`),
-is a refactor that was *meant* to be faster. Hazard 56 records why the first version of this
+is a refactor that was _meant_ to be faster. Hazard 56 records why the first version of this
 paragraph named the wrong confound entirely: it guessed at history instead of checking
 `git merge-base --is-ancestor`, and the fair queue it worried about was already in the baseline.
 
@@ -759,7 +772,7 @@ the reloadable state is one pointer and not one per setting.
 `[server.statics]` (including turning the layer on or off), and `redirect_to_https`/`https_port`.
 
 **Restart-only, and reported on every reload** rather than left to be discovered — a setting the
-implementation cannot honour should be *stated*, or the operator finds out from behaviour:
+implementation cannot honour should be _stated_, or the operator finds out from behaviour:
 
 - listener addresses (`http`, `https`, `fastcgi`) — a bound socket cannot move;
 - backends, their commands and worker counts — those are running processes with live pipes;
@@ -768,7 +781,7 @@ implementation cannot honour should be *stated*, or the operator finds out from 
 
 **A reload is whole-or-nothing.** A file that does not parse, or does not validate, is refused with
 a logged reason and the previous configuration keeps serving. There is no way to apply half of one —
-including when the bad file names settings the server *can* apply, which is the case the test pins.
+including when the bad file names settings the server _can_ apply, which is the case the test pins.
 
 There are two tables — the sites and the certificates — and each is whole-or-nothing **on its own**,
 applied site table first and certificates after. That ordering is deliberate: a certificate that
@@ -780,15 +793,15 @@ signal may see the old one once. Both are in effect when the reload has finished
 **With `[server.acme]`, an issued certificate is carried across a reload** rather than rebuilt from
 the configuration, and the reload now **merges the two populations** instead of choosing between them.
 It used to skip the certificate rebuild entirely whenever ACME was configured, which was right for an
-issued certificate and wrong for a hand-managed one: a site's `[sites.x.tls]` PEM *is* in the
+issued certificate and wrong for a hand-managed one: a site's `[sites.x.tls]` PEM _is_ in the
 configuration, and skipping meant a renewal of it was never picked up. Now the table is rebuilt from
 the file and every certificate that was issued is re-registered over it, so a renewed PEM is read
-*and* an issued certificate stays in service. A name the configuration says nothing about keeps the
-certificate it had. If you are migrating a deployment *away* from ACME, remove `[server.acme]` and
+_and_ an issued certificate stays in service. A name the configuration says nothing about keeps the
+certificate it had. If you are migrating a deployment _away_ from ACME, remove `[server.acme]` and
 restart.
 
 > **A reload never stops the server.** That is worth stating because it was briefly untrue: the
-> `ctrlc` crate's `termination` feature registers `SIGHUP` and runs its *shutdown* callback for it,
+> `ctrlc` crate's `termination` feature registers `SIGHUP` and runs its _shutdown_ callback for it,
 > so `kill -HUP` used to stop a running volucer rather than reload it. Signals are now handled per
 > signal, which is what makes "SIGHUP reloads, SIGTERM stops" expressible at all.
 
@@ -823,16 +836,16 @@ runtime; those are still pre-release, so this targets 0.23 stable.
 
 ## Layout
 
-| Path | Contents |
-| --- | --- |
-| `crates/volucer-core` | Configuration model, backend types, PHP discovery, deployment preflight checks |
-| `crates/volucer-fcgi` | FastCGI record codec, client, transport and CGI environment |
-| `crates/volucer-worker` | The worker protocol: framed codec and message set over a worker's pipes |
-| `crates/volucer-server` | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch |
-| `crates/volucer-http` | The HTTP front-end: a `hyper` listener and the static file layer — the only async code in the project |
-| `crates/volucer` | The `volucer` binary — the crate is named `volucer` so `cargo install volucer` works |
-| `docs/plan.md` | The design and the phase plan |
-| `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements |
+| Path                      | Contents                                                                                              |
+| ------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `crates/volucer-core`     | Configuration model, backend types, PHP discovery, deployment preflight checks                        |
+| `crates/volucer-fcgi`     | FastCGI record codec, client, transport and CGI environment                                           |
+| `crates/volucer-worker`   | The worker protocol: framed codec and message set over a worker's pipes                               |
+| `crates/volucer-server`   | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch                          |
+| `crates/volucer-http`     | The HTTP front-end: a `hyper` listener and the static file layer — the only async code in the project |
+| `crates/volucer`          | The `volucer` binary — the crate is named `volucer` so `cargo install volucer` works                  |
+| `docs/plan.md`            | The design and the phase plan                                                                         |
+| `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements                                   |
 
 The PHP worker SDK is not in this repository. It is
 [`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk), a Composer
@@ -871,7 +884,7 @@ CLI is the exception: its crate is named `volucer` so `cargo install volucer` wo
 
 The internal dependencies in the workspace root carry both a `version` and a `path`, which is
 required: `cargo publish` strips the `path` and resolves from crates.io, so a `path`-only
-dependency is rejected with *"all dependencies must have a version requirement specified"*. All
+dependency is rejected with _"all dependencies must have a version requirement specified"_. All
 six crates share `[workspace.package] version`, and they must be released together — a version
 bump that moves one crate but not its dependents breaks the chain. When publishing a new version,
 publish the leaves first and wait for the index to update before publishing the crates that depend
@@ -912,7 +925,7 @@ traversal, a precompressed variant, a 256 KiB file arriving whole — and, cruci
 `/about`**, which is how the tests prove a path that names no file still reaches the application.
 
 `crates/volucer/tests/serve.rs` is the end-to-end one: it runs the shipped `volucer`
-binary with both listeners configured on port 0, then drives it over HTTP *and* over FastCGI in
+binary with both listeners configured on port 0, then drives it over HTTP _and_ over FastCGI in
 the same process, which is what proves the two front-ends really do share one dispatcher. A second
 test in that file serves a static file and reaches PHP for a route through the same config and the
 same binary.

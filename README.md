@@ -1044,6 +1044,38 @@ The FastCGI integration tests in `crates/volucer-fcgi/tests/php_cgi.rs` start a 
 `php-cgi -b` process and speak the protocol to it. They skip themselves, with a printed reason,
 when no `php-cgi` binary is on `PATH`.
 
+## Installing the binary
+
+The releases above are what an operator wants, and there are two ways to get one.
+
+**Directly.** Download the archive for the platform, verify it against the `.sha256` beside it, and
+put the binary on the `PATH`. That is the whole procedure, and it is the right one for a container
+image or a system package.
+
+**Through Composer.**
+
+```console
+composer require --dev sailantis/volucer-cli
+vendor/bin/volucer-cli
+```
+
+[`sailantis/volucer-cli`](https://github.com/sailantis/volucer-cli) works out which archive this
+machine needs, fetches it to a temporary file, verifies the release's own SHA-256 **before
+extracting anything**, and only then moves the binary into place. A failure at any step leaves an
+existing binary exactly as it was.
+
+It is a **separate package rather than a second entry in this repository**, and the reason is not
+tidiness: Composer needs a `composer.json` at the root of the package it installs, and the root of
+this repository is a Rust workspace. It is also not a `metapackage` — `composer require
+spiral/roadrunner` downloads metadata and not one byte of binary, which is why RoadRunner needs
+`roadrunner/cli` as well.
+
+`composer install` does nothing on its own. The downloader runs when the operator runs it, so
+installing a PHP project does not depend on GitHub being reachable, and the archive is not
+committed here. The tool is named `volucer-cli` and the binary it installs is named `volucer`,
+deliberately: Composer puts a PHP proxy in `vendor/bin` under the tool's name, so a shared name
+would let the download overwrite its own proxy.
+
 ## Releasing
 
 CI runs on every push to `main` and every pull request: `fmt`, `clippy`, an **MSRV** check against a

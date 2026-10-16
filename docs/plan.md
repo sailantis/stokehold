@@ -2104,27 +2104,52 @@ the workflow is the same one, but it finally has an output, so it stops being de
       development loop could not have (one a genuine macOS bug, one a port race). Hazard 75.
       The release path is written but has never run, because it needs a tag.
 
-70. `volucer-cli-package` — the Composer channel, and its mechanism is not the obvious one.
+70. `volucer-cli-package` — **done**, and the built thing differs from this step in four verified
+    details. `sailantis/volucer-cli` (31 files, 223 assertions) resolves the archive for this
+    platform, fetches it to a temporary file, verifies the release's own SHA-256 **before
+    extracting**, and moves the binary into place last.
     - **What `composer require spiral/roadrunner` actually does, verified rather than assumed:**
       nothing. The `composer.json` at that repository's root is `"type": "metapackage"` with no
       `require`, no `bin` and no `autoload` — `composer require` downloads metadata and not one byte
-      of the Go binary. The binary arrives a second way, through `spiral/roadrunner-cli`, which
-      declares `"bin": ["bin/rr"]` and whose `rr get-binary` fetches a platform-matched archive from
-      GitHub Releases (`internal/dload` + `symfony/http-client` + `react/async`). The obvious
-      alternative does not exist: `spiral/roadrunner-binary` 404s on Packagist. So the downloader CLI
-      *is* the mechanism, and a metapackage alone would give a PHP developer nothing runnable.
-    - **Therefore:** a new repository `volucer/volucer-cli`, `"bin": ["bin/volucer"]`, `composer
-      require volucer/volucer-cli` then `vendor/bin/volucer get-binary`. **It has to be its own
-      repository for the same reason the SDK does** — Composer needs `composer.json` at the root, and
-      the Rust workspace is at the root of this one.
-    - The downloader must verify the checksum it just downloaded, and must fail with an actionable
-      message when a platform has no asset rather than leaving a zero-byte file. RoadRunner's own
-      script treats both cases explicitly, which is the shape to copy.
-    - **A second channel is worth having for the same audience:** a `sailantis/volucer`
-      metapackage that carries the *config* documentation and the version compatibility table — the
-      thing a developer reads before installing — while the CLI carries the binary. Two names is a
-      real cost and it is the cost RoadRunner pays; it is worth paying only if the docs and the
-      downloader genuinely do not belong together.
+      of the Go binary. So the downloader CLI *is* the mechanism, and a metapackage alone would give
+      a PHP developer nothing runnable. **Re-verified on Packagist; the claim holds exactly.**
+    - **Four details this step had wrong, each found by reading the packages rather than the docs.**
+      The downloader is **`roadrunner/cli`** (this step said `spiral/roadrunner-cli`, which exists
+      only in that package's `replace` block); it lives at **`roadrunner-php/cli`**, not
+      `spiral/roadrunner-cli`, which 404s; the download is **not in the CLI's code at all** but in a
+      separate package **`internal/dload`** (`php-internal/dload`) reached through DLoad's `get`
+      command, with the CLI's own `resources/dload.xml` deliberately empty; and DLoad selects assets
+      by **regex** — `<repository … asset-pattern="/^roadrunner-.*/"/>` — so the interface between a
+      release workflow and a downloader is an asset-name *pattern*, not a constructed URL.
+    - **Decided against this step's naming.** It proposed `volucer/volucer-cli`; the package and
+      repository are both `sailantis/volucer-cli`, matching the existing Composer vendor
+      `sailantis/volucer-worker`. This org already separates repository name from package name — the
+      SDK is repository `volucer-php-sdk` and package `sailantis/volucer-worker` — so it was a free
+      choice, and one vendor for the project is the better one.
+    - **Also decided against this step's binary name.** It proposed `"bin": ["bin/volucer"]`. Composer
+      writes a PHP proxy into `vendor/bin` under the tool's name, and the tool's whole job is to
+      install a binary *also* meant to be called `volucer` — so a shared name would have the download
+      overwrite its own proxy, and the next `vendor/bin/volucer` would run the *server* with
+      `get-binary` as an argument. The tool is `bin/volucer-cli` and installs `volucer`, and CI
+      asserts that `vendor/bin/volucer` does not exist. **This one was only findable by reading how
+      Composer installs a `bin` and then running a real `composer install`**, which is what the
+      `install` job now does.
+    - **The metapackage is deferred, not rejected.** Its value is a version-compatibility table, and
+      step 72 is where a real compatibility matrix first exists. A second package versioned in
+      lockstep with nothing to say yet is a cost with no reader.
+    - **Stdlib-only, deliberately, against RoadRunner's shape.** `ext-hash` and `ext-json`; no
+      `symfony/console`, no HTTP client, no lockfile. RR's CLI pulls four packages, which its
+      `.rr.yaml` generator justifies; downloading one file does not. Requiring this adds one
+      directory to `vendor/`.
+    - **Verified against a local server, because no release exists yet.** The API base URL is
+      injectable, so version selection, asset selection, the real checksum, real extraction and every
+      refusal run against `php -S` serving a fixture release built from real tar.gz and zip bytes.
+      A fixture server is not a stub: every class under test is the shipping one, and only the origin
+      of the bytes is local. `VOLUCER_CLI_TRANSPORT` forces either transport, because a fallback that
+      has never run is a fallback that does not work.
+    - **Four defences, each falsified by disabling it and confirming the suite fails**: traversal,
+      links, nested archives, and the checksum. Disabling the checksum installed a corrupt archive and
+      the end-to-end test caught it. Hazards 82–84.
     - **Not chosen: a PHP extension.** FrankenPHP's model embeds PHP in the server, which is the
       design hazard 53 priced and this project rejected on grounds of isolation.
 
@@ -2559,6 +2584,11 @@ reading out of a crate description.
 | observability: a hostile header cannot write this log line | **works** | `a_header_cannot_forge_a_log_record_or_shift_a_field` — a `User-Agent` containing a newline, quotes, a backslash and spaces. The count of fields is the assertion that catches it; every positional assertion passed while the line had 31 fields. Hazard 79 |
 | observability: off by default changes nothing | **works** | `no_access_log_config_means_no_log_file_and_no_id_header` — no file created, and no `x-request-id` on the response, because a deployment that did not ask must not have an id appear on its answers. The unit control is `a_plaintext_deployment_is_unchanged_by_any_of_this`, which pins `access_log` absent alongside `tls` and `https` |
 | observability: the trace is continued, not replaced | **works** | `an_inbound_trace_is_continued_and_a_missing_one_starts_unsampled` — the client's trace id is kept, this hop's span id is new, its sampling flag is respected, and a request with no `traceparent` starts **unsampled** rather than claiming to be recorded |
+| Composer: the package **installs** and its proxy runs | **works** | `sailantis/volucer-cli`'s `Install (as a user would)` job: `composer require` into a fresh project against a path repository, then run `vendor/bin/volucer-cli`. This is the half a passing unit suite cannot see — the local suite calls the classes directly and requires `autoload.php` by hand, so it would pass with a wrong `bin` entry or no PSR-4 mapping at all |
+| Composer: the archive the downloader asks for is the one the release builds | **works** | six asset names asserted against `release.yml`'s matrix, so a downloader that stops matching the releases it installs fails the suite instead of failing in the field |
+| Composer: the tool and the binary cannot overwrite each other | **works** | the `vendor/bin/volucer` assertion. Composer proxies a `bin` entry under its own name, so a shared name would have the download replace its own proxy and the next run execute the *server* with `get-binary` as an argument |
+| Composer: a corrupt download installs nothing | **works** | `EndToEndTest` flips one byte of a real archive and leaves the stored checksum alone: exit 1, "checksum mismatch", no binary, and **no temporary file left behind**. Falsified by removing the verification, which installs the corrupt archive — so this is the only thing between a hostile download and an operator's filesystem |
+| Composer: the fallback transport is not just written | **works** | `TransportTest` runs curl **and** the stream wrapper against one fixture server, asserting the status for a 200, a 404, a 500 and a redirect on both. `StreamTransport` reported every status as `0` — `$http_response_header` is a local of the scope that made the request — which would have broken the tool on exactly the hosts that have no curl. Hazard 83 |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
@@ -4610,3 +4640,63 @@ the check is one line — `ReadAllBytes` and count the zeros — which is far ch
 The same class of mistake is `Add-Content` mojibaking non-ASCII (`—` becoming `â€”`), recorded in
 hazard 77's neighbourhood: **every write of non-ASCII text on this host gets byte-verified afterwards,
 and that is now a habit rather than a lesson.**
+
+### Hazard 82 — the extraction check was dead code, and one format said so
+
+The first `Archive` listed a tar through `PharData`, the obvious choice. **`PharData` normalises a
+stored name as it reads it:** an entry whose raw header says `../evil.txt` is reported as a
+*directory* named `..`, and its payload as no leaf at all. So the traversal check never saw a `..`
+component, passed, and defended nothing — for tars.
+
+It was noticed because **`ZipArchive` does not normalise.** `statIndex` reports `../evil.txt` and
+`/abs.txt` verbatim, so the same hostile entry was refused in a zip and silently accepted in a tar.
+The asymmetry between two libraries answering the same question was the whole signal, and it only
+appeared because the hostile case was asserted **for both formats** rather than for the one that was
+convenient.
+
+`TarReader` now reads the 512-byte headers directly, so both formats hand `Archive` the same faithful
+list and one check guards both. Two follow-ons are assertions rather than intentions: the reader's
+fidelity is tested by name (`../evil.txt` must be *present* in its listing — if it normalised, `open`
+would succeed and the name would be absent from its own output), and nothing from the `phar://`
+wrapper is read at all.
+
+**The general rule: a defence that a library normalises away is not a defence, and the way to find
+out is to assert the hostile input through every path that can receive it.** A check tested against
+one format tests one format.
+
+### Hazard 83 — the fallback reported every status as zero, and only the other transport could say so
+
+`StreamTransport` read `$http_response_header` in a **different method** from the one that made the
+request. That variable is a *local of the calling scope*, not a global — the HTTP wrapper populates
+it in the function that performed the request. Read anywhere else it is an empty array, which parses
+to a status of `0`, which every caller reads as "not 200".
+
+On a host without curl that makes a successful API response look like a server error and every
+download look like a failed one. **The tool would be broken on exactly the machines that have no
+curl, which are the machines least able to diagnose it** — and the development host has curl, so
+every local run was green.
+
+It was found by running the *other* transport rather than by reading it, and confirmed by reproducing
+both arrangements side by side: the original returns `0` where the fixed shape returns `200`.
+
+**The general rule: a fallback is a second implementation, and an untested implementation is not a
+fallback — it is a second bug waiting for the environment that needs it.** The status is captured in
+the scope that made the request now, and both transports run against the same fixture server with the
+status asserted for a 200, a 404, a 500 and a redirect.
+
+### Hazard 84 — the fixture did not carry the property the assertion depended on, and only two of three platforms said so
+
+The test proving the executable bit survives extraction built its binary entry with the **default
+mode of 0644** and then asserted `is_executable()`. That is false, and correctly false: the code
+preserves each entry's mode, and the entry said 0644. **A fixture that does not carry the property
+the code relies on cannot test the code** — hazard 77's shape, a test measuring its own fixture.
+
+The assertion was guarded by `DIRECTORY_SEPARATOR === '/'`, because Windows has no such bit to read
+back — so on the development host it never ran. Locally green; CI had Ubuntu and macOS red and
+Windows green. **The guard was correct and the conclusion drawn from it was not**: "Unix-only
+assertion" had quietly become "assertion that cannot fail where I am".
+
+**The general rule: a platform-guarded assertion is invisible on the platforms that skip it, so a
+local pass says nothing about it.** Same hazard as `/proc`-is-not-Unix (hazard 75) — a property
+asserted on one platform and reported as a pass everywhere. The fix was reproduced in WSL before it
+was pushed, so it was verified where it failed rather than inferred from where it passed.

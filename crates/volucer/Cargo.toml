@@ -7,6 +7,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# `cargo install volucer` and a crates.io page both read these; without them the page is a bare
+# title. The path points at the workspace README rather than a second copy that would drift.
+readme = "../../README.md"
+keywords = ["php", "fastcgi", "server", "worker", "application-server"]
+categories = ["command-line-utilities", "web-programming::http-server"]
 
 [[bin]]
 name = "volucer"

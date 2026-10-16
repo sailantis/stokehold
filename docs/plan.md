@@ -1520,7 +1520,8 @@ Phase 7 — packaging
     the prerequisites had already changed once mid-flight (Rust → Rust + C toolchain + NASM + CMake,
     hazard 54) and packaging written before that settled would have been written twice. They have
     now settled — the last TLS consumer is `rustls-acme` — so this is step 69 plus the Composer
-    channel in step 70.
+    channel in step 70. **Step 69 is done**; the deferral was the right call, and it is the reason
+    the prerequisites were known rather than discovered on the release machine.
 23. `bench-harness` — load generator plus comparison against nginx+php-fpm, RoadRunner and
     php-cgi, to state realistic expectations rather than claims.
 
@@ -1676,14 +1677,15 @@ rather than the table: exact name, then longest `*.` wildcard, then the server's
     Harness and rows in `volucer-competition`: `scripts/tls-off-ab.js`,
     `results/tls-off-ab.tsv`, `results/tls-off-ab-noise.tsv`.
 51. `ci-build-matrix` — a build and test workflow. TLS is the workspace's first native dependency
-    (C toolchain + NASM + CMake), and there is no `.github`, no CI, no release artifact and no
-    systemd unit, so "it builds everywhere" is verified only by hand on one host. The prerequisite
-    list just grew from "Rust" to "Rust + C toolchain + NASM + CMake".
+    (C toolchain + NASM + CMake), and at the time there was no `.github`, no CI, no release artifact
+    and no systemd unit, so "it builds everywhere" was verified only by hand on one host. The
+    prerequisite list just grew from "Rust" to "Rust + C toolchain + NASM + CMake".
 
-    **Expanded into Phase 10, and step 69 there is the reason.** The matrix was written as a
-    verification chore, which is why it kept being deferred; once packaging is a *deliverable*, the
-    same workflow has an output to produce and a reason to exist. It is not superseded — it is
-    step 69, and it is no longer last.
+    **Expanded into Phase 10, and step 69 there is the reason — and step 69 is now done.** The
+    matrix was written as a verification chore, which is why it kept being deferred; once packaging
+    is a *deliverable*, the same workflow has an output to produce and a reason to exist. It is not
+    superseded — it is step 69, and it is no longer last. It found the MSRV claim was false on its
+    first run (hazard 74), which is the chore paying for itself.
 52. `tls-acme` — **24b.** `rustls-acme`, whose default and recommended mechanism is TLS-ALPN-01 and
     needs no second port. The plaintext listener this phase adds is what HTTP-01 would need, so
     that option is open rather than blocked.
@@ -2010,22 +2012,63 @@ the workflow is the same one, but it finally has an output, so it stops being de
       `max_body_bytes` that is refused or streamed rather than truncated. (a)–(d) each fail against
       the current code by construction, which is what makes them tests rather than demonstrations.
 
-69. `release-artifacts` — **this is `ci-build-matrix`, kept as one step and given a purpose.**
-    - A build and test workflow for Linux/macOS/Windows, and the three prerequisites it exists to
-      pin: Rust 1.85, a C toolchain + NASM + CMake (`aws-lc-rs`, hazard 54).
-    - Tagged releases producing per-target archives — `volucer-<version>-<os>-<arch>.tar.gz` /
-      `.zip`, the same shape RoadRunner publishes — each with a **checksum file**, and a
-      **`cargo build` from a clean checkout** asserted, since a published crate cannot depend on a
-      version that is not on crates.io yet and the publish order of the seven crates is a real
-      constraint rather than a detail.
-    - Docker images (`glibc` and `musl`), a systemd unit, and Windows service notes. The systemd
-      unit is the one that matters most: `SIGHUP` reload is only useful if an operator can wire it
-      to `ExecReload=`.
-    - **`.github/` does not exist yet** — 0 workflows, 0 tags, no release. Nothing is releaseable
-      today, which is also why every downstream step in this phase is genuinely blocked.
-    - **The measurement belongs here too, and it is not decoration.** A release that has never been
-      installed on a clean machine is a hypothesis. `cargo install volucer` and the archive path
-      are each run once on a host without the source checkout, and the result written down.
+69. `release-artifacts` — **done.** A build and test workflow for Linux/macOS/Windows, tagged
+    releases with per-target archives and checksums, two Docker images, and the systemd unit whose
+    `ExecReload=` is what makes step 53–59's `SIGHUP` reachable in production.
+    - **What the workflow pins is three prerequisites, and only one of them was the expected
+      one.** Rust, a C toolchain + NASM + CMake (`aws-lc-rs`, hazard 54) — and NASM turns out to be
+      the one that bites: CMake and MSVC are on every runner image, NASM is on **none** of the
+      three, verified from the image manifests rather than assumed. It is installed explicitly.
+      `aws-lc-rs` carries a `prebuilt-nasm` feature that would avoid the assembler; it is not
+      enabled, because a silently different crypto build is not a change to make for convenience
+      and it has not been verified on all three targets.
+    - **The declared MSRV was false, and CI is what found it** — which is the step earning its
+      keep on its first run. `[workspace.package] rust-version = "1.85"` refused the workspace on
+      1.85.1: `time` 0.3.55 and `time-core` 0.1.9 declare `rust-version = 1.88.0`, and they reach us
+      through `x509-parser` → `asn1-rs` → `time` (and `rcgen`). Measured: 1.85.1 fails, 1.88.0
+      passes. The number is now **1.88**, and the `msrv` job checks it against a real 1.88
+      toolchain on every run rather than trusting the manifest. Hazard 74.
+    - **A fourth prerequisite nobody had written down: the tree was not `rustfmt`-clean.** 29 files
+      disagreed with rustfmt 1.10.0 under rustc 1.99, none of it recent — the committed code was
+      formatted by an older rustfmt whose defaults have since moved, and nothing had ever run the
+      check. Formatted in its own commit (`094c4f4`) so the gate in the next commit has a green
+      base rather than a 29-file exception list. **The same formatting is stable across rustfmt
+      1.88 and 1.99**, which was checked rather than hoped: a version-pinned formatter would make
+      an MSRV job fail on whitespace.
+    - **`VOLUCER_E2E=1` is what makes the test job mean anything**, and it is the reason the job is
+      worth having. The suites that drive a real `php-cgi` and a real `example/worker.php` skip
+      themselves when PHP or the SDK checkout is missing, and libtest hides the stderr of a passing
+      test — so a machine with no interpreter reports the same green as one that ran everything.
+      The workflow installs PHP, checks out `sailantis/volucer-php-sdk`, sets `VOLUCER_SDK_DIR` and
+      turns a skip into a failure.
+    - **Tagged releases produce what RoadRunner produces**, which was the shape to copy:
+      `volucer-<version>-<target>.tar.gz` / `.zip`, a `.sha256` beside each, and a **draft** release
+      — a tag is a decision and a broken release is public the moment it is not one. Targets:
+      `x86_64`/`aarch64` Linux (`gnu` and `musl`), both macOS architectures, and
+      `x86_64-pc-windows-msvc`. Each archive holds the binary, `README.md`, `LICENSE` and the
+      systemd unit.
+    - **The packaging is testable without a tag, and that is what makes it verified rather than
+      written.** The staging and smoke-test halves live in `packaging/stage-archive.sh` and
+      `packaging/smoke-test-archive.sh` rather than as inline `run:` blocks, because the only way
+      to test an inline block is to push a tag. `packaging/release-selftest.sh` runs the whole path
+      against a real binary on the host it is invoked on: stage, pack, **checksum, extract to a
+      temporary directory, run `volucer version` from there**, and then corrupt the archive and
+      assert the smoke test *refuses* it — a smoke test that passes on anything is a smoke test
+      that proves nothing (hazard 62's shape). Run here under Git Bash: passes.
+    - **Docker: two images from one crate, and neither is published.** A `glibc` image and a
+      `scratch`-based `musl` one. The musl image carries its own `ca-certificates.crt` and names it
+      in `SSL_CERT_FILE`, which is the one thing a static binary cannot work out for itself and
+      without which ACME cannot verify the CA's own endpoint. Both are built and smoke-tested in
+      the workflow with `push: false`; this repository has never pushed to a registry, and adding
+      `push: true` plus a login is the only change needed.
+    - **`cargo package --workspace` is a CI job now**, and it is the publish order's guard: a
+      published crate cannot depend on a version that is not on crates.io yet, and `cargo package`
+      verifies each crate in dependency order. It passes today for all eight crates.
+    - **`.github/` did not exist before this step** — 0 workflows, 0 tags, no release. The first
+      run of the workflow has not happened yet and cannot be run from here; the workflows are
+      linted with `actionlint` (clean), and everything that does not need a runner — the packaging
+      path, `cargo package`, `cargo clippy -D warnings`, `cargo fmt --check` — was run locally.
+      **The first green CI run is the remaining verification**, and it is a push away.
 
 70. `volucer-cli-package` — the Composer channel, and its mechanism is not the obvious one.
     - **What `composer require spiral/roadrunner` actually does, verified rather than assumed:**
@@ -2211,10 +2254,12 @@ do I read the state of the work from the other machine".** Nothing important liv
 folder, and nothing here needs the chat to interpret. The four places to look, in order:
 
 1. **This section** — the current build, the open decisions, and the list of what is built.
-2. **The step list above** (Phase 0–10) — which steps are done; steps 18, 19, 20 and 21 carry a
+2. **The step list above** (Phase 0–10) — which steps are done; steps 18, 19, 20, 21 and 69 carry a
    **done** marker and the rest say what is still open. Step 18 was implemented long before the
-   plan said so; that marker is now corrected. Phase 10 (steps 68–72) is packaging and reachability
-   and is entirely unbuilt, which is the plan's honest state rather than a gap in it.
+   plan said so; that marker is now corrected. **Phase 10 is half done as of step 69**: the server
+   now builds and is packaged for six targets behind a CI gate, and what remains (68, 70, 71, 72)
+   is making it *reachable* — an HTTP `upstream` backend, a Composer channel, the SDK session
+   helper, and one bridge per framework.
 3. **"What actually works today"** below — the same question asked of a running binary, per
    capability, with the probe that established it. This is the section that answers "does it do
    HTTP/2 / SSL yet" without reading code.
@@ -3358,7 +3403,12 @@ installed, and the failure surfaces much later as a CMake error from inside `aws
 the machine or user PATH matched `NASM`; the directory had to be added by hand. The build
 prerequisites for this project are therefore now **Rust + a C toolchain + NASM + CMake**, not
 "Rust", and that is a real change to what a fresh checkout needs. It is why `ci-build-matrix`
-(step 51, now step 69 in Phase 10) should exist before the cross-platform claim is made.
+(step 51, now step 69 in Phase 10) should exist before the cross-platform claim is made — and it
+now does. **NASM was the one that mattered**, and the reason is worth carrying forward: CMake and
+MSVC are on every GitHub runner image and NASM is on none of them, so a workflow that installs the
+toolchain and not the assembler fails later, from inside `aws-lc-sys`, in a way that reads as a
+dependency problem rather than a missing tool. The same wrong shape as the winget trap above, on a
+machine nobody can log into.
 
 **Version decision, also measured rather than assumed.** The Rustls 0.24 line moves providers out of
 the main crate into `rustls-aws-lc-rs` / `rustls-ring`, selected by an explicit runtime install
@@ -4140,6 +4190,38 @@ is read by the code that reports it is not thereby honoured.** `check` printed `
 *configuration* had it, and the account was registered without it — the two paths never met. A
 validation that reads a field and a consumer that uses it are different things, and only a test that
 observes the consumer can tell them apart.
+
+### Hazard 74 — the MSRV was a promise nothing had ever checked
+
+`[workspace.package] rust-version = "1.85"` sat in the manifest from the beginning, and CI is what
+found out it was false. On a real 1.85.1 toolchain `cargo check --workspace` refuses the workspace
+before compiling a line of it:
+
+```text
+error: rustc 1.85.1 is not supported by the following packages:
+  time@0.3.55 requires rustc 1.88.0
+  time-core@0.1.9 requires rustc 1.88.0
+  time-macros@0.2.32 requires rustc 1.88.0
+```
+
+1.88.0 checks clean. `cargo tree -i time` says where it comes from, and the answer is **both** of
+the crates that arrived with TLS: `x509-parser` → `der-parser` → `asn1-rs` → `time` (the ACME work)
+and `rcgen` → `time` (the placeholder certificate). So the number was not stale — it was never
+true for a tree that had TLS in it, and the TLS work landed several steps before anyone asked.
+
+**The general rule.** A declared minimum is a claim about a machine that nobody in the development
+loop is using: the only toolchain anyone had was 1.99, where the claim cannot be falsified. It is
+the same shape as hazard 68's *"the parts were built and the server never used them"* — a statement
+in the repository that nothing observes. It is also why the fix is a **job** and not a corrected
+constant: `cargo +1.88.0 check` runs on every push now, so the number fails a build the day a
+dependency raises its floor rather than the day a user finds out. The constant alone would have been
+just as unverified at 1.88 as it was at 1.85.
+
+**A near-miss worth recording beside it.** The MSRV job would have failed on whitespace if the
+tree's formatting depended on the rustfmt version: `cargo fmt --all --check` is part of the same
+workflow, and 1.88 and 1.99 ship different rustfmt builds. Measured rather than assumed — rustfmt
+1.88.0 reports no diff on the tree formatted by 1.99.0. Had it differed, pinning the formatter to
+the MSRV toolchain would have been the choice, and the check would have needed a comment saying why.
 
 ### Two rules that were one rule at one level and another at the other
 

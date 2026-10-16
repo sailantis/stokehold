@@ -1,0 +1,12 @@
+# Shell scripts run on Unix, where CR is not whitespace — a `case` arm becomes a syntax error
+# (`$'\r'`), which is how the packaging scripts failed the first time they were run. `.editorconfig`
+# asks for LF on write; this is the half that survives a checkout, and Windows has
+# `core.autocrlf=true` by default.
+*.sh text eol=lf
+
+# Workflows are YAML parsed by GitHub, and a stray CR in a `run:` block reaches the shell.
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# The Dockerfile's `RUN` lines are shell too.
+Dockerfile text eol=lf

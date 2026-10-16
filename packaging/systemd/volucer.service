@@ -1,0 +1,47 @@
+[Unit]
+Description=volucer PHP application server
+Documentation=https://github.com/sailantis/volucer
+After=network.target
+
+[Service]
+Type=simple
+# The binary the release archive installs. `cargo install volucer` puts it here too.
+ExecStart=/usr/local/bin/volucer serve --config /etc/volucer/volucer.toml
+
+# The reason this unit exists at all: `SIGHUP` re-reads the configuration and applies it whole, or
+# refuses it and keeps serving the previous one. Without a unit there is nothing to wire the signal
+# to, and the reload work would be unreachable in the deployment shape it was built for.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# `SIGTERM` drains: the listeners stop, in-flight requests finish, and the pool's PHP children are
+# killed with their parent rather than orphaned. Long enough for that to complete, short enough
+# that a systemd restart is not held up by a stuck pool.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=1
+
+# A PHP application server binds `:80`/`:443` (or `:8080`/`:9080` behind a reverse proxy) and reads
+# its document root. It does not need to write anywhere except its ACME cache, which lives under
+# the state directory below.
+User=volucer
+Group=volucer
+StateDirectory=volucer
+WorkingDirectory=/var/lib/volucer
+
+# Certificates issued through ACME are written here. `[server.acme] cache = "acme-cache"` is
+# resolved relative to the *configuration file*, so the two have to agree; this is the pair the
+# unit ships with.
+#   [server.acme]
+#   cache = "/var/lib/volucer/acme-cache"
+
+# The server does not need to write to its own binary, its configuration or the document root.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/volucer
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          # `musl` rather than `-gnu`: a static binary runs on any Linux, which for a server
+          # distributed as an archive is worth more than the last few percent of throughput.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the target
+        run: rustup target add ${{ matrix.target }}
+
+      # `aws-lc-sys` is C and assembly. MSVC and CMake are on the image; NASM is not, on any of
+      # the three, and without it the failure surfaces much later as a CMake error from inside
+      # the dependency rather than as a missing tool.
+      - name: Install NASM (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm musl-tools
+      - name: Install NASM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
+
+      # A musl target links statically, and `aws-lc-sys` builds C and assembly of its own, so the
+      # musl C compiler has to be the one that is used. `musl-tools` supplies `musl-gcc`; the
+      # linker and archiver have to be named or cargo reaches for the glibc ones and fails.
+      - name: Configure the musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> $GITHUB_ENV
+          echo "AR_x86_64_unknown_linux_musl=ar" >> $GITHUB_ENV
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p volucer
+
+      - name: Stage the archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+          EXE_SUFFIX: ${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: bash packaging/stage-archive.sh
+
+      # The claim "this archive runs" is a hypothesis until something runs it. It is extracted
+      # somewhere else entirely and invoked, which is the half that catches a missing
+      # interpreter, a missing linked library and a binary that is not executable. It also
+      # verifies the checksum the Composer downloader will verify.
+      - name: Smoke-test the archive
+        shell: bash
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+        run: bash packaging/smoke-test-archive.sh
+
+      - name: Attest the provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.ARCHIVE_NAME }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            volucer-*.tar.gz
+            volucer-*.zip
+            volucer-*.sha256
+          generate_release_notes: true
+          draft: true
+
+  docker:
+    name: Docker (${{ matrix.image }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [glibc, musl]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      # Built and discarded rather than published. This repository has never pushed to a registry,
+      # and a workflow that starts pushing on its first run is not one to find that out with —
+      # adding `push: true` and a login is the only change needed.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: packaging/docker/Dockerfile
+          target: ${{ matrix.image }}
+          push: false
+          load: true
+          tags: volucer:${{ matrix.image }}
+
+      # The image is a hypothesis until the binary inside it runs. This is also the only step that
+      # would catch a `scratch` image missing its trust store, which is the one thing a static
+      # binary cannot be told about at build time.
+      - name: Smoke-test the image
+        run: docker run --rm volucer:${{ matrix.image }} version

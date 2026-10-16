@@ -1,6 +1,8 @@
 ![Volcucer](docs/images/volucer-logo-text.svg)
 
-A cross-platform application server.
+<h3 style="text-align:center;">
+A cross-platform PHP application server.
+</h3>
 
 `volucer` runs PHP applications in two modes from a single Rust binary:
 
@@ -27,14 +29,16 @@ supervises it for you.
 > HTTP/1.1 and HTTP/2 over the same dispatcher as the FastCGI one — and it serves static files
 > from the document root, so a single `volucer` process can front a site the way nginx plus
 > `php-fpm` would. The CLI is complete: `serve`, `check` and `version`, with the document root and
-> front controller configurable in the file rather than only on a command line. TLS and HTTP/3 are
-> not there yet; see [docs/plan.md](docs/plan.md) for the phase order.
+> front controller configurable in the file rather than only on a command line. TLS is built;
+> HTTP/3 is not there yet. See [docs/plan.md](docs/plan.md) for the phase order.
 >
-> **What is *not* built yet, in one place**, because "not there yet" is too vague to plan against:
-> TLS **is** built (both certificate/key and ACME, steps 42–50 and 60–67) and `SIGHUP` reload **is**
-> built (steps 53–59); what is missing is everything that makes the server *reachable* — release
-> artifacts, a Composer channel, framework bridges, and an HTTP `upstream` backend for runtimes that
-> already own their HTTP loop. Those are steps 68–72, Phase 10, and they are the current frontier.
+> **What is _not_ built yet, in one place**, because "not there yet" is too vague to plan against:
+> TLS **is** built (both certificate/key and ACME, steps 42–50 and 60–67), `SIGHUP` reload **is**
+> built (steps 53–59), and **packaging is built** (step 69) — CI on every push, tagged releases with
+> per-target archives and checksums, a systemd unit, and two Docker images. What is left is making
+> the server _reachable from an application_: a Composer channel, framework bridges, the SDK session
+> helper, and an HTTP `upstream` backend for runtimes that already own their HTTP loop. Those are
+> steps 68 and 70–72, and they are the current frontier.
 >
 > **The async boundary.** `volucer-http` is the only place with a `tokio` runtime, because
 > `hyper` needs one. Every backend stays blocking, and the dispatcher is reached only through
@@ -83,7 +87,7 @@ reload better than a supervisor we would write, and `external` attaches to the p
 systemd already runs. A file still carrying `kind = "spawn_fpm"` is now rejected by name.
 
 A planned fourth kind, **`upstream`**, is not built — a real HTTP reverse proxy for runtimes that
-already own their HTTP loop (Node, ASGI, Go, and anything wanting SSE or WebSockets). It is *not* a
+already own their HTTP loop (Node, ASGI, Go, and anything wanting SSE or WebSockets). It is _not_ a
 fourth arm of the table above: every backend today is reached through a CGI environment, which
 flattens headers to `HTTP_*` and buffers the body, and an HTTP upstream needs the opposite. See
 Phase 10 in [docs/plan.md](docs/plan.md) for why it is a second request path rather than a new
@@ -193,10 +197,21 @@ configuration surface.
 
 ## Getting started
 
-Requires Rust 1.85+.
+Requires Rust 1.88+ (the number is enforced by CI against a real 1.88 toolchain, not asserted).
 
 ```bash
 cargo build --release
+```
+
+Or install a released binary, either way:
+
+```bash
+cargo install volucer                                    # builds from crates.io
+```
+
+```bash
+# or unpack a prebuilt archive, which is published per target with a checksum
+tar -xzf volucer-0.1.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 Validate a configuration and see what `volucer` found on this host:
@@ -834,6 +849,14 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 Rustls 0.24 moves providers into separate crates (`rustls-aws-lc-rs`, `rustls-ring`) selected at
 runtime; those are still pre-release, so this targets 0.23 stable.
 
+**NASM is the one that bites**, and CI is why: CMake and MSVC are on every GitHub runner image, and
+NASM is on **none** of them. It is installed explicitly in `.github/workflows/ci.yml`. Locally the
+failure mode is worse than a missing-tool error — `winget install NASM.NASM` puts the binary on
+disk and _not_ on `PATH`, so `nasm -v` fails in a fresh shell and the real error surfaces later from
+inside `aws-lc-sys` as a CMake failure. `aws-lc-rs` carries a `prebuilt-nasm` feature that avoids
+the assembler entirely; it is not enabled here because it has not been verified on all three
+targets, and a silently different crypto build is not a change to make for convenience.
+
 ## Layout
 
 | Path                      | Contents                                                                                              |
@@ -844,20 +867,25 @@ runtime; those are still pre-release, so this targets 0.23 stable.
 | `crates/volucer-server`   | Backend abstraction, `php-cgi` and worker pools, process lifecycle, dispatch                          |
 | `crates/volucer-http`     | The HTTP front-end: a `hyper` listener and the static file layer — the only async code in the project |
 | `crates/volucer`          | The `volucer` binary — the crate is named `volucer` so `cargo install volucer` works                  |
+| `.github/workflows`       | `ci.yml` on every push and pull request, `release.yml` on a `v*` tag                                  |
+| `packaging/systemd`       | `volucer.service` — the unit whose `ExecReload=` is what makes `SIGHUP` reload reachable              |
+| `packaging/docker`        | `Dockerfile` producing a `glibc` image and a static `musl` one from the same crate                    |
 | `docs/plan.md`            | The design and the phase plan                                                                         |
 | `docs/worker-protocol.md` | The worker wire protocol — the specification the PHP SDK implements                                   |
 
-The PHP worker SDK is not in this repository. It is
+The PHP SDK is not in this repository. It is
 [`sailantis/volucer-php-sdk`](https://github.com/sailantis/volucer-php-sdk), a Composer
 package that implements the other end of the worker protocol. The tests here drive its example
 worker, so a working checkout is expected beside this one — or at `VOLUCER_SDK_DIR`.
 
 ## Development
 
+CI runs on every push to `main` and every pull request. The same three commands locally:
+
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
+cargo fmt --all --check
 ```
 
 The FastCGI integration tests in `crates/volucer-fcgi/tests/php_cgi.rs` start a real
@@ -866,7 +894,44 @@ when no `php-cgi` binary is on `PATH`.
 
 ## Releasing
 
-The crates are not published yet. When they are, the order is **forced by the dependency graph**:
+CI runs on every push to `main` and every pull request: `fmt`, `clippy`, an **MSRV** check against a
+real 1.88 toolchain, the test suite on Linux, macOS and Windows with `VOLUCER_E2E=1` so a skip is a
+failure, and `cargo package --workspace`.
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
+```
+
+`VOLUCER_E2E=1` is what makes the test job mean anything: the suites that drive a real `php-cgi`
+and a real `example/worker.php` **skip themselves** when PHP or the SDK checkout is missing, and
+libtest hides the stderr of a passing test. A machine with no interpreter at all reports the same
+green as one that ran everything. `VOLUCER_SDK_DIR` points those suites at a checkout that is not
+beside this repository, which is how CI passes the SDK repository it fetches.
+
+**Tagging publishes the binaries.** Pushing a `v*` tag runs `.github/workflows/release.yml`, which
+builds a static-linked archive per target, writes a `.sha256` beside each, smoke-tests the archive
+by extracting and running it somewhere else, attests its provenance, and opens a **draft** release:
+
+    volucer-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+    volucer-0.1.0-x86_64-unknown-linux-musl.tar.gz
+    volucer-0.1.0-aarch64-unknown-linux-gnu.tar.gz
+    volucer-0.1.0-aarch64-apple-darwin.tar.gz
+    volucer-0.1.0-x86_64-apple-darwin.tar.gz
+    volucer-0.1.0-x86_64-pc-windows-msvc.zip
+
+Each archive holds the binary, `README.md`, `LICENSE` and the systemd unit. The release is a draft
+because a tag is a decision and a broken release is public the moment it is not.
+
+`packaging/systemd/volucer.service` is the file that makes `SIGHUP` reachable in production: it wires
+`ExecReload=/bin/kill -HUP $MAINPID`. `packaging/docker/Dockerfile` builds two images from one crate
+— `glibc` and `musl` — and the workflow builds both and **publishes neither**, because this
+repository has never pushed to a registry.
+
+### Publishing to crates.io
+
+The crates are not on crates.io yet. When they are, the order is **forced by the dependency graph**:
 a published crate cannot depend on a version that is not on crates.io yet, so the leaves go first.
 
 ```bash

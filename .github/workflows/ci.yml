@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes an older run's answer irrelevant, and a full matrix is
+# three platforms times a C toolchain. Cancel rather than queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      # NASM is not on the runner image and `aws-lc-sys` needs it to assemble its crypto code,
+      # so this is a build prerequisite rather than a linting detail. See the README's
+      # "Build prerequisites".
+      - run: sudo apt-get update && sudo apt-get install -y nasm
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # `rust-version` is a promise about what a clean machine needs, and an unverified promise is how
+  # this one came to be wrong: the manifest said 1.85 while a transitive dependency required 1.88.
+  # The number below is the workspace's `rust-version`, written out because an action cannot
+  # interpolate a manifest.
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nasm
+      - run: cargo +1.88.0 check --workspace --all-targets
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: [fmt, clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+
+      # `aws-lc-sys` is C and assembly, so every platform needs a C toolchain, NASM and CMake.
+      # MSVC and CMake are on the image; NASM is not, on any of the three.
+      - name: Install NASM (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Install NASM (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm --no-progress -y
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
+
+      # PHP is what makes the FastCGI and worker suites mean anything: without it they skip, and
+      # a skip is invisible in a passing run. See the two steps below.
+      - name: Set up PHP
+        uses: shivammathur/setup-php@2.40.0
+        with:
+          php-version: '8.3'
+          tools: none
+          coverage: none
+
+      # The suites that drive a real `php-cgi` and a real `example/worker.php` need the SDK
+      # checkout, which is a separate repository, so it is a separate step.
+      - name: Check out the PHP worker SDK
+        uses: actions/checkout@v7
+        with:
+          repository: sailantis/volucer-php-sdk
+          path: volucer-php-sdk
+
+      # `VOLUCER_E2E` makes a skip a failure, which is the only way this job proves the suites
+      # that need PHP actually ran. Without it the job reports the same green for a machine with
+      # no interpreter at all.
+      - name: Test
+        env:
+          VOLUCER_E2E: '1'
+          VOLUCER_SDK_DIR: ${{ github.workspace }}/volucer-php-sdk
+        run: cargo test --workspace
+
+  # A published crate cannot depend on a version that is not on crates.io yet, so the publish
+  # order is forced and a mistake in it is invisible until release day.
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nasm
+      - run: cargo package --workspace --allow-dirty

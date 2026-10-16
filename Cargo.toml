@@ -14,7 +14,12 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# Not 1.85, which is what this said until CI checked it. `cargo check` on 1.85 refuses the
+# workspace: `time` 0.3.55 and `time-core` 0.1.9 declare `rust-version = 1.88.0`, and they reach
+# us through `x509-parser` -> `asn1-rs` -> `time` (and `rcgen`). Measured, not read off the
+# manifests: 1.85.1 fails, 1.88.0 passes. The `msrv` job in `.github/workflows/ci.yml` is what
+# keeps this number honest.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/sailantis/volucer"
 

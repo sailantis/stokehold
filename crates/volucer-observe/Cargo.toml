@@ -9,5 +9,6 @@ repository.workspace = true
 
 [dependencies]
 getrandom.workspace = true
+httpdate.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

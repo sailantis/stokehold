@@ -44,6 +44,8 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod access_log;
+
 /// The header an inbound request id is read from, and the one the response echoes.
 ///
 /// Lowercase, because HTTP/1.1 header names are case-insensitive and `hyper`'s `HeaderName` is

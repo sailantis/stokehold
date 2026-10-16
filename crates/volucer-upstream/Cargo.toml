@@ -1,0 +1,33 @@
+[package]
+name = "volucer-upstream"
+description = "The HTTP backend for volucer: a pooled client that proxies a request to an origin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+volucer-core.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tower-service.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+# For a test origin's certificate: a real root, a leaf signed by it, and the same leaf
+# presented by an origin whose chain the client has *not* been told to trust. A verification
+# test needs a certificate that fails for the right reason, and a hand-written DER blob would
+# be a fixture nobody can reread.
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["custom-provider"] }
+tokio-rustls = "0.26"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

@@ -8,6 +8,7 @@ members = [
     "crates/volucer-http",
     "crates/volucer-watch",
     "crates/volucer-acme",
+    "crates/volucer-upstream",
     "crates/volucer",
 ]
 
@@ -37,19 +38,39 @@ volucer-server = { version = "0.1.0", path = "crates/volucer-server" }
 volucer-http = { version = "0.1.0", path = "crates/volucer-http" }
 volucer-watch = { version = "0.1.0", path = "crates/volucer-watch" }
 volucer-acme = { version = "0.1.0", path = "crates/volucer-acme" }
+volucer-upstream = { version = "0.1.0", path = "crates/volucer-upstream" }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"
 futures = "0.3"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = [
+    "server-auto",
+    "tokio",
+    # The upstream backend's client, alongside the listener's server. `client-legacy` is what
+    # builds a pooled HTTP/1.1 and HTTP/2 client, and it is the only user of `socket2`,
+    # `httparse` and `libc` in that crate. `client-pool` is deliberately absent: it gates
+    # `client::conn::pool`, which nobody uses here — the pooling comes from `client-legacy`.
+    "client",
+    "client-legacy",
+    "http1",
+    "http2",
+] }
+# The upstream backend's connector has to be written by hand (see `volucer-upstream`), and a
+# hand-written connector is a `tower_service::Service`, so the trait has to be nameable here.
+tower-service = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
 thiserror = "2"
 httpdate = "1"
 rustls = "0.23"
+# The public roots an `https:` upstream origin is verified against when no CA is named. Pinned
+# to 1.x so it is the *same* package `rustls-acme` already pulls in (0.26 is a separate entry
+# in the lockfile that only `futures-rustls` uses), which means adding this changes the
+# dependency graph not at all.
+webpki-roots = "1"
 # Reading a certificate's expiry, for `volucer check`. Already in the graph as a dependency of
 # `rustls-acme`, and taken with `default-features = false` — the same features rustls-acme uses —
 # so this adds not one crate to the build. The alternative was a hand-rolled ASN.1 walk, which is

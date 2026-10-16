@@ -106,12 +106,17 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("volucer: {err}");
+            // The subscriber is initialised by now, and `main` still holds the only `Err` a run can
+            // produce. `error!` puts a fatal message where a log pipeline expects one; the chain is
+            // written as a single event with the causes folded in, because a per-cause event would
+            // be several lines pretending to be one error.
+            let mut causes = String::new();
             let mut source = std::error::Error::source(&err);
             while let Some(cause) = source {
-                eprintln!("  caused by: {cause}");
+                causes.push_str(&format!("\n  caused by: {cause}"));
                 source = cause.source();
             }
+            tracing::error!("volucer: {err}{causes}");
             ExitCode::FAILURE
         }
     }
@@ -150,8 +155,18 @@ fn init_tracing(verbosity: u8) {
         _ => "volucer=trace",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback));
+    // **Diagnostics go to STDERR, and that split is deliberate.** `fmt`'s default writer is
+    // `io::stdout` (verified in `tracing-subscriber-0.3.23/src/fmt/fmt_layer.rs:749`), which would
+    // put log lines on the same stream as the banner and `check`'s report — so an operator
+    // grepping stdout would be reading logs, and a machine parsing `check` output would be reading
+    // both at once. `stderr` is the stream for diagnostics; stdout stays the program's own output.
+    //
+    // It also makes the three sinks this server will have *separately* silenceable: stdout for
+    // program output, stderr for diagnostics, and the access log's own file — which is why a
+    // single `RUST_LOG` filter must not be able to quiet the access log as well.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
 }
@@ -1227,10 +1242,17 @@ fn install_shutdown_handler(
         let forced = Arc::clone(&forced);
         move || {
             if forced.swap(true, Ordering::SeqCst) {
-                eprintln!("\nforced exit");
+                // `error!`, not `warn!`: a second signal is the operator telling the process it has
+                // run out of chances, and the exit code says the shutdown did not complete.
+                tracing::error!("forced exit");
                 std::process::exit(130);
             }
-            eprintln!("\nshutting down; signal again to force");
+            // Through `tracing` rather than `eprintln!`, and this is not tidiness. These lines
+            // used to bypass the subscriber entirely, so they could not be filtered, redirected,
+            // captured or shipped — the one pair of messages an operator reads *while something is
+            // wrong* was the one pair no log pipeline could see. The exit-on-second-signal and the
+            // flag are unchanged.
+            tracing::warn!("shutting down; signal again to force");
             SHUTDOWN.store(true, Ordering::Relaxed);
             if let Some(shutdown) = &shutdown {
                 shutdown.shutdown();

@@ -1975,42 +1975,77 @@ the prerequisites were still moving and would make the work be done twice. That 
 right, and it is why `ci-build-matrix` is now step 69 of this phase rather than a chore before it:
 the workflow is the same one, but it finally has an output, so it stops being deferrable.
 
-68. `upstream-backend` — `kind = "upstream"`, and it is a second request path rather than a fourth
-    arm of the existing one.
-    - **It cannot reuse the CGI representation, and that is the whole reason this is a step of its
-      own.** Every backend today is reached through one shape: `Request { params:
-      Vec<(Vec<u8>, Vec<u8>)>, body }`, built by `to_cgi`. That shape *is* CGI, and it loses exactly
-      what an HTTP upstream must preserve. Headers are flattened to `HTTP_*` (case destroyed,
-      duplicates joined), the request line is three environment variables, and the body is a
-      buffered `Vec<u8>` behind `max_body_bytes` (32 MiB). A `dispatch_to` that took an
-      `IncomingRequest` could not express any of it. So: a parallel path, and a `Request`-shaped
-      abstraction only if a third shape ever appears.
-    - **The two front-ends behave differently, and the difference is not a bug to be evened out.**
-      The FastCGI front-end already speaks CGI — that is what nginx sends it — so it has nothing to
-      translate *from* and an upstream backend reaches it as a request with `params` already
-      present. The HTTP front-end is where the translation happens. Step 68 wires the HTTP path.
-    - **Bodies must stream, in both directions, or the step has not achieved its purpose.** This is
-      the substantial work and it is not optional: `ResponseBody` is `Full<Bytes>`, `read_body`
-      collects the entire upload before dispatch, and both are deliberate — `body_len` is
-      authoritative in the worker protocol so that "a short body is *detected* rather than hanging".
-      Those reasons are about *framed* protocols and do not apply to HTTP, so streaming is added for
-      this backend rather than everywhere. Without it the runtime cannot do SSE, long polling, or
-      WebSockets, which is most of the reason to choose an async runtime at all; with it, an
-      upstream is *strictly more capable* than worker mode for those workloads.
-    - **WebSockets are the expensive part and are separable.** Streaming responses need
-      `hyper`'s body plumbing; an upgrade needs the `Connection`/`Upgrade` dance as well. Order them:
-      streaming first (it is what SSE and long-polling need and it is testable with a slow body),
-      and treat a WebSocket upgrade as its own decision rather than assuming it comes along.
-    - **What it does not do:** nothing about `workers`, `command`, or the worker protocol changes.
-      An upstream is a backend *kind* beside the other three, chosen per site or per route, and a
-      deployment that does not configure one behaves identically.
-    - **Verification:** with no upstream configured, `tests/tls.rs`, `tests/frontend.rs` and
-      `tests/external.rs` are unchanged — that is the "additive" control, the same one ACME used.
-      Then one real upstream (a stdlib HTTP server that answers slowly) with (a) a response that
-      arrives in pieces and reaches the client in pieces, (b) a header whose case survives the
-      round trip, (c) a duplicated request header that arrives twice, (d) a body larger than
-      `max_body_bytes` that is refused or streamed rather than truncated. (a)–(d) each fail against
-      the current code by construction, which is what makes them tests rather than demonstrations.
+68. `upstream-backend` — **done.** `kind = "upstream"`: a reverse proxy to an HTTP origin, for a
+    runtime that already owns its HTTP loop. `http://`, `https://` and `unix:` origins, a pooled
+    client, a streaming request and response body, and one front-end branch. Five commits:
+    `56c8bd7` (the crate) `051e232` (the config) `bada54b` (the backend) `0b0334f` (the front-end)
+    `f8a39ab` (streaming).
+
+    - **A second request path is what it needed to be, and the reason is the CGI representation.**
+      Every backend was reached through one shape — `Request { params, body }` built by `to_cgi` —
+      which *is* CGI and loses exactly what an HTTP origin must preserve: header case, duplicate
+      headers and the request line. So the front-end takes a branch instead of the dispatcher
+      growing an arm, and `dispatch` **stays blocking**: every other backend is a process on a pipe,
+      so making its type async to accommodate the one that is not would drag `spawn_blocking` into
+      the type system of all four.
+    - **The origin's body forced `ResponseBody` from `BoxBody` to `UnsyncBoxBody`**, because
+      `hyper::body::Incoming` wraps `h2::RecvStream` and is `Send` but not `Sync`. The plan called
+      this the step's main risk — "a whole-file change to the hottest code in the server, and if it
+      moves any `static_files` test it comes back out". **It moved none**: two constructions
+      (`body_of`, one `FileBody`), `FileBody` already `Send`, and `hyper`'s server accepts any
+      `B: Body + 'static`. Hazard 78.
+    - **`https:` is supported and always verified.** The plan's earlier draft refused it, on the
+      reasoning that a second trust story was not what "use this for my Node app" needed. That was
+      wrong: nginx does not refuse it, the components were already in the build (`tokio-rustls`'s
+      connector, `rustls-pemfile`, `webpki-roots`), and since the `unix:` arm already forced a
+      hand-written `Service<Uri>` connector, `https:` is that connector with one more step. There
+      is **no `verify = false`** — the same rule that keeps a self-signed certificate off the
+      serving port — and `[backends.<n>.tls]` beside a plaintext origin is refused rather than
+      ignored, because verification an operator believes in and does not have is worse than none.
+    - **A `unix:` origin was in the first commit, not deferred.** `Endpoint::parse` and
+      `SlotAddress::Socket` already used that spelling, so an upstream that could only speak TCP
+      would be the one backend that cannot reach what every other backend reaches. A Windows named
+      pipe is **not** supported — `hyper` has no pipe transport — and the error says so by name.
+    - **Three silent readers were fixed, and one of them had a real consequence.** `version`'s
+      backend list, `check`'s per-request-reset line (which claimed "PHP SAPI" or "application-scoped
+      worker", neither true of somebody else's runtime — `RequestScope` has three answers now), and
+      the `stat`-skip rule. The last one mattered: `skip_stat`'s parameter was `backend_is_worker`,
+      and `!is_worker()` is the *wrong* answer for an upstream because a CGI backend is also not a
+      worker — so both `BackendConfig` and `Backend` gained `interprets_path()`. Falsified by making
+      `Upstream` interpret the path: three unit tests and a new CLI test fail while the *pre-existing*
+      CLI test still passes, so the new test is load-bearing rather than a restatement.
+    - **The config's parser could not live where the plan put it.** The plan had `validate_backend`
+      calling `volucer_upstream::Origin::parse`; `volucer-core` is the leaf crate and `Origin` is
+      hyper-typed, so that inverts the graph. The parser moved into core as `OriginSpec` — hyper-free,
+      the same reasoning that keeps `ChecksumMode` there as a mirror — and `Origin::from_spec` became
+      the only constructor of the client-side type, so "the origin was validated" is structural rather
+      than a habit. It also lets `preflight` describe a *structured* origin rather than only asking
+      "does it parse", which is what its two new warnings need.
+    - **Streaming and concurrency are asserted by timing, and both tests needed falsifying twice.**
+      The response test reads the first of two chunks and checks the clock before the origin's second
+      chunk exists — the one thing a buffering proxy cannot do. The concurrency test's first version
+      was measuring *its own fixture*: a single-threaded accept loop, so five 400 ms requests took
+      2000 ms and looked like a stalled front-end. Its second version *passed* when the upstream path
+      was wrapped in `spawn_blocking`, because that pool is not a single slot — the real failure mode
+      is a runtime with no thread left, so the test now over-subscribes the harness's two-thread
+      runtime five times, and fails correctly when a blocking call is introduced. Hazard 77.
+    - **`max_body_bytes` does not apply to an upstream**, and both halves are asserted in one test:
+      the same oversized body reaches the origin whole *and* is still a 413 on the CGI path, through
+      the same lowered limit. The CGI half is the contrast that makes the bypass a decision — the
+      environment must carry `CONTENT_LENGTH` before PHP reads a byte, so it cannot stream there.
+      This is a real change in exposure and the README says so beside the limit.
+    - **One request is now routed once, not twice.** `prepare()` chose the route from the *site's*
+      table to decide `skip_stat`, and `dispatch()` then re-routed through the *server's* table to
+      pick the backend — so a site with its own routes could skip the stat for one route and dispatch
+      to another. The FastCGI front-end already routed through the site; the HTTP one now does too.
+    - **What it does not do: WebSockets.** The pool keeps the capability — `hyper-util`'s client hands
+      a connection back after an upgrade — but the hop-by-hop filter drops `Connection` and `Upgrade`,
+      which is what a handshake needs to survive. So the *only* change WebSockets need is a
+      conditional skip of those two names, and SSE works today. Recorded rather than implied.
+    - **Verification:** 553 pre-existing tests plus 62 new ones across five commits, green on Windows
+      and on Linux under WSL (Linux is the only place the `unix:` arm compiles). Four falsifications:
+      the path-skip rule, the buffering path, a blocking call in the async context, and the front-end
+      branch itself — the last producing the 502 that is exactly hazard 68's signature.
 
 69. `release-artifacts` — **done.** A build and test workflow for Linux/macOS/Windows, tagged
     releases with per-target archives and checksums, two Docker images, and the systemd unit whose
@@ -4333,3 +4368,79 @@ Two things the attempt bought anyway, both worth keeping:
 - **A `challenge` rejection names the domain and the reason**, which is what the `check` days-left
   report is for. Reading the failures above is exactly the operator experience the CLI step is trying
   to replace.
+
+
+### Hazard 76 — the parser the plan named could not live where the plan put it
+
+Step 68's sub-plan said `validate_backend` would check an upstream origin by calling
+`volucer_upstream::Origin::parse`. That is one line in a table and it cannot be written: `volucer-core`
+is the leaf crate — `serde`, `thiserror`, `toml`, `tracing` — and `Origin` is hyper-typed
+(`base: hyper::Uri`, `authority() -> &hyper::http::uri::Authority`), so the call inverts the graph.
+The commit-1 work had also left `volucer-upstream` declaring a `volucer-core` dependency it never
+referenced, which is the small version of the same confusion.
+
+**The fix is the codebase's own existing pattern, and finding it was the useful part.** `ChecksumMode`
+already lives in `volucer-core` as a *mirror* of the worker protocol's policy, with a comment saying
+"so that the configuration model stays free of the protocol crate, which is what lets `volucer-core`
+be the leaf that every other crate depends on". So the origin parser moved down as `OriginSpec`,
+hyper-free, and `volucer-upstream::Origin::from_spec` became the **only** constructor of the
+client-side type. That is better than a working call would have been: `OriginSpec` has no public
+fields and one parser, so "the origin was validated" is a property of the program rather than of the
+order two functions happen to be called in.
+
+Two consequences worth having, both of which the plan could not have anticipated: `preflight` can now
+describe a *structured* origin — scheme, host, resolved port, socket path — instead of only asking
+"does it parse", which is what its "nothing is listening yet" and "this hop is in clear text"
+warnings need. And the parser is now hyper-free, so `http://` and `https://` are refused by *name* in
+one place rather than by whatever `hyper::Uri` happens to accept: `http:foo` used to reach a different
+error from `http://`.
+
+**The general rule: a plan that says "call X from Y" is making a claim about the dependency graph,
+and that claim is as falsifiable as any other.** It read like a detail because it was one sentence in
+a table of places that must learn a new enum arm — and every other row in that table *was* a detail.
+
+### Hazard 77 — a test that measured its own fixture, twice
+
+Step 68's sub-plan named the `spawn_blocking` boundary as risk 2 and prescribed the test: "a slow
+origin *and* several concurrent requests — a serialised front-end would pass every single-request
+test". The prescription was right and the implementation was wrong twice, in two different ways, and
+both were only visible by falsifying.
+
+**First: the fixture was the thing being measured.** The test origin was a stdlib accept loop that
+served each connection *inline*. Five requests to an origin sleeping 400 ms each took 2000 ms — which
+is exactly the signature the test was written to detect, produced entirely by a single-threaded
+fixture. So the test failed against correct code, and the tempting read was "the front-end is
+serialised". One thread per connection fixed the measurement and not the premise.
+
+**Second: the premise was wrong even when the fixture was right.** With the origin concurrent, the
+test *passed* when the upstream path was wrapped in `spawn_blocking`. That pool is not a single slot,
+so "N concurrent requests take N times as long" is not the failure mode — the actual one is a runtime
+with no thread left to drive the other connections. The test now sends **ten** requests against the
+two-thread runtime the harness builds, five times over-subscribed, and fails correctly when a
+`std::thread::sleep` is introduced into the async path. The doc comment says why the thread count is
+the load-bearing part.
+
+**The rule this is the third instance of, and the sharpest statement of it yet:** a test whose
+falsification is never run is not evidence, *and* a falsification that passes is itself a result —
+it means the test cannot see the bug it was written for. Both readings here would have been wrong
+without one. Hazard 57 was a test asserting nothing-changed against a test that did nothing; hazard 62
+was a stub that reimplemented the thing under test; this is a fixture that reimplemented the *failure
+mode*. In each case the test was green and the green meant nothing.
+
+### Hazard 78 — the change the plan called the risk was the change that cost nothing, and the plan had already worked out why
+
+The sub-plan's risk 1 was `UnsyncBoxBody`: "a whole-file change to `volucer-http`'s public types and
+touches `static_files.rs`, which is 66 KB and the hottest code in the server… if it moves any
+`static_files` test it comes back out and streaming goes behind a second response type."
+
+It moved none. Two constructions existed — `body_of`, and one `BoxBody::new(FileBody { .. })` — and
+`FileBody` was already `Send`. The plan had *already verified* the reason in §3.7: `hyper`'s server
+bounds the response body as `B: Body + 'static` with no `Send` or `Sync` (`http1.rs:536-541`), so the
+looser type is not a compromise and nothing downstream narrows it again. The risk estimate was about
+the *size of the diff* rather than the strictness of the bound, and those are not the same question.
+
+**The general rule, which is the mirror image of hazard 77: a risk whose mitigation is "revert it if
+it breaks" should be attempted early, because the measurement is the mitigation.** Two commits and a
+full test run settled it, and the alternative — designing a second response type around a bound that
+turns out not to bind, to protect against a failure that cannot occur — would have cost real design
+work on behalf of a guess.

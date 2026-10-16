@@ -34,15 +34,17 @@ supervises it for you.
 >
 > **What is _not_ built yet, in one place**, because "not there yet" is too vague to plan against:
 > TLS **is** built (both certificate/key and ACME, steps 42–50 and 60–67), `SIGHUP` reload **is**
-> built (steps 53–59), and **packaging is built** (step 69) — CI on every push, tagged releases with
-> per-target archives and checksums, a systemd unit, and two Docker images. What is left is making
-> the server _reachable from an application_: a Composer channel, framework bridges, the SDK session
-> helper, and an HTTP `upstream` backend for runtimes that already own their HTTP loop. Those are
-> steps 68 and 70–72, and they are the current frontier.
+> built (steps 53–59), **packaging is built** (step 69) — CI on every push, tagged releases with
+> per-target archives and checksums, a systemd unit, and two Docker images — and the HTTP
+> `upstream` backend **is** built (step 68), see [`upstream`](#upstream-a-reverse-proxy-to-an-http-origin).
+> What is left is making the server _reachable from an application_: a Composer channel, framework
+> bridges, and the SDK session helper. Those are steps 70–72, and they are the current frontier.
 >
 > **The async boundary.** `volucer-http` is the only place with a `tokio` runtime, because
-> `hyper` needs one. Every backend stays blocking, and the dispatcher is reached only through
-> `spawn_blocking` — see [the crate docs](crates/volucer-http/src/lib.rs) for why.
+> `hyper` needs one. Every CGI-shaped backend stays blocking, and the dispatcher is reached only
+> through `spawn_blocking` — see [the crate docs](crates/volucer-http/src/lib.rs) for why. An HTTP
+> upstream is the one exception by necessity: it is already asynchronous, so it awaits on the
+> runtime rather than crossing that boundary.
 
 ## Why
 
@@ -64,7 +66,7 @@ Both are served by one dispatcher, so a route can pick whichever semantics it ne
                         │   └► Host ► site (root, controller)      │──► worker pool   (persistent PHP, pipes)
  nginx  ──FastCGI─────► │ FastCGI listener                         │──► php-fpm        (external socket / TCP)
                         │  └► CGI env builder ► dispatcher         │──► php-cgi        (N processes, N ports)
-                        └──────────────────────────────────────────┘
+                        └──────────────────────────────────────────┘──► HTTP origin    (Node, ASGI, Go — over HTTP)
 ```
 
 One binary. No second application is needed to try it — `volucer serve` can be hit directly
@@ -79,6 +81,7 @@ itself. Several `Host` names can be served from one process, each with its own d
 | `worker`    | Persistent PHP process speaking volucer's framed protocol over pipes | No — the application clears its own request scope | all                          |
 | `external`  | An already-running `php-fpm` (systemd-managed)                       | Yes, by php-fpm's SAPI                            | Linux, macOS                 |
 | `spawn_cgi` | N `php-cgi` processes on N ports                                     | Yes, by php-cgi's SAPI                            | all, **required on Windows** |
+| `upstream`  | An HTTP origin that owns its own HTTP loop (Node, ASGI, Go)          | n/a — the origin's runtime is its own business     | all                          |
 
 A fourth kind, `spawn_fpm`, was accepted by the parser and refused at startup — `version`
 advertised it while `Backend::from_config` rejected it. It is **gone** rather than implemented:
@@ -86,12 +89,68 @@ php-fpm already does pool management, `pm.max_requests` recycling, multi-pool te
 reload better than a supervisor we would write, and `external` attaches to the php-fpm that
 systemd already runs. A file still carrying `kind = "spawn_fpm"` is now rejected by name.
 
-A planned fourth kind, **`upstream`**, is not built — a real HTTP reverse proxy for runtimes that
-already own their HTTP loop (Node, ASGI, Go, and anything wanting SSE or WebSockets). It is _not_ a
-fourth arm of the table above: every backend today is reached through a CGI environment, which
-flattens headers to `HTTP_*` and buffers the body, and an HTTP upstream needs the opposite. See
-Phase 10 in [docs/plan.md](docs/plan.md) for why it is a second request path rather than a new
-`kind` in the existing one.
+### `upstream`: a reverse proxy to an HTTP origin
+
+For a runtime that already owns its HTTP loop, `kind = "upstream"` reaches it at its own address and
+relays the request. This is deliberately **not** a fourth arm of the CGI-shaped kinds above: those
+flatten headers into `HTTP_*` and buffer the body before dispatch, because that is what FastCGI is,
+and an HTTP origin needs the opposite.
+
+```toml
+[backends.node]
+kind = "upstream"
+origin = "http://127.0.0.1:3000"
+```
+
+`origin` is one of four shapes and is parsed at startup, so a typo fails there rather than becoming
+a 502 on the first request:
+
+```text
+http://127.0.0.1:3000       TCP, plain text
+https://10.0.0.5:8443       TCP, TLS — always verified
+unix:/run/node.sock         a unix socket, no network at all
+```
+
+A base path and credentials are refused by name, because neither would be honoured: a route prefix
+belongs in the route table, where it is.
+
+**An `https:` origin is always verified, and there is no `verify = false`.** `ca` names a PEM file to
+verify against and defaults to the public roots; `sni` names the certificate's host when it differs
+from the address dialled:
+
+```toml
+[backends.node.tls]
+ca = "/etc/ssl/internal-ca.pem"   # absent = the public roots
+sni = "node.internal"             # optional; defaults to the origin's host
+```
+
+An unverified TLS hop is nginx's classic footgun — every `proxy_ssl_verify off | on` question exists
+because the default is off — and it is strictly worse than plain text, because it *looks* encrypted
+and checks nothing. The same rule already keeps a self-signed certificate off the serving port. A
+deployment that genuinely wants that shape points the origin at `http://` on a loopback port, which
+is honest about what the hop is.
+
+What is different from the CGI-shaped backends, and worth knowing before deploying one:
+
+- **The request body streams and has no size cap.** The `max_body_bytes` limit protects the CGI path,
+  where the environment must carry `CONTENT_LENGTH` before `php-cgi` will read a byte — so the body
+  cannot be streamed there and the limit is what stops an unauthenticated client allocating without
+  bound. An upstream is handed the body unread, so the limit does not apply and **the limit to
+  configure is the origin's.** This is a real change in exposure, accepted by configuring an
+  upstream at all.
+- **The response streams too**, which is what makes SSE and a large download work: an origin that
+  answers in pieces reaches the client in pieces.
+- **The path is the URL, so a route to an upstream skips volucer's `stat`.** There is no script for
+  volucer to resolve — the origin routes on the URL itself — which is why a route to one behaves
+  like a route to a worker rather than like a route to `php-cgi`.
+- **Reachable over HTTP only.** There is no CGI environment to build for one and no way for the
+  FastCGI front-end to hand it a request, so an upstream with no `server.http` listener is a
+  configuration error.
+- **Backends are restart-only** on reload, which an origin URL makes look otherwise. See
+  [What can be changed without a restart](#what-can-be-changed-without-a-restart).
+- **WebSockets are not built.** The connection pool keeps the capability — `hyper-util`'s client can
+  hand a connection back after an upgrade — but the hop-by-hop filter drops `Connection` and
+  `Upgrade`, which is what a WebSocket handshake needs to survive. SSE works; a WebSocket does not.
 
 `spawn_cgi` is implemented: the pool starts the processes, assigns ports, health-checks each
 slot, restarts one that died, and recycles on `max_requests` — the equivalent of php-fpm's

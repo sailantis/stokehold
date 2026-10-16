@@ -1513,3 +1513,404 @@ document_root = {app:?}
     drop(server);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ---------------------------------------------------------------------------
+// The upstream request path: streaming, the body cap, and concurrency.
+//
+// These live here rather than in `volucer`'s CLI tests because they need an in-process listener
+// with a lowered `HttpLimits` and an origin whose behaviour a test can change — and because an
+// upstream needs no PHP, so unlike most of this file they always run rather than skipping.
+// ---------------------------------------------------------------------------
+
+use std::net::TcpListener as OriginListener;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+/// How a test origin answers every request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OriginBehaviour {
+    /// Sleep before answering, so concurrent requests can be told from ones served a thread at a
+    /// time.
+    SlowAnswer { pause_ms: u64 },
+    /// Write one chunk, sleep, write another, then a terminator. Proves the proxy did not buffer:
+    /// a buffered one cannot deliver the first chunk before the second exists.
+    TwoChunks { pause_ms: u64 },
+    /// Read the whole request body and answer with its length. Proves the body was not truncated.
+    EchoLength,
+}
+
+/// A test origin: a stdlib listener that answers every request the same way.
+struct Origin {
+    address: String,
+    seen: Arc<AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Origin {
+    fn start(behaviour: OriginBehaviour) -> Origin {
+        let listener = OriginListener::bind("127.0.0.1:0").expect("bind an origin");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        let address = listener.local_addr().expect("address").to_string();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let counted = Arc::clone(&seen);
+        let stopped = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            // Polling rather than blocking, so the thread ends when the test does instead of
+            // holding the process open. 5 ms is invisible to these assertions.
+            while !stopped.load(AtomicOrdering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // One thread per connection. **Not an optimisation** — an accept loop that
+                        // served each connection inline would serialise the *origin*, and the test
+                        // that measures whether volucer serialises would then be measuring this
+                        // fixture instead. That is exactly what it did first: five 400 ms requests
+                        // took 2000 ms, which looked like a stalled front-end and was a
+                        // single-threaded origin.
+                        let counted = Arc::clone(&counted);
+                        std::thread::spawn(move || serve_origin(stream, behaviour, &counted));
+                    }
+                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        Origin {
+            address,
+            seen,
+            stop,
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.seen.load(AtomicOrdering::Relaxed)
+    }
+}
+
+impl Drop for Origin {
+    fn drop(&mut self) {
+        self.stop.store(true, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Serve one request according to the behaviour, then close.
+fn serve_origin(mut stream: TcpStream, behaviour: OriginBehaviour, seen: &Arc<AtomicUsize>) {
+    // **Explicitly blocking, because the listener is not.** On Windows an accepted socket inherits
+    // the listener's non-blocking mode, so every read and write here would return `WouldBlock` —
+    // which surfaced as a partial response and, one layer up, as "client error (SendRequest)" from
+    // the proxy. On Unix accepted sockets are already blocking, so this is a no-op there and the
+    // reason it is stated rather than assumed.
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    seen.fetch_add(1, AtomicOrdering::Relaxed);
+
+    match behaviour {
+        OriginBehaviour::SlowAnswer { pause_ms } => {
+            let _ = read_request(&mut stream, false);
+            std::thread::sleep(Duration::from_millis(pause_ms));
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nslow!");
+            let _ = stream.flush();
+        }
+        OriginBehaviour::TwoChunks { pause_ms } => {
+            let _ = read_request(&mut stream, false);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: \
+                  chunked\r\n\r\n",
+            );
+            let _ = stream.write_all(b"6\r\nfirst\n\r\n");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(pause_ms));
+            let _ = stream.write_all(b"7\r\nsecond\n\r\n0\r\n\r\n");
+            let _ = stream.flush();
+        }
+        OriginBehaviour::EchoLength => {
+            let raw = read_request(&mut stream, true);
+            // The *body*, not everything read off the socket: reporting the head's length too would
+            // be a number the test cannot predict, which is also how a fixture bug hides a real
+            // truncation.
+            let body = request_body(&raw);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// Read a request, and optionally its body, without knowing the length in advance.
+fn read_request(stream: &mut TcpStream, want_body: bool) -> Vec<u8> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+        let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        if !want_body {
+            break;
+        }
+        let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+        let expected = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if raw.len() >= head_end + 4 + expected {
+            return raw;
+        }
+    }
+    raw
+}
+
+/// The body of a request read off the socket, headers excluded.
+fn request_body(raw: &[u8]) -> &[u8] {
+    match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(at) => &raw[at + 4..],
+        None => &[],
+    }
+}
+
+/// A configuration whose only backend is an upstream pointed at `origin`.
+fn upstream_config(origin: &Origin) -> Config {
+    Config {
+        server: ServerConfig {
+            http: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        },
+        backends: [(
+            "node".to_string(),
+            BackendConfig::Upstream(volucer_core::config::UpstreamConfig {
+                origin: format!("http://{}", origin.address),
+                tls: None,
+            }),
+        )]
+        .into_iter()
+        .collect(),
+        default_backend: Some("node".to_string()),
+        routes: Vec::new(),
+        sites: BTreeMap::new(),
+    }
+}
+
+/// A listener serving `origin`, with the given limits.
+fn upstream_server(origin: &Origin, limits: HttpLimits) -> Option<Server> {
+    let config = upstream_config(origin);
+    let routing = front_controller_routing();
+    let dispatcher = match Dispatcher::from_config(&config, routing.clone()) {
+        Ok(dispatcher) => dispatcher,
+        Err(err) => {
+            eprintln!("skipping: the upstream backend could not be built: {err}");
+            return None;
+        }
+    };
+    Server::start(
+        dispatcher,
+        routing,
+        limits,
+        volucer_core::config::StaticConfig::default(),
+    )
+}
+
+/// **The body cap does not apply to an upstream, and the same body to a CGI backend is still a
+/// 413.**
+///
+/// Both halves are needed. A cap that was merely *raised* would pass a "does a big body work" test
+/// for every body under the default, so the limit is lowered in this test's own `HttpLimits` — as
+/// the existing CGI 413 test does — and the same body is sent down both paths.
+///
+/// The CGI half is the contrast that makes the bypass a decision rather than a regression: the
+/// environment has to carry `CONTENT_LENGTH` before PHP will read a byte, so `read_body` cannot
+/// stream there, and the limit is what keeps an unauthenticated client from allocating at will.
+#[test]
+fn a_body_past_the_cap_streams_to_an_origin_and_is_still_a_413_for_cgi() {
+    let origin = Origin::start(OriginBehaviour::EchoLength);
+    let tiny = HttpLimits {
+        max_body_bytes: 64,
+        ..HttpLimits::default()
+    };
+    let Some(server) = upstream_server(&origin, tiny) else {
+        return;
+    };
+
+    // 256 bytes against a 64-byte cap. The origin's answer is the length it read, so a truncated or
+    // refused body is a smaller number rather than a different status — a stronger assertion than
+    // "not 413".
+    let payload = "x".repeat(256);
+    let request = format!(
+        "POST /upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: {}\r\nConnection: \
+         close\r\n\r\n{payload}",
+        payload.len()
+    );
+    let response = exchange(&server.address, request.as_bytes());
+    assert_eq!(
+        response.status, 200,
+        "an upstream must not refuse a body for a cap its own client never set: {response:?}"
+    );
+    assert_eq!(
+        response.text(),
+        "256",
+        "the origin must have received every byte: {response:?}"
+    );
+
+    drop(server);
+
+    // The same body against the CGI path, through the same lowered limit: still refused, and
+    // refused *while being read* rather than by a backend.
+    let routing = front_controller_routing();
+    let dispatcher = Dispatcher::from_config(&unreachable_config(), routing.clone())
+        .expect("a dispatcher that starts no process");
+    let Some(cgi_server) = Server::start(
+        dispatcher,
+        routing,
+        tiny,
+        volucer_core::config::StaticConfig::default(),
+    ) else {
+        return;
+    };
+    let refused = exchange(&cgi_server.address, request.as_bytes());
+    assert_eq!(
+        refused.status, 413,
+        "the cap still guards the CGI path, which cannot stream: {refused:?}"
+    );
+}
+
+/// **The response body arrives in pieces, not at the end.**
+///
+/// Asserted by *timing*, and nothing weaker would do: an origin that wrote two chunks and then
+/// terminated would give a buffering proxy the same bytes and the same status. What a buffered
+/// proxy cannot do is deliver the first chunk before the second exists — so this reads until the
+/// first chunk arrives, checks the clock, and only then lets the origin finish.
+///
+/// The origin's pause is deliberately much larger than the assertion's margin: a flaky test here
+/// would be read as "streaming broke", which is the one conclusion this must not produce by
+/// accident.
+#[test]
+fn an_origin_that_answers_in_pieces_reaches_the_client_in_pieces() {
+    let origin = Origin::start(OriginBehaviour::TwoChunks { pause_ms: 1500 });
+    let Some(server) = upstream_server(&origin, HttpLimits::default()) else {
+        return;
+    };
+
+    let mut stream = TcpStream::connect(&server.address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n")
+        .expect("write");
+
+    let started = std::time::Instant::now();
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 512];
+    // Read until the first chunk has arrived, which is what "not buffered" means.
+    while !String::from_utf8_lossy(&raw).contains("first") {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(err) => panic!("reading the first chunk failed: {err}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(1200),
+            "the origin holds its second chunk for 1500 ms, so the first arriving this late means \
+             the proxy waited for the whole body: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+    }
+
+    let first_chunk_at = started.elapsed();
+    let head = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "the head must arrive before the body does: {head:?}"
+    );
+    assert!(
+        !head.contains("second"),
+        "the second chunk must not exist yet, or this test proves nothing: {head:?}"
+    );
+
+    // Then read the rest, which the origin writes after its pause.
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).expect("read the rest");
+    let whole = format!("{head}{}", String::from_utf8_lossy(&rest));
+    assert!(
+        whole.contains("second"),
+        "the rest must still arrive: {whole:?}"
+    );
+    // The timing assertion restated as the number it was: a buffered proxy would have delivered
+    // both chunks together, at or after the pause.
+    assert!(
+        first_chunk_at < Duration::from_millis(1200),
+        "the first chunk arrived at {first_chunk_at:?}, which is after the origin's pause"
+    );
+}
+
+/// A slow origin is served concurrently, with more requests in flight than the runtime has threads.
+///
+/// The `spawn_blocking` boundary's failure mode is a **stall**, not a wrong answer — the module doc
+/// says so — so a single-request test passes while the server is serialised behind one call.
+///
+/// **The thread count is the point, and a falsification is what found that out.** This test's first
+/// version sent five requests against a two-thread runtime and *passed* when the upstream path was
+/// wrapped in `spawn_blocking`: that pool is not a single slot, so the mistake is not "takes N times
+/// as long" but "the runtime has no thread left to drive the other connections". `Server::start_sites`
+/// builds a **two-thread** runtime, so ten requests is five times over-subscribed, and a path that
+/// parks a runtime thread cannot satisfy them.
+///
+/// The origin sleeps 400 ms per request. Ten concurrently finish in about 400 ms; serviced a
+/// runtime-thread at a time they take whole multiples of that.
+#[test]
+fn a_slow_origin_is_served_concurrently_rather_than_thread_at_a_time() {
+    let origin = Origin::start(OriginBehaviour::SlowAnswer { pause_ms: 400 });
+    let Some(server) = upstream_server(&origin, HttpLimits::default()) else {
+        return;
+    };
+    let address = server.address.clone();
+
+    // Deliberately far above the two-thread runtime `Server::start_sites` builds.
+    const CONCURRENCY: usize = 10;
+
+    let started = std::time::Instant::now();
+    let workers: Vec<_> = (0..CONCURRENCY)
+        .map(|_| {
+            let address = address.clone();
+            std::thread::spawn(move || get(&address, "/slow"))
+        })
+        .collect();
+    let answers: Vec<_> = workers
+        .into_iter()
+        .map(|w| w.join().expect("join"))
+        .collect();
+    let elapsed = started.elapsed();
+
+    for answer in &answers {
+        assert_eq!(answer.status, 200, "{answer:?}");
+        assert_eq!(answer.text(), "slow!");
+    }
+    assert_eq!(
+        origin.request_count(),
+        CONCURRENCY,
+        "every request must have reached the origin"
+    );
+
+    // Ten 400 ms requests in parallel take about 400 ms; serviced a runtime-thread at a time they
+    // take 2000 ms or more. The bound sits between the two with room on both sides, because this is
+    // a smoke test for a stall rather than a benchmark.
+    assert!(
+        elapsed < Duration::from_millis(1600),
+        "{CONCURRENCY} concurrent requests to an origin that sleeps 400 ms each took {elapsed:?}, \
+         which is the shape of a front-end that parks a runtime thread per request (about 2000 ms) \
+         rather than one that awaits (about 400 ms)"
+    );
+}

@@ -1,0 +1,13 @@
+[package]
+name = "volucer-observe"
+description = "Request identity and trace context: the two things a request log and a trace share"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+getrandom.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

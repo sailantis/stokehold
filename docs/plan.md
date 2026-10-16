@@ -2174,6 +2174,81 @@ multiplexes a single transport connection between several independent FastCGI re
 `request_id` is a `u16`) but no provider implements it, so a consumer would have to be written as
 well as a producer. No HTTP/3, no `prefork-optional`, no `rpc-sidechannel`.
 
+**Two things are recorded here that this plan previously did not mention at all**, because the user
+asked about both and the honest answer was "neither is anywhere in this document":
+
+### gRPC — a named non-goal, in the shape RoadRunner has, with the trigger that would unblock it
+
+The user's recollection was that RoadRunner advertises gRPC "as a worker". That is **correct**, and
+reading RR's own source settled what it actually is:
+
+```yaml
+grpc:
+  listen: "tcp://127.0.0.1:9001"     # a real HTTP/2 server of its own, not a proxy
+  proto: ["*.proto"]                  # descriptors for routing and reflection
+  pool:
+    command: "php my-super-app.php"   # the pool still speaks RR's own framed protocol
+```
+
+and on the PHP side (`tests/php_test_files/grpc/worker-grpc.php`) a Spiral `Server` registers
+services and calls `serve(Worker::create())`. So **gRPC terminates in the server and the worker
+protocol carries the message** — in, out, and the worker re-serializes. It is not `grpc_pass`.
+
+**That shape fits volucer, and the earlier dismissal of this was wrong.** The objection was that
+worker-style backends serve one request at a time, so concurrent HTTP/2 streams would serialize —
+but that limit is a property of the worker protocol's *framing* (one request in flight per
+connection), not of gRPC or of PHP, and RoadRunner does not multiplex either. So it is viable.
+
+**Why it is nonetheless its own step and not this phase.** Two hard reasons, and neither is "it is
+big":
+
+1. **Trailers are entirely absent, and gRPC's status *is* a trailer.** `grep -i trailer` across every
+   crate finds three hits, all of them in a *strip* list (`translate.rs:34`, `listener.rs:1502`,
+   `client.rs:279`) and none of them a construction. `translate_response` copies
+   `{status, headers, body, version}` (`translate.rs:152`), so `grpc-status` would be dropped and
+   **every call would look failed**. This is shared work: it unlocks gRPC-to-an-origin too. It is the
+   first deliverable, not a detail.
+2. **nginx's record in exactly this code path.** nginx only gained HTTP/2 to an origin in **1.29.4
+   (09 Dec 2025)** — `CHANGES:233` — and has since shipped **two memory-safety CVEs in it**:
+   CVE-2026-42055 (heap buffer overflow proxying a crafted request to an HTTP/2 **or gRPC** backend,
+   1.30.3) and CVE-2026-42926 (`proxy_set_body` data injection into an HTTP/2 backend, 1.30.1).
+   Two in eighteen months, in a codebase with more hardening than anything else on the internet.
+   Framing code gets its own step with its own test story.
+
+**What it needs, concretely:** the listener already speaks h2 with ALPN and prior knowledge both
+proven (the row at *What actually works today*); a gRPC route is `/pkg.Service/Method`, which
+`path_prefix` already expresses; **trailers end to end**; h2 multiplexing, so a stream is handed to a
+backend as a stream rather than as a pool slot; and `.proto` descriptors for routing and reflection,
+which is the heaviest single piece (`prost-build`/`protox`) and a new config surface.
+
+**The trigger that should make someone start it:** a real application that wants to *serve* gRPC, as
+opposed to a runtime that wants to *call* gRPC services — the latter is `upstream`'s job and works
+today. Recorded so the answer is "here is the design", not silence.
+
+### Observability — a new step, added because the answer was thin
+
+`init_tracing` (`main.rs:144`) is `EnvFilter` + `fmt` and nothing else; there are **no spans anywhere**
+(zero `#[instrument]`, `span!`, `Span` across every crate) and **no access log** — the only per-request
+data is atomic counters read once for the shutdown summary. The signal path additionally uses
+`eprintln!` (`main.rs:1230`, `main.rs:1233`), which bypasses `tracing` and is exactly the line that
+breaks once logging is provider-based.
+
+**nginx's way is the target, and it is cheaper than it sounds.** nginx has no tracing framework:
+`$request_id` is 16 random bytes hex-dumped to 32 chars (`ngx_http_variables.c:2298`), and
+`$request_time`/`$msec`/`$bytes_sent`/`$status`/`$upstream_response_time` are variables
+(`ngx_http_variables.c:288–373`) that `ngx_http_log_module.c` interpolates into an operator-chosen
+format. One id, two timings, both on one line, correlated afterwards. Only OTLP export needs a
+framework; a structured request line and W3C `traceparent` propagation do not.
+
+**The user chose the core first and OTel as a layer on top of it**, and the reason is not caution:
+OpenTelemetry exports *spans*, this server has no spans and no request identity, and adopting it first
+would mean wiring an exporter to nothing. `temp/plan-tracing.md` carries the six-commit sub-plan.
+Two findings from writing it are worth recording here: `traceparent` **already reaches PHP and
+origins unchanged** (`to_cgi` maps it to `HTTP_TRACEPARENT` and it is in neither strip list), so the
+work is generating and adopting the id rather than forwarding it; and OTLP/**HTTP** (port 4318) avoids
+`tonic`/`prost` entirely, which matters in a lockfile that contains neither — RoadRunner defaults to
+`client: http` for the same reason.
+
 **Why the multiplexing refusal is written down rather than left implicit:** it is the question an
 async-runtime user asks first, and the answer that satisfies them is not multiplexing. An async
 runtime does not lack the *ability* to handle concurrent requests — `Node`'s event loop is the whole

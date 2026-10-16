@@ -294,14 +294,6 @@ pub fn connection_named(headers: &hyper::HeaderMap) -> Vec<hyper::header::Header
     named
 }
 
-/// Whether an `origin` string is one this build can dial at all.
-///
-/// Used by configuration validation, so a bad origin is refused at startup rather than becoming a
-/// 502 on the first request.
-pub fn validate_origin(spec: &str) -> Result<Origin> {
-    Origin::parse(spec)
-}
-
 /// The body a streamed inbound request carries, re-exported so a caller can name it without
 /// depending on `hyper` directly.
 pub type IncomingBody = hyper::body::Incoming;

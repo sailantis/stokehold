@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{BackendConfig, Config};
+use crate::config::{BackendConfig, Config, OriginSpec};
 use crate::program::{resolve_program, split_command};
 
 /// One thing that is probably not what the operator meant.
@@ -316,6 +316,42 @@ fn inspect_programs(config: &Config, warnings: &mut Vec<Warning>) {
                             "start php-fpm before serving, or ignore this if it starts first",
                         ));
                     }
+                }
+            }
+            BackendConfig::Upstream(upstream) => {
+                // A unix socket is checked the same way the `external` backend's is, and for the
+                // same reason: a missing one is the common cause of a first-request 502, and it is
+                // cheap to notice. A malformed origin is *not* reported here — `Config::validate`
+                // refuses it outright, so repeating it as a warning would be a weaker second
+                // answer to a question already answered.
+                let Ok(origin) = OriginSpec::parse(&upstream.origin, upstream.tls.clone()) else {
+                    continue;
+                };
+                if let Some(path) = origin.socket_path() {
+                    if !path.exists() {
+                        warnings.push(Warning::with_hint(
+                            format!(
+                                "backends.{name}: nothing is listening on {} yet",
+                                upstream.origin
+                            ),
+                            "start the application before serving, or ignore this if it starts \
+                             first",
+                        ));
+                    }
+                }
+                // The one thing an origin cannot state about itself, and the reason this is a
+                // warning rather than silence: an operator who wrote `http://` for a hop that
+                // crosses a network has made a security decision, possibly without noticing it.
+                // Loopback and a socket are excluded, because neither leaves the host.
+                if !origin.is_tls() && !origin.is_local() {
+                    warnings.push(Warning::with_hint(
+                        format!(
+                            "backends.{name}: {:?} sends the request in clear text to another host",
+                            upstream.origin
+                        ),
+                        "use `https://` if this hop crosses a network you do not control; \
+                         `http://` is fine for a loopback address or a unix socket",
+                    ));
                 }
             }
         }
@@ -742,6 +778,113 @@ key = "shop.key"
         assert!(
             tls_warnings(&warnings).is_empty(),
             "a deployment with no TLS must not be warned about TLS: {warnings:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The upstream backend's two filesystem-adjacent checks.
+    // -----------------------------------------------------------------------
+
+    /// A plaintext origin on another host is the one thing an operator may not have noticed.
+    ///
+    /// The counterpart to a missing socket: it is not a mistake `Config::validate` can see,
+    /// because `http://10.0.0.5:3000` is a perfectly well-formed origin. What makes it worth
+    /// saying is that a hop crossing a network in clear text is a *security decision*, and the
+    /// configuration does not otherwise say so anywhere.
+    #[test]
+    fn a_plaintext_origin_on_another_host_is_reported() {
+        let root = Fixture::new("upstream-plaintext");
+        root.write("index.php");
+        let text = r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:8080"
+[backends.node]
+kind = "upstream"
+origin = "http://10.0.0.5:3000"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let warnings = inspect(&config, root.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains("clear text"), "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("10.0.0.5"),
+            "the message must name the origin at fault: {warnings:?}"
+        );
+        assert!(
+            warnings[0]
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("https://")),
+            "the hint must name the fix: {warnings:?}"
+        );
+    }
+
+    /// A loopback origin, a socket and a TLS origin are all silent.
+    ///
+    /// The three ways a hop can be fine, asserted together because the rule is one rule: it is
+    /// *crossing a network* that is worth a word, and none of these does. A check that warned on
+    /// all of them would be noise an operator learns to skip.
+    #[test]
+    fn a_local_or_tls_origin_is_not_warned_about() {
+        let root = Fixture::new("upstream-local");
+        root.write("index.php");
+
+        let local = r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:8080"
+[backends.node]
+kind = "upstream"
+origin = "http://127.0.0.1:3000"
+"#;
+        // `10.0.0.5` with TLS: across a network, but encrypted, so there is nothing to say.
+        let tls = r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:8080"
+[backends.node]
+kind = "upstream"
+origin = "https://10.0.0.5:8443"
+"#;
+        for (label, text) in [("loopback", local), ("tls", tls)] {
+            let config = Config::from_toml(text).expect("parses");
+            let warnings = inspect(&config, root.path());
+            assert!(
+                !warnings.iter().any(|w| w.message.contains("clear text")),
+                "{label} must not be warned about: {warnings:?}"
+            );
+        }
+    }
+
+    /// A unix-socket origin whose socket is not there is reported, exactly as the
+    /// `external` backend's is.
+    ///
+    /// The same courtesy for the same reason: a missing local socket is the common cause of a
+    /// first-request 502, and it is cheap to notice before the listener binds.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_upstream_socket_is_reported() {
+        let root = Fixture::new("upstream-socket");
+        root.write("index.php");
+        let socket = root.path().join("nothing-here.sock");
+        let text = format!(
+            r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:8080"
+[backends.node]
+kind = "upstream"
+origin = "unix:{}"
+"#,
+            socket.display()
+        );
+        let config = Config::from_toml(&text).expect("parses");
+        let warnings = inspect(&config, root.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("nothing is listening"),
+            "{warnings:?}"
         );
     }
 }

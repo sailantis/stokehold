@@ -215,6 +215,34 @@ socket = "unix:/run/php/php-fpm.sock"
 # socket = "unix:/run/volucer-fpm.sock"
 
 # ---------------------------------------------------------------------------
+# HTTP upstream: a runtime that already owns its HTTP loop (Node, Python, Go)
+# is reached at its own address and the request is relayed to it. This is not a
+# CGI backend: there is no environment to build and no protocol to speak, only
+# an HTTP request passed on. The path is handed over as the URL, so the origin
+# does its own routing -- a route to one skips volucer's `stat` for the same
+# reason a worker's does.
+#
+# Reachable over HTTP only, and `server.http` must be set. A Windows named pipe
+# is not supported: the HTTP client has no pipe transport.
+# ---------------------------------------------------------------------------
+# [backends.node]
+# kind = "upstream"
+# origin = "http://127.0.0.1:3000"
+#
+# A unix socket instead of a loopback port, where the platform has them. Strictly
+# less exposed than TCP: there is no address for a stray process to connect to.
+# origin = "unix:/run/node.sock"
+#
+# An `https:` origin is supported and always verified -- there is no
+# `verify = false`, because a hop that looks encrypted and checks nothing is
+# worse than a plaintext one. `ca` absent means the public roots, which is right
+# for a publicly-trusted origin and wrong for an internal service.
+# origin = "https://node.internal:8443"
+# [backends.node.tls]
+# ca = "/etc/ssl/internal-ca.pem"   # absent = the public roots
+# sni = "node.internal"             # optional; defaults to the origin's host
+
+# ---------------------------------------------------------------------------
 # Routes. The most specific matching route wins: a route stating both a host and
 # a path beats one stating only a path, and ties go to the earlier entry. A
 # request that matches no route goes to default_backend.

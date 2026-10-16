@@ -133,7 +133,7 @@ fn version() {
         "  php floor:        {}",
         volucer_server::MINIMUM_PHP_VERSION
     );
-    println!("  backends:         worker, external fpm, spawn_cgi");
+    println!("  backends:         worker, external fpm, spawn_cgi, upstream");
     // ACME is advertised only as *available*, because whether it is in use is a property of the
     // configuration rather than of the build — `volucer check` is where a deployment's own answer
     // is printed. Saying "TLS-ALPN-01" rather than "ACME" matters: it is the one challenge this
@@ -1583,30 +1583,43 @@ fn check(
         println!("    {name}: {}{default}", backend.kind().replace('_', "-"));
         println!(
             "      per-request reset: {}",
-            if backend.resets_per_request() {
-                "yes (PHP SAPI)"
-            } else {
-                "no (application-scoped worker)"
-            }
+            backend.request_scope().describe()
         );
+        // Stated rather than discovered, and only while it is true: this build can describe,
+        // validate and check an origin, but the HTTP front-end has no request path for one yet, so
+        // `serve` refuses. Without this line `check` would answer "configuration OK" for a
+        // configuration that cannot start, which is the one thing this command must not do. The
+        // line goes away in the commit that adds the request path.
+        if matches!(backend, volucer_core::config::BackendConfig::Upstream(_)) {
+            println!(
+                "      not served yet:    this build has no request path for an upstream, so \
+                 `serve` will refuse it"
+            );
+        }
     }
 
     // A route is printed as the three matchers it can state, with `skip_stat` where it
     // applies — the saving is real and an operator should be able to see where the
     // router is still checking the filesystem and where it has stopped.
-    let print_route = |route: &volucer_core::config::RouteConfig, worker: bool, indent: &str| {
-        let host = route.host.as_deref().unwrap_or("*");
-        let prefix = route.path_prefix.as_deref().unwrap_or("*");
-        let suffix = route.path_suffix.as_deref().unwrap_or("*");
-        println!("{indent}{host}{prefix}…{suffix} -> {}", route.backend);
-        if volucer_core::config::skip_stat(route, worker) {
-            println!("{indent}  stat: skipped (the pattern proves the extension)");
-        }
-    };
-    let is_worker = |name: &str| {
-        config.backends.get(name).is_some_and(|backend| {
-            matches!(backend, volucer_core::config::BackendConfig::Worker(_))
-        })
+    let print_route =
+        |route: &volucer_core::config::RouteConfig, interprets_path: bool, indent: &str| {
+            let host = route.host.as_deref().unwrap_or("*");
+            let prefix = route.path_prefix.as_deref().unwrap_or("*");
+            let suffix = route.path_suffix.as_deref().unwrap_or("*");
+            println!("{indent}{host}{prefix}…{suffix} -> {}", route.backend);
+            if volucer_core::config::skip_stat(route, interprets_path) {
+                println!("{indent}  stat: skipped (the pattern proves the extension)");
+            }
+        };
+    // Whether the backend reads the path as a file to execute. A worker does not, and neither does
+    // an upstream — so both skip the router's `stat`, which is why this asks the question that way
+    // round rather than asking "is it a worker". A name that selects nothing is treated as
+    // interpreting the path: a backend that is not there cannot vouch for the safety of skipping.
+    let interprets_path = |name: &str| {
+        config
+            .backends
+            .get(name)
+            .is_none_or(volucer_core::config::BackendConfig::interprets_path)
     };
 
     println!("  routes:");
@@ -1614,7 +1627,7 @@ fn check(
         println!("    (none: every request goes to the default backend)");
     }
     for route in &config.routes {
-        print_route(route, is_worker(&route.backend), "    ");
+        print_route(route, interprets_path(&route.backend), "    ");
     }
 
     println!("  sites:");
@@ -1639,7 +1652,7 @@ fn check(
         if let Some(routes) = &site.routes {
             println!("      routes:");
             for route in routes {
-                print_route(route, is_worker(&route.backend), "        ");
+                print_route(route, interprets_path(&route.backend), "        ");
             }
         }
         if let Some(backend) = &site.default_backend {

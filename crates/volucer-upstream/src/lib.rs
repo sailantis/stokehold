@@ -36,3 +36,9 @@ pub use client::{UpstreamClient, UpstreamRequest, UpstreamResponse};
 pub use error::{Result, UpstreamError};
 pub use origin::{Origin, UpstreamTls};
 pub use translate::{prepare_request, translate_response};
+
+/// The configuration model's checked origin, re-exported.
+///
+/// So a caller that has an `Origin` can name the type it was built from without depending on
+/// `volucer-core` as well, and so the two halves of "what an origin may be" travel together.
+pub use volucer_core::config::OriginSpec;

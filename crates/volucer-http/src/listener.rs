@@ -1114,7 +1114,7 @@ async fn prepare(
         volucer_core::config::select_route(&site.routes, host, path)
     };
     let skips_stat = route.is_some_and(|route| {
-        volucer_core::config::skip_stat(route, front_end.dispatcher.is_worker(&route.backend))
+        volucer_core::config::skip_stat(route, front_end.dispatcher.interprets_path(&route.backend))
     });
 
     // Everything from here on blocks: routing stats the filesystem to resolve

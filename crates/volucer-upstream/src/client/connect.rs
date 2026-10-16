@@ -124,19 +124,19 @@ fn client_config(origin: &Origin, tls: &UpstreamTls) -> Result<Arc<ClientConfig>
     // so a chain that does not reach `roots` fails the handshake. Deliberate — see the crate docs.
     //
     // The verification *name* is checked here rather than at connect time: a typo in `sni` is a
-    // configuration mistake, and a configuration mistake belongs at startup.
-    if tls.sni.is_some() {
-        hello_name(origin, tls)?;
-    } else {
-        let host = origin
-            .authority()
-            .map(|authority| authority.host().to_string())
-            .unwrap_or_default();
-        ServerName::try_from(host.clone()).map_err(|source| UpstreamError::InvalidOrigin {
-            origin: host,
-            reason: format!("the origin's host is not a name a certificate can carry: {source}"),
+    // configuration mistake, and a configuration mistake belongs at startup. The check is the same
+    // one `hello_name` will make, asked of the resolved name so an IPv6 literal is unbracketed
+    // before rustls sees it.
+    let name = origin
+        .verification_name()
+        .ok_or_else(|| UpstreamError::InvalidOrigin {
+            origin: origin.host_port().unwrap_or_default(),
+            reason: "there is no name to verify the origin's certificate against".to_string(),
         })?;
-    }
+    ServerName::try_from(name.clone()).map_err(|source| UpstreamError::InvalidOrigin {
+        origin: name,
+        reason: format!("the origin's host is not a name a certificate can carry: {source}"),
+    })?;
     Ok(Arc::new(config))
 }
 
@@ -237,19 +237,19 @@ impl tower_service::Service<Uri> for Connector {
 /// Dial the origin, handshaking when it is `https:`.
 async fn dial(inner: &Inner) -> Result<ConnIo> {
     match &inner.origin {
-        Origin::Network { base, tls: None } => {
-            let stream = TcpStream::connect(host_port(base)).await?;
+        Origin::Network { tls: None, .. } => {
+            let stream = TcpStream::connect(host_port(&inner.origin)).await?;
             // Set once per *connection*, not per request: the pool reuses this for many requests,
             // and a small request behind Nagle's algorithm is a latency bug.
             let _ = stream.set_nodelay(true);
             Ok(ConnIo(Box::new(stream)))
         }
-        Origin::Network { base, tls: Some(_) } => {
+        Origin::Network { tls: Some(_), .. } => {
             let config = inner
                 .tls
                 .clone()
                 .expect("a TLS origin was built with a config");
-            let stream = TcpStream::connect(host_port(base)).await?;
+            let stream = TcpStream::connect(host_port(&inner.origin)).await?;
             let _ = stream.set_nodelay(true);
 
             let settings = inner.origin.tls().expect("a TLS origin has settings");
@@ -278,39 +278,23 @@ async fn dial(inner: &Inner) -> Result<ConnIo> {
     }
 }
 
-fn host_port(base: &Uri) -> String {
-    let host = base.host().unwrap_or("127.0.0.1");
-    match base.port_u16() {
-        Some(port) => format!("{host}:{port}"),
-        None => {
-            let port = if base.scheme_str() == Some("https") {
-                443
-            } else {
-                80
-            };
-            format!("{host}:{port}")
-        }
-    }
+fn host_port(origin: &Origin) -> String {
+    // Resolved by the configuration model, so a port-less origin dials its scheme's default rather
+    // than a string that happens to contain no colon.
+    origin
+        .host_port()
+        .unwrap_or_else(|| "127.0.0.1:80".to_string())
 }
 
 /// The name the origin's certificate is verified against.
 fn hello_name(origin: &Origin, tls: &UpstreamTls) -> Result<ServerName<'static>> {
-    let name = match &tls.sni {
-        Some(sni) => sni.clone(),
-        None => origin
-            .authority()
-            .map(|authority| authority.host().to_string())
-            .unwrap_or_default(),
-    };
-    if name.is_empty() {
-        return Err(UpstreamError::InvalidOrigin {
-            origin: origin
-                .authority()
-                .map(|authority| authority.as_str().to_string())
-                .unwrap_or_default(),
+    let name = origin
+        .verification_name()
+        .ok_or_else(|| UpstreamError::InvalidOrigin {
+            origin: origin.host_port().unwrap_or_default(),
             reason: "there is no name to verify the origin's certificate against".to_string(),
-        });
-    }
+        })?;
+    let _ = tls;
     ServerName::try_from(name.clone()).map_err(|source| UpstreamError::InvalidOrigin {
         origin: name,
         reason: format!("it is not a name a certificate can carry: {source}"),

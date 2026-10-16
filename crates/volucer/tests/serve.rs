@@ -1185,6 +1185,108 @@ default_backend = "cgi"
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// An upstream route skips the `stat`, and the per-request-reset line describes it honestly.
+///
+/// Both are *silent* failures: neither is a compile error, and each is a place the new backend
+/// kind is accepted and then described wrongly. The `stat` one has a real consequence — an upstream
+/// routes on the URL its own way, so volucer resolving the path to a script would check a file
+/// nothing reads, and a path naming no file would be a 404 for a request the origin wanted.
+///
+/// Asserted through `check` rather than through the function, because the question the bug asked is
+/// "what does an operator see", and because `check` is where the two readers of these rules meet.
+#[test]
+fn check_describes_an_upstream_and_skips_the_stat_for_its_routes() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-check-upstream-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let config_path = root.join("volucer.toml");
+    let config = format!(
+        r#"
+default_backend = "node"
+
+[server]
+http = "127.0.0.1:8080"
+document_root = {root}
+
+[backends.node]
+kind = "upstream"
+origin = "http://127.0.0.1:3000"
+
+[backends.cgi]
+kind = "spawn_cgi"
+binary = 'C:\php\php-cgi.exe'
+
+# A prefix route: it proves nothing about the extension, so a *CGI* backend keeps the stat.
+[[routes]]
+path_prefix = "/legacy"
+backend = "cgi"
+
+# The same shape pointed at the upstream: the path is the origin's business, so no stat.
+[[routes]]
+path_prefix = "/api"
+backend = "node"
+"#,
+        root = toml_string(&root.display().to_string()),
+    );
+    std::fs::write(&config_path, config).expect("write the config");
+
+    let output = Command::new(&binary)
+        .arg("check")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("the check command runs");
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    // 1. The kind is named, and the reset line does not claim either of the two things that
+    //    existed before it.
+    assert!(text.contains("node: upstream"), "{text}");
+    assert!(
+        text.contains("per-request reset: not applicable"),
+        "an upstream owns its own request scope, and neither of the two older answers is true \
+         of it: {text}"
+    );
+    // And the one thing `check` must never do: call a configuration good that `serve` will refuse.
+    assert!(
+        text.contains("not served yet"),
+        "`check` must not answer \"configuration OK\" for a kind this build refuses to serve: {text}"
+    );
+
+    // 2. `/api` skips the stat, `/legacy` does not — the contrast is what makes this a test of
+    //    the rule rather than of the word "skipped" appearing somewhere.
+    let route_line = |prefix: &str, backend: &str| {
+        text.lines()
+            .position(|line| line.contains(prefix) && line.contains(&format!("-> {backend}")))
+            .unwrap_or_else(|| panic!("the {prefix} route is printed: {text}"))
+    };
+    let api = route_line("/api", "node");
+    assert!(
+        text.lines()
+            .nth(api + 1)
+            .unwrap_or("")
+            .contains("stat: skipped"),
+        "an upstream does not read the path, so a route to one must skip the stat: {text}"
+    );
+    let legacy = route_line("/legacy", "cgi");
+    assert!(
+        !text
+            .lines()
+            .nth(legacy + 1)
+            .unwrap_or("")
+            .contains("stat: skipped"),
+        "a prefix route to a CGI backend proves nothing about the extension, so the stat stays: \
+         {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Send a signal to a running server, on a platform that has that signal.
 ///
 /// `None` on Windows, where the test is skipped with a reason rather than failing: there is no

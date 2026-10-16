@@ -29,7 +29,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use volucer_upstream::{Origin, UpstreamClient, UpstreamRequest, UpstreamTls};
+use volucer_upstream::{Origin, OriginSpec, UpstreamClient, UpstreamRequest, UpstreamTls};
 
 /// Make the crypto provider available, as every rustls entry point needs.
 ///
@@ -191,10 +191,11 @@ fn request() -> UpstreamRequest<Empty<Bytes>> {
 }
 
 fn https_origin(address: SocketAddr, tls: Option<UpstreamTls>) -> Origin {
-    Origin::Network {
-        base: format!("https://{address}").parse().expect("a URL"),
-        tls,
-    }
+    // Through the configuration model's parser rather than by building the variant, so a test
+    // client is wired the same way a deployment's is — and so it cannot express an origin no
+    // configuration could produce.
+    let spec = OriginSpec::parse(&format!("https://{address}"), tls).expect("a usable origin");
+    Origin::from_spec(&spec).expect("a usable origin")
 }
 
 #[tokio::test]

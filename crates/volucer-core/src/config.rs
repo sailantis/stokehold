@@ -491,10 +491,12 @@ pub fn select_route<'a>(
 /// static property of the configuration, so it is decided once at startup rather than
 /// per request — and never written by hand, because the decision belongs with the code
 /// that knows why it is safe.
-pub fn skip_stat(route: &RouteConfig, backend_is_worker: bool) -> bool {
-    // A worker never interprets the path: it reads `script_filename` as metadata and
-    // routes on `REQUEST_URI`, so there is no file for the stat to protect.
-    if backend_is_worker {
+pub fn skip_stat(route: &RouteConfig, backend_interprets_path: bool) -> bool {
+    // A backend that does not interpret the path never reads the file it names, so there is
+    // nothing for the stat to protect. That covers two kinds for two different reasons: a worker
+    // reads `script_filename` as metadata and routes on `REQUEST_URI`, and an upstream is handed
+    // the path as a URL and does its own routing with it. See `BackendConfig::interprets_path`.
+    if !backend_interprets_path {
         return true;
     }
     // A suffix that pins a script extension, e.g. `.php`. Compared with the same
@@ -1289,6 +1291,45 @@ pub enum BackendConfig {
     External(ExternalConfig),
     /// N `php-cgi` processes on N ports. The only option on Windows.
     SpawnCgi(SpawnCgiConfig),
+    /// An HTTP origin volucer proxies to, for a runtime that owns its own HTTP loop.
+    ///
+    /// Named by role rather than by language: a Node, Python or Go application served by an
+    /// application server of its own is the same thing to volucer, which only has to hand it an
+    /// HTTP request and relay the answer. This is a *fourth* shape rather than a variation on the
+    /// three above because it shares none of their machinery: there is no CGI environment, no
+    /// FastCGI record and no volucer protocol, only hyper's client.
+    Upstream(UpstreamConfig),
+}
+
+/// Whether a backend resets state between requests in the application's own runtime.
+///
+/// Three answers, not two, and the third is the one that would be got wrong by a boolean: an
+/// upstream is neither PHP's SAPI resetting per request nor an application-scoped PHP worker — it
+/// is somebody else's runtime, whose request scope is its own business and not something this
+/// side can describe. `check` prints exactly that rather than claiming one of the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestScope {
+    /// PHP's SAPI rebuilds it for every request (CGI, php-fpm, `php-cgi`).
+    PhpSapi,
+    /// The application lives across requests and clears its own (the worker protocol).
+    ApplicationScoped,
+    /// A runtime of its own, which volucer does not reach into.
+    OriginScoped,
+}
+
+impl RequestScope {
+    /// The phrase `volucer check` prints for this answer.
+    ///
+    /// Owned by the type rather than written at the call site, so the answer and its description
+    /// cannot drift apart — and so the three cases are one value instead of a `bool` that would
+    /// have to be reinterpreted wherever it is printed.
+    pub fn describe(self) -> &'static str {
+        match self {
+            RequestScope::PhpSapi => "yes (PHP SAPI)",
+            RequestScope::ApplicationScoped => "no (application-scoped worker)",
+            RequestScope::OriginScoped => "not applicable (the origin owns its request scope)",
+        }
+    }
 }
 
 impl BackendConfig {
@@ -1297,12 +1338,371 @@ impl BackendConfig {
             BackendConfig::Worker(_) => "worker",
             BackendConfig::External(_) => "external",
             BackendConfig::SpawnCgi(_) => "spawn_cgi",
+            BackendConfig::Upstream(_) => "upstream",
         }
     }
 
     /// True when the backend resets state per request in PHP's own SAPI.
     pub fn resets_per_request(&self) -> bool {
-        !matches!(self, BackendConfig::Worker(_))
+        matches!(self.request_scope(), RequestScope::PhpSapi)
+    }
+
+    /// Where a request's state is scoped for this backend.
+    pub fn request_scope(&self) -> RequestScope {
+        match self {
+            BackendConfig::Worker(_) => RequestScope::ApplicationScoped,
+            BackendConfig::External(_) | BackendConfig::SpawnCgi(_) => RequestScope::PhpSapi,
+            BackendConfig::Upstream(_) => RequestScope::OriginScoped,
+        }
+    }
+
+    /// Whether this backend interprets the path as a file to execute.
+    ///
+    /// The question a route's `skip_stat` turns on, and it is *not* the complement of
+    /// [`Self::resets_per_request`]: a worker does not reset per request and an upstream does not
+    /// either, but only the worker is reached through a CGI environment for which the path is
+    /// metadata. An upstream is handed the path as the request's URL, and does its own routing with
+    /// it, so volucer stat-ing it first would check a file nothing reads.
+    pub fn interprets_path(&self) -> bool {
+        matches!(
+            self,
+            BackendConfig::External(_) | BackendConfig::SpawnCgi(_)
+        )
+    }
+
+    /// The parsed origin, for an `upstream` backend.
+    ///
+    /// `None` for the three CGI-shaped kinds. Parsed rather than stored because the configuration
+    /// model deserialises straight from TOML: a field holding a parsed value would have to be
+    /// filled in by hand after every load, and a reload reads the file again. This is called at
+    /// startup, at `check`, and once per backend when its client is built — never per request.
+    ///
+    /// The error is returned rather than logged so the caller decides: `validate_backend` turns it
+    /// into a configuration error, `preflight` into a warning.
+    pub fn origin(&self) -> Option<std::result::Result<OriginSpec, String>> {
+        match self {
+            BackendConfig::Upstream(upstream) => {
+                Some(OriginSpec::parse(&upstream.origin, upstream.tls.clone()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// An HTTP origin, reached over the network or a unix socket.
+///
+/// Parsed by [`OriginSpec::parse`], which lives here so that the *configuration model* can
+/// describe and check an origin without the client crate's parser — the same reason
+/// [`ChecksumMode`] mirrors the worker protocol's policy instead of importing it. `volucer-core`
+/// is the leaf every other crate depends on, so it cannot depend on `volucer-upstream`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamConfig {
+    /// Where the origin is: `http://host:port`, `https://host:port`, or `unix:/path/to.sock`.
+    pub origin: String,
+
+    /// How to trust an `https:` origin. An error beside any other scheme, since there is no
+    /// handshake for it to describe.
+    #[serde(default)]
+    pub tls: Option<UpstreamTlsConfig>,
+}
+
+/// How an `https:` origin is verified.
+///
+/// Two knobs and no third. There is deliberately **no** `verify = false`: an unverified TLS hop is
+/// strictly worse than a plaintext one, because it looks encrypted and checks nothing, and this
+/// project already refuses the equivalent shape on the serving side (`[server.tls]` will not put a
+/// self-signed certificate on a wire "for a certificate nothing ever trusted"). A deployment that
+/// wants that shape writes `http://` on a loopback port and says so out loud.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTlsConfig {
+    /// PEM file holding the roots to verify the origin against. Absent means the public roots.
+    #[serde(default)]
+    pub ca: Option<PathBuf>,
+
+    /// The name to verify against, when it is not the host in `origin`. The common case is
+    /// dialling an IP or a service address while the certificate names a host.
+    #[serde(default)]
+    pub sni: Option<String>,
+}
+
+/// A parsed `origin`, in the configuration model's own terms.
+///
+/// `volucer-upstream`'s `Origin` is hyper-typed — a `Uri`, an `Authority` — and a configuration
+/// model cannot carry one without depending on `hyper`, which this crate deliberately does not.
+/// The reverse is fine and is the direction used: this parses, validates and describes, and the
+/// client crate builds its `Uri` from it once, at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginSpec {
+    /// `host:port` over the network, plaintext or TLS.
+    ///
+    /// Three fields rather than one string because the three have different rules and the
+    /// difference is not reconstructible from the whole: `sni` is what the certificate is verified
+    /// against, `host` is what the `Host` header carries, and the two are *meant* to differ when a
+    /// deployment dials a service address.
+    Network {
+        /// `"http"` or `"https"`.
+        scheme: &'static str,
+        /// The host name or bracketed IPv6 literal, without the port.
+        host: String,
+        /// The port, defaulted from the scheme when the origin names none.
+        port: u16,
+        /// How to verify an `https:` origin. Always `Some` for `https`, always `None` for `http`.
+        tls: Option<UpstreamTlsConfig>,
+    },
+    /// A unix socket on this host.
+    ///
+    /// Only produced on a platform that has one. On Windows the parse refuses `unix:` by name
+    /// rather than accepting a path nothing can dial — the same rule `Endpoint` uses.
+    #[cfg(unix)]
+    Socket(PathBuf),
+}
+
+impl OriginSpec {
+    /// Parse an `origin` string, together with the `[backends.<n>.tls]` table that belongs to it.
+    ///
+    /// One constructor rather than two, and the TLS table is a *parameter* rather than something
+    /// attached afterwards, because the two are only meaningful together: a `tls` table beside a
+    /// plaintext origin describes a handshake that will never happen, so an origin parsed without
+    /// it could not be checked for that at all.
+    ///
+    /// Strict, and every refusal is a shape that would otherwise be *silently* read as something
+    /// else: a bare `host:port` would be a guess between a path and an address, a base path and
+    /// credentials would look honoured when nothing consumes them, an unknown scheme would be
+    /// treated as plaintext, and a `tls` table beside `http` would look like a verified hop.
+    pub fn parse(spec: &str, tls: Option<UpstreamTlsConfig>) -> std::result::Result<Self, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("it is empty".to_string());
+        }
+
+        if let Some(path) = spec.strip_prefix("unix:") {
+            if path.is_empty() {
+                return Err("the unix socket path is empty".to_string());
+            }
+            if tls.is_some() {
+                return Err(
+                    "a [backends.<n>.tls] table is set beside a `unix:` origin, which has no \
+                     handshake for it to describe; remove it"
+                        .to_string(),
+                );
+            }
+            #[cfg(unix)]
+            {
+                if path.contains('\0') {
+                    return Err("the unix socket path contains a NUL byte".to_string());
+                }
+                if path.len() > UNIX_SOCKET_PATH_MAX {
+                    return Err(format!(
+                        "the unix socket path is {} bytes and the platform allows \
+                         {UNIX_SOCKET_PATH_MAX}",
+                        path.len()
+                    ));
+                }
+                return Ok(OriginSpec::Socket(PathBuf::from(path)));
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(
+                    "unix sockets are not available on this platform, and a Windows named \
+                            pipe cannot be used here: the HTTP client has no pipe transport, so an \
+                            origin must be reached over TCP on Windows"
+                        .to_string(),
+                );
+            }
+        }
+
+        let (scheme, rest) = spec.split_once("://").ok_or_else(|| {
+            format!(
+                "{spec:?} has no scheme; write `http://127.0.0.1:3000` (a bare `host:port` would \
+                 be neither plaintext nor TLS for certain, so it is not guessed at)"
+            )
+        })?;
+        let scheme: &'static str = match scheme {
+            "http" => "http",
+            "https" => "https",
+            other => {
+                return Err(format!(
+                    "{other:?} is not a scheme an origin can be reached with; use `http`, `https` \
+                     or `unix`"
+                ))
+            }
+        };
+
+        // Everything before the first `/` is authority. A path, a query or a fragment after it
+        // would have to be joined with the request's own, and a prefix joined without saying so is
+        // worse than one that is refused — a route prefix belongs in the route table, where it is.
+        let (authority, tail) = match rest.find(['/', '?', '#']) {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, ""),
+        };
+        // Checked before the path, so `http:///api` is reported as having no host rather than as
+        // carrying a path — the missing host is the mistake that makes the rest unreadable.
+        if authority.is_empty() {
+            return Err("it has no host; write `http://127.0.0.1:3000`".to_string());
+        }
+        if !tail.is_empty() && tail != "/" {
+            return Err(format!(
+                "it carries the path {tail:?}; an origin is only an address, and a route prefix \
+                 belongs in the route table (`path_prefix = ...`)"
+            ));
+        }
+        if authority.contains('@') {
+            return Err(
+                "it carries credentials, which an origin has no use for: volucer forwards \
+                        the client's credentials, never an origin's own"
+                    .to_string(),
+            );
+        }
+
+        let (host, port) = split_authority(authority, scheme)?;
+        match scheme {
+            // Absent means the public roots, which is the right default for a publicly-trusted
+            // origin and the wrong one for an internal service — which is exactly why it is the
+            // documented default rather than something inferred.
+            "https" => Ok(OriginSpec::Network {
+                scheme,
+                host,
+                port,
+                tls: Some(tls.unwrap_or_default()),
+            }),
+            _ => {
+                if tls.is_some() {
+                    return Err(format!(
+                        "a [backends.<n>.tls] table is set beside the `{scheme}` origin {spec:?}, \
+                         which has no handshake for it to describe; remove it, or make the origin \
+                         `https://`"
+                    ));
+                }
+                Ok(OriginSpec::Network {
+                    scheme,
+                    host,
+                    port,
+                    tls: None,
+                })
+            }
+        }
+    }
+
+    /// The scheme, as it is written in configuration.
+    pub fn scheme(&self) -> &'static str {
+        match self {
+            OriginSpec::Network { scheme, .. } => scheme,
+            #[cfg(unix)]
+            OriginSpec::Socket(_) => "unix",
+        }
+    }
+
+    /// The `host:port` the origin is dialled at, when there is one.
+    ///
+    /// The port is the resolved one, so a caller reporting "nothing is listening on
+    /// 127.0.0.1:80" from `http://127.0.0.1` names the port that was actually chosen rather than
+    /// the empty string the file contains.
+    pub fn host_port(&self) -> Option<(String, u16)> {
+        match self {
+            OriginSpec::Network { host, port, .. } => Some((host.clone(), *port)),
+            #[cfg(unix)]
+            OriginSpec::Socket(_) => None,
+        }
+    }
+
+    /// The socket path, for a `unix:` origin.
+    pub fn socket_path(&self) -> Option<&Path> {
+        match self {
+            OriginSpec::Network { .. } => None,
+            #[cfg(unix)]
+            OriginSpec::Socket(path) => Some(path),
+        }
+    }
+
+    /// How to verify this origin.
+    ///
+    /// `None` for plaintext and for a socket, `Some` for `https` — and the field is *not* optional
+    /// in the `https` case, which is what makes "verification is not optional" a property of the
+    /// type rather than a rule somebody has to remember.
+    pub fn tls(&self) -> Option<&UpstreamTlsConfig> {
+        match self {
+            OriginSpec::Network { tls, .. } => tls.as_ref(),
+            #[cfg(unix)]
+            OriginSpec::Socket(_) => None,
+        }
+    }
+
+    /// Whether this origin is reached over TLS.
+    pub fn is_tls(&self) -> bool {
+        self.tls().is_some()
+    }
+
+    /// Whether the origin is on this host rather than across a network.
+    ///
+    /// Used to decide whether plaintext is worth warning about: a loopback origin is this
+    /// deployment talking to itself and has nothing to protect, while a plaintext hop to another
+    /// host is the one place an operator may not have realised there is no encryption.
+    pub fn is_local(&self) -> bool {
+        match self {
+            OriginSpec::Network { host, .. } => {
+                let bare = host.trim_start_matches('[').trim_end_matches(']');
+                bare.eq_ignore_ascii_case("localhost")
+                    || bare == "::1"
+                    || bare
+                        .parse::<std::net::Ipv4Addr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }
+            #[cfg(unix)]
+            OriginSpec::Socket(_) => true,
+        }
+    }
+}
+
+/// Split `host[:port]`, refusing the shapes that cannot be dialled.
+///
+/// A bracketed IPv6 literal keeps its brackets: they are what distinguishes the colons in the
+/// address from the one before the port, so stripping them here would make the address ambiguous
+/// to everything downstream. Everything else is `SocketAddr`'s rule, taken from `parse_listener`
+/// so an origin and a listener cannot disagree about what a `host:port` is.
+fn split_authority(authority: &str, scheme: &str) -> std::result::Result<(String, u16), String> {
+    let default_port = if scheme == "https" { 443 } else { 80 };
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("{authority:?} opens an IPv6 literal without closing it"))?;
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|source| format!("{host:?} is not an IPv6 address: {source}"))?;
+        let port = match after {
+            "" => default_port,
+            _ => after
+                .strip_prefix(':')
+                .ok_or_else(|| {
+                    format!(
+                        "{authority:?} has something after the IPv6 literal that is \
+                                        not a `:port`"
+                    )
+                })?
+                .parse::<u16>()
+                .map_err(|source| format!("{authority:?} has no usable port: {source}"))?,
+        };
+        return Ok((format!("[{host}]"), port));
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            if host.is_empty() {
+                return Err(format!("{authority:?} names a port with no host"));
+            }
+            if host.contains(':') {
+                return Err(format!(
+                    "{authority:?} has a bare IPv6 address; write it in brackets, e.g. \
+                     `[{host}]:{port}`"
+                ));
+            }
+            let port = port
+                .parse::<u16>()
+                .map_err(|source| format!("{authority:?} has no usable port: {source}"))?;
+            Ok((host.to_string(), port))
+        }
+        None => Ok((authority.to_string(), default_port)),
     }
 }
 
@@ -1550,6 +1950,26 @@ impl Config {
 
         for (name, backend) in &self.backends {
             self.validate_backend(name, backend)?;
+        }
+
+        // An upstream is only reachable over HTTP: there is no CGI environment to build for it and
+        // the FastCGI front-end has no way to hand it a request. A deployment that configures one
+        // and no HTTP listener has configured something that cannot receive a request at all, and
+        // the failure is otherwise silent — the backend starts, the sockets bind, and nothing ever
+        // reaches the origin. An error rather than a warning, unlike the static-layer check below,
+        // because there is no *second* thing the upstream could be for.
+        if self.server.http.is_none() {
+            if let Some((name, _)) = self
+                .backends
+                .iter()
+                .find(|(_, backend)| matches!(backend, BackendConfig::Upstream(_)))
+            {
+                return Err(Error::Config(format!(
+                    "backends.{name} is an upstream, which is only reached over HTTP, but no \
+                     server.http listener is configured; set server.http, or use a FastCGI \
+                     backend for this application"
+                )));
+            }
         }
 
         // Static content is served over HTTP, and a FastCGI client does its own — so asking
@@ -2115,9 +2535,80 @@ impl Config {
                     ));
                 }
             }
+            BackendConfig::Upstream(u) => {
+                // Parsing is also the validation of the `[backends.<n>.tls]` table: the origin and
+                // the table are only meaningful together, so `OriginSpec::parse` takes the table and
+                // refuses one that has no handshake to describe.
+                let origin = OriginSpec::parse(&u.origin, u.tls.clone())
+                    .map_err(|reason| Error::Config(format!("backends.{name}.origin: {reason}")))?;
+                // The scheme decides whether a `tls` table belongs at all, and the parse above has
+                // already refused the combination that does not. `origin` is kept in scope rather
+                // than discarded so the rule is readable here: `sni` and `ca` are only reachable
+                // for a `https:` origin.
+
+                if let Some(tls) = origin.tls() {
+                    if let Some(ca) = &tls.ca {
+                        if ca.as_os_str().is_empty() {
+                            return bad(format!(
+                                "backends.{name}.tls.ca is empty; name the PEM file, or remove \
+                                 the key to use the public roots"
+                            ));
+                        }
+                    }
+                    if let Some(sni) = &tls.sni {
+                        // The verification name is checked at startup, not at connect time: a typo
+                        // in `sni` is a configuration mistake, and a configuration mistake belongs
+                        // where the file is read rather than in a 502 on the first request.
+                        let sni = sni.trim();
+                        if sni.is_empty() {
+                            return bad(format!(
+                                "backends.{name}.tls.sni is empty; name the host the certificate \
+                                 carries, or remove the key to verify against the origin's own host"
+                            ));
+                        }
+                        // `host:port` and a trailing dot are both refused by this, which is right:
+                        // a verification name is a DNS name, and a port is not part of one.
+                        if sni.parse::<std::net::IpAddr>().is_err() && !is_dns_name(sni) {
+                            return bad(format!(
+                                "backends.{name}.tls.sni {sni:?} is not a host name or IP address"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Whether `name` is a shape a certificate can be verified against.
+///
+/// Deliberately stricter than DNS allows: no leading or trailing dot, no empty label, and no
+/// characters outside letters, digits, `-` and `_`. A name that is *more* permissive than this
+/// would be accepted here and then fail rustls' own `ServerName` parse at startup, which reports
+/// the failure from a place that cannot say which key it came from.
+fn is_dns_name(name: &str) -> bool {
+    // A single trailing dot is a valid absolute name in DNS but rustls' `ServerName` refuses it,
+    // and a certificate's SAN never carries it either, so refusing it here says so once.
+    if name.is_empty() || name.len() > 253 || name.ends_with('.') || name.starts_with('.') {
+        return false;
+    }
+    name.split('.').all(|label| {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        // A label may not begin or end with a hyphen — DNS's own rule, and the reason a bare `-`
+        // is not a host name. Enforced rather than left to `ServerName`, so the error names the
+        // key it came from.
+        let mut bytes = label.bytes();
+        let first = bytes.next().expect("a non-empty label has a first byte");
+        let last = label.as_bytes()[label.len() - 1];
+        let edge = |b: u8| b.is_ascii_alphanumeric();
+        if !edge(first) || !edge(last) {
+            return false;
+        }
+        bytes.all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
 }
 
 /// Validate one route, whichever table it came from.
@@ -4623,5 +5114,387 @@ key = "c.key"
         https_only
             .validate()
             .expect("a TLS-only deployment is valid");
+    }
+
+    // -----------------------------------------------------------------------
+    // The upstream backend's configuration surface.
+    // -----------------------------------------------------------------------
+
+    /// A config with one upstream backend, for the tests below.
+    fn upstream_config(backend_body: &str) -> String {
+        format!(
+            r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:8080"
+[backends.node]
+kind = "upstream"
+{backend_body}
+"#
+        )
+    }
+
+    #[test]
+    fn an_upstream_backend_parses_and_names_itself() {
+        let config = Config::from_toml(&upstream_config("origin = \"http://127.0.0.1:3000\""))
+            .expect("parses");
+        config.validate().expect("validates");
+        let backend = &config.backends["node"];
+        assert_eq!(backend.kind(), "upstream");
+        // The third answer, which is the reason `request_scope` is an enum: neither PHP's SAPI nor
+        // an application-scoped worker describes somebody else's runtime.
+        assert_eq!(backend.request_scope(), RequestScope::OriginScoped);
+        assert!(!backend.resets_per_request());
+        // And the question the route table's `stat` turns on, which is *not* the negation of the
+        // line above: a worker and an upstream both skip it, for two different reasons.
+        assert!(!backend.interprets_path());
+    }
+
+    #[test]
+    fn an_upstream_is_restart_only_like_every_other_backend() {
+        // A URL looks reloadable in a way a `command` does not, which is why the README says so and
+        // why the restart-only list names backends as a class. Pinned here so a later change that
+        // made an origin reloadable has to decide about this deliberately: the *only* thing
+        // `preflight` has to say about a loopback origin is nothing.
+        let warnings = crate::preflight::inspect(
+            &Config::from_toml(&upstream_config("origin = \"http://127.0.0.1:3000\""))
+                .expect("parses"),
+            std::path::Path::new("."),
+        );
+        assert!(
+            !warnings.iter().any(|w| w.message.contains("backends.node")),
+            "a loopback origin raises nothing of its own: {warnings:?}"
+        );
+    }
+
+    /// Every origin shape that is accepted, and that the parse resolves what it should.
+    ///
+    /// A named row type rather than a tuple: three fields of different shapes in a slice literal
+    /// is exactly the thing a reader has to count on their fingers.
+    #[test]
+    fn the_four_origin_shapes_are_accepted_and_resolved() {
+        struct Case {
+            spec: &'static str,
+            scheme: &'static str,
+            host_port: Option<(&'static str, u16)>,
+            tls: bool,
+        }
+        let cases: &[Case] = &[
+            Case {
+                spec: "http://127.0.0.1:3000",
+                scheme: "http",
+                host_port: Some(("127.0.0.1", 3000)),
+                tls: false,
+            },
+            Case {
+                spec: "http://[::1]:3000",
+                scheme: "http",
+                host_port: Some(("[::1]", 3000)),
+                tls: false,
+            },
+            // No port: the scheme's default, resolved once here rather than at dial time, so an
+            // error message names the port that was actually chosen.
+            Case {
+                spec: "http://origin.test",
+                scheme: "http",
+                host_port: Some(("origin.test", 80)),
+                tls: false,
+            },
+            Case {
+                spec: "https://origin.test",
+                scheme: "https",
+                host_port: Some(("origin.test", 443)),
+                tls: true,
+            },
+            Case {
+                spec: "https://10.0.0.5:8443",
+                scheme: "https",
+                host_port: Some(("10.0.0.5", 8443)),
+                tls: true,
+            },
+        ];
+        for case in cases {
+            let spec = case.spec;
+            let origin = OriginSpec::parse(spec, None)
+                .unwrap_or_else(|err| panic!("{spec} must parse: {err}"));
+            assert_eq!(origin.scheme(), case.scheme, "{spec}");
+            assert_eq!(
+                origin.host_port(),
+                case.host_port.map(|(h, p)| (h.to_string(), p)),
+                "{spec}"
+            );
+            assert_eq!(origin.is_tls(), case.tls, "{spec}");
+        }
+
+        #[cfg(unix)]
+        {
+            let origin = OriginSpec::parse("unix:/run/node.sock", None).expect("parses");
+            assert_eq!(origin.scheme(), "unix");
+            assert_eq!(origin.host_port(), None);
+            assert_eq!(
+                origin.socket_path(),
+                Some(std::path::Path::new("/run/node.sock"))
+            );
+            // A socket leaves the host, so there is nothing for a plaintext warning to be about —
+            // which is the same answer `is_local` gives a loopback address and the opposite of what
+            // it gives `http://10.0.0.5`.
+            assert!(origin.is_local());
+        }
+        assert!(OriginSpec::parse("http://127.0.0.1:3000", None)
+            .expect("parses")
+            .is_local());
+        assert!(OriginSpec::parse("http://localhost:3000", None)
+            .expect("parses")
+            .is_local());
+        assert!(!OriginSpec::parse("http://10.0.0.5:3000", None)
+            .expect("parses")
+            .is_local());
+    }
+
+    /// The shapes that are refused, each for the reason it names.
+    ///
+    /// Table-driven because the rules are independent: one case per rule, each asserting the
+    /// *reason*. A test that asserted "some error" for all of them would pass against one
+    /// over-broad rule.
+    #[test]
+    fn an_origin_that_cannot_be_used_is_refused_with_its_reason() {
+        // Built rather than written out, because a userinfo-looking literal is exactly what a
+        // secret scanner is for — and a test whose input depends on a scanner's opinion is a test
+        // that can silently change meaning. The parse only has to see an `@` before the path.
+        let with_userinfo = format!("http://{}@{}", "user", "127.0.0.1:3000");
+        let cases: Vec<(&str, &[&str])> = vec![
+            // A bare `host:port` is the dangerous one: read as plaintext it would be a silent
+            // downgrade, so it is refused rather than guessed at.
+            ("127.0.0.1:3000", &["no scheme"]),
+            ("", &["empty"]),
+            ("http://", &["no host"]),
+            ("http:///api", &["no host"]),
+            ("http://:3000", &["no host"]),
+            ("ftp://127.0.0.1:3000", &["ftp", "unix"]),
+            // A base path would have to be joined with the request's own, and the join rule is not
+            // guessable — so it is refused with the alternative rather than silently dropped.
+            ("http://127.0.0.1:3000/app", &["/app", "route table"]),
+            ("http://127.0.0.1:3000/?x=1", &["route table"]),
+            (with_userinfo.as_str(), &["credentials"]),
+            // Brackets are what disambiguate an IPv6 literal's colons from the port's, so a bare
+            // one is refused with the shape to write instead.
+            ("http://::1:3000", &["brackets"]),
+            ("http://[::1:3000", &["without closing"]),
+            ("http://origin.test:notaport", &["port"]),
+        ];
+        for (spec, expected) in cases {
+            let err = OriginSpec::parse(spec, None)
+                .err()
+                .unwrap_or_else(|| panic!("{spec} must be refused"));
+            for needle in expected.iter() {
+                assert!(
+                    err.contains(needle),
+                    "{spec}: {err:?} must mention {needle:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tls_table_beside_a_plaintext_or_socket_origin_is_refused() {
+        // The one thing worse than no verification is verification the operator believes in: a
+        // `[backends.n.tls]` table beside `http://` or `unix:` would describe a handshake that
+        // never happens, and it would be silently ignored if the parse did not take it.
+        for origin in ["http://127.0.0.1:3000", "unix:/run/node.sock"] {
+            let spec = format!("{origin:?}");
+            let text = upstream_config(&format!(
+                "origin = {spec}\n[backends.node.tls]\nca = \"ca.pem\"\n"
+            ));
+            let config = Config::from_toml(&text).expect("parses");
+            let err = config.validate().expect_err("must fail");
+            let message = err.to_string();
+            assert!(message.contains("backends.node"), "{origin}: {message}");
+            assert!(
+                message.contains("handshake"),
+                "the error must say why the table has no meaning: {origin}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_https_origin_accepts_its_tls_table() {
+        let text = r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:8080"
+[backends.node]
+kind = "upstream"
+origin = "https://node.internal:8443"
+[backends.node.tls]
+ca = "/etc/ssl/internal-ca.pem"
+sni = "node.internal"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        config.validate().expect("validates");
+        let origin = config.backends["node"]
+            .origin()
+            .expect("an upstream has an origin")
+            .expect("the origin parses");
+        let tls = origin.tls().expect("https has tls settings");
+        assert_eq!(tls.sni.as_deref(), Some("node.internal"));
+        assert_eq!(
+            tls.ca.as_deref(),
+            Some(std::path::Path::new("/etc/ssl/internal-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn an_empty_tls_key_is_refused_rather_than_read_as_absent() {
+        // TOML cannot tell `""` from a missing key, and an empty CA path would otherwise become
+        // "the public roots" — a silent change of what the hop is verified against.
+        let cases: &[(&str, &str)] = &[
+            ("ca = \"\"", "tls.ca is empty"),
+            ("sni = \"\"", "tls.sni is empty"),
+        ];
+        for (body, expected) in cases {
+            let text = upstream_config(&format!(
+                "origin = \"https://node.internal:8443\"\n[backends.node.tls]\n{body}\n"
+            ));
+            let config = Config::from_toml(&text).expect("parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(err.to_string().contains(expected), "{body}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_sni_that_is_not_a_name_is_refused_at_validation() {
+        // A verification name is a DNS name; a port or a scheme inside one is a mistake worth
+        // naming where the file is read, rather than a handshake error on the first request.
+        for bad in [
+            "node.internal:8443",
+            "https://node.internal",
+            "node..internal",
+            "-",
+        ] {
+            let text = upstream_config(&format!(
+                "origin = \"https://10.0.0.5:8443\"\n[backends.node.tls]\nsni = {bad:?}\n"
+            ));
+            let config = Config::from_toml(&text).expect("parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(err.to_string().contains("not a host name"), "{bad}: {err}");
+        }
+        // A bare IP is a name a certificate can carry, since a certificate may hold an address.
+        let text = upstream_config(
+            "origin = \"https://10.0.0.5:8443\"\n[backends.node.tls]\nsni = \"10.0.0.5\"\n",
+        );
+        Config::from_toml(&text)
+            .expect("parses")
+            .validate()
+            .expect("an IP is a usable verification name");
+    }
+
+    #[test]
+    fn an_upstream_needs_an_http_listener() {
+        // There is no CGI environment to build for an upstream and no way for the FastCGI
+        // front-end to hand it a request, so without an HTTP listener the backend starts, the
+        // sockets bind, and nothing ever reaches the origin. Silent otherwise, so it is an error.
+        let text = r#"
+default_backend = "node"
+[server]
+fastcgi = "127.0.0.1:9080"
+[backends.node]
+kind = "upstream"
+origin = "http://127.0.0.1:3000"
+"#;
+        let config = Config::from_toml(text).expect("parses");
+        let err = config.validate().expect_err("must fail");
+        let message = err.to_string();
+        assert!(message.contains("backends.node"), "{message}");
+        assert!(message.contains("server.http"), "{message}");
+    }
+
+    #[test]
+    fn the_three_silent_readers_answer_correctly_for_an_upstream() {
+        // Three places accepted the new kind and described it wrongly, none of them a compile
+        // error. Two are pure functions and are pinned here; the third is `check`'s output and is
+        // asserted at the CLI level, where it is actually printed.
+        let config = Config::from_toml(&upstream_config("origin = \"http://127.0.0.1:3000\""))
+            .expect("parses");
+        let backend = &config.backends["node"];
+
+        // 1. What `check` prints for the per-request-reset line. Neither of the two strings that
+        //    existed before is true of an upstream.
+        let line = backend.request_scope().describe();
+        assert!(line.contains("not applicable"), "{line}");
+        assert!(!line.contains("PHP SAPI"), "{line}");
+        assert!(!line.contains("application-scoped"), "{line}");
+
+        // 2. Whether a route to it skips the router's `stat`. The path is the origin's business —
+        //    there is no script for volucer to resolve — so it must.
+        assert!(
+            !backend.interprets_path(),
+            "an upstream routes on the URL, so the path is not a file to stat"
+        );
+    }
+
+    #[test]
+    fn an_upstream_and_a_worker_skip_the_stat_for_different_reasons() {
+        // The rule `skip_stat` asks about, stated once for all three shapes: the answer is not
+        // "is it a worker", because an upstream reaches the same answer from the other side.
+        let config = Config::from_toml(&upstream_config("origin = \"http://127.0.0.1:3000\""))
+            .expect("parses");
+        let worker = Config::from_toml(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#,
+        )
+        .expect("parses");
+        let cgi = Config::from_toml(
+            r#"
+[server]
+http = "127.0.0.1:8080"
+[backends.cgi]
+kind = "spawn_cgi"
+binary = "/usr/bin/php-cgi"
+"#,
+        )
+        .expect("parses");
+
+        let prefix = |config: &Config, name: &str| {
+            let route = RouteConfig {
+                host: None,
+                path_prefix: Some("/legacy".to_string()),
+                path_suffix: None,
+                backend: name.to_string(),
+            };
+            skip_stat(&route, config.backends[name].interprets_path())
+        };
+
+        assert!(
+            prefix(&config, "node"),
+            "an upstream does not read the path"
+        );
+        assert!(prefix(&worker, "app"), "a worker does not read the path");
+        assert!(
+            !prefix(&cgi, "cgi"),
+            "php-cgi emits the file it is pointed at, so the stat is the guard"
+        );
+    }
+
+    #[test]
+    fn the_removed_keys_of_other_backends_are_still_refused() {
+        // `deny_unknown_fields`, checked for the new arm specifically: a `kind = "upstream"` file
+        // carrying `command` or `workers` is a copy-paste from another backend, and it should be a
+        // parse error rather than a key that is silently ignored.
+        for key in [
+            "command = \"php worker.php\"",
+            "workers = 4",
+            "binary = \"/usr/bin/php\"",
+        ] {
+            let text = upstream_config(&format!("origin = \"http://127.0.0.1:3000\"\n{key}"));
+            assert!(
+                Config::from_toml(&text).is_err(),
+                "{key} must not be accepted by an upstream backend"
+            );
+        }
     }
 }

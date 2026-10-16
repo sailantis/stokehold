@@ -101,6 +101,18 @@ impl Dispatcher {
         self.backends.get(backend).is_some_and(Backend::is_worker)
     }
 
+    /// Whether the named backend reads the path as a file to execute.
+    ///
+    /// The question a route's `skip_stat` turns on. Not the negation of [`Self::is_worker`]: an
+    /// upstream does not interpret the path either, but for its own reason, and a route to one must
+    /// skip the `stat` just as a worker's does. An unknown name answers `true` — a backend that is
+    /// not there cannot vouch for skipping a check.
+    pub fn interprets_path(&self, backend: &str) -> bool {
+        self.backends
+            .get(backend)
+            .is_none_or(Backend::interprets_path)
+    }
+
     /// Names of every backend, for diagnostics.
     pub fn backend_names(&self) -> Vec<&str> {
         self.backends.values().map(Backend::name).collect()

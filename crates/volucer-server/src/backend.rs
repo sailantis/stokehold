@@ -170,6 +170,16 @@ pub enum Backend {
     /// The application boots once and stays resident, so PHP does *not* reset
     /// state between requests — the application clears its own request scope.
     Worker { name: String, pool: WorkerPool },
+    /// An HTTP origin volucer proxies to.
+    ///
+    /// Present before the request path is, so that every `match` over a backend has a real arm
+    /// instead of an `unreachable!()` that a later commit would have to remember to remove. It
+    /// carries the name and the parsed origin and nothing else: the pooled client arrives with the
+    /// dispatch, because a client built here would be a second implementation of the connector.
+    Upstream {
+        name: String,
+        origin: volucer_core::config::OriginSpec,
+    },
 }
 
 impl Backend {
@@ -196,6 +206,21 @@ impl Backend {
                 name: name.to_string(),
                 pool: WorkerPool::start(name, worker)?,
             }),
+            BackendConfig::Upstream(upstream) => {
+                // The configuration model can describe and validate an origin; nothing here can
+                // *reach* one yet, because the HTTP front-end has no branch for this kind and the
+                // FastCGI one never will. Refusing at startup is the honest answer: a backend that
+                // accepted the request and could not serve it would be a 500 per request with no
+                // explanation, and the operator's config error would look like an application bug.
+                Err(ServerError::Misconfigured {
+                    backend: name.to_string(),
+                    reason: format!(
+                        "the upstream backend ({:?}) is not served yet: this build can describe and \
+                         validate an origin, but the HTTP front-end has no request path for it",
+                        upstream.origin
+                    ),
+                })
+            }
         }
     }
 
@@ -203,7 +228,8 @@ impl Backend {
         match self {
             Backend::External { name, .. }
             | Backend::SpawnCgi { name, .. }
-            | Backend::Worker { name, .. } => name,
+            | Backend::Worker { name, .. }
+            | Backend::Upstream { name, .. } => name,
         }
     }
 
@@ -212,6 +238,7 @@ impl Backend {
             Backend::External { .. } => "external",
             Backend::SpawnCgi { .. } => "spawn_cgi",
             Backend::Worker { .. } => "worker",
+            Backend::Upstream { .. } => "upstream",
         }
     }
 
@@ -224,9 +251,20 @@ impl Backend {
         matches!(self, Backend::Worker { .. })
     }
 
+    /// Whether this backend reads the path as a file to execute.
+    ///
+    /// The question the route table's `stat` turns on, and the reason it is not `!is_worker()`: an
+    /// upstream does not interpret the path either, for a different reason — it is an HTTP peer
+    /// that routes on the URL itself, so volucer stat-ing the path first would check a file the
+    /// origin never reads. See [`BackendConfig::interprets_path`], which is where the rule and its
+    /// reasoning live; this is the same answer for the built backend.
+    pub fn interprets_path(&self) -> bool {
+        matches!(self, Backend::External { .. } | Backend::SpawnCgi { .. })
+    }
+
     /// Whether PHP's own SAPI resets state between requests for this backend.
     pub fn resets_per_request(&self) -> bool {
-        !matches!(self, Backend::Worker { .. })
+        !matches!(self, Backend::Worker { .. } | Backend::Upstream { .. })
     }
 
     /// Send a request to this backend.
@@ -239,6 +277,10 @@ impl Backend {
             Backend::External { .. } => self.request_external(request),
             Backend::SpawnCgi { pool, .. } => pool.request(request),
             Backend::Worker { pool, .. } => pool.request(request),
+            Backend::Upstream { name, .. } => Err(ServerError::Misconfigured {
+                backend: name.clone(),
+                reason: "an upstream speaks HTTP, and this is the FastCGI request path".to_string(),
+            }),
         }
     }
 
@@ -330,6 +372,10 @@ impl Backend {
         match self {
             Backend::SpawnCgi { pool, .. } => pool.shutdown(),
             Backend::Worker { pool, .. } => pool.shutdown(),
+            Backend::Upstream { .. } => {
+                // Nothing was started — the origin is somebody else's process — so there is nothing
+                // to stop. The pooled connections this backend will hold are dropped with it.
+            }
             Backend::External { pool, .. } => {
                 // Nothing was started, so there is nothing to stop; closing the
                 // connections is the whole cleanup. `get_mut` because the pool is

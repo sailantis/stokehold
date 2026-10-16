@@ -202,7 +202,7 @@ working_dir = "."
 # ---------------------------------------------------------------------------
 [backends.fpm]
 kind = "external"
-socket = "unix:/run/php/php8.3-fpm.sock"
+socket = "unix:/run/php/php-fpm.sock"
 
 # ---------------------------------------------------------------------------
 # Self-contained php-fpm: volucer starts php-fpm, which still manages its own

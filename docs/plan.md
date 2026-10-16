@@ -2225,13 +2225,13 @@ which is the heaviest single piece (`prost-build`/`protox`) and a new config sur
 opposed to a runtime that wants to *call* gRPC services — the latter is `upstream`'s job and works
 today. Recorded so the answer is "here is the design", not silence.
 
-### Observability — a new step, added because the answer was thin
+### Observability — **done**, in six commits
 
-`init_tracing` (`main.rs:144`) is `EnvFilter` + `fmt` and nothing else; there are **no spans anywhere**
+`init_tracing` (`main.rs`) was `EnvFilter` + `fmt` and nothing else; there were **no spans anywhere**
 (zero `#[instrument]`, `span!`, `Span` across every crate) and **no access log** — the only per-request
-data is atomic counters read once for the shutdown summary. The signal path additionally uses
-`eprintln!` (`main.rs:1230`, `main.rs:1233`), which bypasses `tracing` and is exactly the line that
-breaks once logging is provider-based.
+data was atomic counters read once for the shutdown summary. The signal path additionally used
+`eprintln!`, which bypasses `tracing` and is exactly the line that breaks once logging is
+provider-based.
 
 **nginx's way is the target, and it is cheaper than it sounds.** nginx has no tracing framework:
 `$request_id` is 16 random bytes hex-dumped to 32 chars (`ngx_http_variables.c:2298`), and
@@ -2241,13 +2241,44 @@ format. One id, two timings, both on one line, correlated afterwards. Only OTLP 
 framework; a structured request line and W3C `traceparent` propagation do not.
 
 **The user chose the core first and OTel as a layer on top of it**, and the reason is not caution:
-OpenTelemetry exports *spans*, this server has no spans and no request identity, and adopting it first
-would mean wiring an exporter to nothing. `temp/plan-tracing.md` carries the six-commit sub-plan.
-Two findings from writing it are worth recording here: `traceparent` **already reaches PHP and
-origins unchanged** (`to_cgi` maps it to `HTTP_TRACEPARENT` and it is in neither strip list), so the
-work is generating and adopting the id rather than forwarding it; and OTLP/**HTTP** (port 4318) avoids
-`tonic`/`prost` entirely, which matters in a lockfile that contains neither — RoadRunner defaults to
-`client: http` for the same reason.
+OpenTelemetry exports *spans*, this server had none and no request identity, and adopting it first
+would have meant wiring an exporter to nothing.
+
+Six commits: `8fef784` (the signal path off `eprintln!`, and diagnostics to stderr), `6be089e` (the
+new `volucer-observe` crate: `RequestId` and `TraceContext`), `9cabe8c` (the access log), `68b6bc3`
+(the `[server.access_log]` config), `468ed73` (`Observability`, the one place identity is decided),
+`f9090de` (both front-ends wired, plus `check`/`version`).
+
+**A new crate rather than modules in `volucer-core`**, for the reason `volucer-watch` exists: there
+are **two front-ends**, so a request id only one assigned, or an access log only one wrote, would make
+the same application's requests appear differently depending on which protocol received them.
+
+**Findings worth recording, because they shrank the work or changed the design:**
+
+- **`traceparent` already reached PHP and origins unchanged**, before any of this: `to_cgi` maps every
+  remaining header to `HTTP_<NAME>`, and `traceparent` is in neither strip list. So the work was
+  generating and adopting the id, never forwarding it.
+- **`getrandom` 0.4 is already in the lockfile twice**, so naming it added exactly one package —
+  `volucer-observe` — and no external crate. Verified by diffing `Cargo.lock`, since the whole claim
+  was that it was already there.
+- **`fmt`'s default writer is `io::stdout`** (`tracing-subscriber-0.3.23/src/fmt/fmt_layer.rs:749`),
+  which is the stream the test harness parses field by field for its startup banner. Moving the signal
+  path into `tracing` without moving diagnostics to stderr would have emitted a log record *into that
+  banner*. The two are one change, and stderr is also what lets the access log be a third, separately
+  silenceable sink.
+- **`RequestId` is an enum, not bytes.** The first version folded an inbound id into 16 bytes and
+  printed that, which defeats adoption entirely — the client is looking for *its* string. Hazard 80 is
+  what happened when the test for it was falsified.
+- **OTLP/HTTP (port 4318) avoids `tonic`/`prost` entirely**, in a lockfile containing neither, which is
+  also why RoadRunner defaults to `client: http`. That is the transport for the export layer.
+- **Three falsifications, and two of them found defects in the tests rather than the code**: the ASCII
+  guard on `TraceContext::parse` was *redundant* (removing it still passed, so it was deleted rather
+  than kept as decoration), and the end-to-end verbatim test used an all-lowercase UUID and so could
+  not detect a normalisation (hazard 80). The third — un-escaping the space in the access log —
+  correctly failed on the field count (hazard 79).
+
+713 tests, clippy clean, green on Windows and Linux (WSL). Hazards 79, 80 and 81 are this phase's own
+record.
 
 **Why the multiplexing refusal is written down rather than left implicit:** it is the question an
 async-runtime user asks first, and the answer that satisfies them is not multiplexing. An async
@@ -2524,6 +2555,10 @@ reading out of a crate description.
 | ACME: additive — off unless configured | **works** | `acme_is_absent_until_the_table_is_written` in `volucer-core`, and the 12 `tests/tls.rs` + 27 `tests/frontend.rs` suites unchanged, which is the control the phase was planned around |
 | ACME: days-to-expiry visibility | **works** | `a_certificates_days_left_are_reported_with_the_warning_they_deserve` and `a_real_certificates_expiry_is_read`, both in `volucer` (the second falsified by making the parser report nothing). `volucer check` prints the authority, names, contact, cache state and days left, because silence is this feature's failure mode |
 | ACME: the engine is actually **wired into `serve`** | **works** | `an_acme_configured_server_serves_its_cached_certificate` — the real binary, a real `[server.acme]`, a certificate written through the crate's own `CertCache` trait, and an assertion that the handshake gets the **cached** certificate rather than the fallback. Falsified by making `serve` build no engine: it fails, and **every other ACME test stays green**, so this is the only coverage of the wiring. Hazard 68: the five steps before it were each committed and green while `serve` never constructed an `Engine` — a deployment with a complete ACME config issued nothing, silently |
+| observability: the id a client sends is the id it gets back | **works** | `the_access_log_records_the_id_the_client_sees` — the real binary, a real `[server.access_log]`, and a request carrying a **mixed-case** UUID. The id must come back verbatim (hyphens, case and all) and appear in the log file, which is read back rather than asserted on a struct. Hazard 80: the first version used an all-lowercase UUID, so lowercasing the echo **passed** — a value that already matches its normalised form cannot test a normalisation |
+| observability: a hostile header cannot write this log line | **works** | `a_header_cannot_forge_a_log_record_or_shift_a_field` — a `User-Agent` containing a newline, quotes, a backslash and spaces. The count of fields is the assertion that catches it; every positional assertion passed while the line had 31 fields. Hazard 79 |
+| observability: off by default changes nothing | **works** | `no_access_log_config_means_no_log_file_and_no_id_header` — no file created, and no `x-request-id` on the response, because a deployment that did not ask must not have an id appear on its answers. The unit control is `a_plaintext_deployment_is_unchanged_by_any_of_this`, which pins `access_log` absent alongside `tls` and `https` |
+| observability: the trace is continued, not replaced | **works** | `an_inbound_trace_is_continued_and_a_missing_one_starts_unsampled` — the client's trace id is kept, this hop's span id is new, its sampling flag is respected, and a request with no `traceparent` starts **unsampled** rather than claiming to be recorded |
 
 **The one surprising row is the `Upgrade` failure, and the mechanism is ours, not `hyper`'s.**
 `hyper-util`'s `auto::Builder` handles the upgrade case only through
@@ -4519,3 +4554,59 @@ it breaks" should be attempted early, because the measurement is the mitigation.
 full test run settled it, and the alternative — designing a second response type around a bound that
 turns out not to bind, to protect against a failure that cannot occur — would have cost real design
 work on behalf of a guess.
+### Hazard 79 — the access log's own injection was a space, and every positional assertion missed it
+
+The access log's text format is nginx's `combined` shape: space-separated, one record per line, with
+client-controlled values in it. The obvious injections are a **quote** (which would end the quoted
+field early) and a **newline** (which would forge a whole record), and the first version escaped both.
+The security test asserted the field positions of a hostile line and passed.
+
+It then asserted the field **count**, and failed with **31 fields where the format has 15**. A hostile
+`User-Agent` of `evil 1.2.3.4 - - [now] "GET /admin HTTP/1.1" 200 1` split into seven tokens: the
+client's own text was being read as fields of *this* log line, and its `200` landed where this
+server's status belongs. Escaping quotes and newlines had hidden nothing worse than a mangled field;
+the **space** is what made the other two matter, because without it a value cannot be told from the
+field separator at all. Escapes are now nginx's `\x20`, `\x22` and `\x5C`, so one parser still reads
+both logs.
+
+**The general rule: in a delimited format, the delimiter is the injection, and positional assertions
+cannot detect a shift in the fields they assert on.** Every `assert_eq!(fields[8], "200")` passed,
+because `fields[8]` *was* `"200"` — the hostile value had supplied one. Only a count of the whole
+record catches a field that should not exist, which is the same reason hazard 62 needed a sampler
+rather than a request-level assertion: the failure was in a property no single value describes.
+
+### Hazard 80 — a falsification passed because the test used a value that could not distinguish
+
+The request id's central promise is that an **adopted** id comes back exactly as it arrived, because
+the client is looking for *its* string in *this* server's log. The unit test asserted that over
+several shapes and would have caught a re-render. The end-to-end test asserted it too.
+
+Falsifying it — lowercasing the echo — **passed**. The test's UUID was already all lowercase, so
+lowercasing was a no-op. The assertion was proving nothing about verbatim-ness: a value that already
+matches its normalised form cannot test a normalisation.
+
+With the value changed to mixed case (`3F2504E0-4f89-11D3-9A0C-0305E82C3301` — upper- and lowercase
+hex, which is a legal client id and is *not* its own normalisation) the same falsification fails on the
+exact text, as it should.
+
+**The general rule: a test input must be able to distinguish the bug from the fix, and "it looks like
+a real example" is not that property.** A UUID is the realistic shape and exactly the wrong one here,
+because real UUIDs are usually lowercase — so the realistic fixture was the one that could not fail.
+The unit test had the same shape of hole and survived only because it enumerated five inputs.
+
+### Hazard 81 — the same sequence of characters meant two different things to two programs
+
+Writing a commit message through PowerShell, then `git commit -F`, failed with *"a NUL byte in commit
+log message not allowed"* — and the byte really was there: the message contained a NUL at the offset
+where the text read `version 00 only`.
+
+PowerShell treats a backtick followed by a digit as an escape, so a literal backtick-`0`-`0` in prose
+became `U+0000`. The same three characters were *text* to the editor that wrote the file and a
+*control code* to the shell that stored it.
+
+**The general rule: prose that quotes an escape sequence must not go through a tool that interprets
+it.** The fix is a single-quoted here-string (which processes no escapes) or a doubled backtick, and
+the check is one line — `ReadAllBytes` and count the zeros — which is far cheaper than the diagnosis.
+The same class of mistake is `Add-Content` mojibaking non-ASCII (`—` becoming `â€”`), recorded in
+hazard 77's neighbourhood: **every write of non-ASCII text on this host gets byte-verified afterwards,
+and that is now a habit rather than a lesson.**

@@ -900,6 +900,93 @@ the effect it was meant to give scale to. So: not measurable here, and the measu
 is in [`volucer-competition`](https://github.com/sailantis/volucer-competition)
 (`scripts/reload-cost-ab.js`, `results/reload-cost-ab-20.tsv` and the two `-noise` controls).
 
+## Observability
+
+One line per completed request, an id that spans the tiers, and a W3C trace context — **without
+OpenTelemetry**. That order is deliberate: a framework exports spans, this server had no spans and no
+request identity, so adopting one first would have meant wiring an exporter to nothing.
+
+### The access log
+
+**Off by default**, so upgrading changes nothing. `[server.access_log]` turns it on:
+
+```toml
+[server.access_log]
+path = "logs/access.log"          # relative resolves against the config file's directory
+format = "combined"               # or "json"
+request_id_header = "X-Request-Id"
+```
+
+The default line is nginx's `combined` format with three fields appended, so a script written for
+nginx reads this log too:
+
+    127.0.0.1 - - [16/Oct/2026:21:35:05 +0000] "GET /x HTTP/1.1" 200 21 "-" "curl/8" 0.012 0.004 3f2504e0-4f89-11d3-9a0c-0305e82c3301
+
+The three additions are the whole request's time, the time to the origin's first byte, and the
+request id. **The first includes the client's own upload**, which is what nginx's `$request_time` does
+and what surprises people about it — the second is the field that separates this server's work from
+the client's slowness. `-` means there was no origin: a static file never had one, where an origin
+that answered instantly did, and rendering both as `0.000` would make a graph of a mixed deployment
+wrong in the direction that flatters it. `format = "json"` emits one object per line instead, with
+`origin_time: null` for the same distinction.
+
+**It is not the diagnostic log, and that separation is the point.** An access log that shared a
+verbosity filter with diagnostics would be one setting away from silence, and both directions are
+wrong: raising verbosity to debug a worker would flood it, and quieting the diagnostics would erase
+the record of who requested what.
+
+Three things it deliberately does not do, each stated rather than implied:
+
+- **A failed write never fails a request.** A full disk or a revoked permission means the log is
+  lost, not that the server stops. The failure is reported **once**, not per request — a per-request
+  warning on a full disk is a flood that buries the message saying why. A path that cannot be opened
+  at startup is the same: `volucer check` says so, and `serve` serves without it.
+- **`bytes_sent` is `0` for a streamed body.** A backend's answer is in memory and knows its length;
+  a static file or an origin's answer does not until it has been written. Counting it for real would
+  put a wrapper task on the hot path for one log field. Text responses from a backend report the real
+  figure.
+- **Values containing a space, quote, backslash or newline are escaped** as `\x20`, `\x22`, `\x5C`
+  and `\n`. This is a security rule, not tidiness: the line is space-separated, so an unescaped space
+  in a `User-Agent` lets a client write fields of *this* log line. A hostile agent string was
+  measured producing 31 fields where the format has 15, with its own `200` landing where this server's
+  status belongs.
+
+### The request id
+
+Every request gets one, and it is **echoed on the response** — including on error pages, because a
+client that cannot quote its id has no way to report the error. Generated ids are 32 hex characters,
+which is exactly nginx's `$request_id` shape, so one `awk` reads both logs.
+
+**An inbound `X-Request-Id` is adopted by default**, and that is the opposite of nginx's behaviour on
+purpose: one id across the tiers is the feature, and an id that changes at every hop cannot correlate
+a client's log with this server's. The value is returned **verbatim** — a UUID keeps its hyphens and
+its letter case, because a normalised value is not findable in the client's own log. Set
+`request_id_header = ""` for nginx's always-generate semantics.
+
+A value that is not a plain identifier is **replaced, never refused**: a newline in an adopted id
+would let a client forge whole log records, and a space would break the field count, so both are
+rejected and a fresh id is minted. A client's malformed header must not become a client's failed
+request.
+
+### Trace context
+
+The W3C `traceparent` header is parsed and continued: the trace id is the client's, and this server
+contributes its own span, because two hops claiming one span is what corrupts a waterfall. A request
+with no `traceparent` starts a **new trace, unsampled** — accepting a header is not the same as
+volunteering to record a trace, and the party that knows what that costs is the one collecting spans.
+
+It is **forwarded to backends with no configuration at all**: `traceparent` becomes
+`HTTP_TRACEPARENT` for PHP and is in neither strip list, so a correlation id already reaches the
+application today. A malformed `traceparent` starts a fresh trace rather than returning an error.
+
+### What is not built yet
+
+**No OTLP export, no span trees, no metrics endpoint, and no sampling.** OpenTelemetry arrives as an
+exporter layer on top of the above — `tracing-opentelemetry` plus `opentelemetry-otlp` over
+**OTLP/HTTP** (port 4318, which avoids `tonic` and `prost` entirely; the lockfile contains neither,
+and RoadRunner defaults to the same transport for the same reason). Doing it in that order is what
+makes it a layer rather than a rewrite.
+
 ### Build prerequisites
 
 `rustls` is used rather than OpenSSL, so there is no DLL/dylib to match against a system OpenSSL.

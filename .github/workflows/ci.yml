@@ -111,4 +111,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y nasm
-      - run: cargo package --workspace --allow-dirty
+      # No `--allow-dirty`: a clean tree is part of what publishable means, and tolerating a dirty
+      # one here would hide exactly the mistake (an uncommitted fix) that a release most often is.
+      - run: cargo package --workspace

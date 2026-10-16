@@ -36,12 +36,38 @@ fn find_php_cgi() -> Option<PathBuf> {
 ///
 /// Racy in principle, but the window is microseconds and the alternative is a
 /// hardcoded port that collides with whatever else is running.
+///
+/// **The race is real and CI found it.** These tests run in parallel inside one binary, so two of
+/// them can be handed the same ephemeral port before either binds it: on `ubuntu-latest` the
+/// `a_status_header_from_the_script_is_preserved` test connected to a `php-cgi` that belonged to a
+/// different test, which answered the readiness probe and then dropped the connection as
+/// `ConnectionReset` — the process it actually spoke to had already been killed by its owner's
+/// `Drop`, and php-cgi accepts one connection at a time. It is intermittent (it passed on a rerun
+/// and on Windows) which is exactly what a port race looks like.
+///
+/// `crates/volucer-server/tests/common/mod.rs` solved this for the pool tests with a process-wide
+/// mutex, for the same reason and with the same wording. This is that fix, applied where the same
+/// helper exists. Not a retry: retrying would hide the collision rather than remove it.
 fn free_port() -> u16 {
+    let _serial = port_lock();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
     listener
         .local_addr()
         .expect("read the bound address")
         .port()
+}
+
+/// Serialise the tests that take a port from the OS.
+///
+/// Only the *reservation* is serialised, not the process that later binds it: the window is the
+/// gap between `free_port` returning and `php-cgi` calling `bind`, and two tests entering that gap
+/// at once is what produced the CI failure above.
+fn port_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The `php-cgi` fixture, reachable over whichever transport the platform offers.

@@ -279,12 +279,23 @@ fn is_running(pid: u32) -> bool {
             .output()
         {
             Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()),
+            // If we cannot ask, assume it is running rather than assert wrongly.
             Err(_) => true,
         }
     }
     #[cfg(unix)]
     {
+        // `/proc` is Linux, not Unix: macOS has no procfs, so the first arm is `false` there and
+        // the whole predicate used to be `false` — which is how this test failed on the macOS
+        // runner and passed on Linux and Windows. `kill -0` asks the question portably: it sends
+        // no signal and only reports whether the process exists and we may signal it.
+        // `crates/volucer-server/tests/pool.rs` already had this fallback; this copy had not.
         PathBuf::from(format!("/proc/{pid}")).exists()
+            || std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(true)
     }
 }
 

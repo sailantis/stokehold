@@ -12,12 +12,27 @@ volucer-core.workspace = true
 volucer-fcgi.workspace = true
 volucer-worker.workspace = true
 volucer-watch.workspace = true
+# The fourth backend kind. This crate already held hyper's *server* types indirectly through
+# `volucer-http`, but the client is what a pooled origin connection needs, and a backend is the
+# thing that owns a connection pool — so it belongs here rather than in the listener, which only
+# has to know how to *call* this.
+volucer-upstream.workspace = true
+bytes.workspace = true
+# `TokioIo` adapts a `tokio` IO to `hyper`'s `Read`/`Write`, which is what a request body needs to
+# cross between the listener's runtime and this crate's client.
+hyper.workspace = true
+hyper-util.workspace = true
+tokio.workspace = true
 # Serializes the request frame's head. The server builds that head by borrowing it out of
 # the CGI environment, so it implements `Serialize` for its own borrowed header type rather
 # than collecting owned pairs for the worker crate to serialize.
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# An empty request body, so an upstream test needs no listener to make one.
+http-body-util.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

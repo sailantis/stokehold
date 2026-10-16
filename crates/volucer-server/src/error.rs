@@ -41,6 +41,31 @@ pub enum ServerError {
         source: volucer_fcgi::FcgiError,
     },
 
+    /// A failure reaching an HTTP origin, or coming back from one.
+    ///
+    /// Kept as the upstream crate's own type rather than flattened into `reason: String`,
+    /// because the front-end has to choose between a 502 and a 504 and only this error knows
+    /// which failure a deadline produces — the same reason [`ServerError::Worker`] keeps
+    /// `FcgiError` instead of its message.
+    #[error("backend {backend:?} could not reach its origin: {source}")]
+    Upstream {
+        backend: String,
+        #[source]
+        source: volucer_upstream::UpstreamError,
+    },
+
+    /// The named backend speaks HTTP, and this is not the HTTP front-end.
+    ///
+    /// Not a misconfiguration and not an unreachable origin: the request arrived on the wrong
+    /// protocol for this backend kind. The FastCGI front-end has no way to hand an upstream a
+    /// request at all, so the honest answer is a 500 that names the mistake rather than a 502
+    /// from a connection that was never attempted.
+    #[error(
+        "backend {backend:?} is an HTTP upstream, which cannot be reached over FastCGI; \
+         a request for it must arrive on the HTTP listener"
+    )]
+    WrongProtocol { backend: String },
+
     #[error("backend {backend:?} could not speak the worker protocol: {source}")]
     WorkerProtocol {
         backend: String,
@@ -119,6 +144,9 @@ impl ServerError {
                 matches!(source, volucer_worker::WorkerError::Timeout(_))
             }
             ServerError::Worker { source, .. } | ServerError::Fcgi(source) => source.is_timeout(),
+            // An origin that was reached and stayed silent is the one time `UpstreamError` calls
+            // itself a timeout; everything else it reports is an origin that could not be reached.
+            ServerError::Upstream { source, .. } => source.is_timeout(),
             ServerError::Io(io) => io.kind() == std::io::ErrorKind::TimedOut,
             _ => false,
         }

@@ -122,6 +122,29 @@ fn main() -> ExitCode {
 /// The PHP floor is here because it is a build fact an operator has to be able
 /// to check from a shell: a worker below it starts and then cannot be asked for
 /// a per-request peak. See the README in `sailantis/volucer-php-sdk`.
+/// Whether an HTTP **upstream** backend can be served at all by this build.
+///
+/// `false` until the HTTP front-end gains its branch for one, and `true` forever after. It exists
+/// so that `check` cannot answer "configuration OK" for a kind `serve` refuses — which is the one
+/// lie this command must not tell — and so the message about it disappears by itself rather than
+/// being remembered and removed by hand.
+///
+/// A *capability* flag rather than a version test, because the two callers ask different questions:
+/// `check` prints, `serve` refuses, and both must agree. One `const` is what makes them unable to
+/// disagree, and the test below is what keeps it from outliving its reason.
+pub const SERVES_UPSTREAM: bool = false;
+
+/// Report a backend this build can describe but cannot serve.
+///
+/// One place for the words, so `check` and `serve` say the same thing — an operator reading
+/// "configuration OK" and then a refusal at startup has two different stories to reconcile.
+pub fn unserved_upstream_message(backend: &str) -> String {
+    format!(
+        "backends.{backend} is an upstream, and this build has no request path for one yet: the \
+         configuration is checked and the origin validated, but `serve` will refuse this backend"
+    )
+}
+
 fn version() {
     println!("volucer {}", env!("CARGO_PKG_VERSION"));
     println!("  front-ends:       HTTP/1.1, HTTP/2 (cleartext), FastCGI, TLS (rustls)");
@@ -564,6 +587,21 @@ fn serve(
     )?;
     for name in dispatcher.backend_names() {
         tracing::info!(backend = %name, "backend ready");
+    }
+    // The same rule `check` prints, enforced where it matters. `serve` builds the backend — so a
+    // bad origin or an unreadable CA is already a startup failure — but until the HTTP front-end
+    // gains its branch for an upstream there is no request path for one, and a server that started
+    // and then 500'd every request for that backend would be a configuration error wearing an
+    // application bug's clothes.
+    if !SERVES_UPSTREAM {
+        if let Some((name, _)) = config.backends.iter().find(|(_, backend)| {
+            matches!(backend, volucer_core::config::BackendConfig::Upstream(_))
+        }) {
+            return Err(ServerError::Misconfigured {
+                backend: name.clone(),
+                reason: unserved_upstream_message(name),
+            });
+        }
     }
     // A static-only deployment answers a path that names no file with a 500 and
     // nothing else in the log, so the reason is stated once here rather than left
@@ -1588,12 +1626,15 @@ fn check(
         // Stated rather than discovered, and only while it is true: this build can describe,
         // validate and check an origin, but the HTTP front-end has no request path for one yet, so
         // `serve` refuses. Without this line `check` would answer "configuration OK" for a
-        // configuration that cannot start, which is the one thing this command must not do. The
-        // line goes away in the commit that adds the request path.
-        if matches!(backend, volucer_core::config::BackendConfig::Upstream(_)) {
+        // configuration that cannot start, which is the one thing this command must not do.
+        //
+        // It reads the same `SERVES_UPSTREAM` flag `serve` reads, so the two cannot tell an
+        // operator different stories, and the line disappears by itself when the flag flips rather
+        // than having to be remembered and deleted.
+        if matches!(backend, volucer_core::config::BackendConfig::Upstream(_)) && !SERVES_UPSTREAM {
             println!(
-                "      not served yet:    this build has no request path for an upstream, so \
-                 `serve` will refuse it"
+                "      not served yet:    {}",
+                unserved_upstream_message(name)
             );
         }
     }

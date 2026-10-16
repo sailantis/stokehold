@@ -1287,6 +1287,77 @@ backend = "node"
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A configuration this build can check but cannot serve says so in both places.
+///
+/// The assertion is that `check` and `serve` tell the *same* story: an operator who reads
+/// "configuration OK" and then gets a refusal at startup has two accounts to reconcile, and the
+/// only honest version is for `check` to have said it first. Both read one flag (`SERVES_UPSTREAM`)
+/// and one message function, so this test is what keeps them from drifting apart — and what will
+/// notice when the flag flips in the commit that adds the request path, at which point the whole
+/// test becomes vacuous and should be removed with it.
+#[test]
+fn an_unserved_upstream_is_reported_by_check_and_refused_by_serve() {
+    let Some(binary) = volucer_binary() else {
+        eprintln!("skipping: the volucer binary is not built (run `cargo build`)");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("volucer-unserved-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the root");
+
+    let config_path = root.join("volucer.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+default_backend = "node"
+[server]
+http = "127.0.0.1:8080"
+document_root = {root}
+[backends.node]
+kind = "upstream"
+origin = "http://127.0.0.1:3000"
+"#,
+            root = toml_string(&root.display().to_string()),
+        ),
+    )
+    .expect("write the config");
+
+    let check = Command::new(&binary)
+        .arg("check")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("the check command runs");
+    let check_text = String::from_utf8_lossy(&check.stdout);
+    assert!(check.status.success(), "{check:?}");
+    assert!(
+        check_text.contains("not served yet"),
+        "`check` must warn before `serve` refuses: {check_text}"
+    );
+
+    // `serve` fails, and its message names the backend and repeats the reason — not merely
+    // "misconfigured", which would send an operator looking for a typo in a file that is valid.
+    let serve = Command::new(&binary)
+        .arg("serve")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("the serve command runs");
+    assert!(
+        !serve.status.success(),
+        "serve must refuse an unserved kind"
+    );
+    let serve_text = String::from_utf8_lossy(&serve.stderr);
+    assert!(serve_text.contains("node"), "{serve_text}");
+    assert!(
+        serve_text.contains("no request path"),
+        "the refusal must say why, and match what `check` printed: {serve_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Send a signal to a running server, on a platform that has that signal.
 ///
 /// `None` on Windows, where the test is skipped with a reason rather than failing: there is no

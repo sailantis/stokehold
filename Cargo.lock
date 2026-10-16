@@ -1774,11 +1774,17 @@ dependencies = [
 name = "volucer-server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "volucer-core",
  "volucer-fcgi",
+ "volucer-upstream",
  "volucer-watch",
  "volucer-worker",
  "windows-sys 0.61.2",

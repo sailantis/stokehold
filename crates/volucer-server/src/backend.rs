@@ -172,15 +172,28 @@ pub enum Backend {
     Worker { name: String, pool: WorkerPool },
     /// An HTTP origin volucer proxies to.
     ///
-    /// Present before the request path is, so that every `match` over a backend has a real arm
-    /// instead of an `unreachable!()` that a later commit would have to remember to remove. It
-    /// carries the name and the parsed origin and nothing else: the pooled client arrives with the
-    /// dispatch, because a client built here would be a second implementation of the connector.
+    /// The client is built in [`Backend::from_config`], because a CA that cannot be read is a
+    /// startup failure rather than a 502 on the first request. It is cheap to clone — the pool,
+    /// the connector and the configuration are behind `Arc` inside `hyper-util`'s `Client` — and
+    /// it is `Send + Sync` without its body being `Sync`, so it fits the `&self` contract the
+    /// dispatcher needs.
     Upstream {
         name: String,
-        origin: volucer_core::config::OriginSpec,
+        client: volucer_upstream::UpstreamClient<UpstreamBody>,
     },
 }
+
+/// The body an inbound HTTP request carries on its way to an origin.
+///
+/// `hyper::body::Incoming`, boxed by the listener. Boxed rather than generic because a `Backend`
+/// is one type for every configured backend, and making the *dispatcher* generic over a body type
+/// to accommodate this one arm would drag the type parameter through every CGI call site that has
+/// nothing to do with it.
+///
+/// The error is `io::Error` because that is what the listener already produces for a body it
+/// failed to read — see `volucer_http::UnsyncBoxBody`, which the front-end builds for exactly this
+/// parameter.
+pub type UpstreamBody = volucer_upstream::UpstreamBody;
 
 impl Backend {
     /// Build a backend from its configuration.
@@ -207,18 +220,35 @@ impl Backend {
                 pool: WorkerPool::start(name, worker)?,
             }),
             BackendConfig::Upstream(upstream) => {
-                // The configuration model can describe and validate an origin; nothing here can
-                // *reach* one yet, because the HTTP front-end has no branch for this kind and the
-                // FastCGI one never will. Refusing at startup is the honest answer: a backend that
-                // accepted the request and could not serve it would be a 500 per request with no
-                // explanation, and the operator's config error would look like an application bug.
-                Err(ServerError::Misconfigured {
-                    backend: name.to_string(),
-                    reason: format!(
-                        "the upstream backend ({:?}) is not served yet: this build can describe and \
-                         validate an origin, but the HTTP front-end has no request path for it",
-                        upstream.origin
-                    ),
+                // Validated rather than accepted on faith: `Config::validate` refuses a bad origin,
+                // but a `Backend` can be built from a `BackendConfig` that never went through it,
+                // and an origin that cannot parse would otherwise become a 502 on every request for
+                // a reason the log does not name.
+                let spec =
+                    volucer_core::config::OriginSpec::parse(&upstream.origin, upstream.tls.clone())
+                        .map_err(|reason| ServerError::Misconfigured {
+                            backend: name.to_string(),
+                            reason: format!("backends.{name}.origin: {reason}"),
+                        })?;
+                let origin = volucer_upstream::Origin::from_spec(&spec).map_err(|source| {
+                    ServerError::Misconfigured {
+                        backend: name.to_string(),
+                        reason: source.to_string(),
+                    }
+                })?;
+                // The client is built here, so a CA that cannot be read is a startup failure rather
+                // than a 502 on the first request — the same rule `ClientPool::new` follows for a
+                // php-fpm socket and `CgiPool::start` for a binary.
+                let client =
+                    volucer_upstream::UpstreamClient::new(origin, None).map_err(|source| {
+                        ServerError::Misconfigured {
+                            backend: name.to_string(),
+                            reason: source.to_string(),
+                        }
+                    })?;
+                Ok(Backend::Upstream {
+                    name: name.to_string(),
+                    client,
                 })
             }
         }
@@ -263,8 +293,13 @@ impl Backend {
     }
 
     /// Whether PHP's own SAPI resets state between requests for this backend.
+    ///
+    /// **Only meaningful for the three CGI-shaped kinds.** An upstream is somebody else's runtime
+    /// and this cannot answer for it — which is why it is not the question the front-end asks.
+    /// [`BackendConfig::request_scope`] owns the three-answer version and the text `check` prints;
+    /// this is the two-answer version, kept for the callers that genuinely mean PHP.
     pub fn resets_per_request(&self) -> bool {
-        !matches!(self, Backend::Worker { .. } | Backend::Upstream { .. })
+        matches!(self, Backend::External { .. } | Backend::SpawnCgi { .. })
     }
 
     /// Send a request to this backend.
@@ -277,9 +312,8 @@ impl Backend {
             Backend::External { .. } => self.request_external(request),
             Backend::SpawnCgi { pool, .. } => pool.request(request),
             Backend::Worker { pool, .. } => pool.request(request),
-            Backend::Upstream { name, .. } => Err(ServerError::Misconfigured {
+            Backend::Upstream { name, .. } => Err(ServerError::WrongProtocol {
                 backend: name.clone(),
-                reason: "an upstream speaks HTTP, and this is the FastCGI request path".to_string(),
             }),
         }
     }

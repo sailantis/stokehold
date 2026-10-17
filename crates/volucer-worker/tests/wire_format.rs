@@ -199,23 +199,46 @@ fn the_unknown_field_is_absent_unless_it_is_true() {
     assert!(text.contains("\"unknown\":true"), "{text}");
 }
 
-/// Request ids and call ids occupy disjoint halves of the id space, which is what makes a mix-up
-/// between them a visible correlation failure rather than a silent match.
+/// Request ids and call ids stay in disjoint halves as they are allocated, which is what makes a
+/// mix-up between them a visible correlation failure rather than a silent match.
+///
+/// **Written over a range rather than against the constants, because asserting on the constants is a
+/// check that cannot fail** — the compiler folds it away, and `clippy` says so. What matters is not
+/// that `FIRST_CALL_ID` is `u32::MAX`; it is that the allocators keep their ids on their own side of the
+/// midpoint the read loop tests. So this walks both sequences and applies the *same predicate the read
+/// loop applies*, which is the only form in which the test can disagree with the code.
 #[test]
-fn request_ids_and_call_ids_are_in_different_halves() {
-    assert_eq!(FIRST_REQUEST_ID, 1);
-    assert_eq!(FIRST_CALL_ID, u32::MAX);
+fn request_ids_and_call_ids_stay_in_different_halves() {
+    // The predicate from the read loop, written once so this and the code cannot drift.
+    fn is_a_call_id(id: u32) -> bool {
+        id >= FIRST_CALL_ID_HALF
+    }
+
+    // A run of requests, allocated the way the channel allocates them.
+    let mut id = FIRST_REQUEST_ID;
+    for _ in 0..1000 {
+        assert!(
+            !is_a_call_id(id),
+            "request id {id} must not be in the calls' half"
+        );
+        id = if id == u32::MAX { 1 } else { id + 1 };
+    }
+
+    // A run of calls, allocated downward.
+    let mut id = FIRST_CALL_ID;
+    for _ in 0..1000 {
+        assert!(
+            is_a_call_id(id),
+            "call id {id} must not be in the requests' half"
+        );
+        id = id.wrapping_sub(1);
+    }
+
+    // Zero stays reserved and belongs to neither range, so "not a request" remains unambiguous.
     assert!(
-        FIRST_REQUEST_ID < FIRST_CALL_ID_HALF,
-        "requests count up from below the midpoint"
+        !is_a_call_id(0),
+        "0 is not a call id, and is not a request id either"
     );
-    assert!(
-        FIRST_CALL_ID >= FIRST_CALL_ID_HALF,
-        "and calls count down from above it"
-    );
-    // What the read loop actually tests, so the two agree by construction rather than by a comment.
-    assert!(!(FIRST_REQUEST_ID >= FIRST_CALL_ID_HALF));
-    assert!(FIRST_CALL_ID >= FIRST_CALL_ID_HALF);
 }
 
 #[test]

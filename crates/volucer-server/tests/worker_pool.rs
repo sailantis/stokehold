@@ -20,9 +20,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use volucer_core::config::WorkerConfig;
+use volucer_core::config::{BackendConfig, Config, WorkerConfig};
 use volucer_fcgi::{build_params, Request, RequestInfo, Routing};
-use volucer_server::WorkerPool;
+use volucer_server::{Dispatcher, WorkerPool};
 
 mod common;
 use common::serial;
@@ -1351,4 +1351,154 @@ fn a_sample_is_drained_and_not_recounted_by_a_second_scrape() {
         rendered.contains("example.request_count 1"),
         "three scrapes, one sample:\n{rendered}"
     );
+}
+
+/// A live worker makes a call mid-request and the registry answers it.
+///
+/// **This is the test the whole call plane was missing.** Everything below it had been proven
+/// separately — the channel answers a `CALL` when a handler is installed, the registry routes
+/// `"<namespace>.<verb>"` to a namespace, `WorkersNamespace` reads the pools, `Dispatcher::from_config`
+/// installs the registry on a channel before its handshake — and none of it had ever been connected to a
+/// running PHP process. So a deployment could have had every part correct and a call that never arrives,
+/// which is exactly the failure a unit test per layer cannot see.
+///
+/// It goes through `Dispatcher::from_config`, not through a registry built by hand, because *that* is the
+/// wiring under test: a registry the test assembles would prove the pieces work together while leaving the
+/// code that assembles them in production unexercised. The consequence is visible in the assertions — the
+/// worker's own `backend` name in `workers.list` comes from the directory the dispatcher filled in.
+///
+/// The path exercised is the whole of `docs/plugins.md` §4 end to end: application code inside a request
+/// handler writes a frame the server did not ask for, the server's exchange thread — mid-request, holding
+/// the pipes — recognises it as a call rather than a protocol error, dispatches it into the registry, and
+/// the worker reads the answer out of a stream that still owes it a response.
+#[test]
+fn a_worker_calls_the_server_mid_request_and_the_registry_answers() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-call-worker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("call-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    // Every call happens *inside* the handler, which is the only place it can happen: the server's
+    // reader for this worker is parked between requests.
+    $pool = $worker->call('workers.list');
+    $description = $worker->call('config.describe');
+    $refused = $worker->call('kv.get', ['key' => 'session:1']);
+
+    return Response::json([
+        'workers' => count($pool),
+        'backends' => implode(',', array_unique(array_column($pool, 'backend'))),
+        'idle_runtimes' => array_values(array_filter(array_column($pool, 'runtime'))),
+        'unobservable' => count(array_filter($pool, static fn ($w) => $w['pid'] === 0)),
+        // Read from the application's side of the channel, because that is the side redaction
+        // protects: an application that can read the deployment's credentials can leak them. The
+        // `command` is here as the control — it must survive, or the assertion above it would pass
+        // against an answer that was redacted into nothing.
+        'described_command' => $description['backends']['app']['command'] ?? null,
+        'refused_error' => $worker->lastCallError(),
+        'refused' => $refused,
+    ]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        // Two workers, so the pool has a slot that is *not* the one serving this request. The caller's
+        // own slot cannot describe itself — its lock is held by the request it is being called from —
+        // and a pool of one would make that the only entry, hiding the difference between "reporting
+        // works" and "reporting works for everyone except the caller".
+        workers: 2,
+        // Both namespaces, because `workers.list` needs one and `config.describe` the other, and the
+        // point is that they arrive through the configuration rather than through a test's wiring.
+        services: vec!["config".to_string(), "workers".to_string()],
+        ..config(2)
+    });
+    let configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        default_backend: Some("app".to_string()),
+        ..Config::default()
+    };
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+    let response = dispatcher
+        .dispatch(&get("/"))
+        .expect("the request is served");
+    let (status, _) = response.parse_status_headers();
+    assert_eq!(
+        status, 200,
+        "the request that made the calls still succeeds"
+    );
+
+    let body = body_of(&response);
+    let answer: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("the worker answered with JSON: {err}\n{body}"));
+    assert_eq!(
+        answer["workers"], 2,
+        "the worker asked how many workers there are and got an answer from the live pool: {answer}"
+    );
+    assert_eq!(
+        answer["backends"], "app",
+        "and the entries name the backend the dispatcher filed the pool under, which is what a \
+         worker.reset index has to be resolved against: {answer}"
+    );
+    assert!(
+        answer["described_command"]
+            .as_str()
+            .is_some_and(|c| c.contains("call-worker.php")),
+        "config.describe returned the backend's command, so the answer was assembled and not \
+         redacted away: {answer}"
+    );
+    assert!(
+        answer["refused"].is_null() && answer["refused_error"].as_str().is_some(),
+        "a method no namespace serves is refused by name rather than killing the worker: {answer}"
+    );
+    assert!(
+        answer["refused_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("kv")),
+        "and the refusal names the namespace that is missing, which is the whole of what a caller \
+         can act on: {answer}"
+    );
+
+    // The two entries are the two halves of the `try_lock` rule that this test forced. The sibling is
+    // idle and describes itself fully; the worker that is *asking* is serving a request, so its slot
+    // lock is held by that request and it reports nothing about itself.
+    //
+    // The runtime string is `"<version> (<sapi>)"` — `8.3.31 (cli)` on the machine this was written on —
+    // so it is asserted as that shape rather than as a substring "PHP", which it does not contain.
+    assert!(
+        answer["idle_runtimes"].as_array().is_some_and(|runtimes| {
+            runtimes.iter().any(|r| {
+                r.as_str()
+                    .is_some_and(|r| r.contains('(') && r.contains('.'))
+            })
+        }),
+        "the idle sibling reports the PHP version and SAPI it handshook with: {answer}"
+    );
+    assert_eq!(
+        answer["unobservable"], 1,
+        "and exactly one entry could not be read — the caller's own, which is locked by the request \
+         it is calling from. That is the deadlock this test found: taking that lock would hang until \
+         the request deadline killed the worker: {answer}"
+    );
+
+    // The pool still serves afterwards, which is the property that makes a call safe: it is an extra
+    // frame in an exchange, not a second exchange.
+    let again = dispatcher.dispatch(&get("/")).expect("a second request");
+    assert_eq!(again.parse_status_headers().0, 200);
 }

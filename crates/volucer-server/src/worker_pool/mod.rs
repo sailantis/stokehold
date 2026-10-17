@@ -575,43 +575,69 @@ impl WorkerPool {
     /// has one, but it is a label for logs, and a status entry whose backend came from the pool could
     /// disagree with the key the dispatcher indexed it under.
     ///
-    /// `idle` is `free_slots`'s question asked per slot rather than in aggregate, and it is asked
-    /// through the same lease the request path uses — see [`WorkerPool::take_specific`]. An `idle` of
-    /// `false` therefore means "a request is using this slot right now", which is the answer an operator
-    /// asking "which worker may I restart" needs. `false` is also what a slot with no pipes reports, so a
-    /// worker that died is not offered as restartable.
+    /// # `try_lock`, never `lock`, and why that is not a shortcut
+    ///
+    /// **This method is reachable from a call, and a call is served on the exchange thread of a worker
+    /// whose request is in flight** — which holds that worker's slot lock for the whole of the request.
+    /// So a `workers.list` that took each slot lock in turn would block on the caller's *own* slot,
+    /// waiting for a lock the caller is holding. That is not a theoretical race: it is what the first
+    /// end-to-end test of the call plane did, hanging until the 30-second request deadline killed the
+    /// worker with no hint of which call was to blame. It is also why `locked_slots`'s "the lock is never
+    /// held across a request" is no longer true — a call runs *inside* one.
+    ///
+    /// `try_lock` turns that into an answer. A contended slot is one that is serving a request right now,
+    /// which is precisely what `idle: false` means, so it is described correctly rather than skipped or
+    /// waited for. Its counters are behind the lock the request holds and are reported as zero, which is
+    /// the honest value for "not observable from here" — and they are not actionable anyway: a worker
+    /// serving a request cannot be reset, `WorkerPool::restart` refuses it with `AllBusy`.
+    ///
+    /// A poisoned lock is reported the same way. It should not happen — the only panic inside a slot is
+    /// caught by `catch_unwind` in the codec — and a pool whose locks are poisoned is not one to hand
+    /// work to, so "not idle, nothing known" is the safer of the two available answers.
     pub fn worker_status(&self) -> Vec<crate::calls::WorkerStatus> {
         // The free list is read **once**, before the slots are, so one answer describes one instant: a
         // slot cannot be described as idle here and taken a microsecond later by a request that this
-        // list never saw. The slots are locked after, each in turn, which is the order `pids` and
-        // `publish_metrics` already use and is safe for the same reason — no lock is held across a
-        // request.
+        // list never saw.
         let free = self
             .free
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .ids
             .clone();
-        self.locked_slots()
+        self.slots
             .iter()
             .enumerate()
-            .map(|(index, slot)| crate::calls::WorkerStatus {
-                backend: String::new(),
-                index,
-                pid: slot.child.id(),
-                idle: free.contains(&index),
-                served: slot.served,
-                memory_bytes: slot.peak_memory_bytes,
-                runtime: format!("{} ({})", slot.hello.php_version, slot.hello.sapi),
+            .map(|(index, slot)| {
+                let unobserved = crate::calls::WorkerStatus {
+                    backend: String::new(),
+                    index,
+                    pid: 0,
+                    idle: false,
+                    served: 0,
+                    memory_bytes: 0,
+                    runtime: String::new(),
+                };
+                match slot.try_lock() {
+                    Ok(slot) => crate::calls::WorkerStatus {
+                        pid: slot.child.id(),
+                        idle: free.contains(&index),
+                        served: slot.served,
+                        memory_bytes: slot.peak_memory_bytes,
+                        runtime: format!("{} ({})", slot.hello.php_version, slot.hello.sapi),
+                        ..unobserved
+                    },
+                    Err(_) => unobserved,
+                }
             })
             .collect()
     }
 
     /// Every slot, locked in turn.
     ///
-    /// The lock is never held across a request here, which is why this is safe
-    /// to call while other threads are serving: it takes each lock only long
-    /// enough to read a field.
+    /// The lock is held only long enough to read a field, so this is safe from any thread that is *not*
+    /// serving one of these workers. It is **not** safe from the exchange thread: a call is handled there
+    /// while its request holds the slot lock, so a call that reached this would wait for itself; see
+    /// [`WorkerPool::worker_status`] for the `try_lock` version the call path uses.
     fn locked_slots(&self) -> Vec<std::sync::MutexGuard<'_, Slot>> {
         self.slots
             .iter()
@@ -865,6 +891,20 @@ impl WorkerPool {
     /// for the whole of a request. An operator asking to restart a worker that is currently
     /// working gets `AllBusy` rather than a hang or a replacement swapped out from under a
     /// live request.
+    ///
+    /// # This can be reached from a call, and it blocks for as long as a worker takes to boot
+    ///
+    /// `worker.reset` is a call, so this runs **on the exchange thread** of whichever worker asked —
+    /// while that worker's request is in flight, and while its slot lock is held. `respawn` boots a PHP
+    /// process and waits for its handshake, bounded by `HANDSHAKE_TIMEOUT` and in practice the
+    /// application's boot time. So a worker that resets a sibling stalls its *own* request for that long,
+    /// and if the stall outlasts the request's deadline the pool kills it — the concrete instance of the
+    /// hazard in `docs/plugins.md` §4.2.
+    ///
+    /// Not fixed here, and deliberately not papered over with a shorter timeout: what a call's deadline
+    /// should be is open decision §10 item 9, and picking one here would decide the policy by accident. What
+    /// *is* settled is that it cannot deadlock — `take_specific` only returns a slot that is in the free
+    /// list, so the only lock taken below is one that no request holds.
     pub fn restart(&self, index: usize) -> Result<()> {
         let Some(slot) = self.slots.get(index) else {
             return Err(ServerError::NoWorker {

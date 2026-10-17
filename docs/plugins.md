@@ -305,6 +305,17 @@ that was measured faster than the alternatives (hazard 46 — a Windows pipe rea
 against ~0.09 ms on a socket; the socket transport already exists for that case and is selected
 automatically).
 
+**Hazard: a call is served while the caller's own slot lock is held, so a call handler may not take a slot
+lock.** Found by the first end-to-end test of the call plane, which hung until the request deadline killed
+the worker: `workers.list` walked every slot with `lock()`, and the call was being served on the exchange
+thread of a worker whose request was holding slot 0 — so it waited for its own lock. Nothing in the design
+above is wrong; what was missing is that **a call runs inside a request**, which the existing invariant
+"the slot lock is never held across a request" had stopped being true of. The rule for handlers is
+therefore: a slot lock may only be taken by something that is not serving a request, so a handler reads
+pool state with `try_lock` and reports what it could not observe rather than waiting for it. That is not a
+degradation — a slot that is locked is a slot serving a request, which is exactly `idle: false`, and it is
+not restartable either (`WorkerPool::restart` refuses it with `AllBusy`).
+
 **Hazard: an undrained channel stalls a call at the deadline.**
 `ChannelExchange::request` posts an exchange and waits on `recv_timeout`, so a worker blocked
 answering a server call cannot have the next *request* written to it — the send succeeds, the

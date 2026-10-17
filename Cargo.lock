@@ -1776,6 +1776,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "volucer-kv"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "volucer-metrics"
 version = "0.1.0"
 dependencies = [

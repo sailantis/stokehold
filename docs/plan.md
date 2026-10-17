@@ -2233,22 +2233,56 @@ big":
    `{status, headers, body, version}` (`translate.rs:152`), so `grpc-status` would be dropped and
    **every call would look failed**. This is shared work: it unlocks gRPC-to-an-origin too. It is the
    first deliverable, not a detail.
+   — **Sharply qualified by [plugins.md](./plugins.md) §6.6.** Read that before acting on this item.
+   The finding is correct about *this code* — nothing here constructs a trailer — but wrong about
+   *the effort*, because the ability to carry one is already present and unused: hyper 1.12 surfaces
+   trailers on ingress for both protocols (`hyper-1.12.0/src/body/incoming.rs:176`, `:209`),
+   `volucer_upstream::incoming_body` preserves frames (`client.rs:248`), and the front-end hands an
+   origin's body to the client without conversion (`listener.rs:1323`), since `UpstreamBody` and
+   `ResponseBody` are one type. What is missing is a small `Body` impl that *yields*
+   `Frame::trailers` — the same shape as the hand-written `FileBody` at `static_files.rs:806` — plus
+   the status mapping. The two claims that survive unqualified are the shared-work point and the
+   need for its own tests.
 2. **nginx's record in exactly this code path.** nginx only gained HTTP/2 to an origin in **1.29.4
    (09 Dec 2025)** — `CHANGES:233` — and has since shipped **two memory-safety CVEs in it**:
    CVE-2026-42055 (heap buffer overflow proxying a crafted request to an HTTP/2 **or gRPC** backend,
    1.30.3) and CVE-2026-42926 (`proxy_set_body` data injection into an HTTP/2 backend, 1.30.1).
    Two in eighteen months, in a codebase with more hardening than anything else on the internet.
    Framing code gets its own step with its own test story.
+   — *Mitigated, not dismissed:* volucer does not construct h2 frames at all, hyper does, so this
+   exposure is the trailer-construction and status-mapping code rather than a hand-written state
+   machine.
 
-**What it needs, concretely:** the listener already speaks h2 with ALPN and prior knowledge both
-proven (the row at *What actually works today*); a gRPC route is `/pkg.Service/Method`, which
-`path_prefix` already expresses; **trailers end to end**; h2 multiplexing, so a stream is handed to a
-backend as a stream rather than as a pool slot; and `.proto` descriptors for routing and reflection,
-which is the heaviest single piece (`prost-build`/`protox`) and a new config surface.
+**What it needs, concretely** — restated from §6.6, which supersedes the list that was here:
+the listener already speaks h2 with ALPN and prior knowledge both proven (the row at *What actually
+works today*), and a gRPC route is `/pkg.Service/Method`, which `path_prefix` already expresses. The
+remaining work is **three separable tiers**: (A) construct trailers and pass a call through to a
+Unix-socket origin — no schema, no worker, no new listener; (B) carry the call to an application over
+`CALL`/`RETURN`, still with the server opaque to the message; (C) reflection, the only consumer of
+`.proto` descriptors, and optional. **No `.proto` parsing is on the request path in any tier**,
+because gRPC's inner framing is length-delimited and therefore schema-independent. That replaces
+this section's earlier assumption that `.proto` descriptors, `prost-build`/`protox` and a new config
+surface were prerequisites — they are prerequisites of tier C alone.
 
 **The trigger that should make someone start it:** a real application that wants to *serve* gRPC, as
-opposed to a runtime that wants to *call* gRPC services — the latter is `upstream`'s job and works
-today. Recorded so the answer is "here is the design", not silence.
+opposed to a runtime that wants to *call* gRPC services. Note that the *calling* case is §6.6 tier A
+and is now the cheapest gRPC work available, and that a runtime which already speaks gRPC — Node,
+Go, Python — is reached through the same `upstream` backend that §7.1 adds for Django and Rails.
+Recorded so the answer is "here is the design", not silence.
+
+**Extended by [plugins.md](./plugins.md) §6.6, which corrects two things above.** The trailers
+finding is right about the *code* and too pessimistic about the *effort*: hyper 1.12 surfaces
+trailers on ingress for h1 and h2, `volucer_upstream::incoming_body` preserves frames, and the
+front-end hands an origin's body to the client without conversion — so what is actually missing is
+only the code that **constructs** a trailer, not the ability to carry one. And the `.proto`
+question turned out to be a false choice: the server can route, frame and answer a gRPC call
+without parsing any schema, because gRPC's inner framing is length-delimited and therefore
+schema-independent; descriptors are needed only by an optional reflection service. That re-cuts
+the work into three S–M steps rather than one XL one, the first of which is a pass-through to a
+Unix-socket origin and involves no worker at all. The section also covers the *rest* of the
+RoadRunner surface — metrics, a control-plane `CALL`/`RETURN` pair on the worker channel, KV, locks,
+jobs, OTLP export, the Python/Ruby question — and §9 of it lists what is deliberately **not**
+copied from RoadRunner.
 
 ### Observability — **done**, in six commits
 

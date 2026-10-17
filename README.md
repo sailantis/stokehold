@@ -987,6 +987,12 @@ exporter layer on top of the above — `tracing-opentelemetry` plus `opentelemet
 and RoadRunner defaults to the same transport for the same reason). Doing it in that order is what
 makes it a layer rather than a rewrite.
 
+There is also **no control plane and no external services**: no KV, no distributed locks, no job
+queue, no gRPC, and no way to ask a running server anything or tell it anything other than a
+signal. [docs/plugins.md](./docs/plugins.md) is the design for all of it — a native relay socket
+carrying the existing frame, services registered against it, and a separate, cheaper track for
+running Django and Rails as supervised HTTP origins. It is a plan, not a description of the code.
+
 ### Build prerequisites
 
 `rustls` is used rather than OpenSSL, so there is no DLL/dylib to match against a system OpenSSL.

@@ -29,8 +29,8 @@ worker to write to, and the supervisor drains it so the pipe buffer cannot fill 
 child.
 
 ```
-  volucer ──HELLO/REQUEST/CONTROL/PING──►  php worker  (stdin)
-            ◄─HELLO_ACK/RESPONSE/BODY ────  … ──LOG/METRIC/EVENT─  (stdout)
+  volucer ──HELLO/REQUEST/CONTROL/PING/CALL──►  php worker  (stdin)
+            ◄─HELLO_ACK/RESPONSE/BODY/RETURN ──  … ──LOG/METRIC/EVENT─  (stdout)
 ```
 
 The protocol is **symmetric**: the same codec reads what it wrote, so the PHP SDK mirrors this
@@ -44,7 +44,7 @@ Every frame is a 16-byte header followed by exactly `payload_len` payload bytes.
 offset  size  field
 0       4     payload_len        payload bytes, excluding this header
 4       1     protocol_version   must be 1
-5       1     message_type       1..=14, see below
+5       1     message_type       1..=16, see below
 6       2     flags              see below
 8       4     request_id         0 = unsolicited / control
 12      4     crc32c(payload)    CRC-32C, see below
@@ -98,27 +98,50 @@ The numbering is part of the protocol. These values must never be reordered or r
 | 12 | `PING` | either direction | no | Keep-alive probe |
 | 13 | `PONG` | either direction | no | Answer to `PING` |
 | 14 | `ERROR` | either direction | no | `message`, `request_id`, `recoverable` |
+| 15 | `CALL` | server → worker | yes | `method`, JSON params. A call to the *application*, asked while a request is in flight |
+| 16 | `RETURN` | worker → server | yes | `ok`, and a JSON result or an error |
 
 An unknown type number is rejected rather than skipped: skipping it would silently misalign the
 reader from the sender's expectations.
 
 ### Which types a worker may receive
 
-A worker only ever handles `HELLO`, `REQUEST`, `PING` and `CONTROL`, and answers each of them. It
-does not handle `RESPONSE`, `BODY`, `END`, `HELLO_ACK`, `CONTROL_ACK`, `PONG` or `ERROR` — a
-server sending any of those is a protocol error, and both the Rust codec and the PHP SDK refuse
+A worker handles `HELLO`, `REQUEST`, `PING`, `CONTROL` and `CALL`, and answers each of them. It
+does not handle `RESPONSE`, `BODY`, `END`, `HELLO_ACK`, `CONTROL_ACK`, `PONG`, `RETURN` or `ERROR` —
+a server sending any of those is a protocol error, and both the Rust codec and the PHP SDK refuse
 them rather than guessing. `LOG`, `METRIC` and `EVENT` are absorbed and ignored wherever they
 appear, because a peer echoing telemetry back must not derail the loop.
 
+### Calls, and why they share this channel
+
+A `CALL` is the server asking the *application* something — `kv.get`, `lock.acquire`, a declared
+metric — and it travels on this channel rather than a socket of its own, for two reasons: the
+channel is already open, and a second one would make the worker's liveness ambiguous (closing this
+channel is the whole shutdown mechanism, see *Shutdown*).
+
+The rule a worker follows is one sentence: **while a request is in flight, a frame that is not part
+of the response is a call.** `CONTROL`, `PING`, `LOG`, `METRIC` and `EVENT` already behaved that
+way; `CALL` is another arm of the same dispatch. Calls must be answered even when they cannot be
+served — a `RETURN` carrying an error, never a dropped frame — because dropping one leaves the
+server waiting until its deadline.
+
+Calls are **server → worker only**. A worker has no way to originate one: the response is how it
+answers. In the other direction, work arriving for a worker (a job, a gRPC message) is a second
+*exchange*, not a call, and is deliberately not part of this mechanism.
+
 ### Correlation
 
-`request_id` is meaningful only for `REQUEST`, `RESPONSE`, `BODY` and `END`. Every other type is
-unsolicited and **must** carry `request_id = 0`.
+`request_id` is meaningful for `REQUEST`, `RESPONSE`, `BODY`, `END`, `CALL` and `RETURN`. Every
+other type is unsolicited and **must** carry `request_id = 0`.
 
-Ids are allocated by the server, start at **1**, and increment per request. **`0` is reserved**
-and never used as a request id, so a correlation bug is visible instead of silently matching.
-The counter wraps at `u32::MAX` back to 1, skipping 0. Requests are never multiplexed: a worker
-serves one request at a time, so a demux table would buy nothing.
+Request ids are allocated by the server, start at **1**, and increment per request. **`0` is
+reserved** and never used as a request id, so a correlation bug is visible instead of silently
+matching. The counter wraps at `u32::MAX` back to 1, skipping 0. Requests are never multiplexed: a
+worker serves one request at a time, so a demux table would buy nothing.
+
+**Call ids are allocated downward from `u32::MAX`**, so the two ranges meet only after four billion
+requests and a mix-up between a call and a request is a visible correlation failure rather than a
+silent match — the same reasoning that reserved 0.
 
 ## Body framing
 
@@ -274,6 +297,21 @@ either  ──PING──►  other
         ◄─PONG───
 ```
 
+### A call, while a request is in flight
+
+```
+server  ──CALL (method, params)────────────────────►  worker
+        ◄─RETURN (ok, result | error)────────────────
+```
+
+A `CALL` may only arrive **during** a request, because that is when a worker is reading: between
+requests the server's exchange thread is parked on its work channel and nothing drains the pipe.
+A worker answers with `RETURN` in both cases, including when it cannot serve the method — a dropped
+call leaves the server waiting until its deadline, and a deadline is a kill.
+
+`CALL` and `RETURN` are correlated, and their ids come from the opposite end of the range to
+request ids, so a call mistaken for a request is a visible correlation failure.
+
 ### Telemetry, at any time
 
 `LOG`, `METRIC` and `EVENT` may arrive **during** any of the above, always with `request_id = 0`.
@@ -381,6 +419,19 @@ each exchange runs on a thread the pool is free to stop waiting on; the worker i
 the pending read return. That is also why a recycled worker's pipes are not reused after a
 timeout — the reader may still be inside a read.
 
+**A call outlives a request, so a call's timeout is not a kill.** A `CALL` runs on the same
+exchange thread as the request that is in flight, which means the request's deadline covers it —
+and the pool's answer to a missed deadline is to kill the worker. For a request that is correct:
+the response is lost and the application may have run it, so the worker is discarded rather than
+reused (above). For a call it is not, because a call has no response to lose in that sense and does
+have *state* to lose: a worker killed inside `lock.acquire` leaves the server unable to say whether
+the lock was taken, and that is the ambiguity the lock API already refuses to paper over. So a call
+carries its own deadline, enforced **inside** the handler rather than by the exchange thread, and a
+call that runs out of time is reported as a failed call with unknown state and the worker is kept.
+The request it was serving then fails on its own deadline if the delay was enough to matter, which
+is the correct division: the request's deadline governs the *request*, not the calls made during
+it.
+
 **Recycling and telemetry.** `LOG` and `METRIC` records that arrive while a request is in flight
 are attached to that request's response *and* kept on the channel, so a caller can see either the
 per-request view or everything the worker has ever said. The server renders a request's records
@@ -402,5 +453,15 @@ checksum and framing are payload-agnostic by construction, so a future msgpack c
 profiling ever justifies one) changes no framing. Bodies are the exception and are always raw
 bytes.
 
-Field names in the JSON payloads are part of the protocol: the PHP SDK decodes the same objects,
-so renaming a field is a protocol change.
+Field names in the JSON payloads are part of the protocol: the SDK implements the same objects, so
+renaming a field is a protocol change. **Adding an optional field is not** — a reader that does not
+know it ignores it, which is why `HelloAck::runtime` and the call metadata can be added without a
+version bump.
+
+`CALL` and `RETURN` were added as types 15 and 16 in the same way: a new *number* in an existing
+range, not a new framing. That was only safe because nothing was released — an SDK that does not
+know a type number refuses it as fatal rather than skipping it (see *Errors and their
+consequences*), so adding a type after a release would have required upgrading every worker before
+the server that talks to it. The rule for the future is therefore: with deployed workers, a new
+type number needs the handshake to advertise it and the server to send only what a worker has
+agreed to.

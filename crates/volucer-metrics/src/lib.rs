@@ -43,6 +43,8 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+pub mod http;
+
 /// How many distinct label sets one metric name may have.
 ///
 /// Chosen to be far above any legitimate use in this server and far below the point at which

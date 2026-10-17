@@ -419,10 +419,52 @@ base_port = 19001
 # url = "redis://127.0.0.1:6379"
 # pool_size = 16                  # one per worker is the natural size; a call blocks the worker that asked
 
+# ---------------------------------------------------------------------------
+# Resource locks. Absent means no lock plane, and then a worker calling
+# `lock.*` is refused -- the same rule every other service follows.
+#
+# **Read this before using a lock for anything that matters.** A lock here is
+# for coordinating *work*: collapsing a cache miss, keeping two workers from
+# rendering the same PDF twice, making a retry cheap. It is NOT a correctness
+# primitive. A lock has a lease and no fencing token, so a worker that stalls
+# past its lease -- a pause, a swap storm, a debugger -- still believes it holds
+# the lock while the server has given it to somebody else, and two processes
+# are then inside the section the lock was meant to guard. No server-side care
+# fixes that, because the late writer is late precisely because it was not
+# running. Where a real invariant is at stake, use the storage's own
+# conditional write: a unique index, a compare-and-swap, `SET NX`.
+#
+# `driver = "memory"` keeps the locks in this process, so they coordinate this
+# server's workers and nothing else. That is the common deployment and it needs
+# nothing installed. Two things about the API that are easy to get wrong:
+#
+#   * `ttl` of 0 means **held until released**, not "expires immediately".
+#   * `update_lease` **replaces** what is left of the lease; it does not add to
+#     it. A caller reading it as "another N seconds" can be released early.
+# ---------------------------------------------------------------------------
+# [lock]
+# driver = "memory"
+
+# Redis, so locks are shared between processes and survive a restart of this
+# one. Needs a build with the `redis` feature, like the KV driver above, and
+# takes the same URL and pool settings for the same reasons.
+#
+# `read_timeout_ms` is the deadline on one command. It is the setting that
+# turns a Redis that stopped answering into a lock whose state is reported as
+# *unknown* rather than into a worker that hangs holding a slot; the caller is
+# then told to resolve it by asking, which is the only correct answer and the
+# one this server will not invent.
+# [lock]
+# driver = "redis"
+# url = "redis://127.0.0.1:6379"
+# pool_size = 16                  # one per worker is the natural size
+# read_timeout_ms = 5000          # 5s; the deadline on one lock command
+
 # Grant a backend access to one of them by name. A bare "kv" is refused, because
 # a deployment that adds a second storage later would find the first worker's
-# calls quietly going somewhere else.
+# calls quietly going somewhere else. `"lock"` is the whole name -- a lock is
+# named by its *resource*, so there is one lock namespace and no name to write.
 # [backends.ops]
 # kind = "worker"
 # command = "php bin/ops-worker.php"
-# services = ["config", "workers", "kv.sessions"]
+# services = ["config", "workers", "kv.sessions", "lock"]

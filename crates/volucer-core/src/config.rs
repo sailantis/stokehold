@@ -76,6 +76,20 @@ pub struct Config {
     /// it may reach; see [`Config::validate`] for where that is checked.
     #[serde(default)]
     pub kv: BTreeMap<String, KvStorageConfig>,
+
+    /// The resource locks, or absent for none.
+    ///
+    /// **One table where KV has many**, and that is the difference between the two features rather than
+    /// an inconsistency. A KV storage is *named* because a deployment wants several with different
+    /// lifetimes and backends, and a worker has to say which one it is calling. A lock backend is a
+    /// single mechanism: a lock is named by its *resource*, so two lock tables would be two independent
+    /// views of one namespace — two processes locked on `"pdf:create"` through two tables would not see
+    /// each other, which is a bug that is invisible in configuration and appears in production.
+    ///
+    /// The consequence for the call plane is the same as KV's: a backend reaches it by naming the
+    /// namespace in `services`, and there is exactly one name to write.
+    #[serde(default)]
+    pub lock: Option<LockConfig>,
 }
 
 /// One `[kv.<name>]` storage: which driver, and that driver's own settings.
@@ -172,6 +186,124 @@ impl KvStorageConfig {
     }
 }
 
+/// `[lock]`: which driver coordinates resource locks, and that driver's own settings.
+///
+/// # Why this is one table and not a `[lock.<name>]` map
+///
+/// The shape KV has, and the reason it does not apply here: see [`Config::lock`]. A lock is named by its
+/// resource, so two tables would be two namespaces that do not see each other.
+///
+/// # Why a tagged enum, as `KvStorageConfig` is
+///
+/// Same argument as that one's own documentation: RR's `driver = "redis"` plus a free-form `config` table
+/// means a misspelled key parses, is ignored, and leaves an operator with a client pointed at a default
+/// and nothing in the log. Here every unknown key is a parse error naming the key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "driver", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LockConfig {
+    /// Locks held in this process. The default, and the one that needs nothing installed.
+    Memory(MemoryLockConfig),
+
+    /// Locks held in Redis, and therefore shared between processes and across a restart of this one.
+    ///
+    /// Behind the `redis` cargo feature, so a build without it refuses this driver at *parse* time rather
+    /// than accepting a table whose backend cannot be built.
+    #[cfg(feature = "redis")]
+    Redis(RedisLockConfig),
+}
+
+/// `[lock] driver = "memory"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryLockConfig {}
+
+/// `[lock] driver = "redis"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisLockConfig {
+    /// The server, as a URL: `redis://127.0.0.1:6379`, optionally with a username, password and database.
+    ///
+    /// The same key, the same shape and the same validation as `[kv.<name>]`'s `url`, deliberately: an
+    /// operator pointing two features at one server should be able to copy a line, and a second URL
+    /// spelling for one client is a second thing to get wrong. `config.describe` redacts it for the
+    /// same reason it redacts the KV one — it may carry a credential.
+    pub url: String,
+
+    /// How many connections to keep.
+    ///
+    /// One per worker is the natural size, since a call blocks the worker that asked.
+    #[serde(default = "default_redis_pool_size")]
+    pub pool_size: usize,
+
+    /// How long one command may take before it is considered failed.
+    ///
+    /// **The deadline that turns a hung Redis into an `Unknown` rather than a stuck worker**, and the
+    /// reason it is configuration rather than a constant: a deployment with a replicating Redis over a
+    /// slow link needs a longer one, and the failure mode of too short a value is a lock whose state is
+    /// permanently unknown to its holder.
+    ///
+    /// The client's own default when absent. Millisecond-resolution because the value ends up as a socket
+    /// option, and a whole-second granularity would make sub-second deadlines unexpressible.
+    #[serde(default = "default_lock_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+}
+
+fn default_lock_read_timeout_ms() -> u64 {
+    // Five seconds, which is what RoadRunner's own Redis lock configuration defaults to and what the
+    // worker protocol's request timeout already is — so a lock command cannot outlive the request that
+    // issued it by much, and a worker killed for exceeding its deadline is not killed while a lock
+    // command it cannot see the end of is still running.
+    5000
+}
+
+impl LockConfig {
+    /// The driver's name, as it is written in configuration.
+    pub fn driver(&self) -> &'static str {
+        match self {
+            LockConfig::Memory(_) => "memory",
+            #[cfg(feature = "redis")]
+            LockConfig::Redis(_) => "redis",
+        }
+    }
+}
+
+/// The Redis URL and pool rules, applied identically to every table that names a Redis.
+///
+/// **One function, because there are now two tables and there will be three** (`docs/plugins.md` §6.4
+/// wants a jobs driver on the same client). A second copy of these checks is a second place for the
+/// credential rule to be written slightly differently — and the credential rule is the one where a
+/// divergence is a password on the wire in the clear.
+#[cfg(feature = "redis")]
+fn validate_redis(what: &str, url: &str, pool_size: usize) -> std::result::Result<(), Error> {
+    // Checked for the shape a client will accept, not by connecting: `volucer check` must not require the
+    // server to be up, and a URL that parses is all the configuration can vouch for. A server that is not
+    // there is reported by `serve` when it connects.
+    if !url.starts_with("redis://") && !url.starts_with("rediss://") {
+        return Err(Error::Config(format!(
+            "{what}.url {url:?} is not a Redis URL; it must start with \"redis://\" or \"rediss://\", \
+             e.g. \"redis://127.0.0.1:6379\""
+        )));
+    }
+    if url.contains('@') && !url.contains("rediss://") {
+        // A password over a plaintext connection. An error rather than a warning: a *configuration* is
+        // the one place where nobody is watching a log at the moment the decision is made, and
+        // `rediss://` is the fix. The message never repeats the URL, because the URL is the credential.
+        return Err(Error::Config(format!(
+            "{what}.url carries a credential (it has an \"@\") over a plaintext connection; use \
+             \"rediss://\" to encrypt it, or accept that the password crosses the network in the clear \
+             by making the connection local"
+        )));
+    }
+    if pool_size == 0 {
+        return Err(Error::Config(format!(
+            "{what}.pool_size is 0, so no call could ever be served; remove the key for the {default} \
+             default",
+            default = default_redis_pool_size()
+        )));
+    }
+    Ok(())
+}
+
 impl Config {
     /// Whether a name in a backend's `services` list is one this configuration can honour.
     ///
@@ -186,9 +318,18 @@ impl Config {
     /// A bare `"kv"` is refused for that reason rather than silently resolving to "the only one":
     /// a deployment with a second storage added later would find the first worker's calls quietly
     /// going somewhere else.
+    ///
+    /// A lock backend is the third shape, and it is the fixed half: `[lock]` is a single table, so
+    /// `"lock"` is a name that means the same thing to every worker. What it *is* checked against is the
+    /// presence of the table, which is why it is not in [`CALL_NAMESPACES`] — a backend granted `"lock"`
+    /// with no `[lock]` is a worker that boots, serves traffic, and cannot reach a lock it was told it
+    /// had, which is exactly the silent failure the KV case is checked for.
     pub fn is_a_call_service(&self, service: &str) -> bool {
         if CALL_NAMESPACES.contains(&service) {
             return true;
+        }
+        if service == "lock" {
+            return self.lock.is_some();
         }
         match service.strip_prefix("kv.") {
             Some(storage) => self.kv.contains_key(storage),
@@ -2330,35 +2471,26 @@ impl Config {
                 }
                 #[cfg(feature = "redis")]
                 KvStorageConfig::Redis(redis) => {
-                    // Checked for the shape a client will accept, not by connecting: `volucer check`
-                    // must not require the server to be up, and a URL that parses is all the
-                    // configuration can vouch for. A server that is not there is reported by `serve`
-                    // when it connects.
-                    if !redis.url.starts_with("redis://") && !redis.url.starts_with("rediss://") {
-                        return Err(Error::Config(format!(
-                            "kv.{name}.url {:?} is not a Redis URL; it must start with \
-                             \"redis://\" or \"rediss://\", e.g. \"redis://127.0.0.1:6379\"",
-                            redis.url
-                        )));
-                    }
-                    if redis.url.contains('@') && !redis.url.contains("rediss://") {
-                        // A password over a plaintext connection, warned about rather than refused:
-                        // a loopback or a same-host network is a legitimate deployment, and refusing
-                        // it would make the safe half of the configuration the one nobody can use.
-                        return Err(Error::Config(format!(
-                            "kv.{name}.url carries a credential (it has an \"@\") over a plaintext \
-                             connection; use \"rediss://\" to encrypt it, or accept that the password \
-                             crosses the network in the clear by making the connection local"
-                        )));
-                    }
-                    if redis.pool_size == 0 {
-                        return Err(Error::Config(format!(
-                            "kv.{name}.pool_size is 0, so no call could ever be served; remove the \
-                             key for the {default} default",
-                            default = default_redis_pool_size()
-                        )));
-                    }
+                    // The label is the same spelling the keys use, so an operator reading the refusal can
+                    // find the line by grep.
+                    validate_redis(&format!("kv.{name}"), &redis.url, redis.pool_size)?;
                 }
+            }
+        }
+
+        #[cfg(feature = "redis")]
+        if let Some(LockConfig::Redis(redis)) = &self.lock {
+            validate_redis("lock", &redis.url, redis.pool_size)?;
+            if redis.read_timeout_ms == 0 {
+                // Zero is refused rather than read as "no deadline": a command with no deadline is a
+                // worker that hangs on a Redis that went away, which is the failure this key exists to
+                // bound. An operator who wrote it meant "wait for ever", and that is not on offer.
+                return Err(Error::Config(
+                    "lock.read_timeout_ms is 0, so a lock command would have no deadline and a worker \
+                     blocked on it could not be told the outcome; remove the key for the five-second \
+                     default"
+                        .to_string(),
+                ));
             }
         }
 
@@ -2964,8 +3096,9 @@ impl Config {
                     if !self.is_a_call_service(namespace) {
                         return bad(format!(
                             "services contains {namespace:?}, which is not a namespace the server \
-                             implements; known namespaces are {known}, and a KV storage is named \
-                             \"kv.<name>\" — {storages}",
+                             implements; known namespaces are {known}, a KV storage is named \
+                             \"kv.<name>\" — {storages} — and locks are reached as \"lock\", which \
+                             {lock}",
                             known = CALL_NAMESPACES
                                 .iter()
                                 .map(|name| format!("\"{name}\""))
@@ -2982,6 +3115,11 @@ impl Config {
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 )
+                            },
+                            lock = if self.lock.is_some() {
+                                "this deployment has a [lock] table"
+                            } else {
+                                "needs a [lock] table to be configured"
                             }
                         ));
                     }
@@ -4765,6 +4903,213 @@ pool_size = 0
         assert!(message.contains("16"), "and quote the default: {message}");
     }
 
+    /// A `[lock]` table is what makes `"lock"` a name a backend may put in `services`.
+    ///
+    /// The `[lock]` namespace is the third shape of the allow-list, and the one that is easiest to get
+    /// wrong: its *name* is fixed — a lock is named by its resource, so there is exactly one lock backend
+    /// — which makes it look like the fixed half ([`CALL_NAMESPACES`]), while what it actually needs is
+    /// the check the KV half gets. A backend granted `"lock"` with no `[lock]` table is a worker that
+    /// boots, serves traffic, and cannot reach a lock it was told it had. That is precisely the silent
+    /// failure the KV case exists to prevent, so it is asserted here in both directions.
+    #[test]
+    fn a_lock_service_needs_a_lock_table_and_a_lock_table_is_enough() {
+        let with_table = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[lock]
+driver = "memory"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["lock"]
+"#;
+        Config::from_toml(with_table)
+            .expect("the file parses")
+            .validate()
+            .expect("a [lock] table is a lock service that is honoured");
+
+        let without = with_table.replace("[lock]\ndriver = \"memory\"\n", "");
+        let err = Config::from_toml(&without)
+            .expect("the file still parses")
+            .validate()
+            .expect_err("must not validate");
+        let message = err.to_string();
+        assert!(
+            message.contains("\"lock\""),
+            "the error must quote the service that is wrong: {message}"
+        );
+        assert!(
+            message.contains("needs a [lock] table"),
+            "and say what the deployment is missing rather than only that the name is unknown: {message}"
+        );
+
+        // And the other direction: with the table present, a refusal that lists what *is* available must
+        // not claim there is no lock backend.
+        let err = Config::from_toml(&with_table.replace(
+            "services = [\"lock\"]",
+            "services = [\"lock\", \"workes\"]",
+        ))
+        .expect("the file parses")
+        .validate()
+        .expect_err("`workes` is a typo for a fixed namespace");
+        assert!(
+            err.to_string().contains("has a [lock] table"),
+            "a refusal that lists what is available must be told about the lock backend: {err}"
+        );
+    }
+
+    /// An unknown key in a `[lock]` table is refused, and so is a misspelled `driver`.
+    #[test]
+    fn the_lock_table_is_typed_like_the_kv_one_it_sits_beside() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[lock]
+driver = "memory"
+max_bytes = 1024
+"#;
+        let err = Config::from_toml(text).expect_err("max_bytes is not a lock key");
+        let message = err.to_string();
+        assert!(
+            message.contains("max_bytes"),
+            "the refusal must name the key, which is the whole reason this is a tagged enum rather than \
+             `driver` plus a free-form table: {message}"
+        );
+
+        let misspelled = text.replace("max_bytes", "driover");
+        let err = Config::from_toml(&misspelled).expect_err("driover is not a lock key");
+        assert!(
+            err.to_string().contains("driover"),
+            "and it must name a misspelled one too: {err}"
+        );
+    }
+
+    /// `[lock] driver = "memory"` with no further keys is the whole of the single-node setup.
+    #[test]
+    fn the_memory_lock_driver_needs_no_keys_at_all() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[lock]
+driver = "memory"
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        config
+            .validate()
+            .expect("nothing to configure is not a mistake");
+        let lock = config.lock.as_ref().expect("the table is there");
+        assert_eq!(
+            lock.driver(),
+            "memory",
+            "a describe that said something other than the tag would be a lie in the one answer an \
+             operator uses to find out what is running"
+        );
+    }
+
+    /// An **absent** `[lock]` table is not the memory driver — it is no lock plane at all.
+    #[test]
+    fn a_configuration_with_no_lock_table_grants_no_lock_service() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        assert!(
+            config.lock.is_none(),
+            "absent must stay absent: defaulting to the memory driver would make `services = [\"lock\"]` \
+             work in a deployment that never configured a lock backend, which is the silent grant the \
+             allow-list exists to prevent"
+        );
+        assert!(!config.is_a_call_service("lock"));
+
+        // The table's absence is a different thing from the table being there with no driver line, and
+        // the second is refused by name rather than read as the default.
+        let text = format!("{text}\n[lock]\n");
+        let err = Config::from_toml(&text).expect_err("an empty [lock] table names no driver");
+        assert!(
+            err.to_string().contains("driver"),
+            "and the refusal must name the missing key: {err}"
+        );
+    }
+
+    /// The lock backend's Redis rules are the KV ones, because they are one function.
+    ///
+    /// Asserted separately rather than trusted to the shared helper, because the two tables reach it from
+    /// different places — a loop over a `BTreeMap` and a single `Option` — and the interesting failure is
+    /// the second call site quietly not being wired up at all.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn the_lock_backend_gets_the_same_redis_checks_as_a_kv_storage() {
+        let with = |tail: &str| {
+            let text = format!(
+                r#"
+[server]
+http = "127.0.0.1:8080"
+[lock]
+driver = "redis"
+{tail}
+"#
+            );
+            Config::from_toml(&text)
+                .expect("the file parses")
+                .validate()
+        };
+
+        with("url = \"redis://127.0.0.1:6379\"").expect("a plain loopback URL is the ordinary case");
+
+        let err = with("url = \"127.0.0.1:6379\"").expect_err("a bare host:port is not a URL");
+        assert!(err.to_string().contains("lock.url"), "{err}");
+        assert!(err.to_string().contains("redis://"), "{err}");
+
+        let err = with("url = \"redis://:secret@redis.example.com:6379\"")
+            .expect_err("a credential over plaintext must be refused");
+        let message = err.to_string();
+        assert!(
+            !message.contains("secret"),
+            "and the password must not be echoed: {message}"
+        );
+
+        let err = with("url = \"redis://127.0.0.1:6379\"\npool_size = 0")
+            .expect_err("a zero pool could serve no call");
+        assert!(err.to_string().contains("lock.pool_size"), "{err}");
+
+        let err = with("url = \"redis://127.0.0.1:6379\"\nread_timeout_ms = 0")
+            .expect_err("a zero deadline is a command that can never be resolved");
+        let message = err.to_string();
+        assert!(message.contains("lock.read_timeout_ms"), "{message}");
+        assert!(
+            message.contains("five-second"),
+            "and it must quote the default back: {message}"
+        );
+    }
+
+    /// The default read timeout is the one the documentation promises, and it is reachable by omitting it.
+    ///
+    /// Pinned because the value is written twice — here and in the lock crate's own documentation — and
+    /// a default that drifted would be a deadline nobody could predict from the file.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn an_omitted_lock_read_timeout_is_five_seconds() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[lock]
+driver = "redis"
+url = "redis://127.0.0.1:6379"
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        let lock = config.lock.as_ref().expect("the table is there");
+        let LockConfig::Redis(redis) = lock else {
+            panic!("the driver is redis");
+        };        assert_eq!(redis.read_timeout_ms, 5000);
+        assert_eq!(
+            redis.pool_size,
+            default_redis_pool_size(),
+            "and the pool default is the KV one, shared through the same function"
+        );
+    }
+
     /// A key inside a `[kv.<name>]` table that the driver does not have is refused.
     ///
     /// The whole reason the table is a tagged enum rather than `driver` plus a free-form map: this is
@@ -4903,6 +5248,23 @@ driver = "memory"
         assert!(
             text.contains("# [kv.sessions]"),
             "{} no longer documents a [kv.*] storage",
+            path.display()
+        );
+        // And for the lock table, which is the one place the fencing warning has to be readable by
+        // the person about to configure it — `docs/plugins.md` §9.2 asks for it in the README, and a
+        // deployment never reads the README before copying the example.
+        assert!(
+            text.contains("# [lock]"),
+            "{} no longer documents the [lock] table",
+            path.display()
+        );
+        assert!(
+            // Two single-line fragments rather than the whole sentence: the file is CRLF and this file
+            // is not, so a `contains` spanning a line boundary fails for a reason that has nothing to do
+            // with the documentation being there.
+            text.contains("NOT a correctness") && text.contains("no fencing token"),
+            "{} no longer carries the warning that a lock is not a correctness primitive; that \
+             warning is the reason this feature is safe to ship at all",
             path.display()
         );
     }

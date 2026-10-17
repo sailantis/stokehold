@@ -20,7 +20,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use volucer_core::config::{BackendConfig, Config, KvStorageConfig, MemoryKvConfig, WorkerConfig};
+use volucer_core::config::{
+    BackendConfig, Config, KvStorageConfig, LockConfig, MemoryKvConfig, MemoryLockConfig,
+    WorkerConfig,
+};
 use volucer_fcgi::{build_params, Request, RequestInfo, Routing};
 use volucer_server::{Dispatcher, WorkerPool};
 
@@ -1730,4 +1733,243 @@ fn json_body(response: &volucer_fcgi::Response) -> serde_json::Value {
     let body = body_of(response);
     serde_json::from_str(&body)
         .unwrap_or_else(|err| panic!("the worker answered with JSON: {err}\n{body}"))
+}
+
+/// A lock acquired by one request is contended by the next, over a real channel.
+///
+/// The same argument as the KV test above and the third instance of the pattern: `LockNamespace`,
+/// `MemoryLocks`, `build_locks` and the `services` allow-list were each tested separately, and the thing
+/// that could still be wrong is the seam — `build_locks` returning `None` while the configuration granted
+/// `lock`, or the namespace being installed under a name the router does not key on. So this goes through
+/// `Dispatcher::from_config` with a real PHP process and calls the methods from inside a request handler.
+///
+/// It asserts the three answers an acquisition has, in one run:
+///
+/// - **acquired**, with the id the server generated, because the caller sent none — the client-side half
+///   of that design is only useful if the id comes back;
+/// - **contended** (`ok` true, `acquired` false), which is an ordinary answer rather than an error, and
+///   the distinction RoadRunner's own documentation is emphatic about;
+/// - **released by the id it was given**, and then not contended any more — which is what makes the id
+///   meaningful rather than decorative.
+#[test]
+fn a_lock_acquired_by_one_request_is_contended_by_the_next() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-lock-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("lock-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+
+// Held across requests by being taken with no lease: `ttl` absent means "until released", which is the
+// one lock semantic that is the opposite of what the same key means to a KV value.
+$held = null;
+$held_id = null;
+
+$worker->run(static function (Request $request, Worker $worker) use (&$held, &$held_id): Response {{
+    $path = parse_url($request->uri, PHP_URL_PATH);
+
+    if ($path === '/hold') {{
+        $acquired = $worker->call('lock.acquire', ['resource' => 'pdf:create']);
+        $held = (bool) $acquired['acquired'];
+        $held_id = $acquired['id'];
+        return Response::json([
+            'acquired' => $acquired['acquired'],
+            'id_is_set' => $held_id !== null && $held_id !== '',
+            'mode' => $acquired['mode'],
+            // An id was generated for us, so `remaining_ms` is null because the lease has no deadline.
+            'remaining_is_null' => $acquired['remaining_ms'] === null,
+        ]);
+    }}
+
+    if ($path === '/contend') {{
+        // The same worker, a second call, while the first lock is still held. Note that the id is a
+        // *new* one: contending with itself is refused with an error rather than answered with
+        // `acquired: false`, and neither of those is what this asserts.
+        $second = $worker->call('lock.acquire', ['resource' => 'pdf:create']);
+        $exists = $worker->call('lock.exists', ['resource' => 'pdf:create']);
+        $holders = $worker->call('lock.holders', ['resource' => 'pdf:create']);
+        return Response::json([
+            'acquired' => $second['acquired'],
+            'error' => $worker->lastCallError(),
+            'exists' => $exists['exists'],
+            'holders' => count($holders['holders']),
+        ]);
+    }}
+
+    if ($path === '/release') {{
+        $released = $worker->call('lock.release', ['resource' => 'pdf:create', 'id' => $held_id]);
+        $after = $worker->call('lock.exists', ['resource' => 'pdf:create']);
+        // A second release of the same id is `false` rather than an error, which is what a `finally`
+        // block depends on: cleanup that could throw is cleanup that gets skipped.
+        $again = $worker->call('lock.release', ['resource' => 'pdf:create', 'id' => $held_id]);
+        return Response::json([
+            'released' => $released['released'],
+            'again' => $again['released'],
+            'exists_after' => $after['exists'],
+        ]);
+    }}
+
+    return Response::json(['error' => 'unknown path']);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        // One worker, deliberately: the lock has to be visible to the *same* worker's next request, and a
+        // pool of two would make the test depend on which slot served it. Cross-worker reachability is
+        // what the memory driver's shared registry gives, and the KV test above already covers that shape.
+        workers: 1,
+        services: vec!["lock".to_string()],
+        ..config(1)
+    });
+    let mut configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        default_backend: Some("app".to_string()),
+        ..Config::default()
+    };
+    configured.lock = Some(LockConfig::Memory(MemoryLockConfig {}));
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+
+    let held = json_body(
+        &dispatcher
+            .dispatch(&get("/hold"))
+            .expect("the hold is served"),
+    );
+    assert_eq!(held["acquired"], true, "{held}");
+    assert_eq!(
+        held["id_is_set"], true,
+        "the server generated an id and the answer carries it, which is the only way a caller that sent \
+         none can release the lock: {held}"
+    );
+    assert_eq!(
+        held["mode"], "exclusive",
+        "and the default mode is exclusive, because a shared default would stop two writers excluding \
+         each other: {held}"
+    );
+    assert_eq!(
+        held["remaining_is_null"], true,
+        "`ttl` absent means held until released, so there is no remaining time: {held}"
+    );
+
+    let contended = json_body(
+        &dispatcher
+            .dispatch(&get("/contend"))
+            .expect("the contention is served"),
+    );
+    assert_eq!(
+        contended["acquired"], false,
+        "a second acquisition contends rather than failing: {contended}"
+    );
+    assert_eq!(
+        contended["error"],
+        serde_json::Value::Null,
+        "and `lastCallError` stays null, because contention is a successful call: {contended}"
+    );
+    assert_eq!(
+        contended["exists"], true,
+        "exists answers the question a caller resolving an unknown state asks: {contended}"
+    );
+    assert_eq!(contended["holders"], 1, "{contended}");
+
+    let released = json_body(
+        &dispatcher
+            .dispatch(&get("/release"))
+            .expect("the release is served"),
+    );
+    assert_eq!(released["released"], true, "{released}");
+    assert_eq!(
+        released["again"], false,
+        "releasing what is already gone is an answer, not an error: {released}"
+    );
+    assert_eq!(released["exists_after"], false, "{released}");
+}
+
+/// A lock call from a backend that was not granted the service is refused, by name.
+///
+/// The capability half of the same seam, and the one worth asserting separately: the *default* is that no
+/// worker may lock anything, so a deployment that forgets the `services` line gets a refusal rather than a
+/// distributed lock it did not mean to hand out.
+#[test]
+fn a_lock_call_from_a_backend_without_the_grant_is_refused() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-lock-denied-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("denied-lock-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response {{
+    $answer = $worker->call('lock.acquire', ['resource' => 'pdf:create']);
+    return Response::json([
+        'acquired' => $answer['acquired'],
+        'error' => $worker->lastCallError(),
+        'unknown' => $worker->lastCallWasUnknown(),
+    ]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        // No `services` at all, which is the default and the right default.
+        workers: 1,
+        ..config(1)
+    });
+    let mut configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        default_backend: Some("app".to_string()),
+        ..Config::default()
+    };
+    // The table is there; the *grant* is what is missing, which is the distinction that makes this a
+    // capability test rather than a configuration test.
+    configured.lock = Some(LockConfig::Memory(MemoryLockConfig {}));
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+    let answer = json_body(
+        &dispatcher
+            .dispatch(&get("/"))
+            .expect("the request is served"),
+    );
+
+    assert!(
+        answer["acquired"].is_null(),
+        "a worker with no `lock` in its services list must not acquire anything, so the call never \
+         reaches an acquisition at all: {answer}"
+    );
+    assert_eq!(
+        answer["unknown"], false,
+        "and a refused call is decided, not undetermined: {answer}"
+    );
+    let message = answer["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("lock"),
+        "the refusal names the namespace that is missing: {message}"
+    );
 }

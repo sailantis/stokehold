@@ -13,6 +13,11 @@ repository.workspace = true
 # links no client at all. `docs/plugins.md` §5.
 tracing.workspace = true
 thiserror.workspace = true
+# For the fresh id an acquisition generates when the caller names none. The same source the request id
+# and the trace id come from, so nothing new enters the graph — see `volucer-observe`'s documentation of
+# what its predictability would and would not affect. A lock id is the same kind of value: it names a
+# holder for as long as one critical section lasts, and nothing is authorised by it.
+getrandom.workspace = true
 
 [features]
 default = []

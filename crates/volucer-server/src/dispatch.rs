@@ -7,12 +7,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, Weak};
 
-use volucer_core::config::{BackendConfig, Config, KvStorageConfig, RouteConfig};
+use volucer_core::config::{BackendConfig, Config, KvStorageConfig, LockConfig, RouteConfig};
 use volucer_fcgi::{cgi, Request, Response};
 
 use crate::backend::{Backend, UpstreamBody};
 use crate::calls::{
-    ConfigNamespace, KvNamespace, MethodRegistry, PoolLookup, WorkerStatus, WorkersNamespace,
+    ConfigNamespace, KvNamespace, LockNamespace, MethodRegistry, PoolLookup, WorkerStatus,
+    WorkersNamespace,
 };
 use crate::error::{Result, ServerError};
 
@@ -155,6 +156,43 @@ fn build_stores(config: &Config) -> Result<BTreeMap<String, Arc<dyn volucer_kv::
     Ok(stores)
 }
 
+/// Build the lock backend, once.
+///
+/// # Why this is not a map like `build_stores`
+///
+/// A lock is named by its **resource**, so one deployment has one lock namespace and there is nothing for
+/// a second backend to mean: two of them would not see each other's locks, and two processes locked on
+/// `"pdf:create"` through different ones would both believe they were inside the section. `[lock]` is a
+/// single table for that reason, and this returns a single backend for the same one.
+///
+/// Falls back to [`volucer_lock::MemoryLocks`] when no `[lock]` table is configured — but the caller only
+/// uses the result for backends that were *granted* `lock`, and `Config::validate` refuses that grant
+/// without a table. So the fallback is for a `Config` built in a test and never validated, and it is the
+/// memory driver rather than a refusal because a test wanting to exercise a lock namespace should not
+/// have to write a `[lock]` table to do it.
+fn build_locks(config: &Config) -> Result<Option<Arc<dyn volucer_lock::Locks>>> {
+    let Some(lock) = &config.lock else {
+        return Ok(None);
+    };
+
+    let locks: Arc<dyn volucer_lock::Locks> = match lock {
+        LockConfig::Memory(_) => Arc::new(volucer_lock::MemoryLocks::new()),
+        #[cfg(feature = "redis")]
+        LockConfig::Redis(_) => {
+            // Built by the Redis driver when §6.3's second half lands. Reported as a misconfiguration
+            // rather than a panic, because this is a configuration a build can be handed and the message
+            // is what tells an operator which build to install.
+            return Err(ServerError::Misconfigured {
+                backend: "lock".to_string(),
+                reason: "the redis lock driver is not implemented yet; use driver = \"memory\""
+                    .to_string(),
+            });
+        }
+    };
+    tracing::info!(driver = %lock.driver(), "lock backend ready");
+    Ok(Some(locks))
+}
+
 /// Build one worker backend's method registry from its `services` list.
 ///
 /// # Why the `config.describe` document is assembled here
@@ -177,6 +215,7 @@ fn worker_registry(
     config: &Config,
     directory: &Arc<PoolDirectory>,
     stores: &BTreeMap<String, Arc<dyn volucer_kv::Store>>,
+    locks: &Option<Arc<dyn volucer_lock::Locks>>,
 ) -> MethodRegistry {
     let mut registry = MethodRegistry::new();
     // Collected rather than installed per entry, because there is **one** `kv` namespace per registry and
@@ -192,6 +231,19 @@ fn worker_registry(
                     Arc::clone(directory) as Arc<dyn PoolLookup>
                 ))
             }
+            // Installed from the built backend rather than from the configuration, for the reason the KV
+            // arm below skips a storage it cannot find: a worker granted a lock plane that could not be
+            // built must be refused by name, not handed a namespace that answers every call with "no lock
+            // backend configured" — which reads like a configuration mistake rather than the internal one
+            // it would be. `Config::validate` refuses the grant in the first place, so this arm is only
+            // reachable from a `Config` built in a test and never validated.
+            "lock" => match locks {
+                Some(locks) => registry = registry.with(LockNamespace::new(Arc::clone(locks))),
+                None => tracing::error!(
+                    "a worker is granted the `lock` service but no lock backend was built; its calls \
+                     will be refused, which should have been impossible"
+                ),
+            },
             other => match other.strip_prefix("kv.") {
                 // A name checked against the `[kv.*]` tables when the configuration was validated, so a
                 // miss here is a store that was not built rather than a name never checked. Skipping is
@@ -292,6 +344,9 @@ impl Dispatcher {
         // backends granted the same storage share one map rather than getting a private copy that
         // silently diverges — which would be the worst possible bug in a cache, since both would work.
         let stores = build_stores(config)?;
+        // And the lock backend, for the same reason: a worker granted `lock` has to find it already
+        // there, and the registry is built per backend while the backend itself is built once.
+        let locks = build_locks(config)?;
 
         let directory = Arc::new(PoolDirectory::default());
         let mut backends = BTreeMap::new();
@@ -304,6 +359,7 @@ impl Dispatcher {
                         config,
                         &directory,
                         &stores,
+                        &locks,
                     ));
                     registries.insert(name.clone(), Arc::clone(&registry));
                     Some(registry)
@@ -797,11 +853,11 @@ mod tests {
         let directory = Arc::new(PoolDirectory::default());
         let stores = build_stores(&config).expect("no storage needs a server");
         assert!(
-            worker_registry(&[], &config, &directory, &stores).is_empty(),
+            worker_registry(&[], &config, &directory, &stores, &None).is_empty(),
             "no services must mean no namespaces"
         );
 
-        let granted = worker_registry(&["config".to_string()], &config, &directory, &stores);
+        let granted = worker_registry(&["config".to_string()], &config, &directory, &stores, &None);
         assert_eq!(granted.names(), vec!["config"]);
         assert!(
             !granted.names().contains(&"workers"),
@@ -812,13 +868,121 @@ mod tests {
         // one case so that adding a name to `CALL_NAMESPACES` without an arm fails *this* test rather
         // than a deployment.
         for name in volucer_core::config::CALL_NAMESPACES {
-            let registry = worker_registry(&[name.to_string()], &config, &directory, &stores);
+            let registry =
+                worker_registry(&[name.to_string()], &config, &directory, &stores, &None);
             assert_eq!(
                 registry.names(),
                 vec![*name],
                 "{name} is allowed by the configuration and must have an implementation"
             );
         }
+    }
+
+    /// A granted `lock` service reaches the registry, and it is reachable as a *call*.
+    ///
+    /// This is the `build_locks` seam — the third time in this document's history that a wiring function
+    /// between two tested things was the only untested part, after `set_call_handler` and `build_stores`.
+    /// So it is asserted by making a real call through the registry rather than by inspecting the
+    /// namespace list: a registry that named `lock` while `build_locks` returned `None` would pass the
+    /// weaker check, and that is precisely the bug the KV case had.
+    #[test]
+    fn a_granted_lock_service_is_reachable_through_the_registry() {
+        let mut config = config_with(&[("app", unreachable_backend())], "app");
+        config.lock = Some(volucer_core::config::LockConfig::Memory(
+            volucer_core::config::MemoryLockConfig {},
+        ));
+
+        let directory = Arc::new(PoolDirectory::default());
+        let stores = build_stores(&config).expect("no storage needs a server");
+        let locks = build_locks(&config)
+            .expect("the memory driver needs no server")
+            .expect("a [lock] table builds a backend");
+
+        let registry = worker_registry(
+            &["lock".to_string()],
+            &config,
+            &directory,
+            &stores,
+            &Some(locks),
+        );
+        assert_eq!(registry.names(), vec!["lock"]);
+
+        // Through the registry, not around it: the call has to route on the first dot, find the
+        // namespace, reach the backend and come back.
+        let acquired = registry.serve(&call_with(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": "worker-1" }),
+        ));
+        assert!(acquired.ok, "{acquired:?}");
+        assert_eq!(
+            acquired.result.expect("a result")["acquired"],
+            serde_json::json!(true)
+        );
+
+        let twice = registry.serve(&call_with(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": "worker-2" }),
+        ));
+        assert_eq!(
+            twice.result.expect("a result")["acquired"],
+            serde_json::json!(false),
+            "a second worker must contend with the first, through the real backend"
+        );
+    }
+
+    /// With no `[lock]` table there is no backend, so a granted `lock` is skipped rather than faked.
+    ///
+    /// `Config::validate` refuses that grant before a server serves it, so this is only reachable from a
+    /// configuration built in a test. The behaviour that matters is which way it fails: an empty `lock`
+    /// namespace installed anyway would answer `lock.acquire` with "no lock backend configured", which
+    /// reads like a configuration mistake rather than the internal one it is.
+    #[test]
+    fn a_lock_service_with_no_backend_installs_nothing() {
+        let config = config_with(&[("app", unreachable_backend())], "app");
+        assert!(config.lock.is_none());
+
+        let directory = Arc::new(PoolDirectory::default());
+        let stores = build_stores(&config).expect("no storage needs a server");
+        assert!(
+            build_locks(&config).expect("nothing to build").is_none(),
+            "an absent [lock] table must not produce a backend"
+        );
+
+        let registry = worker_registry(&["lock".to_string()], &config, &directory, &stores, &None);
+        assert!(
+            registry.is_empty(),
+            "a granted service with nothing behind it must be refused by name rather than answered \
+             with an empty namespace: {:?}",
+            registry.names()
+        );
+    }
+
+    /// The default read timeout is the one the documentation promises, and it is reachable by omitting it.
+    ///
+    /// Pinned because the value is written in three places — the configuration default, the lock crate's
+    /// documentation, and RoadRunner's own default — and a default that drifted would be a deadline
+    /// nobody could predict from the file.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn an_omitted_lock_read_timeout_is_five_seconds() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[lock]
+driver = "redis"
+url = "redis://127.0.0.1:6379"
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        let lock = config.lock.as_ref().expect("the table is there");
+        let LockConfig::Redis(redis) = lock else {
+            panic!("the driver is redis");
+        };
+        assert_eq!(redis.read_timeout_ms, 5000);
+        assert_eq!(
+            redis.pool_size, 16,
+            "and the pool default is the KV one, written out here because this crate cannot name a \
+             driver's constant — the two are one value in configuration"
+        );
     }
 
     /// Two storages granted to one backend arrive in **one** `kv` namespace.
@@ -846,6 +1010,7 @@ mod tests {
             &config,
             &directory,
             &stores,
+            &None,
         );
 
         assert_eq!(
@@ -901,6 +1066,7 @@ mod tests {
             &config,
             &directory,
             &stores,
+            &None,
         );
 
         let key = crate::params::encode_base64(b"shared-key");
@@ -937,7 +1103,13 @@ mod tests {
 
         let directory = Arc::new(PoolDirectory::default());
         let stores = build_stores(&config).expect("no storage needs a server");
-        let registry = worker_registry(&["kv.sessions".to_string()], &config, &directory, &stores);
+        let registry = worker_registry(
+            &["kv.sessions".to_string()],
+            &config,
+            &directory,
+            &stores,
+            &None,
+        );
 
         let refused = registry.serve(&call_with(
             "kv.secrets.get",

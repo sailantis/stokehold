@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use volucer_lock::{Lease, Mode};
 use volucer_worker::{Call, Return};
 
 use crate::params::{decode_base64, encode_base64, Params};
@@ -188,6 +189,587 @@ mod tests {
             params: serde_json::Value::Null,
             traceparent: None,
         }
+    }
+
+    /// A lock namespace over a real memory backend, and the backend itself for assertions.
+    ///
+    /// **The real driver rather than a stub**, because the properties worth pinning here are the ones at
+    /// the boundary between the wire format and the semantics — `ttl = 0` meaning for ever, an absent id
+    /// being generated — and a stub would have to reimplement the meaning of a TTL to be asked about it.
+    fn locks() -> (LockNamespace, Arc<volucer_lock::MemoryLocks>) {
+        let backend = Arc::new(volucer_lock::MemoryLocks::new());
+        let namespace = LockNamespace::new(Arc::clone(&backend) as Arc<dyn volucer_lock::Locks>);
+        (namespace, backend)
+    }
+
+    /// A lock call with `params`.
+    fn lock_call(name: &str, params: serde_json::Value) -> Call {
+        Call {
+            name: name.to_string(),
+            params,
+            traceparent: None,
+        }
+    }
+
+    /// The `id` an answer carried, or a panic explaining what the answer was instead.
+    fn answered_id(answer: &Return) -> String {
+        answer
+            .result
+            .as_ref()
+            .and_then(|result| result.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("the answer carries no id: {answer:?}"))
+            .to_string()
+    }
+
+    /// A fresh id every time, so two calls in one test are two holders rather than one that contends
+    /// with itself.
+    fn an_id() -> serde_json::Value {
+        serde_json::json!(volucer_lock::generate_id())
+    }
+
+    /// An acquisition with no id gets one, and the caller is told what it is.
+    ///
+    /// Without the id in the answer the lock is unappealing and unreleasable: release and renewal are
+    /// scoped by it, so a caller that did not choose one has no way to say which holder it is. RoadRunner's
+    /// client generates its own instead; the argument for generating it on the server is in the type's
+    /// documentation, and this pins that the value comes back either way.
+    #[test]
+    fn an_acquisition_without_an_id_is_given_one_and_the_answer_carries_it() {
+        let (namespace, _backend) = locks();
+
+        let answer = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        assert!(answer.ok, "{answer:?}");
+        let result = answer.result.clone().expect("a result");
+        assert_eq!(result["acquired"], serde_json::json!(true), "{result}");
+        assert_eq!(result["mode"], serde_json::json!("exclusive"));
+
+        let id = answered_id(&answer);
+        assert_eq!(id.len(), 32, "a generated id is sixteen bytes of hex: {id}");
+
+        // And the id it gave out is the one that releases it.
+        let released = namespace.serve(&lock_call(
+            "lock.release",
+            serde_json::json!({ "resource": "pdf:create", "id": id }),
+        ));
+        assert_eq!(
+            released.result.expect("a result")["released"],
+            serde_json::json!(true)
+        );
+    }
+
+    /// `ttl = 0` means held until released — the opposite of what it means to a KV value.
+    ///
+    /// The test exists because the obvious implementation copies the KV TTL accessor, and in KV a zero TTL
+    /// is "delete this key". A lock that did the same would be granted and released inside one call, which
+    /// reads to the application as a lock that was never granted but *does not contend* — so it would not
+    /// fail loudly, it would fail by letting everything through.
+    #[test]
+    fn a_zero_ttl_on_a_lock_means_held_until_released() {
+        let (namespace, backend) = locks();
+
+        for ttl in [serde_json::json!(0), serde_json::json!(null)] {
+            let answer = namespace.serve(&lock_call(
+                "lock.acquire",
+                serde_json::json!({ "resource": "pdf:create", "ttl": ttl, "mode": "shared" }),
+            ));
+            assert!(answer.ok, "{answer:?}");
+            assert_eq!(
+                answer.result.expect("a result")["remaining_ms"],
+                serde_json::json!(null),
+                "a lease with no deadline reports no remaining time"
+            );
+        }
+
+        let holders = volucer_lock::Locks::holders(&*backend, "pdf:create").expect("holders");
+        assert_eq!(
+            holders.len(),
+            2,
+            "both holders are there and neither has a deadline"
+        );
+        assert!(holders.iter().all(|holder| holder.remaining.is_none()));
+
+        // A non-zero TTL is a real deadline, which is the other half of the same accessor.
+        let answer = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({
+                "resource": "other",
+                "ttl": 5_000_000,
+                "mode": "exclusive"
+            }),
+        ));
+        let remaining = answer.result.expect("a result")["remaining_ms"].clone();
+        assert!(
+            remaining.as_u64().is_some_and(|ms| ms > 4_000 && ms <= 5_000),
+            "five million microseconds is five seconds, not five million of something else: {remaining}"
+        );
+    }
+
+    /// Contention is a successful call with `acquired: false`, not a refusal.
+    ///
+    /// The distinction is the one RoadRunner's own documentation is emphatic about: a completed call can
+    /// still mean "you did not get it", and an application that read `ok` alone would walk into the
+    /// section. So `ok` is true and `acquired` is false, and the failure the caller must not miss is the
+    /// *third* answer — `unknown` — which is asserted separately below.
+    #[test]
+    fn contention_is_an_answer_with_acquired_false_rather_than_a_refusal() {
+        let (namespace, _backend) = locks();
+
+        let first = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": an_id() }),
+        ));
+        assert_eq!(
+            first.result.expect("a result")["acquired"],
+            serde_json::json!(true)
+        );
+
+        let second = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": an_id() }),
+        ));
+        assert!(second.ok, "contention is not an error: {second:?}");
+        let result = second.result.expect("a result");
+        assert_eq!(result["acquired"], serde_json::json!(false), "{result}");
+        assert_eq!(result["mode"], serde_json::json!(null));
+        assert!(
+            !result["id"].is_null(),
+            "and the id that contended is echoed, because the client needs the one it will use next: \
+             {result}"
+        );
+
+        // A reader is excluded by the writer too, in the same shape.
+        let reader = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "mode": "shared", "id": an_id() }),
+        ));
+        assert_eq!(
+            reader.result.expect("a result")["acquired"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// `try_acquire` does not wait, and `acquire` with no `wait` does not either.
+    ///
+    /// Asserted by timing, because that is the only thing that distinguishes them from `acquire` with a
+    /// wait: an implementation that treated a missing `wait` as "wait for ever" would hang here, and one
+    /// that treated `try_acquire` as `acquire` would make the test slow rather than fail — so the bound is
+    /// generous enough not to be flaky and tight enough that a real wait would miss it.
+    #[test]
+    fn neither_try_acquire_nor_an_absent_wait_waits_for_anything() {
+        let (namespace, _backend) = locks();
+        let held = an_id();
+        let acquired = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": held }),
+        ));
+        assert_eq!(
+            acquired.result.expect("a result")["acquired"],
+            serde_json::json!(true)
+        );
+
+        let started = std::time::Instant::now();
+        for method in ["lock.try_acquire", "lock.acquire"] {
+            let answer = namespace.serve(&lock_call(
+                method,
+                serde_json::json!({ "resource": "pdf:create", "id": an_id() }),
+            ));
+            assert_eq!(
+                answer.result.expect("a result")["acquired"],
+                serde_json::json!(false),
+                "{method} must not have acquired it"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "two calls with nothing to wait on took {:?}, so one of them waited",
+            started.elapsed()
+        );
+
+        // And `try_acquire` ignores a `wait` it is sent, rather than waiting for it: the method name is
+        // the statement, and a client that sends both means the one it called.
+        let started = std::time::Instant::now();
+        namespace.serve(&lock_call(
+            "lock.try_acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": an_id(), "wait": 10_000_000 }),
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "try_acquire waited {:?} for a wait it must ignore",
+            started.elapsed()
+        );
+    }
+
+    /// An acquisition that a backend could not decide is `unknown`, never "not acquired".
+    ///
+    /// The property the whole third answer exists for, and it cannot be reached through the memory driver
+    /// — which is the point of a driver that has nothing to fail — so the backend is a stub that fails on
+    /// demand. A caller told `acquired: false` here would enter the section believing it was empty.
+    #[test]
+    fn an_acquisition_a_backend_could_not_decide_is_reported_as_unknown() {
+        /// A backend that refuses every acquisition with whatever `Error` it was given.
+        #[derive(Debug)]
+        struct Failing(volucer_lock::Error);
+
+        impl volucer_lock::Locks for Failing {
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+            fn try_acquire(
+                &self,
+                _resource: &str,
+                _id: &str,
+                _mode: Mode,
+                _lease: Lease,
+            ) -> volucer_lock::Result<Option<volucer_lock::Holder>> {
+                Err(clone_error(&self.0))
+            }
+            fn acquire(
+                &self,
+                resource: &str,
+                id: &str,
+                mode: Mode,
+                lease: Lease,
+                _wait: Duration,
+            ) -> volucer_lock::Result<Option<volucer_lock::Holder>> {
+                self.try_acquire(resource, id, mode, lease)
+            }
+            fn release(&self, _resource: &str, _id: &str) -> volucer_lock::Result<bool> {
+                Err(clone_error(&self.0))
+            }
+            fn release_all(&self, _resource: &str) -> volucer_lock::Result<bool> {
+                Err(clone_error(&self.0))
+            }
+            fn holders(&self, _resource: &str) -> volucer_lock::Result<Vec<volucer_lock::Holder>> {
+                Err(clone_error(&self.0))
+            }
+            fn update_lease(
+                &self,
+                _resource: &str,
+                _id: &str,
+                _lease: Lease,
+            ) -> volucer_lock::Result<bool> {
+                Err(clone_error(&self.0))
+            }
+        }
+
+        fn clone_error(err: &volucer_lock::Error) -> volucer_lock::Error {
+            match err {
+                volucer_lock::Error::Unknown {
+                    resource,
+                    operation,
+                    reason,
+                } => volucer_lock::Error::Unknown {
+                    resource: resource.clone(),
+                    operation,
+                    reason: reason.clone(),
+                },
+                volucer_lock::Error::Backend { driver, reason } => volucer_lock::Error::Backend {
+                    driver,
+                    reason: reason.clone(),
+                },
+                other => volucer_lock::Error::Backend {
+                    driver: "failing",
+                    reason: other.to_string(),
+                },
+            }
+        }
+
+        let backend = Arc::new(Failing(volucer_lock::Error::Backend {
+            driver: "redis",
+            reason: "the connection dropped after the command was sent".to_string(),
+        }));
+        let namespace = LockNamespace::new(backend as Arc<dyn volucer_lock::Locks>);
+
+        let answer = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        assert!(!answer.ok, "{answer:?}");
+        assert!(
+            answer.unknown,
+            "a failed acquisition must be `unknown`, because the caller cannot tell whether the command \
+             ran: {answer:?}"
+        );
+
+        // The third case, and the one that is easy to get wrong in the other direction: a *decided*
+        // failure during an acquisition. A name the backend refuses locally was never sent anywhere, so
+        // it is a refusal — and the version of this code that reported it as unknown is what this
+        // assertion was written after.
+        #[derive(Debug)]
+        struct Refusing;
+        impl volucer_lock::Locks for Refusing {
+            fn name(&self) -> &'static str {
+                "refusing"
+            }
+            fn try_acquire(
+                &self,
+                resource: &str,
+                _id: &str,
+                _mode: Mode,
+                _lease: Lease,
+            ) -> volucer_lock::Result<Option<volucer_lock::Holder>> {
+                Err(volucer_lock::Error::BadResource {
+                    reason: format!("{resource:?} is not a name this backend stores"),
+                })
+            }
+            fn acquire(
+                &self,
+                resource: &str,
+                id: &str,
+                mode: Mode,
+                lease: Lease,
+                _wait: Duration,
+            ) -> volucer_lock::Result<Option<volucer_lock::Holder>> {
+                self.try_acquire(resource, id, mode, lease)
+            }
+            fn release(&self, _resource: &str, _id: &str) -> volucer_lock::Result<bool> {
+                Ok(false)
+            }
+            fn release_all(&self, _resource: &str) -> volucer_lock::Result<bool> {
+                Ok(false)
+            }
+            fn holders(&self, _resource: &str) -> volucer_lock::Result<Vec<volucer_lock::Holder>> {
+                Ok(Vec::new())
+            }
+            fn update_lease(
+                &self,
+                _resource: &str,
+                _id: &str,
+                _lease: Lease,
+            ) -> volucer_lock::Result<bool> {
+                Ok(false)
+            }
+        }
+        let refusing = LockNamespace::new(Arc::new(Refusing) as Arc<dyn volucer_lock::Locks>);
+        let answer = refusing.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        assert!(!answer.ok, "{answer:?}");
+        assert!(
+            !answer.unknown,
+            "a backend that refused the name touched nothing, so there is nothing undetermined here: \
+             {answer:?}"
+        );
+
+        // The other direction, and it is what makes the flag mean anything: a failure that *is* decided —
+        // a read — is a refusal, so a caller can retry it without wondering.
+        let answer = namespace.serve(&lock_call(
+            "lock.exists",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        assert!(!answer.ok, "{answer:?}");
+        assert!(
+            !answer.unknown,
+            "a read that failed did nothing, so it is a refusal rather than an unknown: {answer:?}"
+        );
+    }
+
+    /// `update_ttl` replaces the lease and answers `false` for an id that holds nothing.
+    ///
+    /// The `false` is the part worth having: a caller renewing a lock it had already lost must stop, and
+    /// a method that reported success because the *call* succeeded is how an application keeps writing
+    /// into a section two processes are in.
+    #[test]
+    fn update_ttl_replaces_the_lease_and_tells_a_caller_when_it_renewed_nothing() {
+        let (namespace, _backend) = locks();
+        let id = an_id();
+        namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": serde_json::json!(id) }),
+        ));
+
+        let renewed = namespace.serve(&lock_call(
+            "lock.update_ttl",
+            serde_json::json!({
+                "resource": "pdf:create",
+                "id": serde_json::json!(id),
+                "ttl": 2_000_000
+            }),
+        ));
+        assert_eq!(
+            renewed.result.expect("a result")["updated"],
+            serde_json::json!(true)
+        );
+
+        let holders = namespace.serve(&lock_call(
+            "lock.holders",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        let remaining = holders.result.expect("a result")["holders"][0]["remaining_ms"].clone();
+        assert!(
+            remaining
+                .as_u64()
+                .is_some_and(|ms| ms > 1_000 && ms <= 2_000),
+            "two seconds, from now, rather than added to whatever was left: {remaining}"
+        );
+
+        let nobody = namespace.serve(&lock_call(
+            "lock.update_ttl",
+            serde_json::json!({ "resource": "pdf:create", "id": an_id(), "ttl": 1_000_000 }),
+        ));
+        assert_eq!(
+            nobody.result.expect("a result")["updated"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// A missing `resource`, an unknown `mode`, and a verb that does not exist are each refused by name.
+    ///
+    /// The three are different mistakes with different fixes, so each message has to say which it is — and
+    /// a missing resource must not be reported as a resource the *backend* refused, which would send an
+    /// operator looking at the wrong thing.
+    #[test]
+    fn a_lock_call_that_cannot_be_understood_is_refused_by_name() {
+        let (namespace, _backend) = locks();
+
+        let missing = namespace.serve(&lock_call("lock.acquire", serde_json::json!({})));
+        assert!(!missing.ok);
+        let message = missing.error.expect("a reason");
+        assert!(message.contains("\"resource\""), "{message}");
+        assert!(
+            message.contains("required"),
+            "a missing parameter must not be reported as a bad one: {message}"
+        );
+
+        let bad_mode = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf", "mode": "readonly" }),
+        ));
+        let message = bad_mode.error.expect("a reason");
+        assert!(message.contains("readonly"), "{message}");
+        assert!(
+            message.contains("shared"),
+            "and say what is accepted: {message}"
+        );
+
+        let unknown = namespace.serve(&lock_call(
+            "lock.steal",
+            serde_json::json!({ "resource": "pdf" }),
+        ));
+        let message = unknown.error.expect("a reason");
+        assert!(message.contains("steal"), "{message}");
+        assert!(
+            message.contains("release_all"),
+            "and list the methods that do exist, because a typo and a missing feature read the same \
+             otherwise: {message}"
+        );
+
+        // A name that is not a lock call at all, and one that is only the namespace.
+        for name in ["lock", "lock."] {
+            let answer = namespace.serve(&call(name));
+            assert!(!answer.ok, "{name} must be refused");
+            assert!(answer.error.expect("a reason").contains("lock method"));
+        }
+    }
+
+    /// `release` and `release_all` answer `false` when nothing was there, and `holders` shows the live set.
+    #[test]
+    fn releasing_what_is_not_held_is_an_answer_rather_than_a_failure() {
+        let (namespace, _backend) = locks();
+
+        let nothing = namespace.serve(&lock_call(
+            "lock.release",
+            serde_json::json!({ "resource": "pdf:create", "id": an_id() }),
+        ));
+        assert!(nothing.ok, "{nothing:?}");
+        assert_eq!(
+            nothing.result.expect("a result")["released"],
+            serde_json::json!(false)
+        );
+
+        let all = namespace.serve(&lock_call(
+            "lock.release_all",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        assert!(all.ok);
+        assert_eq!(
+            all.result.expect("a result")["released"],
+            serde_json::json!(false)
+        );
+
+        let exists = namespace.serve(&lock_call(
+            "lock.exists",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        assert_eq!(
+            exists.result.expect("a result")["exists"],
+            serde_json::json!(false)
+        );
+
+        // Now hold it with two readers and a writer's view, to see the list work.
+        let held = an_id();
+        namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": held, "mode": "shared" }),
+        ));
+        namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": an_id(), "mode": "shared" }),
+        ));
+
+        let holders = namespace.serve(&lock_call(
+            "lock.holders",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        let holders = holders.result.expect("a result")["holders"]
+            .as_array()
+            .expect("an array")
+            .clone();
+        assert_eq!(holders.len(), 2, "{holders:?}");
+        assert!(holders.iter().all(|holder| holder["mode"] == "shared"));
+
+        let exists = namespace.serve(&lock_call(
+            "lock.exists",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        assert_eq!(
+            exists.result.expect("a result")["exists"],
+            serde_json::json!(true)
+        );
+
+        // And the writer's view: `release_all` takes both readers, whatever ids they chose.
+        let all = namespace.serve(&lock_call(
+            "lock.release_all",
+            serde_json::json!({ "resource": "pdf:create" }),
+        ));
+        assert_eq!(
+            all.result.expect("a result")["released"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            namespace
+                .serve(&lock_call(
+                    "lock.exists",
+                    serde_json::json!({ "resource": "pdf:create" })
+                ))
+                .result
+                .expect("a result")["exists"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// An acquisition that hands in an id the backend will not take is refused, and nothing is stored.
+    #[test]
+    fn an_id_the_backend_refuses_is_refused_over_the_wire_by_name() {
+        let (namespace, backend) = locks();
+
+        let answer = namespace.serve(&lock_call(
+            "lock.acquire",
+            serde_json::json!({ "resource": "pdf:create", "id": "bad\u{1}id" }),
+        ));
+        assert!(!answer.ok, "{answer:?}");
+        assert!(
+            !answer.unknown,
+            "a name this server refuses was never sent anywhere, so nothing is undetermined: {answer:?}"
+        );
+        let message = answer.error.expect("a reason");
+        assert!(message.contains("control character"), "{message}");
+        assert_eq!(backend.tracked(), 0);
     }
 
     /// A namespace that answers one name and records what it was asked.
@@ -844,6 +1426,380 @@ impl KvNamespace {
     }
 }
 
+/// The `lock` namespace: one lock backend, reached by resource name.
+///
+/// # One namespace holding one backend, unlike `kv`
+///
+/// `KvNamespace` holds several storages because a deployment names them and a worker has to say which.
+/// A lock is named by its **resource**, so there is nothing for a second lock backend to mean: two of
+/// them would be two namespaces that do not see each other, and two processes locked on `"pdf:create"`
+/// through different ones would both believe they were inside the section. `[lock]` is therefore a
+/// single table, and `services = ["lock"]` is the whole of what a worker writes.
+///
+/// # The verbs, and the two answers that are deliberately not a boolean
+///
+/// `lock.acquire`, `.try_acquire`, `.release`, `.release_all`, `.exists`, `.holders`, `.update_ttl`.
+///
+/// An acquisition answers `{"acquired": …, "id": …, "mode": …, "remaining_ms": …}`. `acquired: false` is
+/// contention and is a *successful* call, because nothing failed: the caller knows it does not hold the
+/// lock, which is exactly what RoadRunner's `Response.Ok` conveys on its own wire and what its
+/// documentation tells applications to check before entering the section.
+///
+/// A backend failure during an acquisition is **`Return::unknown_state`**, not a refusal. That is the
+/// whole reason the third answer exists: a Redis that dropped a reply mid-acquire may or may not have set
+/// the key, and a caller told "not acquired" would walk into the section anyway. `unknown: true` tells it
+/// to resolve the question with `lock.exists` — the instruction RoadRunner's own documentation gives in
+/// prose, made mechanical.
+///
+/// # Ids
+///
+/// An acquisition with no `id` gets one from [`volucer_lock::generate_id`], and the answer carries it.
+/// **The caller must keep it**: an id is what release and renewal are scoped by, and a caller that loses
+/// one has a lock nobody can release until its lease runs out. That is a hazard of RoadRunner's design
+/// rather than of this implementation — the alternative, a server-held handle keyed by a connection, does
+/// not exist here, because a call arrives on a request and the request ends.
+///
+/// # `ttl` is in microseconds, and zero means "until released"
+///
+/// Both are RoadRunner's own wire semantics, and both are stated because each is the opposite of an
+/// obvious guess. Microseconds because a contended cache fill wants tens of milliseconds and seconds
+/// cannot express one. Zero-means-for-ever because that is what a lock TTL of zero has always meant,
+/// and it is the *opposite* of what a zero TTL means to a KV value — so a copy of the KV accessor here
+/// would have produced a lock released the instant it was granted.
+pub struct LockNamespace {
+    /// `None` when the deployment configured no `[lock]` table. The namespace is then not installed at
+    /// all — see `dispatch.rs` — so this is a belt for a test, not a path a worker can reach.
+    locks: Arc<dyn volucer_lock::Locks>,
+}
+
+impl LockNamespace {
+    /// A namespace over one lock backend.
+    pub fn new(locks: Arc<dyn volucer_lock::Locks>) -> Self {
+        LockNamespace { locks }
+    }
+
+    /// The resource a call names, or a refusal.
+    ///
+    /// **Required, and checked for shape before the backend sees it**, so a missing `resource` is told
+    /// apart from a resource the backend refuses. The first is a client built against a different method
+    /// set; the second is a name this server will not store.
+    fn resource_of(params: &Params, method: &str) -> std::result::Result<String, Return> {
+        match params.required_string("resource") {
+            Ok(resource) => Ok(resource),
+            Err(err) => Err(Return::refused(format!("{method} was called with {err}"))),
+        }
+    }
+
+    /// The id a call names, or a fresh one.
+    ///
+    /// Absent, empty and `null` all mean "generate one", which is deliberate: a client that sends
+    /// `"id": ""` because it built the params from a template means what a client that omits the key
+    /// means, and refusing it would be a distinction with no purpose behind it.
+    fn id_of(params: &Params) -> std::result::Result<String, Return> {
+        match params.string("id") {
+            Ok(Some(id)) if !id.is_empty() => Ok(id),
+            Ok(_) => Ok(volucer_lock::generate_id()),
+            Err(err) => Err(Return::refused(format!("the id {err}"))),
+        }
+    }
+
+    /// The hold a call asks for, from `mode` and `ttl`.
+    ///
+    /// The mode defaults to **exclusive**, which is the reading a caller who did not think about it
+    /// wants: a shared lock is an optimisation for a read path, and defaulting to it would silently stop
+    /// two writers from excluding each other.
+    fn hold_of(params: &Params, method: &str) -> std::result::Result<(Mode, Lease), Return> {
+        let mode = match params.string("mode") {
+            Ok(None) => Mode::Exclusive,
+            Ok(Some(mode)) => match mode.as_str() {
+                "exclusive" | "write" => Mode::Exclusive,
+                "shared" | "read" => Mode::Shared,
+                other => {
+                    return Err(Return::refused(format!(
+                        "the mode {other:?} for {method} is neither \"exclusive\" nor \"shared\""
+                    )))
+                }
+            },
+            Err(err) => return Err(Return::refused(format!("the mode for {method} {err}"))),
+        };
+        Ok((mode, Self::lease_of(params, method)?))
+    }
+
+    /// The lease a call asks for, from `ttl` in microseconds.
+    ///
+    /// Zero and absent both mean [`Lease::Forever`] — "held until released" — which is the one place
+    /// where copying the KV TTL accessor would have produced a lock released the instant it was granted.
+    fn lease_of(params: &Params, method: &str) -> std::result::Result<Lease, Return> {
+        match params.microseconds("ttl") {
+            Ok(None) => Ok(Lease::Forever),
+            Ok(Some(Duration::ZERO)) => Ok(Lease::Forever),
+            Ok(Some(ttl)) => Ok(Lease::for_duration(ttl)),
+            Err(err) => Err(Return::refused(format!("the ttl for {method} {err}"))),
+        }
+    }
+
+    /// How long an acquisition may wait, from `wait` in microseconds.
+    ///
+    /// Absent and zero are both "one attempt", because that is what a zero wait has always meant here and
+    /// a client that omits the key is the same client that sent zero.
+    fn wait_of(params: &Params, method: &str) -> std::result::Result<Duration, Return> {
+        match params.microseconds("wait") {
+            Ok(None) => Ok(Duration::ZERO),
+            Ok(Some(wait)) => Ok(wait),
+            Err(err) => Err(Return::refused(format!("the wait for {method} {err}"))),
+        }
+    }
+
+    /// Run a backend operation, turning any failure into the right kind of refusal.
+    ///
+    /// **The one place the unknown/known distinction is decided**, so no verb can get it wrong. Three
+    /// kinds of failure arrive here and they are not the same answer:
+    ///
+    /// - `Error::Unknown` is undetermined by construction — the driver cannot say whether the command
+    ///   took effect — so it becomes [`Return::unknown_state`] whatever the verb is.
+    /// - `BadResource`, `BadId` and `AlreadyHeld` are **decided**: the backend refused before it touched
+    ///   anything, so nothing can be in an unknown state, and a caller may retry with a better name.
+    /// - `Error::Backend` is undetermined **during an acquisition only**, because the command may have
+    ///   reached the server before the failure and a lock may exist that the caller does not know it
+    ///   holds. Everywhere else it is a refusal.
+    ///
+    /// The first version of this got the last two wrong — it reported *any* failure during an acquisition
+    /// as unknown, including a name the backend refused locally — and the test for it caught that. The
+    /// reason it matters is not tidiness: `unknown` tells a caller to go and ask, and a flag set on
+    /// failures that are perfectly well known is a flag callers learn to ignore.
+    fn attempt<T>(
+        method: &str,
+        resource: &str,
+        acquiring: bool,
+        op: impl FnOnce() -> volucer_lock::Result<T>,
+        success: impl FnOnce(T) -> Return,
+    ) -> Return {
+        match op() {
+            Ok(value) => success(value),
+            Err(err) => {
+                tracing::warn!(method, resource, %err, "a lock call failed");
+                let undetermined = match err {
+                    volucer_lock::Error::Unknown {
+                        ref reason,
+                        operation,
+                        ..
+                    } => {
+                        return Return::unknown_state(format!(
+                            "{method} {operation} on {resource:?} left the lock state unknown: {reason}"
+                        ))
+                    }
+                    volucer_lock::Error::Backend { .. } => acquiring,
+                    volucer_lock::Error::BadResource { .. }
+                    | volucer_lock::Error::BadId { .. }
+                    | volucer_lock::Error::AlreadyHeld { .. } => false,
+                };
+
+                if undetermined {
+                    return Return::unknown_state(format!(
+                        "{method} on {resource:?} left the lock state unknown: {err}"
+                    ));
+                }
+                Return::refused(format!("{method} on {resource:?} failed: {err}"))
+            }
+        }
+    }
+
+    /// The answer shape every acquisition uses.
+    ///
+    /// `id` is echoed even when nothing was acquired, because a client that sent no id has just been
+    /// handed one and needs it regardless of the outcome: the next call it makes must use the same one or
+    /// it will contend with itself.
+    fn held(holder: Option<volucer_lock::Holder>, id: &str) -> Return {
+        let Some(holder) = holder else {
+            return Return::ok(serde_json::json!({
+                "acquired": false,
+                "id": id,
+                "mode": null,
+                "remaining_ms": null,
+            }));
+        };
+        Return::ok(serde_json::json!({
+            "acquired": true,
+            "id": holder.id,
+            "mode": holder.mode.as_str(),
+            "remaining_ms": holder.remaining.map(|left| left.as_millis() as u64),
+        }))
+    }
+}
+
+impl Namespace for LockNamespace {
+    fn name(&self) -> &'static str {
+        // `lock` and nothing else: a lock is named by its resource, so there is one lock namespace per
+        // deployment rather than one per backend — see the type's documentation.
+        "lock"
+    }
+
+    fn serve(&self, call: &Call) -> Return {
+        let params = match Params::from_value(&call.params, &call.name) {
+            Ok(params) => params,
+            Err(err) => {
+                return Return::refused(format!("the {} method was called with {err}", call.name))
+            }
+        };
+
+        // The prefix is stripped here rather than left to `MethodRegistry`, because the registry routes
+        // on the text before the first dot: everything below is a verb with no `lock.` on it, which is
+        // what makes the match arms read as the method names a client writes.
+        let verb = match call.name.strip_prefix("lock.") {
+            Some(verb) if !verb.is_empty() => verb,
+            _ => {
+                return Return::refused(format!(
+                    "{} does not name a lock method; {}",
+                    call.name, METHODS
+                ))
+            }
+        };
+
+        match verb {
+            "acquire" | "try_acquire" => {
+                let resource = match Self::resource_of(&params, &call.name) {
+                    Ok(resource) => resource,
+                    Err(refusal) => return refusal,
+                };
+                let (mode, lease) = match Self::hold_of(&params, &call.name) {
+                    Ok(hold) => hold,
+                    Err(refusal) => return refusal,
+                };
+                // `try_acquire` takes no `wait` and ignores one if it is sent, rather than refusing it:
+                // the two methods exist to say different things, and a client that passes both means the
+                // one it called.
+                let wait = if verb == "try_acquire" {
+                    Duration::ZERO
+                } else {
+                    match Self::wait_of(&params, &call.name) {
+                        Ok(wait) => wait,
+                        Err(refusal) => return refusal,
+                    }
+                };
+                let id = match Self::id_of(&params) {
+                    Ok(id) => id,
+                    Err(refusal) => return refusal,
+                };
+                Self::attempt(
+                    verb,
+                    &resource,
+                    true,
+                    || self.locks.acquire(&resource, &id, mode, lease, wait),
+                    |holder| Self::held(holder, &id),
+                )
+            }
+            "release" => {
+                let resource = match Self::resource_of(&params, &call.name) {
+                    Ok(resource) => resource,
+                    Err(refusal) => return refusal,
+                };
+                let id = match Self::id_of(&params) {
+                    Ok(id) => id,
+                    Err(refusal) => return refusal,
+                };
+                Self::attempt(
+                    "release",
+                    &resource,
+                    false,
+                    || self.locks.release(&resource, &id),
+                    // `released: false` is an answer, not a failure: "my lock is already gone" is what a
+                    // `finally`-shaped caller most wants to hear, and the `id` is echoed so it can log
+                    // which one it was.
+                    |released| Return::ok(serde_json::json!({ "released": released, "id": id })),
+                )
+            }
+            "release_all" => {
+                let resource = match Self::resource_of(&params, &call.name) {
+                    Ok(resource) => resource,
+                    Err(refusal) => return refusal,
+                };
+                Self::attempt(
+                    "release_all",
+                    &resource,
+                    false,
+                    || self.locks.release_all(&resource),
+                    |released| Return::ok(serde_json::json!({ "released": released })),
+                )
+            }
+            "exists" => {
+                let resource = match Self::resource_of(&params, &call.name) {
+                    Ok(resource) => resource,
+                    Err(refusal) => return refusal,
+                };
+                Self::attempt(
+                    "exists",
+                    &resource,
+                    false,
+                    || self.locks.exists(&resource),
+                    |exists| Return::ok(serde_json::json!({ "exists": exists })),
+                )
+            }
+            "holders" => {
+                let resource = match Self::resource_of(&params, &call.name) {
+                    Ok(resource) => resource,
+                    Err(refusal) => return refusal,
+                };
+                Self::attempt(
+                    "holders",
+                    &resource,
+                    false,
+                    || self.locks.holders(&resource),
+                    |holders| {
+                        // Built rather than serialized through a derive, because `Holder::remaining` is a
+                        // `Duration` and the wire carries milliseconds: a `Serialize` on the type would put
+                        // seconds-and-nanos in one answer and milliseconds in another, which is how a
+                        // client reading two methods comes to disagree with itself.
+                        let holders: Vec<serde_json::Value> = holders
+                            .into_iter()
+                            .map(|holder| {
+                                serde_json::json!({
+                                    "id": holder.id,
+                                    "mode": holder.mode.as_str(),
+                                    "remaining_ms": holder.remaining.map(|left| left.as_millis() as u64),
+                                })
+                            })
+                            .collect();
+                        Return::ok(serde_json::json!({ "holders": holders }))
+                    },
+                )
+            }
+            "update_ttl" => {
+                let resource = match Self::resource_of(&params, &call.name) {
+                    Ok(resource) => resource,
+                    Err(refusal) => return refusal,
+                };
+                let id = match Self::id_of(&params) {
+                    Ok(id) => id,
+                    Err(refusal) => return refusal,
+                };
+                // Only the lease is read here, and the mode is deliberately not consulted: a renewal
+                // changes a deadline and nothing else. Taking `mode` and ignoring it would be an argument
+                // that looks like it does something.
+                let lease = match Self::lease_of(&params, &call.name) {
+                    Ok(lease) => lease,
+                    Err(refusal) => return refusal,
+                };
+                Self::attempt(
+                    "update_ttl",
+                    &resource,
+                    false,
+                    || self.locks.update_lease(&resource, &id, lease),
+                    // `updated: false` means the id holds nothing, which is the answer a caller must act
+                    // on: the section it is in is no longer protected.
+                    |updated| Return::ok(serde_json::json!({ "updated": updated, "id": id })),
+                )
+            }
+            other => Return::refused(format!(
+                "the lock namespace does not serve {other:?}; {METHODS}"
+            )),
+        }
+    }
+}
+
+/// The method list, written once so a refusal and the documentation cannot disagree about it.
+const METHODS: &str =
+    "the lock methods are acquire, try_acquire, release, release_all, exists, holders \
+                       and update_ttl";
 /// The `workers` namespace: what the pools look like, and how to restart one worker.
 ///
 /// # Why this needs no new machinery

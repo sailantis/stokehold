@@ -2005,6 +2005,7 @@ dependencies = [
 name = "volucer-lock"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -2042,6 +2043,7 @@ dependencies = [
  "volucer-core",
  "volucer-fcgi",
  "volucer-kv",
+ "volucer-lock",
  "volucer-metrics",
  "volucer-observe",
  "volucer-upstream",

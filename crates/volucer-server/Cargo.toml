@@ -24,6 +24,10 @@ volucer-metrics.workspace = true
 # so a deployment using only the memory driver does not link a Redis to serve it — which is the whole
 # argument of `docs/plugins.md` §5 about features being grouped per driver.
 volucer-kv.workspace = true
+# The lock trait and the in-memory driver, for the `lock` namespace. A leaf crate like the one above and
+# for the same reason, plus one of its own: a lock is named by its *resource*, so there is one lock
+# backend and `services = ["lock"]` is the whole name.
+volucer-lock.workspace = true
 # The fourth backend kind. This crate already held hyper's *server* types indirectly through
 # `volucer-http`, but the client is what a pooled origin connection needs, and a backend is the
 # thing that owns a connection pool — so it belongs here rather than in the listener, which only
@@ -51,7 +55,6 @@ default = []
 # Enables the `redis` KV driver and the Redis client that serves it — and, in time, the lock in
 # `docs/plugins.md` §6.3, which shares the client. A build without it links no Redis at all.
 redis = ["volucer-kv/redis", "volucer-core/redis"]
-
 [dev-dependencies]
 # An empty request body, so an upstream test needs no listener to make one.
 http-body-util.workspace = true

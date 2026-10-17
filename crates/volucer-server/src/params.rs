@@ -36,6 +36,7 @@
 //!   compatibility cost something when it costs nothing.
 
 use serde_json::{Map, Value};
+use std::time::Duration;
 
 /// The params of a call, with typed accessors that refuse the wrong type rather than defaulting it.
 #[derive(Debug, Clone, Default)]
@@ -159,6 +160,25 @@ impl Params {
                     json_type_of(other)
                 ),
             }),
+        }
+    }
+
+    /// A duration parameter, in microseconds.
+    ///
+    /// **Microseconds, not seconds**, and that is the one place this module's units are not the obvious
+    /// ones. The reason is RoadRunner's own wire format: its lock API takes `Request.ttl` and
+    /// `Request.wait` in microseconds and its PHP SDK converts from seconds, precisely so that a
+    /// sub-second wait is expressible. Taking seconds here would make `wait` coarser than the thing the
+    /// lock is for — a contended cache fill wants tens of milliseconds — and the conversion belongs on
+    /// the client, where the application's own units already live.
+    ///
+    /// A float is refused rather than rounded, and a negative value is refused with a message that says
+    /// so: `wait = -1` becoming a duration by wrapping is the kind of quiet arithmetic mistake that turns
+    /// "do not wait" into "wait for ever".
+    pub fn microseconds(&self, name: &str) -> ParamResult<Option<Duration>> {
+        match self.unsigned(name)? {
+            None => Ok(None),
+            Some(micros) => Ok(Some(Duration::from_micros(micros))),
         }
     }
 

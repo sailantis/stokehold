@@ -166,6 +166,55 @@ pub struct Holder {
     pub remaining: Option<Duration>,
 }
 
+/// A fresh id for an acquisition the caller did not name one for.
+///
+/// # Why the server generates it rather than the client
+///
+/// RoadRunner's PHP client makes one up itself, and that is the half of its API worth not copying: a
+/// client-generated id is a value the *server* has to accept and store verbatim, which means the server
+/// cannot tell a deliberate 4 KiB id from a caller sending its payload by mistake. Here the id is the
+/// server's to produce, so the rules on it ([`validate_id`]) apply to it as much as to one a caller
+/// chose — and an application that does not care about the id does not have to invent a scheme for it.
+///
+/// # It is not a token, and nothing is authorised by it
+///
+/// Sixteen bytes from the system RNG, hex-encoded. A caller holding an id can release the lock that id
+/// acquired, and nothing else: an id is scoped to the resource it was granted on, so there is no value
+/// here worth guessing even if the RNG is unavailable — `volucer-observe`'s documentation covers what a
+/// predictable fallback would and would not affect, and this is the same kind of value.
+///
+/// The fallback exists for the same reason and is deliberately *not* silent: it logs once, because an
+/// environment with no entropy is worth knowing about even when nothing depends on it.
+pub fn generate_id() -> String {
+    let mut bytes = [0u8; ID_BYTES];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Predictable, and acceptable for the reason above. A counter and the clock, mixed the way
+        // `volucer-observe`'s fallback mixes them, so that two ids in the same nanosecond differ.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        let mut seed = nanos ^ sequence.rotate_left(29);
+        for slot in bytes.iter_mut() {
+            // A cheap splitmix step: the point is only that every byte moves.
+            seed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(7);
+            *slot = (seed >> 24) as u8;
+        }
+    }
+    let mut out = String::with_capacity(ID_BYTES * 2);
+    for byte in bytes {
+        // `{:02x}` per byte rather than a hex crate: sixteen bytes is not worth a dependency, and this is
+        // the same reasoning the metrics crates use for their exposition encoder.
+        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// How many random bytes an id carries. Sixteen, so a collision is not something to think about.
+const ID_BYTES: usize = 16;
+
 /// What can go wrong.
 ///
 /// No catch-all arm: each variant exists because it has a different fix, and the two that matter most
@@ -611,6 +660,32 @@ mod tests {
             Err(Error::BadResource { .. })
         ));
         assert!(matches!(validate("pdf", &long), Err(Error::BadId { .. })));
+    }
+
+    #[test]
+    fn a_generated_id_is_hex_and_two_of_them_differ() {
+        let first = generate_id();
+        let second = generate_id();
+
+        assert_eq!(
+            first.len(),
+            ID_BYTES * 2,
+            "a fixed-width id in hex: {first}"
+        );
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "lowercase hex, so an id copied out of a log is the id that was stored: {first}"
+        );
+        assert_ne!(
+            first, second,
+            "two calls must not collide, which is the property the RNG is there for"
+        );
+
+        // And the id the server may produce has to satisfy the rules it enforces on a client's, or a
+        // generated id would be the one value that could not be released.
+        validate("pdf", &first).expect("a generated id is a valid id");
     }
 
     #[test]

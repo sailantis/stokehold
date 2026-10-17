@@ -47,9 +47,10 @@ volucer-kv = { version = "0.1.0", path = "crates/volucer-kv" }
 volucer-lock = { version = "0.1.0", path = "crates/volucer-lock" }
 # The Redis client, **optional** and behind a feature. A deployment using the in-memory store must not
 # link a Redis to get it, which is the rule `docs/plugins.md` §5 states for every driver. Default
-# features are off — they pull in `num-bigint` and `sha1_smol` for script and big-number support a KV
-# store does not use — and `connection-manager` is deliberately **not** enabled: it implies `aio` and
-# therefore a runtime, and this crate's store trait is synchronous on purpose.
+# features are off — they pull in `num-bigint` for big-number support a KV store does not use — and
+# `connection-manager` is deliberately **not** enabled: it implies `aio` and therefore a runtime, and
+# these stores are synchronous on purpose. `sha1_smol` arrives with `redis`'s `script` feature, which
+# only `volucer-lock` asks for: the lock operations are Lua and `Script` is the API for them.
 redis = { version = "1.7", default-features = false }
 volucer-acme = { version = "0.1.0", path = "crates/volucer-acme" }
 volucer-upstream = { version = "0.1.0", path = "crates/volucer-upstream" }

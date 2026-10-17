@@ -18,6 +18,21 @@ thiserror.workspace = true
 # what its predictability would and would not affect. A lock id is the same kind of value: it names a
 # holder for as long as one critical section lasts, and nothing is authorised by it.
 getrandom.workspace = true
+# The `script` feature is on here and off at the workspace level, because only this crate needs it: the
+# lock operations are Lua scripts (check-and-write as one operation) and `Script` is the API for them.
+# It pulls in `sha1_smol` and nothing else, which is what makes it a reasonable ask — the alternative is
+# sending a kilobyte of script text on every lock call.
+redis = { workspace = true, features = ["script"], optional = true }
 
 [features]
 default = []
+# The Redis driver. The client is shared with `volucer-kv` and named here as an optional dependency
+# rather than through a re-export, because a feature that enabled another crate's module would couple the
+# two drivers' versions for no reason.
+redis = ["dep:redis"]
+
+[dev-dependencies]
+# The integration tests in `tests/redis.rs` drive the driver through the client directly — one test
+# checks the raw `HLEN` of a released resource, which is a fact about the server rather than about this
+# crate's API. Gated through the same feature by `#![cfg(feature = "redis")]` at the top of the file.
+redis = { workspace = true, features = ["script"] }

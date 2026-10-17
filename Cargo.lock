@@ -1282,6 +1282,7 @@ dependencies = [
  "itoa",
  "percent-encoding",
  "ryu",
+ "sha1_smol",
  "socket2",
  "url",
  "xxhash-rust",
@@ -1489,6 +1490,12 @@ checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sharded-slab"
@@ -2006,6 +2013,7 @@ name = "volucer-lock"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "redis",
  "thiserror 2.0.21",
  "tracing",
 ]

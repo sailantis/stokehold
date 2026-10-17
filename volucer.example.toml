@@ -449,11 +449,20 @@ base_port = 19001
 # one. Needs a build with the `redis` feature, like the KV driver above, and
 # takes the same URL and pool settings for the same reasons.
 #
+# Holders live in one hash per resource at `volucer:lock:<resource>`, so
+# `HGETALL volucer:lock:pdf:create` in redis-cli shows exactly who is inside and
+# until when. That prefix is also what to search for when clearing a wedged lock
+# by hand — after `release_all` has been tried, which is the supported way.
+#
 # `read_timeout_ms` is the deadline on one command. It is the setting that
 # turns a Redis that stopped answering into a lock whose state is reported as
 # *unknown* rather than into a worker that hangs holding a slot; the caller is
 # then told to resolve it by asking, which is the only correct answer and the
 # one this server will not invent.
+#
+# A resource is shared between deployments, so two applications pointing at one
+# Redis must not both use a resource name like "cache". Namespace it the way you
+# would a cache key.
 # [lock]
 # driver = "redis"
 # url = "redis://127.0.0.1:6379"

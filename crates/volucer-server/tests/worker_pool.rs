@@ -1728,6 +1728,175 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     );
 }
 
+/// A Redis lock is shared between **two servers**, over real PHP workers.
+///
+/// This is the property the whole Redis driver exists for and the one `MemoryLocks` cannot have: two
+/// dispatchers, each with its own pool and its own process, seeing one lock because the state is in the
+/// server rather than in either of them. A test through one dispatcher would pass against a driver that
+/// kept the lock in a `static`, which is exactly the mistake the memory driver already is.
+///
+/// The lock is taken by the first dispatcher's worker and then contended by the *second* dispatcher's —
+/// a different process, a different pool, a different `MemoryLocks` if the driver were not Redis — and
+/// then taken again after the first releases it.
+///
+/// Skipped with a printed reason when there is no Redis at `REDIS_URL`, like the driver's own tests, and
+/// `VOLUCER_E2E=1` turns that skip into a failure.
+#[cfg(feature = "redis")]
+#[test]
+fn a_redis_lock_is_shared_between_two_servers() {
+    let _serial = serial();
+    require_sdk!();
+
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    // Unique per *run*, not per process: a lease from an earlier run is still live for its TTL, and
+    // Windows reuses process ids aggressively — so a pid-only name would have this test contend with the
+    // previous run of itself. That is not hypothetical: it is how this test failed the first time it ran
+    // as part of the whole suite, after passing alone.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let resource = format!("test-e2e-{}-{nanos}", std::process::id());
+    use volucer_lock::Locks as _;
+
+    let probe = match volucer_lock::RedisLocks::connect(&url, 1, Duration::from_secs(5)) {
+        Ok(locks) => locks,
+        Err(err) => {
+            let reason = format!("no Redis at {url}: {err}");
+            if skip_is_a_failure() {
+                panic!("VOLUCER_E2E is set, so a skipped test is a failure: {reason}");
+            }
+            eprintln!("skipping: {reason}");
+            return;
+        }
+    };
+    probe.release_all(&resource).expect("start from nothing");
+
+    let dir = std::env::temp_dir().join(format!("volucer-lock-redis-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+
+    // One script body, written to two paths: the resource is a query argument so the same file can hold,
+    // contend and release, and each dispatcher gets a copy of it under its own name.
+    let script_body = || {
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$held = null;
+$worker->run(static function (Request $request, Worker $worker) use (&$held): Response {{
+    $path = parse_url($request->uri, PHP_URL_PATH);
+    // Through the SDK's accessor rather than `$_GET`, which a worker does not populate — the server
+    // sends the URI and the SDK parses the query, and nothing fills the superglobal.
+    $resource = $request->query()['resource'] ?? 'unnamed';
+
+    if ($path === '/hold') {{
+        $acquired = $worker->call('lock.acquire', ['resource' => $resource, 'ttl' => 60000000]);
+        $held = $acquired['id'];
+        return Response::json(['acquired' => $acquired['acquired'], 'id' => $held]);
+    }}
+
+    if ($path === '/contend') {{
+        $other = $worker->call('lock.acquire', ['resource' => $resource]);
+        return Response::json([
+            'acquired' => $other['acquired'],
+            'error' => $worker->lastCallError(),
+        ]);
+    }}
+
+    if ($path === '/release') {{
+        $released = $worker->call('lock.release', ['resource' => $resource, 'id' => $held]);
+        return Response::json(['released' => $released['released']]);
+    }}
+
+    return Response::json(['error' => 'unknown path']);
+}});
+"#
+        )
+    };
+
+    let first_script = dir.join("first.php");
+    let second_script = dir.join("second.php");
+    std::fs::write(&first_script, script_body()).expect("write the first worker");
+    std::fs::write(&second_script, script_body()).expect("write the second worker");
+
+    let configure = |script: &std::path::Path| {
+        let backend = BackendConfig::Worker(WorkerConfig {
+            command: format!("php \"{}\"", script.display()),
+            workers: 1,
+            services: vec!["lock".to_string()],
+            ..config(1)
+        });
+        let mut configured = Config {
+            backends: [("app".to_string(), backend)].into_iter().collect(),
+            default_backend: Some("app".to_string()),
+            ..Config::default()
+        };
+        configured.lock = Some(LockConfig::Redis(volucer_core::config::RedisLockConfig {
+            url: url.clone(),
+            pool_size: 2,
+            read_timeout_ms: 5000,
+        }));
+        configured
+    };
+
+    let first = Dispatcher::from_config(&configure(&first_script), Routing::default())
+        .expect("the first pool starts");
+    let second = Dispatcher::from_config(&configure(&second_script), Routing::default())
+        .expect("the second pool starts");
+
+    let held = json_body(
+        &first
+            .dispatch(&get(&format!("/hold?resource={resource}")))
+            .expect("the hold is served"),
+    );
+    assert_eq!(held["acquired"], true, "{held}");
+    assert!(
+        held["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the server generated an id and the answer carries it: {held}"
+    );
+
+    // The second server, whose own process has never seen this lock.
+    let contended = json_body(
+        &second
+            .dispatch(&get(&format!("/contend?resource={resource}")))
+            .expect("the contention is served"),
+    );
+    assert_eq!(
+        contended["acquired"], false,
+        "a second *server* must contend with the first one's lock, which is the whole reason the Redis \
+         driver exists: {contended}"
+    );
+    assert_eq!(
+        contended["error"],
+        serde_json::Value::Null,
+        "and it is contention rather than a refusal: {contended}"
+    );
+
+    let released = json_body(
+        &first
+            .dispatch(&get(&format!("/release?resource={resource}")))
+            .expect("the release is served"),
+    );
+    assert_eq!(released["released"], true, "{released}");
+
+    // And now the second server can take it, which proves the release reached the shared state rather
+    // than only the first server's copy of it.
+    let after = json_body(
+        &second
+            .dispatch(&get(&format!("/contend?resource={resource}")))
+            .expect("the second contention is served"),
+    );
+    assert_eq!(
+        after["acquired"], true,
+        "after the holder released it, the other server takes it: {after}"
+    );
+
+    probe.release_all(&resource).expect("clean up");
+}
+
 /// The JSON body of a response, as the fixtures write it.
 fn json_body(response: &volucer_fcgi::Response) -> serde_json::Value {
     let body = body_of(response);

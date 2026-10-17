@@ -64,8 +64,12 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 pub mod memory;
+#[cfg(feature = "redis")]
+pub mod redis_lock;
 
 pub use memory::MemoryLocks;
+#[cfg(feature = "redis")]
+pub use redis_lock::{RedisLocks, DEFAULT_READ_TIMEOUT};
 
 /// The longest lease a caller may ask for.
 ///

@@ -54,7 +54,7 @@ tracing.workspace = true
 default = []
 # Enables the `redis` KV driver and the Redis client that serves it — and, in time, the lock in
 # `docs/plugins.md` §6.3, which shares the client. A build without it links no Redis at all.
-redis = ["volucer-kv/redis", "volucer-core/redis"]
+redis = ["volucer-kv/redis", "volucer-core/redis", "volucer-lock/redis"]
 [dev-dependencies]
 # An empty request body, so an upstream test needs no listener to make one.
 http-body-util.workspace = true

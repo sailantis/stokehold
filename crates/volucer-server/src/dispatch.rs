@@ -178,15 +178,20 @@ fn build_locks(config: &Config) -> Result<Option<Arc<dyn volucer_lock::Locks>>> 
     let locks: Arc<dyn volucer_lock::Locks> = match lock {
         LockConfig::Memory(_) => Arc::new(volucer_lock::MemoryLocks::new()),
         #[cfg(feature = "redis")]
-        LockConfig::Redis(_) => {
-            // Built by the Redis driver when §6.3's second half lands. Reported as a misconfiguration
-            // rather than a panic, because this is a configuration a build can be handed and the message
-            // is what tells an operator which build to install.
-            return Err(ServerError::Misconfigured {
+        LockConfig::Redis(redis) => {
+            // Built here rather than lazily on the first acquisition: an unreachable server is a startup
+            // failure, exactly as it is for a KV storage, rather than a 500 on the first request that
+            // needs a lock — and `connect` is what `PING`s to find out.
+            let locks = volucer_lock::RedisLocks::connect(
+                &redis.url,
+                redis.pool_size,
+                std::time::Duration::from_millis(redis.read_timeout_ms),
+            )
+            .map_err(|err| ServerError::Misconfigured {
                 backend: "lock".to_string(),
-                reason: "the redis lock driver is not implemented yet; use driver = \"memory\""
-                    .to_string(),
-            });
+                reason: err.to_string(),
+            })?;
+            Arc::new(locks)
         }
     };
     tracing::info!(driver = %lock.driver(), "lock backend ready");

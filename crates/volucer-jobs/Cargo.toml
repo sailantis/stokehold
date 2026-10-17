@@ -1,0 +1,18 @@
+[package]
+name = "volucer-jobs"
+description = "Queues for volucer: the driver trait and the in-memory driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The same two the KV and lock crates have, and for the same reason: the refusals a caller must read are
+# the only thing a driver needs, and every driver past `memory` is behind a feature so that a single-node
+# deployment links no client at all. `docs/plugins.md` §5.
+tracing.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []

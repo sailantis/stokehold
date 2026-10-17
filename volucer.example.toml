@@ -227,6 +227,11 @@ workers = 0               # 0 = one per logical CPU
 memory_limit_mb = 256     # recycle a worker above this RSS
 max_requests = 1000       # and after this many requests
 working_dir = "."
+# services = ["config"]   # Namespaces this backend's workers may CALL, mid-request. Absent
+                          # means none, which is the safe default: the worker channel is a
+                          # remote-execution surface and this key is the only thing limiting
+                          # it. "workers" also allows worker.reset, so grant it only to an
+                          # operator's worker, never to one facing the public.
 # transport = "pipe"      # Defaults to "socket" on Windows and "pipe" elsewhere,
                           # which is the measured winner on each: PHP's stream layer
                           # reads a Windows pipe ~100x slower than a socket, and that

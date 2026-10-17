@@ -1886,6 +1886,25 @@ pub struct WorkerConfig {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 
+    /// Which control namespaces this backend's workers may call.
+    ///
+    /// **Absent means none, and that is the whole point of the key.** A worker's channel is a
+    /// remote-execution surface — see `docs/plugins.md` §4.5 — and the only thing protecting it
+    /// is which methods the server agreed to answer. So a backend that faces the public gets a
+    /// registry without `workers`, and therefore cannot restart its siblings, while an operator's
+    /// worker gets one that can. A process-wide registry would give every worker every
+    /// capability, which is the shape the design refuses.
+    ///
+    /// Named rather than spelled as method names: the unit of capability here is the namespace,
+    /// because that is the unit a handler is written and reviewed as, and because `["kv"]` is a
+    /// one-line diff where a list of verbs is a diff per verb that no reviewer reads.
+    ///
+    /// Only a `worker` backend has this key at all: the other three have no channel to install a
+    /// handler on, and their configuration tables refuse it rather than accept a key that
+    /// advertises a surface which does not exist.
+    #[serde(default)]
+    pub services: Vec<String>,
+
     /// Whether the per-frame `crc32c` is verified.
     ///
     /// Defaults to [`ChecksumMode::Required`], which is what every volucer release
@@ -1895,6 +1914,9 @@ pub struct WorkerConfig {
     /// simply keeps checksumming — see [`ChecksumMode`].
     #[serde(default)]
     pub checksum: ChecksumMode,
+    // `services` is declared above, before the transport docs, because it is the key an
+    // operator reads first: it is the one that decides what the application may ask for.
+    /// How the server and a worker are connected.
 
     /// How the server and a worker are connected.
     ///
@@ -1973,6 +1995,26 @@ impl std::fmt::Display for WorkerTransport {
 /// The server listens before starting the worker, so the address is known up front and the
 /// worker is told rather than having to discover it.
 pub const WORKER_SOCKET_ENV: &str = "VOLUCER_WORKER_SOCKET";
+
+/// The call namespaces a worker backend may be granted, and therefore the whole of the
+/// allow-list `WorkerConfig::services` is checked against.
+///
+/// **An allow-list rather than "anything the registry will accept", because a misspelled
+/// namespace must be a startup failure rather than a silent refusal at call time.** A worker
+/// granted `["workes"]` has no capability at all, and the only symptom would be an application
+/// that reports "the server refused the call" — which reads as a server bug, not a typo. The
+/// same argument `#[serde(deny_unknown_fields)]` makes for a misspelled *key* applies to a
+/// misspelled *value* here.
+///
+/// The list is the namespaces `volucer-server` implements, and it lives in `volucer-core` because
+/// validation does. Adding a service means adding a name here, which is the one place a reviewer
+/// has to look to see the whole surface a worker can reach.
+pub const CALL_NAMESPACES: &[&str] = &[
+    // The deployment's own description, redacted. `docs/plugins.md` §4.6.
+    "config",
+    // The pools: `workers.list` and `worker.reset`. `docs/plugins.md` §4.4.
+    "workers",
+];
 
 /// How strictly the worker protocol's per-frame `crc32c` is enforced.
 ///
@@ -2720,6 +2762,27 @@ impl Config {
             BackendConfig::Worker(w) => {
                 if w.command.trim().is_empty() {
                     return bad("worker command must not be empty".to_string());
+                }
+                // Checked by name against the allow-list, so a typo is refused here rather than
+                // becoming a worker that boots, serves traffic, and is silently unable to call
+                // anything. A duplicate is refused for the same reason a duplicate key would be:
+                // it means two lines disagree and only one of them is read.
+                let mut seen = std::collections::BTreeSet::new();
+                for namespace in &w.services {
+                    if !CALL_NAMESPACES.contains(&namespace.as_str()) {
+                        return bad(format!(
+                            "services contains {namespace:?}, which is not a namespace the server \
+                             implements; known namespaces are {}",
+                            CALL_NAMESPACES
+                                .iter()
+                                .map(|name| format!("\"{name}\""))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    if !seen.insert(namespace) {
+                        return bad(format!("services names {namespace:?} twice"));
+                    }
                 }
             }
             BackendConfig::External(e) => {
@@ -4208,8 +4271,98 @@ addres = "typo"
         assert!(err.to_string().contains("addres"), "{err}");
     }
 
-    /// `volucer.example.toml` parses and validates.
+    /// A misspelled namespace in `services` is a startup failure, not a silent refusal.
     ///
+    /// The failure this exists to prevent is quiet in a specific way. `services = ["workes"]` grants a
+    /// worker no capability at all, and the deployment boots, serves every request, and only shows the
+    /// problem when the application asks the server to reset a worker and is told the method is not
+    /// registered — which reads as a server bug rather than as a typo in a configuration file. So the
+    /// name is checked against the allow-list where the file is read, which is the same place
+    /// `deny_unknown_fields` refuses a misspelled *key*.
+    #[test]
+    fn a_misspelled_namespace_in_services_is_refused_by_name() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["workes"]
+"#;
+        let config = Config::from_toml(text).expect("the file parses; the value is what is wrong");
+        let err = config.validate().expect_err("must not validate");
+        let message = err.to_string();
+        assert!(
+            message.contains("\"workes\""),
+            "the error must quote the value that is wrong: {message}"
+        );
+        // The message names the alternatives, because an operator reading it has to fix the file
+        // from the message alone.
+        assert!(
+            message.contains("\"config\"") && message.contains("\"workers\""),
+            "the error must name the valid namespaces: {message}"
+        );
+    }
+
+    /// A namespace named twice is refused, because two lines would disagree and one is read.
+    ///
+    /// Harmless at this instant — the registry is a map, so a duplicate is absorbed — and worth
+    /// refusing anyway: a duplicate is what a hand-merged configuration looks like right before the
+    /// two copies diverge, and the divergence would then be invisible because the first copy wins.
+    #[test]
+    fn a_namespace_listed_twice_in_services_is_refused() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["config", "config"]
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        let err = config.validate().expect_err("must not validate");
+        assert!(
+            err.to_string().contains("twice"),
+            "the error must say what is wrong: {err}"
+        );
+    }
+
+    /// `services` is absent by default, and the default is the safe one.
+    ///
+    /// Asserted rather than assumed because it is the whole security argument: a backend that faces
+    /// the public must not become able to restart its siblings because somebody added a key
+    /// elsewhere. The default is `Vec::new`, and `#[serde(default)]` is the only thing making an
+    /// omitted key mean "no capability" rather than a parse error — so a change to either is a change
+    /// to the security posture, and this is what notices.
+    #[test]
+    fn a_worker_without_the_services_key_may_call_nothing() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        config
+            .validate()
+            .expect("an omitted services list is valid");
+        let BackendConfig::Worker(worker) = config.backends.get("app").expect("app is configured")
+        else {
+            panic!("app is a worker backend");
+        };
+        assert!(
+            worker.services.is_empty(),
+            "an omitted services key must grant nothing, got {:?}",
+            worker.services
+        );
+    }
+
+    /// `volucer.example.toml` parses and validates.
+
     /// It is documentation, and a documentation file that does not parse is documentation that
     /// lies: an operator copies a block out of it, gets a message about a key that does not exist,
     /// and has no way to tell whether the file is wrong or they are. **Nothing else in the tree
@@ -4246,6 +4399,13 @@ addres = "typo"
                 path.display()
             );
         }
+        // The `services` key is new with the call path and is the one an operator must find to
+        // grant anything at all, so its absence from the example is a documentation failure.
+        assert!(
+            text.contains("# services = ["),
+            "{} no longer documents the per-backend `services` key",
+            path.display()
+        );
     }
 
     #[test]

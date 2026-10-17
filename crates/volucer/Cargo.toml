@@ -23,6 +23,9 @@ volucer-fcgi.workspace = true
 volucer-http.workspace = true
 # The access log, for `serve` to build and `check` to report the destination of.
 volucer-observe.workspace = true
+# The registry behind the metrics endpoint. A leaf crate, and the only new dependency this step
+# adds; see its manifest for why the exposition encoder is written by hand.
+volucer-metrics.workspace = true
 volucer-server.workspace = true
 # The ACME engine, so a configured `[server.acme]` actually issues rather than merely validating.
 volucer-acme.workspace = true

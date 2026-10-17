@@ -55,6 +55,16 @@ pub enum HttpError {
     #[error("cannot start the async runtime: {0}")]
     Runtime(#[source] std::io::Error),
 
+    /// An accepted listener could not be handed to the runtime.
+    ///
+    /// Distinct from [`HttpError::Bind`], which is about *taking* an address: this one happens after
+    /// the port is held, when converting a bound `std::net::TcpListener` into its `tokio` equivalent
+    /// fails. The two want different sentences in a log — one says "this address is not yours", the
+    /// other says "this process is out of descriptors" — and merging them would make a resource
+    /// exhaustion read as a configuration mistake.
+    #[error("the listener could not be served: {0}")]
+    Io(#[source] std::io::Error),
+
     /// A certificate or key could not be loaded, or they do not pair.
     ///
     /// Reported before the port is bound, because a listener that starts and then fails every
@@ -78,9 +88,13 @@ impl HttpError {
             HttpError::BadGateway(_) => 502,
             HttpError::Overloaded => 503,
             HttpError::GatewayTimeout(_) => 504,
-            // Neither of these reaches a client: they stop the listener before it
-            // accepts anything. Reported as a 500 rather than panicking.
-            HttpError::Bind { .. } | HttpError::Runtime(_) | HttpError::Tls { .. } => 500,
+            // None of these reaches a client: they stop the listener before it accepts anything, or
+            // they are the listener failing to be served at all. Reported as a 500 rather than
+            // panicking.
+            HttpError::Bind { .. }
+            | HttpError::Runtime(_)
+            | HttpError::Io(_)
+            | HttpError::Tls { .. } => 500,
         }
     }
 

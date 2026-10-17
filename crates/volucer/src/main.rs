@@ -11,7 +11,7 @@ use volucer_core::config::{resolve_access_log_path, AccessLogFormat, Config, Min
 use volucer_core::php;
 use volucer_core::sites::Sites;
 use volucer_fcgi::cgi::Routing;
-use volucer_http::{HttpLimits, RunningHttp};
+use volucer_http::{HttpLimits, RunningHttp, RunningStatus};
 use volucer_server::{Contention, Dispatcher, FastCgiListener, Limits, ServerError};
 
 #[derive(Parser, Debug)]
@@ -1136,7 +1136,6 @@ fn wait_for_shutdown() {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
-
 /// Set once a Ctrl-C has been seen, so a listener that cannot be told directly
 /// can still be waited on.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);

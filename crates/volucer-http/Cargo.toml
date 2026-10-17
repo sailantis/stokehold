@@ -19,6 +19,10 @@ volucer-upstream.workspace = true
 # crate and `volucer-server` depend on it — see the note in that crate's manifest for why the
 # decision is shared rather than per-listener.
 volucer-observe.workspace = true
+# The registry behind `/metrics` and the `rr_http_*` names. A leaf crate with one dependency; see
+# its own manifest for why the exposition encoder is written by hand rather than taken from the
+# `prometheus` crate.
+volucer-metrics.workspace = true
 volucer-acme.workspace = true
 volucer-worker.workspace = true
 arc-swap.workspace = true

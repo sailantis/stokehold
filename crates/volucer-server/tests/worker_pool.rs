@@ -1897,6 +1897,153 @@ $worker->run(static function (Request $request, Worker $worker) use (&$held): Re
     probe.release_all(&resource).expect("clean up");
 }
 
+/// A worker pushes a job through the `jobs` namespace, over a real channel, into a real pipeline.
+///
+/// The fourth instance of the end-to-end obligation (`set_call_handler`, `build_stores`, `build_locks`,
+/// and now `build_queues`), and it goes through `Dispatcher::from_config` for the reason the others do:
+/// a registry a test assembles proves the pieces work together while leaving the code that assembles them
+/// in production unexercised. The specific failure this catches is a `[jobs]` table that builds no driver,
+/// or one built under a name the router does not key on.
+///
+/// The assertion that matters is the *other* half: the job the worker pushed is then reserved **from the
+/// driver the dispatcher built**, so the test proves the push landed in a queue a consumer can read rather
+/// than only that a call was answered.
+#[test]
+fn a_worker_pushes_a_job_into_a_pipeline_a_consumer_can_read() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-jobs-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("jobs-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response {{
+    $path = parse_url($request->uri, PHP_URL_PATH);
+
+    if ($path === '/denied') {{
+        // A pipeline the deployment does not have: the refusal must name it *and* what does exist, which
+        // is the same shape every namespace's refusals take.
+        $answer = $worker->call('jobs.push', ['pipeline' => 'nosuch', 'task' => 'App\\Jobs\\X']);
+        return Response::json(['error' => $worker->lastCallError(), 'pushed' => $answer['pushed'] ?? null]);
+    }}
+
+    $answer = $worker->call('jobs.push', [
+        'pipeline' => 'emails',
+        'task' => 'App\\Jobs\\SendEmail',
+        // Bytes above 0x7f and a serialized shape, because that is what an application queues.
+        'payload' => base64_encode('{{"to":"a@b"}}'),
+        'headers' => ['traceparent' => '00-abc-def-01'],
+    ]);
+    $size = $worker->call('jobs.size', ['pipeline' => 'emails']);
+    $pipelines = $worker->call('jobs.pipelines');
+
+    return Response::json([
+        'pushed' => $answer['pushed'] ?? null,
+        'id' => $answer['id'] ?? null,
+        'size' => $size['size'] ?? null,
+        'in_flight' => $size['in_flight'] ?? null,
+        'pipelines' => array_column($pipelines['pipelines'] ?? [], 'name'),
+    ]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers: 1,
+        services: vec!["jobs".to_string()],
+        ..config(1)
+    });
+    let mut configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        default_backend: Some("app".to_string()),
+        ..Config::default()
+    };
+    configured.jobs = Some(volucer_core::config::JobsConfig {
+        // Nothing consumed: this is a producer-only deployment, which is the common web node and the
+        // configuration the test is modelling.
+        consume: Vec::new(),
+        pipelines: [
+            (
+                "emails".to_string(),
+                volucer_core::config::PipelineConfig::Memory(
+                    volucer_core::config::MemoryPipelineConfig {},
+                ),
+            ),
+            (
+                "reports".to_string(),
+                volucer_core::config::PipelineConfig::Memory(
+                    volucer_core::config::MemoryPipelineConfig {},
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        pool: None,
+    });
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+
+    let pushed = json_body(&dispatcher.dispatch(&get("/")).expect("the push is served"));
+    assert_eq!(pushed["pushed"], true, "{pushed}");
+    assert!(
+        pushed["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the push answers with the driver's id: {pushed}"
+    );
+    assert_eq!(
+        pushed["size"], 1,
+        "and the job is in the pipeline the moment the call returns: {pushed}"
+    );
+    assert_eq!(pushed["in_flight"], 0, "{pushed}");
+    assert_eq!(
+        pushed["pipelines"],
+        serde_json::json!(["emails", "reports"]),
+        "both pipelines are listed, which is what a worker discovers what it may push to from: {pushed}"
+    );
+
+    // **Read back through the dispatcher's own driver**, which is the assertion that makes this an
+    // end-to-end test rather than a call-plane test: the job the worker pushed is really in a queue, and
+    // it carries what the worker sent.
+    let queues = dispatcher.queues().expect("the [jobs] table built a plane");
+    let consumed = queues.consumed();
+    let (_, emails) = consumed
+        .iter()
+        .find(|(name, _)| *name == "emails")
+        .expect("emails is a pipeline");
+    let reserved = volucer_jobs::Driver::reserve(&**emails, "emails", 1, Duration::from_secs(60))
+        .expect("reserved");
+    assert_eq!(reserved.len(), 1, "the pushed job must be reservable");
+    assert_eq!(reserved[0].job.task, "App\\Jobs\\SendEmail");
+    assert_eq!(
+        reserved[0].job.payload, b"{\"to\":\"a@b\"}",
+        "and its payload is exactly the bytes that went in"
+    );
+    assert_eq!(reserved[0].job.header("traceparent"), Some("00-abc-def-01"));
+
+    // The refusal names both the pipeline asked for and the ones that exist.
+    let denied = json_body(
+        &dispatcher
+            .dispatch(&get("/denied"))
+            .expect("the refusal is served"),
+    );
+    assert_eq!(denied["pushed"], serde_json::Value::Null, "{denied}");
+    let message = denied["error"].as_str().unwrap_or_default();
+    assert!(message.contains("nosuch"), "{message}");
+    assert!(message.contains("emails"), "{message}");
+}
+
 /// The JSON body of a response, as the fixtures write it.
 fn json_body(response: &volucer_fcgi::Response) -> serde_json::Value {
     let body = body_of(response);

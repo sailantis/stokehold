@@ -56,21 +56,35 @@ pub struct ParamError {
 pub type ParamResult<T> = std::result::Result<T, ParamError>;
 
 impl Params {
-    /// The `params` of a call, which may be absent, `null`, or an object.
+    /// The `params` of a call, which may be absent, `null`, an object, or **an empty list**.
     ///
-    /// Absent and `null` both become an empty set, because a client that sends `"params": null` means
-    /// what a client that omits the key means, and refusing one of the two would be a distinction with
-    /// no purpose behind it.
+    /// # Why an empty list is accepted
     ///
-    /// A `params` that is *not* an object is refused, and that is not pedantry: `"params": [1,2,3]` from a
-    /// client that confused the two JSON container types would otherwise read as "no arguments", and the
-    /// method would run with defaults. That is how a `delete` becomes a `clear`.
+    /// Because PHP cannot produce an empty object. `json_encode([])` is `[]`, not `{}`, so a client
+    /// written in PHP that calls a no-argument method — the natural spelling of
+    /// `Worker::call('jobs.pipelines')` — sends `"params": []` and has no way to send anything else
+    /// without being awkward about it. Refusing that would make every no-argument method uncallable from
+    /// the language this client exists for, and the failure is a *refusal of the call itself*, which reads
+    /// as a server bug.
+    ///
+    /// This was found by the first end-to-end test of a no-argument method through `Params`, and it is
+    /// worth recording because the shape of the mistake is subtle: the rule below was written for a client
+    /// that confused two container types, and an empty array is not that client.
+    ///
+    /// # And why a non-empty list is still refused
+    ///
+    /// `"params": [1,2,3]` is the case the rule was written for: a client that confused the two JSON
+    /// container types, whose arguments would otherwise read as "no arguments" and let the method run with
+    /// defaults. That is how a `delete` becomes a `clear`, and the distinction that keeps it safe is
+    /// *empty* rather than "is a list".
     pub fn from_value(value: &Value, method: &str) -> ParamResult<Self> {
         match value {
             Value::Null => Ok(Params::default()),
             Value::Object(object) => Ok(Params {
                 object: object.clone(),
             }),
+            // The one list that is not a mistake — see above.
+            Value::Array(items) if items.is_empty() => Ok(Params::default()),
             other => Err(ParamError {
                 name: "params".to_string(),
                 reason: format!(
@@ -385,8 +399,17 @@ mod tests {
             assert!(params.is_empty(), "{json} should carry no parameters");
         }
 
+        // **An empty list is accepted**, and it is the one list that is not a mistake: PHP cannot produce
+        // an empty object, so `json_encode([])` is `[]` and a no-argument call from the language this
+        // client exists for arrives that way. Found by the first end-to-end test of a no-argument method.
+        let value: Value = serde_json::from_str("[]").unwrap();
+        let params =
+            Params::from_value(&value, "jobs.pipelines").expect("an empty list is no arguments");
+        assert!(params.is_empty());
+
         // The one that matters: a client that confused the two JSON container types would otherwise get
-        // the method's defaults, which is how a `delete` becomes a `clear`.
+        // the method's defaults, which is how a `delete` becomes a `clear`. A *non-empty* list is still
+        // refused, and the boundary between the two is exactly "empty".
         let value: Value = serde_json::from_str("[1,2,3]").unwrap();
         let err = Params::from_value(&value, "kv.set").expect_err("must be refused");
         assert!(err.to_string().contains("list"), "{err}");

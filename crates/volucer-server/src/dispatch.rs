@@ -42,6 +42,13 @@ pub struct Dispatcher {
     /// Filled in at the end of [`Dispatcher::from_config`], from the pools that function has just
     /// started — no self-reference, no deferred initialisation a caller could forget.
     directory: Arc<PoolDirectory>,
+    /// The queues, for the tests and for a future consumer side to reach from outside a worker.
+    ///
+    /// A strong handle, unlike the directory above, and the difference is a real one rather than an
+    /// oversight: a driver is not the owner of anything that owns the dispatcher — no pool holds a
+    /// driver, so there is no cycle to avoid. The consumer side of step 5 will poll these, which is why
+    /// they are kept rather than rebuilt.
+    queues: Option<Arc<JobsPlane>>,
 }
 
 /// What `worker.reset` reaches the pools through, without holding one alive.
@@ -514,6 +521,7 @@ impl Dispatcher {
             routing,
             routes: config.routes.clone(),
             directory,
+            queues: jobs,
         })
     }
 
@@ -529,6 +537,14 @@ impl Dispatcher {
             Backend::Worker { .. } => Some(Arc::clone(&self.directory)),
             _ => None,
         })
+    }
+
+    /// The queues this deployment built, if it has a `[jobs]` table.
+    ///
+    /// For the tests, and for whatever polls them next — the consumer half of step 5. `None` means no
+    /// `[jobs]` table, which is the same distinction `[lock]` makes: absent is not "the default driver".
+    pub fn queues(&self) -> Option<Arc<JobsPlane>> {
+        self.queues.as_ref().map(Arc::clone)
     }
 
     /// Whether any backend was configured.

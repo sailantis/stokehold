@@ -380,3 +380,32 @@ base_port = 19001
 # [status]
 # address = "127.0.0.1:2114"
 # unavailable_status_code = 503   # some load balancers expect 503 specifically
+
+# ---------------------------------------------------------------------------
+# Key-value storages, by name. Absent means none, and then a worker cannot
+# call `kv.*` at all -- the same rule every service follows: what a worker can
+# reach is what its backend's `services` list names, and nothing else.
+#
+# `driver = "memory"` is the only driver today. It lives in this process: the
+# map is shared by every worker, which is the point, since a PHP static is
+# per-worker and a pool of 8 workers gives an application cache a hit rate of
+# 1/8 with no way to invalidate.
+#
+# max_bytes bounds the *values* stored, not the process's heap -- the hash map
+# holding them costs roughly two to three times as much again, so 64 MiB here
+# is a few hundred MiB of resident memory at worst. A value that will not fit
+# is refused rather than evicting something else, and the refusal is logged.
+# When the store is full it first sweeps expired entries, so a cache of
+# short-lived items reclaims itself.
+# ---------------------------------------------------------------------------
+# [kv.sessions]
+# driver = "memory"
+# max_bytes = 67108864            # 64 MiB; the default
+
+# Grant a backend access to one of them by name. A bare "kv" is refused, because
+# a deployment that adds a second storage later would find the first worker's
+# calls quietly going somewhere else.
+# [backends.ops]
+# kind = "worker"
+# command = "php bin/ops-worker.php"
+# services = ["config", "workers", "kv.sessions"]

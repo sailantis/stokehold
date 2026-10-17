@@ -85,6 +85,12 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// about this setting notices before the OOM killer does: at this size a leak is visible in `ps` long
 /// before it is fatal, and an application caching more than this is one that should be on a driver
 /// with a disk behind it.
+///
+/// **`volucer-core` writes this number a second time** as its own default for a `[kv.*]` table that
+/// omits `max_bytes`, because a leaf crate that everything depends on cannot take a dependency on a
+/// driver to name a default. Both copies are pinned by a test — `the_kv_default_bound_is_pinned_…`
+/// there and `the_default_bound_is_the_one_the_configuration_writes` here — so a change to either
+/// fails a test rather than making an omitted key mean something different from a named one.
 pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// One stored value and its deadline.
@@ -434,6 +440,21 @@ mod tests {
 
     fn store() -> MemoryStore {
         MemoryStore::with_max_bytes(DEFAULT_MAX_BYTES)
+    }
+
+    #[test]
+    fn the_default_bound_is_the_one_the_configuration_writes() {
+        // `volucer-core` writes this number a second time as its own default for a `[kv.*]` table
+        // that omits `max_bytes`, because it is the leaf crate and cannot depend on a driver to
+        // name a default. Both copies are pinned, here and in `config.rs`, so editing one fails a
+        // test instead of making an omitted key mean a different bound from a named one.
+        assert_eq!(DEFAULT_MAX_BYTES, 64 * 1024 * 1024);
+        assert_eq!(
+            MemoryStore::default().max_bytes(),
+            DEFAULT_MAX_BYTES,
+            "a store built with no bound must get the configured default, or every driver that \
+             constructs one differently would need a test of its own"
+        );
     }
 
     #[test]

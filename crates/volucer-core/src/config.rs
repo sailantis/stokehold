@@ -63,6 +63,100 @@ pub struct Config {
     /// exposing every counter in the process.
     #[serde(default)]
     pub status: Option<StatusConfig>,
+
+    /// Key-value storages, by name. Absent means none, and a worker cannot then call `kv.*` at all.
+    ///
+    /// **Named, because one deployment wants several.** A session cache and a fragment cache have
+    /// different lifetimes, different bounds and sometimes different backends, and a single global
+    /// store would make `clear` — which is per storage, see [`volucer_kv`'s own documentation] —
+    /// unable to express that. RoadRunner has the same shape, and this is one of the places
+    /// matching it costs nothing.
+    ///
+    /// A table rather than a list, so that a backend's `services` list can be told *which* storage
+    /// it may reach; see [`Config::validate`] for where that is checked.
+    #[serde(default)]
+    pub kv: BTreeMap<String, KvStorageConfig>,
+}
+
+/// One `[kv.<name>]` storage: which driver, and that driver's own settings.
+///
+/// # Why a tagged enum and not `driver` plus an untyped table
+///
+/// This is the one place the document says outright that it diverges from RoadRunner's shape
+/// (`docs/plugins.md` §6.2), and the reason is the same one [`BackendConfig`] gives: RR's
+/// `driver = "redis"` plus a free-form `config` table means `adress` is a key that parses, is
+/// ignored, and leaves an operator with a Redis client pointed at the default port and no message
+/// saying why. A tag and a typed arm make every one of those a parse error naming the key.
+///
+/// It is *flatter* for the same reason it is typed — `max_bytes` sits beside `driver` rather than
+/// inside a `config` table — because a nested table for one key would be a level of indirection
+/// that exists only to look like somebody else's file format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "driver", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KvStorageConfig {
+    /// In this process's memory. Sharded, bounded by bytes, with per-item expiry.
+    ///
+    /// The default for a single-node deployment, and the one that needs nothing installed. See
+    /// `volucer-kv` for what the bound means and why it is bytes rather than entries.
+    Memory(MemoryKvConfig),
+}
+
+/// `[kv.<name>] driver = "memory"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryKvConfig {
+    /// How many bytes of stored values to hold before refusing to store more.
+    ///
+    /// Defaults to 64 MiB. **Deliberately not an entry count**, and deliberately not the process's
+    /// heap either: this is the sum of the values' own lengths, and the map holding them costs
+    /// roughly two to three times as much again. The module documentation in `volucer-kv` states
+    /// the multiplier rather than letting the setting imply something it does not mean.
+    #[serde(default = "default_kv_max_bytes")]
+    pub max_bytes: usize,
+}
+
+fn default_kv_max_bytes() -> usize {
+    // Written out rather than referring to `volucer-kv`'s constant, because this crate is the leaf
+    // that everything depends on and taking a dependency on a *driver* to name a default would
+    // invert that. The two are asserted equal by a test in `volucer-kv`, so they cannot drift
+    // silently — the alternative, a second value here, is what that test exists to prevent.
+    64 * 1024 * 1024
+}
+
+impl KvStorageConfig {
+    /// The driver's name, as it is written in configuration.
+    ///
+    /// For logs and for `config.describe`. Matches the serde tag, which a test asserts.
+    pub fn driver(&self) -> &'static str {
+        match self {
+            KvStorageConfig::Memory(_) => "memory",
+        }
+    }
+}
+
+impl Config {
+    /// Whether a name in a backend's `services` list is one this configuration can honour.
+    ///
+    /// Two shapes, and the second is the one worth explaining: a fixed namespace is always
+    /// available (the server's own machinery, [`CALL_NAMESPACES`]), while a KV storage is
+    /// **named** — `"kv.sessions"` — because a deployment may have several and a worker has to say
+    /// which. That is checked against this file's own `[kv.*]` tables rather than against a list of
+    /// drivers, so `services = ["kv.sessions"]` with no `[kv.sessions]` table is refused at startup
+    /// instead of becoming a worker that boots, serves traffic, and cannot reach a cache it was
+    /// told it had.
+    ///
+    /// A bare `"kv"` is refused for that reason rather than silently resolving to "the only one":
+    /// a deployment with a second storage added later would find the first worker's calls quietly
+    /// going somewhere else.
+    pub fn is_a_call_service(&self, service: &str) -> bool {
+        if CALL_NAMESPACES.contains(&service) {
+            return true;
+        }
+        match service.strip_prefix("kv.") {
+            Some(storage) => self.kv.contains_key(storage),
+            None => false,
+        }
+    }
 }
 
 /// The Prometheus endpoint.
@@ -1996,8 +2090,8 @@ impl std::fmt::Display for WorkerTransport {
 /// worker is told rather than having to discover it.
 pub const WORKER_SOCKET_ENV: &str = "VOLUCER_WORKER_SOCKET";
 
-/// The call namespaces a worker backend may be granted, and therefore the whole of the
-/// allow-list `WorkerConfig::services` is checked against.
+/// The call namespaces a worker backend may be granted, and the fixed half of the allow-list
+/// `WorkerConfig::services` is checked against.
 ///
 /// **An allow-list rather than "anything the registry will accept", because a misspelled
 /// namespace must be a startup failure rather than a silent refusal at call time.** A worker
@@ -2006,9 +2100,11 @@ pub const WORKER_SOCKET_ENV: &str = "VOLUCER_WORKER_SOCKET";
 /// same argument `#[serde(deny_unknown_fields)]` makes for a misspelled *key* applies to a
 /// misspelled *value* here.
 ///
-/// The list is the namespaces `volucer-server` implements, and it lives in `volucer-core` because
-/// validation does. Adding a service means adding a name here, which is the one place a reviewer
-/// has to look to see the whole surface a worker can reach.
+/// The list is the namespaces `volucer-server` implements that need no configuration of their own,
+/// and it lives in `volucer-core` because validation does. A service that *is* configuration — a KV
+/// storage, whose name is chosen by the deployment — is not here: it is checked against the tables
+/// in the same file, by [`Config::is_a_call_service`]. Adding a fixed service means adding a name
+/// here, which is the one place a reviewer has to look to see the whole surface a worker can reach.
 pub const CALL_NAMESPACES: &[&str] = &[
     // The deployment's own description, redacted. `docs/plugins.md` §4.6.
     "config",
@@ -2167,6 +2263,33 @@ impl Config {
                     "status.unavailable_status_code {} is not an HTTP status code",
                     status.unavailable_status_code
                 )));
+            }
+        }
+
+        // The KV storages, checked here for the same reason the listeners above are: an empty name or
+        // a typo in one is a configuration mistake, and `volucer check` should say so rather than the
+        // first `kv.get` from a worker.
+        for (name, storage) in &self.kv {
+            if name.is_empty() {
+                return Err(Error::Config(
+                    "a [kv.<name>] table has an empty name, so there is no way for a call to name it"
+                        .to_string(),
+                ));
+            }
+            match storage {
+                KvStorageConfig::Memory(memory) => {
+                    // Zero is refused rather than accepted as "unbounded". An unbounded cache is the
+                    // thing the bound exists to prevent, and an operator who wrote `max_bytes = 0`
+                    // meant something — most likely "no limit" — that this will not do. Saying so is
+                    // the only way they find out before the OOM killer does.
+                    if memory.max_bytes == 0 {
+                        return Err(Error::Config(format!(
+                            "kv.{name}.max_bytes is 0, which would refuse every value; set a limit \
+                             or remove the key for the {default} byte default",
+                            default = default_kv_max_bytes()
+                        )));
+                    }
+                }
             }
         }
 
@@ -2769,15 +2892,28 @@ impl Config {
                 // it means two lines disagree and only one of them is read.
                 let mut seen = std::collections::BTreeSet::new();
                 for namespace in &w.services {
-                    if !CALL_NAMESPACES.contains(&namespace.as_str()) {
+                    if !self.is_a_call_service(namespace) {
                         return bad(format!(
                             "services contains {namespace:?}, which is not a namespace the server \
-                             implements; known namespaces are {}",
-                            CALL_NAMESPACES
+                             implements; known namespaces are {known}, and a KV storage is named \
+                             \"kv.<name>\" — {storages}",
+                            known = CALL_NAMESPACES
                                 .iter()
                                 .map(|name| format!("\"{name}\""))
                                 .collect::<Vec<_>>()
-                                .join(", ")
+                                .join(", "),
+                            storages = if self.kv.is_empty() {
+                                "no [kv.*] table is configured at all".to_string()
+                            } else {
+                                format!(
+                                    "this deployment has {}",
+                                    self.kv
+                                        .keys()
+                                        .map(|name| format!("\"kv.{name}\""))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            }
                         ));
                     }
                     if !seen.insert(namespace) {
@@ -4361,6 +4497,186 @@ command = "php worker.php"
         );
     }
 
+    /// A `services` entry naming a KV storage is checked against the `[kv.*]` tables, not a driver list.
+    ///
+    /// This is the shape the second half of the allow-list takes, and the failure it prevents is
+    /// specific: `services = ["kv.sessions"]` with no `[kv.sessions]` table is a worker that boots,
+    /// serves traffic, and cannot reach a cache it was told it had. It is the same class of bug as the
+    /// misspelled namespace above and it has to be caught in the same place.
+    #[test]
+    fn a_services_entry_naming_a_kv_storage_must_match_a_configured_table() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[kv.sessions]
+driver = "memory"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["kv.sessions"]
+"#;
+        Config::from_toml(text)
+            .expect("the file parses")
+            .validate()
+            .expect("a storage that exists is a service that is honoured");
+
+        // The same file with the table removed. The value is what is wrong, so the error must be about
+        // the *service*, and it must name the storages there are — otherwise an operator has to guess.
+        let missing = text.replace("[kv.sessions]\ndriver = \"memory\"\n", "");
+        let config = Config::from_toml(&missing).expect("the file still parses");
+        let err = config.validate().expect_err("must not validate");
+        let message = err.to_string();
+        assert!(
+            message.contains("\"kv.sessions\""),
+            "the error must quote the service that is wrong: {message}"
+        );
+        assert!(
+            message.contains("no [kv.*] table is configured at all"),
+            "and say that there is no storage to name: {message}"
+        );
+    }
+
+    /// A bare `"kv"` is refused rather than resolved to the only storage there is.
+    ///
+    /// Tempting to allow, and wrong: a deployment that adds a second storage later would find the
+    /// first worker's calls quietly going somewhere else, which is the kind of wrongness that shows up
+    /// as a cache miss rate rather than as an error.
+    #[test]
+    fn a_bare_kv_service_is_refused_because_it_does_not_say_which_storage() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[kv.sessions]
+driver = "memory"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["kv"]
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        let err = config.validate().expect_err("must not validate");
+        let message = err.to_string();
+        assert!(
+            message.contains("\"kv.sessions\""),
+            "the error must show what the entry should have said: {message}"
+        );
+    }
+
+    /// A `[kv.*]` table whose driver is misspelled is refused, naming the key it did not understand.
+    #[test]
+    fn an_unknown_kv_driver_is_refused_rather_than_ignored() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[kv.cache]
+driver = "redis"
+address = "redis://127.0.0.1:6379"
+"#;
+        // `redis` is not implemented yet, so this is also the record of what the error looks like for a
+        // driver that is planned and not built: `unknown variant`, not a silent no-op.
+        let err = Config::from_toml(text).expect_err("must not be accepted");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown variant `redis`"),
+            "the error must name the variant: {message}"
+        );
+        assert!(
+            message.contains("`memory`"),
+            "and say what there is: {message}"
+        );
+    }
+
+    /// A key inside a `[kv.<name>]` table that the driver does not have is refused.
+    ///
+    /// The whole reason the table is a tagged enum rather than `driver` plus a free-form map: this is
+    /// the `adress` typo that RoadRunner's shape accepts and silently ignores, leaving a client pointed
+    /// at the default port with nothing in the log.
+    #[test]
+    fn an_unknown_key_in_a_kv_table_is_refused_rather_than_ignored() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[kv.cache]
+driver = "memory"
+adress = "redis://127.0.0.1:6379"
+"#;
+        let err = Config::from_toml(text).expect_err("must not be accepted");
+        assert!(
+            err.to_string().contains("adress"),
+            "the error must name the key: {err}"
+        );
+    }
+
+    /// A zero `max_bytes` is refused rather than taken as "unbounded".
+    ///
+    /// An operator who writes zero means something, and it is not what this would do. Refusing is the
+    /// only way they find out before the OOM killer does — and accepting it as "no limit" would make the
+    /// one setting that bounds the cache the one setting that can disable it.
+    #[test]
+    fn a_zero_kv_bound_is_refused_with_the_default_quoted_back() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[kv.cache]
+driver = "memory"
+max_bytes = 0
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        let err = config.validate().expect_err("must not validate");
+        let message = err.to_string();
+        assert!(
+            message.contains("kv.cache.max_bytes"),
+            "the error must name the key: {message}"
+        );
+        assert!(
+            message.contains("67108864"),
+            "and quote the default it would have had: {message}"
+        );
+    }
+
+    /// The `max_bytes` default is the one `volucer-kv` would have used, pinned as a value.
+    ///
+    /// The number is written twice — here for a configuration that omits the key, in `volucer-kv` for a
+    /// store built by a test or by a caller that has no configuration — and the duplication is deliberate:
+    /// making this crate depend on a *driver* to name a default would invert the dependency the workspace
+    /// is built on, since everything depends on `volucer-core`. So the number is pinned here, where an edit
+    /// to it is visible in a diff that also has to change the driver, and the driver's own test pins its
+    /// copy. Two pins rather than one silent disagreement.
+    #[test]
+    fn the_kv_default_bound_is_pinned_where_both_crates_can_be_checked_against_it() {
+        assert_eq!(
+            default_kv_max_bytes(),
+            64 * 1024 * 1024,
+            "if this changes, volucer-kv's DEFAULT_MAX_BYTES must change with it, or a deployment \
+             that omits the key gets a different bound from one that names it"
+        );
+    }
+
+    /// The driver name matches the serde tag, so `config.describe` and the file cannot disagree.
+    #[test]
+    fn the_kv_driver_name_matches_its_tag() {
+        let text = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[kv.cache]
+driver = "memory"
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        let storage = config.kv.get("cache").expect("cache is configured");
+        assert_eq!(
+            storage.driver(),
+            "memory",
+            "a describe that said something other than the tag would be a lie in the one answer an \
+             operator uses to find out what is running"
+        );
+    }
+
     /// `volucer.example.toml` parses and validates.
     ///
     /// It is documentation, and a documentation file that does not parse is documentation that
@@ -4404,6 +4720,13 @@ command = "php worker.php"
         assert!(
             text.contains("# services = ["),
             "{} no longer documents the per-backend `services` key",
+            path.display()
+        );
+        // Same argument for the KV table: it is the first service whose *name* an operator chooses,
+        // and `services = ["kv.sessions"]` cannot be written at all without knowing that.
+        assert!(
+            text.contains("# [kv.sessions]"),
+            "{} no longer documents a [kv.*] storage",
             path.display()
         );
     }

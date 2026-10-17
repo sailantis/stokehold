@@ -1273,3 +1273,77 @@ fn a_slot_comes_back_after_a_failed_request() {
         );
     }
 }
+
+/// A metric a worker emitted reaches a registry, through a real scrape.
+///
+/// **This is the end-to-end proof of step 1, and it is the one thing that could not be tested in
+/// pieces.** The registry is covered on its own, and so is the encoder; what is only observable here
+/// is that a `METRIC` frame from a live PHP process — through the SDK's `emitMetric`, over the real
+/// transport, decoded by the real codec — reaches the registry the metrics endpoint renders. Every
+/// piece could pass its own tests with the wire between them disconnected, which is exactly the
+/// failure the `absorb_metric` call this feature builds on had: it decoded the frame and dropped it.
+///
+/// The SDK's example worker emits `example.request` on every request, so no fixture is involved and a
+/// change to either side fails here.
+#[test]
+fn a_workers_own_metric_reaches_the_registry() {
+    let Some(pool) = start(1) else {
+        return;
+    };
+
+    let registry = volucer_metrics::Registry::new();
+    // Declared, because the registry refuses a name nobody described — and declaring it here rather
+    // than in the pool is the point: a worker publishing a metric is publishing a name the *operator*
+    // has to have decided to accept. `docs/plugins.md` §6.1 has the `[metrics] collect` table that will
+    // make this a configuration entry rather than a call a test makes by hand.
+    registry.describe_histogram(
+        "example.request",
+        "Requests the example worker counted",
+        &[],
+    );
+
+    let answer = pool.request(&get("/")).expect("a response");
+    assert!(
+        answer.stdout.starts_with(b"Status: 200"),
+        "the request should have been served: {}",
+        String::from_utf8_lossy(&answer.stdout)
+    );
+
+    pool.publish_metrics(&registry);
+    let rendered = registry.render();
+    assert!(
+        rendered.contains("example.request_count 1"),
+        "the worker's own sample should reach the registry:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("# HELP example.request Requests the example worker counted"),
+        "and keep the help text the operator declared, not the worker's:\n{rendered}"
+    );
+}
+
+/// A sample is counted once, however many times a scrape runs.
+///
+/// The drain is what makes this true, and it is the property that would be easiest to get wrong: a
+/// queue that were copied rather than drained would make a worker's single emission appear to grow
+/// with the number of scrapes, and a graph of it would climb for a reason that has nothing to do with
+/// the application.
+#[test]
+fn a_sample_is_drained_and_not_recounted_by_a_second_scrape() {
+    let Some(pool) = start(1) else {
+        return;
+    };
+
+    let registry = volucer_metrics::Registry::new();
+    registry.describe_histogram("example.request", "Requests", &[]);
+
+    pool.request(&get("/")).expect("a response");
+    pool.publish_metrics(&registry);
+    pool.publish_metrics(&registry);
+    pool.publish_metrics(&registry);
+
+    let rendered = registry.render();
+    assert!(
+        rendered.contains("example.request_count 1"),
+        "three scrapes, one sample:\n{rendered}"
+    );
+}

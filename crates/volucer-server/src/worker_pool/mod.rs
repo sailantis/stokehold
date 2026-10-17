@@ -91,6 +91,7 @@ use volucer_core::config::WorkerConfig;
 use volucer_fcgi::{Request, Response};
 use volucer_worker::codec::RequestStage;
 use volucer_worker::codec::WorkerResponse;
+use volucer_worker::message::MetricRecord;
 use volucer_worker::{Control, HelloAck, MessageType, RequestHeaderJson, WorkerError, UNSOLICITED};
 
 mod exchange;
@@ -312,6 +313,20 @@ pub struct WorkerPool {
     /// `memory_limit_mb` in bytes, worked out once.
     memory_limit_bytes: Option<u64>,
     max_requests: Option<u64>,
+    /// Metrics the workers themselves have emitted, on their way to the registry.
+    ///
+    /// **A queue between the worker and the scrape, and that indirection is the whole design.** A
+    /// worker's `METRIC` frame arrives mid-request, on the exchange thread, holding no reference to
+    /// any registry — and it must not: the frame layer would then know what a metric is, and the
+    /// registry would become reachable from a thread that exists to shuffle bytes. So the pool
+    /// accumulates, and the next scrape drains. The alternative, publishing on arrival, would need the
+    /// registry threaded through the exchange, which is the coupling `volucer-metrics` exists to avoid.
+    ///
+    /// A plain `Mutex<Vec>`: the write is once per worker per metric and the read is once per scrape,
+    /// so neither side is on a hot path. Drained rather than copied, so a long-running deployment does
+    /// not grow this without bound — a worker that emits a per-request metric is bounded by the requests
+    /// it serves, but a worker that emitted one per loop iteration would not be.
+    pending_metrics: Mutex<Vec<MetricRecord>>,
     /// Held for the life of the pool; dropping it reaps every worker.
     guard: LifecycleGuard,
 }
@@ -366,6 +381,7 @@ impl WorkerPool {
                 .memory_limit_mb
                 .map(|mb| mb.saturating_mul(1024 * 1024)),
             max_requests: config.max_requests,
+            pending_metrics: Mutex::new(Vec::new()),
             guard,
         };
 
@@ -557,6 +573,32 @@ impl WorkerPool {
     /// same thing `pids` and `peak_memory_bytes` do, and safe for the same reason: no lock is held
     /// across a request.
     pub fn publish_metrics(&self, registry: &volucer_metrics::Registry) {
+        // What the workers themselves emitted, first — so a sample from a worker that has since been
+        // recycled still reaches the graph, and so this drain happens even if the pool turns out to
+        // have no slots to describe below.
+        //
+        // Drained rather than copied, and that bounds the queue: a worker emitting one sample per
+        // request is bounded by the requests it serves, but one emitting a sample per loop iteration
+        // is not, and a queue that only ever grows would be a leak wearing a feature's name. Drained
+        // *before* the registry is written to, so a sample is never counted twice by two concurrent
+        // scrapes — the `Mutex` makes the drain atomic, and the second scrape finds an empty queue.
+        let samples: Vec<(String, f64)> = {
+            let mut pending = self
+                .pending_metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *pending)
+                .into_iter()
+                .map(|record| (record.name, record.value))
+                .collect()
+        };
+        for (name, value) in samples {
+            // An undeclared name is refused by the registry and counted there, which is the right place
+            // for that answer: whether a name is known is a property of the registry, not of the pool
+            // that forwarded it.
+            let _ = registry.observe(&name, &[], value);
+        }
+
         // The free list is the pool's own answer to "which slots are available", so both the count
         // and the per-worker state are read from it rather than inferred from a second flag that
         // could disagree with it. Taken and released immediately: this is a reading, not a lease.
@@ -711,6 +753,19 @@ impl WorkerPool {
                 });
             }
         };
+
+        // Whatever the worker said about itself on the way to answering, kept for the next scrape.
+        // Taken here rather than at the scrape, because the response is about to be consumed by
+        // `render` and the records live on it — and because a worker that is recycled before the next
+        // scrape would otherwise take its samples with it, which is precisely when they are
+        // interesting.
+        if !response.metrics.is_empty() {
+            let mut pending = self
+                .pending_metrics
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.extend(response.metrics.iter().cloned());
+        }
 
         let duration = started.elapsed();
         after_response(

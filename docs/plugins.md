@@ -583,17 +583,36 @@ Deliberately flatter than RR's `driver` + untyped `config` pair: a driver-tagged
 same pattern `BackendConfig` uses and which makes an invalid key an error at parse time rather than
 a silently-ignored one.
 
-**Copied faithfully.** Per-item TTL; PSR-16 method set (`get`, `set`, `has`, `delete`, `clear`,
-`getMultiple`, `setMultiple`, `deleteMultiple`, TTL accessors); a key namespace per storage so two
-applications sharing one Redis do not collide; the serializer being pluggable on the *client* side
-rather than fixed on the server, because that is where the E2E-encryption case lives.
+**Built, and three things about it were decided by the code rather than by this document.**
 
-**Drivers, in order.** `memory` (a sharded map with a TTL sweeper — useful on its own for
-single-node caching, and the reference implementation for the trait) → `redis` (`redis-rs`, already
-the right shape for both KV and the lock in §6.3, so one dependency serves two features) →
-`file` (an embedded store; see the hazard below) → `memcached` (a small text-protocol client; the
-weakest of the four because RR's own memcached driver cannot report TTL, so it is last and
-optional).
+- **`memory` is done, end to end.** `volucer-kv` is a leaf crate — the trait and the driver — and a
+  test drives a real PHP process through `Kv::set` and `Kv::get` against a real `MemoryStore`, with
+  two workers so that "the next request finds what the last one left" is asserted rather than
+  assumed. The bound is **bytes**, not entries (100k entries of 1 KiB is 100 MB and of 1 MiB is
+  100 GB), expiry is decided on read and swept only when an insert is about to fail, and a store
+  that is full **refuses** rather than evicting, because a refusal is visible in a log and an
+  eviction is a cache miss that looks like the application's bug.
+- **A storage is named, and a backend is granted it by name.** `services = ["kv.sessions"]`, checked
+  against this file's own `[kv.*]` tables at startup. A bare `"kv"` is refused rather than resolved to
+  the only storage there is: a deployment that adds a second later would otherwise find the first
+  worker's calls quietly going somewhere else.
+- **The value is base64 on the wire and the server has no serializer.** A JSON string cannot carry a
+  byte above `0x7f`, and an application that compresses or encrypts what it caches has such bytes
+  constantly. This is the part of the design that is load-bearing rather than stylistic: it is what
+  makes end-to-end encryption possible at all, where RR's server-side serialization makes it
+  impossible.
+
+**Copied faithfully.** Per-item TTL; PSR-16 method set (`get`, `set`, `has`, `delete`, `clear`,
+`getMultiple`, `setMultiple`, TTL accessors); a key namespace per storage so two applications sharing
+one Redis do not collide; the serializer being pluggable on the *client* side rather than fixed on
+the server, because that is where the E2E-encryption case lives. `deleteMultiple` is not implemented:
+`getMultiple` and `setMultiple` exist because they are one call where the loop is many, and a delete
+of n keys is n cheap calls whose batched form would buy a round trip and cost a wire format.
+
+**Drivers, in order.** `memory` (**done**) → `redis` (`redis-rs`, already the right shape for both KV
+and the lock in §6.3, so one dependency serves two features) → `file` (an embedded store; see the
+hazard below) → `memcached` (a small text-protocol client; the weakest of the four because RR's own
+memcached driver cannot report TTL, so it is last and optional).
 
 **Hazard.** RR's boltdb driver has a `permissions: 0755` default on a *database file*, which is
 world-readable where it should not be. If volucer ships a file-backed driver, the default is `0600`
@@ -1009,7 +1028,7 @@ progress on something earlier look bigger.
 | --- | --- | --- | --- | --- |
 | 1 | **Metrics + status** | — | S–M | **Done.** No calls, no driver, no protocol change; makes everything after it observable |
 | 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
-| 3 | **KV: `memory`, then `redis`** | 2 | S, M | Smallest service on the call path; proves the registry shape |
+| 3 | **KV: `memory`, then `redis`** | 2 | S, M | **`memory` done.** Smallest service on the call path; proves the registry shape. `redis` is next and shares its client with step 4 |
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | Shares the Redis client; carries the fencing warning |
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | The layer plan.md §6 already designed |
@@ -1041,6 +1060,22 @@ answer is now *no* — which means every later step is a registry entry rather t
 Step 3 (KV) is next: the first service to be a registry entry rather than machinery, and the one that
 tests whether the "capability is a namespace" shape holds up for a service that is not about the server
 itself.
+
+**Step 3's `memory` driver is done, and it answered that question.** The shape holds: `kv` is one namespace
+per backend holding only the storages that backend's `services` list names, so §4.5's rule is enforced
+without any code in the storage layer knowing what a capability is. Two things the document did not
+anticipate and the code settled:
+
+- **The registry routes on the first dot**, so `kv.sessions.get` is the `kv` namespace with the verb
+  `sessions.get`. One `MethodRegistry::with` call per granted storage would therefore have the second
+  replace the first — one of two caches silently answering "no storage configured" — which is why the
+  granted storages are collected and installed once.
+- **The only thing connecting the configuration to the registry is `build_stores`.** Six layers were
+  tested and none of them could see its absence; the end-to-end test found it in one run. That is the
+  second time this document has been corrected by a seam rather than by a design argument, and it is
+  worth noticing as a pattern: **the wiring between two tested things is where the untested bug lives.**
+
+`redis` remains, and it is wanted before locks because §6.3's implementation shares its client.
 
 Note the shape of the end of the list. gRPC is **no longer one XL item behind a gate**: it is three
 items of S–M each, the first of which needs no schema, no worker and no new listener. The XL item

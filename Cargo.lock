@@ -1815,6 +1815,7 @@ dependencies = [
  "tracing",
  "volucer-core",
  "volucer-fcgi",
+ "volucer-kv",
  "volucer-metrics",
  "volucer-observe",
  "volucer-upstream",

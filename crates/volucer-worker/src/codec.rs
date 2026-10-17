@@ -1450,6 +1450,219 @@ mod tests {
         assert!(err.to_string().contains("a response frame"), "{err}");
     }
 
+    /// A call arriving mid-response is *served*, not failed.
+    ///
+    /// The distinction this pins is the whole of the feature: the read loop's catch-all treats an
+    /// unexpected type as fatal — correctly, since a type it does not know means the two ends
+    /// disagree about the protocol — and a `CALL` is not unexpected. The response still completes, and
+    /// the call is answered on the way past.
+    #[test]
+    fn a_call_mid_response_is_answered_and_the_request_completes() {
+        let mut script = WorkerScript::default();
+        script.json(
+            MessageType::Call,
+            crate::FIRST_CALL_ID,
+            &Call {
+                name: "kv.get".to_string(),
+                params: serde_json::json!({ "key": "a" }),
+                traceparent: None,
+            },
+        );
+        script.head(1, 200, 2);
+        script.body(1, b"ok", true);
+        script.json(
+            MessageType::End,
+            1,
+            &RequestEnd {
+                app_status: 0,
+                peak_memory_bytes: 0,
+                duration_us: 0,
+                keep_alive: true,
+            },
+        );
+
+        let mut channel = script.channel();
+        channel.set_call_handler(Box::new(|call: &Call| {
+            assert_eq!(call.name, "kv.get", "the handler sees the call's name");
+            assert_eq!(call.params["key"], "a", "and its parameters");
+            Return::ok(serde_json::json!({ "value": "abc" }))
+        }));
+
+        let response = channel
+            .request(&RequestHeader::default(), b"")
+            .expect("the request completes despite the call");
+        assert_eq!(&response.body, b"ok");
+
+        // And the answer was written, on the call's own id.
+        let sent = sent_frames(&channel.writer);
+        let answer = sent
+            .iter()
+            .find(|(header, _)| header.message_type == MessageType::Return)
+            .expect("a RETURN frame");
+        assert_eq!(answer.0.request_id, crate::FIRST_CALL_ID);
+        let returned: Return = Json::decode(&answer.1).expect("a decodable answer");
+        assert!(returned.ok);
+        assert_eq!(returned.result, Some(serde_json::json!({ "value": "abc" })));
+    }
+
+    /// With no handler installed, a call is refused with an answer rather than ignored.
+    ///
+    /// Silence is the failure to avoid: a dropped `CALL` leaves the server waiting until its own
+    /// deadline, and — as `docs/plugins.md` §4.2 records — a deadline in this pool is a kill.
+    #[test]
+    fn a_call_with_no_handler_installed_is_refused_not_ignored() {
+        let mut script = WorkerScript::default();
+        script.json(
+            MessageType::Call,
+            crate::FIRST_CALL_ID,
+            &Call {
+                name: "kv.get".to_string(),
+                params: serde_json::Value::Null,
+                traceparent: None,
+            },
+        );
+        script.head(1, 200, 0);
+        script.json(
+            MessageType::End,
+            1,
+            &RequestEnd {
+                app_status: 0,
+                peak_memory_bytes: 0,
+                duration_us: 0,
+                keep_alive: true,
+            },
+        );
+
+        let mut channel = script.channel();
+        channel
+            .request(&RequestHeader::default(), b"")
+            .expect("the request completes");
+
+        let sent = sent_frames(&channel.writer);
+        let answer = sent
+            .iter()
+            .find(|(header, _)| header.message_type == MessageType::Return)
+            .expect("an answer, not silence");
+        let returned: Return = Json::decode(&answer.1).expect("a decodable answer");
+        assert!(!returned.ok);
+        assert!(
+            !returned.unknown,
+            "nothing happened, so nothing is ambiguous"
+        );
+        assert!(
+            returned
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("kv.get")),
+            "and the refusal names the method that could not be served: {returned:?}"
+        );
+    }
+
+    /// A handler that panics refuses the call rather than taking the worker with it.
+    ///
+    /// The handler runs on the exchange thread that owns this worker's pipes for its whole life, so an
+    /// escaping panic would poison the channel. The request must still complete.
+    #[test]
+    fn a_panicking_call_handler_refuses_the_call_and_keeps_the_worker() {
+        let mut script = WorkerScript::default();
+        script.json(
+            MessageType::Call,
+            crate::FIRST_CALL_ID,
+            &Call {
+                name: "kv.get".to_string(),
+                params: serde_json::Value::Null,
+                traceparent: None,
+            },
+        );
+        script.head(1, 200, 2);
+        script.body(1, b"ok", true);
+        script.json(
+            MessageType::End,
+            1,
+            &RequestEnd {
+                app_status: 0,
+                peak_memory_bytes: 0,
+                duration_us: 0,
+                keep_alive: true,
+            },
+        );
+
+        let mut channel = script.channel();
+        channel.set_call_handler(Box::new(|_: &Call| panic!("a handler bug")));
+
+        let response = channel
+            .request(&RequestHeader::default(), b"")
+            .expect("the request still completes");
+        assert_eq!(&response.body, b"ok");
+
+        let sent = sent_frames(&channel.writer);
+        let answer = sent
+            .iter()
+            .find(|(header, _)| header.message_type == MessageType::Return)
+            .expect("an answer");
+        let returned: Return = Json::decode(&answer.1).expect("a decodable answer");
+        assert!(!returned.ok, "a panicking handler refuses the call");
+        assert!(
+            returned
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("panic")),
+            "and says why: {returned:?}"
+        );
+    }
+
+    /// A call whose id falls in the requests' half of the range is a wire bug, and is refused rather
+    /// than served — because serving it would mean the two ends disagree about which id space they
+    /// are in, and a correlation that is wrong is worse than a call that is refused.
+    #[test]
+    fn a_call_under_a_requests_id_is_refused() {
+        let mut script = WorkerScript::default();
+        script.json(
+            MessageType::Call,
+            1,
+            &Call {
+                name: "kv.get".to_string(),
+                params: serde_json::Value::Null,
+                traceparent: None,
+            },
+        );
+        script.head(1, 200, 0);
+        script.json(
+            MessageType::End,
+            1,
+            &RequestEnd {
+                app_status: 0,
+                peak_memory_bytes: 0,
+                duration_us: 0,
+                keep_alive: true,
+            },
+        );
+
+        let mut channel = script.channel();
+        channel.set_call_handler(Box::new(|_: &Call| {
+            panic!("the handler must not be reached for an id in the request range")
+        }));
+
+        channel
+            .request(&RequestHeader::default(), b"")
+            .expect("the request completes");
+
+        let sent = sent_frames(&channel.writer);
+        let answer = sent
+            .iter()
+            .find(|(header, _)| header.message_type == MessageType::Return)
+            .expect("an answer");
+        let returned: Return = Json::decode(&answer.1).expect("a decodable answer");
+        assert!(!returned.ok);
+        assert!(
+            returned
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("request's range")),
+            "{returned:?}"
+        );
+    }
+
     #[test]
     fn request_ids_wrap_without_ever_using_the_reserved_zero() {
         let mut script = WorkerScript::default();

@@ -104,30 +104,48 @@ The numbering is part of the protocol. These values must never be reordered or r
 An unknown type number is rejected rather than skipped: skipping it would silently misalign the
 reader from the sender's expectations.
 
-### Which types a worker may receive
+### Which types each side may receive
 
-A worker handles `HELLO`, `REQUEST`, `PING`, `CONTROL` and `CALL`, and answers each of them. It
-does not handle `RESPONSE`, `BODY`, `END`, `HELLO_ACK`, `CONTROL_ACK`, `PONG`, `RETURN` or `ERROR` —
-a server sending any of those is a protocol error, and both the Rust codec and the PHP SDK refuse
-them rather than guessing. `LOG`, `METRIC` and `EVENT` are absorbed and ignored wherever they
-appear, because a peer echoing telemetry back must not derail the loop.
+A worker handles `HELLO`, `REQUEST`, `PING`, `CONTROL` and `RETURN`, and acts on each. A worker
+**originates** `CALL` and never receives one. It does not handle `RESPONSE`, `BODY`, `END`,
+`HELLO_ACK`, `CONTROL_ACK`, `PONG` or `ERROR` — a server sending any of those is a protocol error,
+and both the Rust codec and the PHP SDK refuse them rather than guessing. `LOG`, `METRIC` and `EVENT`
+are absorbed and ignored wherever they appear, because a peer echoing telemetry back must not derail
+the loop.
+
+The server is the mirror image, and the asymmetry is the part that is easy to get backwards: it
+**originates** `REQUEST`, `HELLO`, `CONTROL` and `PING`, **answers** `CALL` with a `RETURN`, and
+treats a `CALL` arriving *at* it as a protocol error. The one sentence to remember is that a call
+travels from the side that has a question to the side that has the answer, and in this protocol the
+application is the side with the questions.
 
 ### Calls, and why they share this channel
 
-A `CALL` is the server asking the *application* something — `kv.get`, `lock.acquire`, a declared
-metric — and it travels on this channel rather than a socket of its own, for two reasons: the
-channel is already open, and a second one would make the worker's liveness ambiguous (closing this
-channel is the whole shutdown mechanism, see *Shutdown*).
+A `CALL` is the **worker** asking the server for something — `kv.get`, `lock.acquire`, a metric the
+server owns the registry for — and it travels on this channel rather than a socket of its own, for
+two reasons: the channel is already open, and a second one would make the worker's liveness ambiguous
+(closing this channel is the whole shutdown mechanism, see *Shutdown*).
 
-The rule a worker follows is one sentence: **while a request is in flight, a frame that is not part
-of the response is a call.** `CONTROL`, `PING`, `LOG`, `METRIC` and `EVENT` already behaved that
-way; `CALL` is another arm of the same dispatch. Calls must be answered even when they cannot be
-served — a `RETURN` carrying an error, never a dropped frame — because dropping one leaves the
-server waiting until its deadline.
+The direction is forced rather than chosen. The server already has a complete way to ask a worker for
+work, which is `REQUEST`; what it has no way to do is *answer* one. A call is the application reaching
+for something the server holds, so the worker is the side that originates it and the server is the
+side that answers — and the worker's own answer to its work remains the response.
 
-Calls are **server → worker only**. A worker has no way to originate one: the response is how it
-answers. In the other direction, work arriving for a worker (a job, a gRPC message) is a second
-*exchange*, not a call, and is deliberately not part of this mechanism.
+The rule the server follows is one sentence: **while a request is in flight, a frame that is not part
+of the response is a call.** `CONTROL`, `PING`, `LOG`, `METRIC` and `EVENT` already behaved that way;
+`CALL` is another arm of the same dispatch on the server, where it is served rather than sent. Calls
+must be answered even when they cannot be served — a `RETURN` carrying an error, never a dropped
+frame — because dropping one leaves the worker blocked on a read that will not return until the
+request's deadline kills it.
+
+**A worker may only call while a request is in flight.** The server has one reader per worker, on the
+lifetime exchange thread, and it is parked on `recv()` *between* requests — so a call made when the
+worker is idle has no reader to answer it and would block until the request deadline. Both sides
+enforce this: the SDK raises rather than hanging, and the server refuses a `CALL` whose id is not in
+the call range it allocated.
+
+In the other direction, work *arriving* for a worker (a job, a gRPC message) is a second *exchange*,
+not a call, and is deliberately not part of this mechanism.
 
 ### Correlation
 

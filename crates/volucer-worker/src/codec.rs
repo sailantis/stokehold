@@ -97,6 +97,13 @@ impl BoundedChannel {
         }
     }
 
+    /// Install what answers a `CALL` that arrives while a request is in flight.
+    ///
+    /// Forwarded to the inner channel; see [`WorkerChannel::set_call_handler`].
+    pub fn set_call_handler(&mut self, handler: Box<CallHandler>) {
+        self.channel.set_call_handler(handler);
+    }
+
     /// The request id that will be used next, forwarded from the inner channel.
     pub fn next_request_id(&self) -> u32 {
         self.channel.next_request_id()

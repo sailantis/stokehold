@@ -75,6 +75,7 @@ pub use request::borrowed_request;
 pub use request::request_header;
 pub use request::{BorrowedRequest, CgiHeader, RequestHeaderParams};
 
+use crate::calls::MethodRegistry;
 use crate::error::{Result, ServerError};
 use crate::lifecycle::LifecycleGuard;
 use crate::pool::worker_count;
@@ -85,7 +86,7 @@ use response::render;
 use spec::Spec;
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use volucer_core::config::WorkerConfig;
 use volucer_fcgi::{Request, Response};
@@ -329,6 +330,15 @@ pub struct WorkerPool {
     pending_metrics: Mutex<Vec<MetricRecord>>,
     /// Held for the life of the pool; dropping it reaps every worker.
     guard: LifecycleGuard,
+    /// What this pool's workers may call, or `None` to grant nothing.
+    ///
+    /// **Held by the pool and not by the caller**, because a worker is replaced many times over a
+    /// deployment's life — on `max_requests`, on a memory threshold, on a failed request, on an
+    /// operator's `worker.reset` — and every one of those goes through the same `boot`. A registry that
+    /// had to be handed in again at each replacement is a registry that would eventually be forgotten at
+    /// one of them, and the symptom would be one recycled worker in a pool that silently cannot call
+    /// anything while its siblings can.
+    call_handler: Option<Arc<MethodRegistry>>,
 }
 
 impl WorkerPool {
@@ -336,7 +346,26 @@ impl WorkerPool {
     ///
     /// Every worker is booted and handshaken here, so a worker that cannot start
     /// is reported at startup rather than on the first request that lands on it.
+    ///
+    /// This is [`WorkerPool::start_with`] with no call handler: the pool's workers may call nothing,
+    /// which is what a backend with no `services` gets.
     pub fn start(name: &str, config: &WorkerConfig) -> Result<Self> {
+        Self::start_with(name, config, None)
+    }
+
+    /// Start a pool whose workers may make calls.
+    ///
+    /// The same pool as [`WorkerPool::start`] with a method registry installed on every worker's
+    /// channel, including those started later to replace a recycled one. Two constructors rather than
+    /// one taking an `Option`, because the distinction they draw is not "configured or not" but
+    /// **capability or no capability**, and a caller that has to write `None` at the call site has to
+    /// think about which one it means. `docs/plugins.md` §4.5 is the argument for keeping that decision
+    /// visible.
+    pub fn start_with(
+        name: &str,
+        config: &WorkerConfig,
+        call_handler: Option<Arc<MethodRegistry>>,
+    ) -> Result<Self> {
         let spec = Spec::from_config(name, config)?;
 
         let guard = LifecycleGuard::new(&format!("volucer-{name}")).map_err(|source| {
@@ -355,7 +384,12 @@ impl WorkerPool {
             // as the `Ready`s `boot` returns: `Slot::drop` reaps the process and
             // `Ready` has no `Drop` at all, so a vector of `Ready`s would leak every
             // PHP child this loop had already started.
-            slots.push(Mutex::new(Slot::from_boot(boot(name, &spec, &guard)?)));
+            slots.push(Mutex::new(Slot::from_boot(boot(
+                name,
+                &spec,
+                &guard,
+                call_handler.as_ref(),
+            )?)));
         }
 
         let pool = WorkerPool {
@@ -383,6 +417,7 @@ impl WorkerPool {
             max_requests: config.max_requests,
             pending_metrics: Mutex::new(Vec::new()),
             guard,
+            call_handler,
         };
 
         tracing::info!(
@@ -530,6 +565,45 @@ impl WorkerPool {
         self.locked_slots()
             .iter()
             .map(|slot| slot.hello.no_checksum)
+            .collect()
+    }
+
+    /// This pool's workers, one entry each, for `workers.list`.
+    ///
+    /// `backend` is left empty and filled in by the caller that knows what this pool is called — the
+    /// dispatcher — because a pool does not know its own configured name in the sense a list needs: it
+    /// has one, but it is a label for logs, and a status entry whose backend came from the pool could
+    /// disagree with the key the dispatcher indexed it under.
+    ///
+    /// `idle` is `free_slots`'s question asked per slot rather than in aggregate, and it is asked
+    /// through the same lease the request path uses — see [`WorkerPool::take_specific`]. An `idle` of
+    /// `false` therefore means "a request is using this slot right now", which is the answer an operator
+    /// asking "which worker may I restart" needs. `false` is also what a slot with no pipes reports, so a
+    /// worker that died is not offered as restartable.
+    pub fn worker_status(&self) -> Vec<crate::calls::WorkerStatus> {
+        // The free list is read **once**, before the slots are, so one answer describes one instant: a
+        // slot cannot be described as idle here and taken a microsecond later by a request that this
+        // list never saw. The slots are locked after, each in turn, which is the order `pids` and
+        // `publish_metrics` already use and is safe for the same reason — no lock is held across a
+        // request.
+        let free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ids
+            .clone();
+        self.locked_slots()
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| crate::calls::WorkerStatus {
+                backend: String::new(),
+                index,
+                pid: slot.child.id(),
+                idle: free.contains(&index),
+                served: slot.served,
+                memory_bytes: slot.peak_memory_bytes,
+                runtime: format!("{} ({})", slot.hello.php_version, slot.hello.sapi),
+            })
             .collect()
     }
 
@@ -717,7 +791,13 @@ impl WorkerPool {
         // choosing a different one.
         if !slot.is_available() {
             tracing::warn!(backend = %self.name, slot = index, "a worker died; replacing it");
-            let outcome = respawn(&self.name, &self.spec, &self.guard, &mut slot);
+            let outcome = respawn(
+                &self.name,
+                &self.spec,
+                &self.guard,
+                self.call_handler.as_ref(),
+                &mut slot,
+            );
             drop(slot);
             // Always retryable, and for a different reason than `invoke`'s failures are:
             // nothing was sent to this worker, so a replay cannot run anything twice whatever
@@ -742,7 +822,13 @@ impl WorkerPool {
                 // failure dropped its exchange, a recoverable one put it back. So
                 // a slot without an exchange is a slot that needs a replacement.
                 if slot.exchange.is_none() {
-                    replace(&self.name, &self.spec, &self.guard, &mut slot);
+                    replace(
+                        &self.name,
+                        &self.spec,
+                        &self.guard,
+                        self.call_handler.as_ref(),
+                        &mut slot,
+                    );
                 }
                 return Err(FailedAttempt {
                     source: ServerError::WorkerProtocol {
@@ -768,15 +854,7 @@ impl WorkerPool {
         }
 
         let duration = started.elapsed();
-        after_response(
-            &self.name,
-            &self.spec,
-            &self.guard,
-            self.max_requests,
-            self.memory_limit_bytes,
-            &mut slot,
-            &response,
-        );
+        self.after_response(&mut slot, &response);
         Ok(render(response, duration))
     }
 
@@ -800,7 +878,13 @@ impl WorkerPool {
         }
 
         let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let outcome = respawn(&self.name, &self.spec, &self.guard, &mut slot);
+        let outcome = respawn(
+            &self.name,
+            &self.spec,
+            &self.guard,
+            self.call_handler.as_ref(),
+            &mut slot,
+        );
         drop(slot);
         self.release(index);
         outcome
@@ -976,12 +1060,81 @@ impl WorkerPool {
         }
         self.released.notify_one();
     }
+
+    /// Decide what a completed response means for the worker that produced it.
+    ///
+    /// A method rather than a free function because it needs six things that all live on the pool — the
+    /// name, the spec, the guard, the call handler and both recycle thresholds — and passing them one by
+    /// one is a signature a reader has to check against the call site rather than trust.
+    fn after_response(&self, slot: &mut Slot, response: &WorkerResponse) {
+        let name = self.name.as_str();
+        slot.served += 1;
+        slot.peak_memory_bytes = response.end.peak_memory_bytes;
+
+        let mut recycle = if response.end.keep_alive {
+            None
+        } else {
+            Some("the worker asked to be recycled")
+        };
+
+        if recycle.is_none() {
+            if let Some(max) = self.max_requests {
+                // `0` means "never", not "immediately" — php-fpm's `pm.max_requests = 0`
+                // and RoadRunner's `max_jobs: 0` both mean a pool that never recycles, and
+                // a bare `served >= max` comparison would instead destroy the worker after
+                // every request. The tests cover the distinction directly.
+                if max > 0 && slot.served >= max {
+                    recycle = Some("max_requests");
+                }
+            }
+        }
+
+        if recycle.is_none() {
+            if let Some(limit) = self.memory_limit_bytes {
+                if slot.peak_memory_bytes > limit {
+                    recycle = Some("memory_limit_mb");
+                }
+            }
+        }
+        if let Some(reason) = recycle {
+            tracing::debug!(backend = %name, pid = slot.child.id(), reason, "recycling a worker");
+            replace(
+                name,
+                &self.spec,
+                &self.guard,
+                self.call_handler.as_ref(),
+                slot,
+            );
+        }
+    }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// A failed attempt at one request, and whether it may be made again.
+#[derive(Debug)]
+struct AttemptError {
+    /// Why the attempt failed.
+    source: WorkerError,
+    /// Whether the request may be sent to the backend again.
+    retryable: bool,
+}
+
+/// The same decision, at the boundary of one whole backend call.
+///
+/// Carried out of `attempt` so `request` can act on it without recomputing the
+/// stage-and-verb rule, and so that a retry decision is made exactly once, in
+/// `invoke`, where the failing exchange actually happened.
+#[derive(Debug)]
+struct FailedAttempt {
+    /// The backend-level failure, reported if the retry is not made or also fails.
+    source: ServerError,
+    /// Whether the request may be sent to the backend again.
+    retryable: bool,
 }
 
 /// Run one request on a worker, putting the slot back into rotation if the pipes
@@ -1035,76 +1188,20 @@ fn invoke(slot: &mut Slot, request: &Request) -> std::result::Result<WorkerRespo
     }
 }
 
-/// A failed attempt at one request, and whether it may be made again.
-#[derive(Debug)]
-struct AttemptError {
-    /// Why the attempt failed.
-    source: WorkerError,
-    /// Whether the request may be sent to the backend again.
-    retryable: bool,
-}
-
-/// The same decision, at the boundary of one whole backend call.
+/// Replace the worker in a slot, keeping the pool's shape.
 ///
-/// Carried out of `attempt` so `request` can act on it without recomputing the
-/// stage-and-verb rule, and so that a retry decision is made exactly once, in
-/// `invoke`, where the failing exchange actually happened.
-#[derive(Debug)]
-struct FailedAttempt {
-    /// The backend-level failure, reported if the retry is not made or also fails.
-    source: ServerError,
-    /// Whether the request may be sent to the backend again.
-    retryable: bool,
-}
-
-/// Decide what a completed response means for the worker that produced it.
-fn after_response(
+/// `call_handler` is carried through so the replacement is the *same worker* in the only sense that
+/// matters to an application: same configuration, same capability. A replacement booted without a
+/// handler would answer every call with "no call handler is installed" and look healthy doing it.
+fn respawn(
     name: &str,
     spec: &Spec,
     guard: &LifecycleGuard,
-    max_requests: Option<u64>,
-    memory_limit_bytes: Option<u64>,
+    call_handler: Option<&Arc<MethodRegistry>>,
     slot: &mut Slot,
-    response: &WorkerResponse,
-) {
-    slot.served += 1;
-    slot.peak_memory_bytes = response.end.peak_memory_bytes;
-
-    let mut recycle = if response.end.keep_alive {
-        None
-    } else {
-        Some("the worker asked to be recycled")
-    };
-
-    if recycle.is_none() {
-        if let Some(max) = max_requests {
-            // `0` means "never", not "immediately" — php-fpm's `pm.max_requests = 0`
-            // and RoadRunner's `max_jobs: 0` both mean a pool that never recycles, and
-            // a bare `served >= max` comparison would instead destroy the worker after
-            // every request. The tests cover the distinction directly.
-            if max > 0 && slot.served >= max {
-                recycle = Some("max_requests");
-            }
-        }
-    }
-
-    if recycle.is_none() {
-        if let Some(limit) = memory_limit_bytes {
-            if slot.peak_memory_bytes > limit {
-                recycle = Some("memory_limit_mb");
-            }
-        }
-    }
-    if let Some(reason) = recycle {
-        tracing::debug!(backend = %name, pid = slot.child.id(), reason, "recycling a worker");
-        replace(name, spec, guard, slot);
-    }
-}
-
-/// Replace the worker in a slot, keeping the pool's shape.
-fn respawn(name: &str, spec: &Spec, guard: &LifecycleGuard, slot: &mut Slot) -> Result<()> {
+) -> Result<()> {
     slot.terminate();
-    let ready = boot(name, spec, guard)?;
+    let ready = boot(name, spec, guard, call_handler)?;
     *slot = Slot::from_boot(ready);
     Ok(())
 }
@@ -1115,8 +1212,14 @@ fn respawn(name: &str, spec: &Spec, guard: &LifecycleGuard, slot: &mut Slot) -> 
 /// same path would only hide the first. The slot is left without pipes, so
 /// `pick_slot` tries again on the next request instead of handing out a worker
 /// that is known to be dead.
-fn replace(name: &str, spec: &Spec, guard: &LifecycleGuard, slot: &mut Slot) {
-    if let Err(err) = respawn(name, spec, guard, slot) {
+fn replace(
+    name: &str,
+    spec: &Spec,
+    guard: &LifecycleGuard,
+    call_handler: Option<&Arc<MethodRegistry>>,
+    slot: &mut Slot,
+) {
+    if let Err(err) = respawn(name, spec, guard, call_handler, slot) {
         tracing::error!(
             backend = %name,
             pid = slot.child.id(),

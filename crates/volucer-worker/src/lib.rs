@@ -36,8 +36,8 @@ pub mod header;
 pub mod message;
 
 pub use codec::{
-    BorrowedHeaders, BoundedChannel, BufferedReader, BufferedWriter, RequestHeaderJson,
-    RequestStage, WorkerChannel, MAX_BODY_CHUNK,
+    BorrowedHeaders, BoundedChannel, BufferedReader, BufferedWriter, CallHandler,
+    RequestHeaderJson, RequestStage, WorkerChannel, MAX_BODY_CHUNK,
 };
 pub use error::{Result, WorkerError};
 pub use header::{

@@ -246,32 +246,33 @@ branch that already exists:
 That second arm is what already happens. `CONTROL` gets an answer and the loop continues; `PING`
 gets `PONG`; `LOG`, `METRIC` and `EVENT` are absorbed without derailing the exchange. A
 `CALL`/`RETURN` pair is *another arm on that same match*, not a new transport, not a new port, and
-not a new socket class. The user-facing rule is one sentence: **while a request is in flight, a
-frame that is not part of the response is a call.**
+not a new socket class. The direction is **worker → server** (§4.3): the application asks, the server
+answers. The user-facing rule is one sentence: **while a request is in flight, a frame that is not
+part of the response is a call.**
 
-**Client side is small, and it can be non-reentrant.** The read primitives are
-`readHeader()`/`readPayload()` (`volucer-php-sdk:src/Worker.php:882`, `:906`), so a
-`readWhile(callable)` that skips frames the caller has no answer for is the entire mechanism — the
-same shape as the existing dispatch, with `CALL` arms added. Nothing needs to interrupt the
-application, because:
+**Client side is small, and it can be non-reentrant.** `Worker::call()` writes the `CALL` and reads
+frames until its own id comes back, handling a `PING`, a `CONTROL` or another `CALL` on the way
+exactly as the main loop handles them — the same shape as the existing dispatch, with `RETURN` arms
+added. Nothing needs to interrupt the application, because:
 
-- server-initiated calls only make sense from inside a request (that is when there is state to
-  inspect);
-- a `CALL` that arrives while the worker is idle is therefore unexpected, and the honest answer is a
-  `RETURN` carrying an error — which is safe precisely because it is *answered* rather than dropped.
+- worker-initiated calls only make sense from inside a request (that is when there is state to
+  inspect, and when the server has a reader waiting);
+- a `CALL` that arrives while the worker is idle is therefore impossible by construction, and
+  `Worker::call()` raises rather than hanging if it is attempted — see §4.3.
 
-So the SDK never needs a nested pump inside handler execution. It needs a dispatch loop that
-answers the arms, which it already has.
+So the SDK never needs a nested pump inside handler execution. It needs a dispatch loop that answers
+the arms, which it already has, plus one method that adds an arm of its own.
 
 **Server side is where the design work is, and all of it is one thread.** There is exactly one
 reader per worker, on the lifetime exchange thread (`exchange.rs:76`), and it is blocked on
 `recv()` **between** requests — nothing reads the pipe then, so telemetry and control frames are
 only ever drained mid-exchange and only while a request is in flight. Four consequences:
 
-1. **Handle calls in `read_response`, not in a new module.** `codec.rs:735` currently ends in
-   `other => Err(WorkerError::NotA { expected: "a response frame", … })`, which is *fatal* — an
-   unknown type mid-response kills the worker. A `CALL` arm has to be handled before that, or it
-   behaves as a protocol failure.
+1. **Handle calls in `read_response`, and answer them from the registry.** `codec.rs:735` currently
+   ends in `other => Err(WorkerError::NotA { expected: "a response frame", … })`, which is *fatal* —
+   an unknown type mid-response kills the worker. A `CALL` arm has to be handled before that, or it
+   behaves as a protocol failure. The arm writes a `RETURN` rather than a `CALL`: the server answers
+   here, and the only thing that originates a call is the worker (§4.3).
 2. **The exchange thread does not need to know what a KV store is.** It hands the call to a handler
    and writes back whatever comes out, so the frame layer does not learn about services and the
    service layer does not learn about framing. §5's service bag is what the handler set is built
@@ -287,9 +288,11 @@ only ever drained mid-exchange and only while a request is in flight. Four conse
    escaping panic is a poisoned or dead worker. Handlers must be `catch_unwind`-guarded, and that is
    a rule rather than a nicety because the failure mode is a request path that dies silently.
 
-`CALL` is server→worker only. Anything a worker says *on its own* keeps the semantics it already
-has (`LOG`/`METRIC`/`EVENT` are unsolicited and absorbed), and a worker→server call is not part of
-this design — the response *is* the worker's way to answer.
+`CALL` is **worker → server** only. A server never originates one — it already has `REQUEST` for
+that — so a `CALL` arriving *at* the server is a protocol error, and the server's arm for it writes a
+`RETURN`. Anything a worker says on its own keeps the semantics it already has (`LOG`/`METRIC`/`EVENT`
+are unsolicited and absorbed), and the response remains the worker's way to answer the work it was
+given.
 
 **Why not a separate socket.** It was the earlier recommendation in this document, and it is worse
 for a reason that has nothing to do with effort: a second socket makes the worker's liveness
@@ -335,13 +338,28 @@ Two new types, and one optional field on an existing one. Nothing else changes.
 
 | # | Name | Direction | Correlated | Carries |
 | --- | --- | --- | --- | --- |
-| 15 | `CALL` | server → worker | yes | `method`, JSON params, `request_id` = the call's own id |
-| 16 | `RETURN` | worker → server | yes | `ok`, JSON result or an error, matching `request_id` |
+| 15 | `CALL` | worker → server | yes | `name` (`"<namespace>.<verb>"`), JSON params, `request_id` = the call's own id |
+| 16 | `RETURN` | server → worker | yes | `ok`, JSON result or an error, and `unknown`, matching `request_id` |
 
-`CALL` ids are allocated from a range disjoint from request ids — request ids start at 1 and
-increment (`FIRST_REQUEST_ID`), so calls are allocated downward from `u32::MAX` — which keeps "a
-stray correlation bug is visible instead of silently matching" true
-(`crates/volucer-worker/src/lib.rs:53`), the property that made 0 reserved.
+**The direction is worker → server, and it is worth stating plainly because the opposite reading is
+just as plausible on first contact.** A call is the *application* asking the server for something —
+`kv.get`, `lock.acquire`, a metric — which is the only direction that has a reason to exist: the
+server already has a complete way to ask a worker to do work, and it is `REQUEST`. So a call changes
+nothing about the response exchange it arrives during, and the id it carries is allocated by the
+**worker**, counting down from `u32::MAX`.
+
+`CALL` ids are therefore allocated from a range disjoint from request ids — request ids are the
+server's and start at 1 and increment (`FIRST_REQUEST_ID`) — which keeps "a stray correlation bug is
+visible instead of silently matching" true (`crates/volucer-worker/src/lib.rs:53`), the property that
+made 0 reserved. Two consequences follow, and both are load-bearing:
+
+- **A server never originates a call**, so a `CALL` arriving *at* the server is a protocol error rather
+  than something to serve — `docs/worker-protocol.md`'s "which types may be received" table now says so
+  on both sides.
+- **A worker only ever calls while a request is in flight.** The server's reader for a worker is parked
+  on `recv()` between requests, so an answer to a call made outside a request has nobody to arrive at.
+  `Worker::call()` refuses rather than hanging on that, because a hang there is a worker killed at the
+  *request's* deadline with nothing in the log naming the call responsible.
 
 `HELLO_ACK` gains one optional field, `runtime` (`"php"`/`"python"`/`"ruby"`), which §7.2 needs
 anyway and which lets the server apply the right policy without guessing. Additive, but see §4.7 —

@@ -133,6 +133,7 @@ fn worker_config(workers: u32) -> Config {
                 working_dir: None,
                 env: Default::default(),
                 checksum: Default::default(),
+                services: Vec::new(),
                 transport: Default::default(),
             }),
         )]

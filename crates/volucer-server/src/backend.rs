@@ -3,11 +3,12 @@
 //! One enum covers every backend shape from the configuration, so the
 //! dispatcher and both front-ends have exactly one thing to call.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use volucer_core::config::BackendConfig;
 use volucer_fcgi::{Endpoint, Request, Response};
 
+use crate::calls::MethodRegistry;
 use crate::error::{Result, ServerError};
 use crate::pool::CgiPool;
 use crate::worker_pool::WorkerPool;
@@ -169,7 +170,12 @@ pub enum Backend {
     ///
     /// The application boots once and stays resident, so PHP does *not* reset
     /// state between requests — the application clears its own request scope.
-    Worker { name: String, pool: WorkerPool },
+    ///
+    /// Behind an `Arc` because the call plane needs to *find* this pool later: `worker.reset` is answered
+    /// by the very pool whose workers are asking, and the dispatcher keeps a [`Weak`](std::sync::Weak)
+    /// handle to it rather than a strong one. The `Arc` is not about sharing — nothing else holds it —
+    /// and everything above this line would work with the pool inline.
+    Worker { name: String, pool: Arc<WorkerPool> },
     /// An HTTP origin volucer proxies to.
     ///
     /// The client is built in [`Backend::from_config`], because a CA that cannot be read is a
@@ -197,7 +203,23 @@ pub type UpstreamBody = volucer_upstream::UpstreamBody;
 
 impl Backend {
     /// Build a backend from its configuration.
+    ///
+    /// A worker backend's workers may call nothing: this is [`Backend::from_config_with`] and a
+    /// `None` registry, which is what a backend whose configuration names no `services` gets.
     pub fn from_config(name: &str, config: &BackendConfig) -> Result<Self> {
+        Self::from_config_with(name, config, None)
+    }
+
+    /// Build a backend from its configuration, with a method registry for its workers if it is a pool.
+    ///
+    /// `registry` is ignored for the three kinds that have no channel to install a handler on, and is
+    /// passed to the pool for the one that does — the pool installs it on every worker's channel before
+    /// that worker's handshake, and again on every replacement.
+    pub fn from_config_with(
+        name: &str,
+        config: &BackendConfig,
+        registry: Option<Arc<MethodRegistry>>,
+    ) -> Result<Self> {
         match config {
             BackendConfig::External(external) => {
                 let endpoint = Endpoint::parse(&external.socket).map_err(|source| {
@@ -217,7 +239,7 @@ impl Backend {
             }),
             BackendConfig::Worker(worker) => Ok(Backend::Worker {
                 name: name.to_string(),
-                pool: WorkerPool::start(name, worker)?,
+                pool: Arc::new(WorkerPool::start_with(name, worker, registry)?),
             }),
             BackendConfig::Upstream(upstream) => {
                 // Validated rather than accepted on faith: `Config::validate` refuses a bad origin,
@@ -450,7 +472,21 @@ impl Backend {
     pub fn shutdown(&mut self) {
         match self {
             Backend::SpawnCgi { pool, .. } => pool.shutdown(),
-            Backend::Worker { pool, .. } => pool.shutdown(),
+            Backend::Worker { pool, .. } => {
+                // `get_mut` because the pool is now behind an `Arc`: the dispatcher keeps a *weak*
+                // handle to it so that `worker.reset` can find it, and `get_mut` fails only if
+                // something holds a strong one — which nothing but this enum does. A failure here
+                // would be a leaked graceful stop rather than a leaked process, since `Drop` still
+                // terminates every worker; it is logged rather than ignored so that a future clone
+                // somewhere else is visible instead of silent.
+                match Arc::get_mut(pool) {
+                    Some(pool) => pool.shutdown(),
+                    None => tracing::warn!(
+                        "a worker pool could not be stopped gracefully because it is still shared; \
+                         its workers will be killed rather than drained"
+                    ),
+                }
+            }
             Backend::Upstream { .. } => {
                 // Nothing was started — the origin is somebody else's process — so there is nothing
                 // to stop. The pooled connections this backend will hold are dropped with it.
@@ -537,6 +573,7 @@ mod tests {
                 working_dir: None,
                 env: Default::default(),
                 checksum: Default::default(),
+                services: Vec::new(),
                 transport: Default::default(),
             }),
         )

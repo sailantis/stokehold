@@ -5,12 +5,14 @@
 
 use super::exchange::{Channel, ChannelExchange};
 use super::spec::Spec;
+use crate::calls::MethodRegistry;
 use crate::error::{Hint, Result, ServerError, SOCKET_WORKER_HINT};
 use crate::lifecycle::{configure_command, LifecycleGuard};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use volucer_core::config::WORKER_SOCKET_ENV;
 use volucer_worker::{BoundedChannel, Checksum, HelloAck, WorkerError};
@@ -104,8 +106,25 @@ fn accept_with_deadline(
     }
 }
 
-/// The hint for a startup failure, given how the worker was going to be reached.
+/// Install what answers a worker's call, if anything does.
 ///
+/// `handler` is `None` for a worker whose backend granted no `services`, and the channel then refuses
+/// every call by name. That refusal is deliberate and is the security boundary `docs/plugins.md` §4.5
+/// describes: a worker facing the public reaches no namespace at all, and the only thing saying so is
+/// the absence of a handler rather than a list that has to be consulted correctly on every call.
+///
+/// The `Arc` is cloned per worker and moved into the closure, so the read loop holds one reference
+/// rather than a borrow of the dispatcher — which is what makes the channel independent of the
+/// dispatcher's lifetime, and what lets a pool outlive the caller that built it.
+fn install_call_handler(channel: &mut Channel, handler: Option<&Arc<MethodRegistry>>) {
+    let Some(registry) = handler else {
+        return;
+    };
+    let registry = Arc::clone(registry);
+    channel.set_call_handler(Box::new(move |call| registry.serve(call)));
+}
+
+/// The hint for a startup failure, given how the worker was going to be reached.
 /// A pipe-transport worker that exits during its handshake is an ordinary application failure
 /// — a syntax error, a missing extension, a bad path — and `StartupExited` already says
 /// everything useful about it. A socket-transport worker has one far more likely explanation
@@ -123,7 +142,15 @@ fn transport_hint(spec: &Spec) -> Option<&'static str> {
 /// Everything that can go wrong with a worker does so here, which is the point:
 /// a worker that cannot boot is a startup error, not a mystery on the first
 /// request that happens to reach it.
-pub(super) fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Ready> {
+///
+/// `handler` is the method registry this backend's workers may call, or `None` to grant nothing. It
+/// is installed on the channel before the handshake; see [`install_call_handler`].
+pub(super) fn boot(
+    name: &str,
+    spec: &Spec,
+    guard: &LifecycleGuard,
+    handler: Option<&Arc<MethodRegistry>>,
+) -> Result<Ready> {
     // A socket-transport worker is connected to a listener that has to exist *before* the
     // process starts, because the address is handed to it as an environment variable
     // rather than discovered by it. So the listener is bound first and the worker spawns
@@ -207,7 +234,7 @@ pub(super) fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Re
         drain_stderr(name.to_string(), child.id(), stderr);
     }
 
-    let channel = match listener {
+    let mut channel = match listener {
         // The worker connects back to the listener bound above. The timeout matters: a
         // worker that never connects must fail here rather than hold startup for ever, and
         // it is bounded by the same budget the handshake gets.
@@ -236,6 +263,13 @@ pub(super) fn boot(name: &str, spec: &Spec, guard: &LifecycleGuard) -> Result<Re
             BoundedChannel::new(stdin, stdout)
         }
     };
+
+    // The call handler goes on **before the handshake**, and the order matters. A worker may send a
+    // `CALL` at any point in its life, and the first thing it does after connecting is boot the
+    // application — which is exactly when a framework wants to ask the server something. Installing
+    // the handler after `HELLO_ACK` would leave that window answering "no call handler is installed",
+    // which is a refusal the worker cannot tell from a server that does not support calls at all.
+    install_call_handler(&mut channel, handler);
 
     match handshake_with_timeout(channel, HANDSHAKE_TIMEOUT, spec.checksum) {
         Ok((channel, ack)) => {

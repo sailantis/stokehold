@@ -20,6 +20,7 @@ pub use calls::{
     ConfigNamespace, MethodRegistry, Namespace, PoolLookup, WorkerStatus, WorkersNamespace,
 };
 pub use dispatch::Dispatcher;
+pub use dispatch::PoolDirectory;
 pub use error::{Result, ServerError};
 pub use frontend::fastcgi::{self, IncomingRequest};
 pub use lifecycle::LifecycleGuard;

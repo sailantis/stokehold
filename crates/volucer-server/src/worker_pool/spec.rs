@@ -93,6 +93,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             checksum: Default::default(),
+            services: Vec::new(),
             transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
@@ -113,6 +114,7 @@ mod tests {
             working_dir: Some(binary),
             env: Default::default(),
             checksum: Default::default(),
+            services: Vec::new(),
             transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();
@@ -129,6 +131,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             checksum: Default::default(),
+            services: Vec::new(),
             transport: Default::default(),
         };
         let err = Spec::from_config("test", &config).unwrap_err();

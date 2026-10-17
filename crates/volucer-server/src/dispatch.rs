@@ -5,11 +5,13 @@
 //! more elaborate belongs with the front-ends, where the request is understood.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock, Weak};
 
-use volucer_core::config::{Config, RouteConfig};
+use volucer_core::config::{BackendConfig, Config, RouteConfig};
 use volucer_fcgi::{cgi, Request, Response};
 
 use crate::backend::{Backend, UpstreamBody};
+use crate::calls::{ConfigNamespace, MethodRegistry, PoolLookup, WorkerStatus, WorkersNamespace};
 use crate::error::{Result, ServerError};
 
 /// Routes requests to backends.
@@ -24,6 +26,179 @@ pub struct Dispatcher {
     /// backend is chosen, which is what lets the FastCGI and HTTP front-ends
     /// behave identically for the same request.
     routes: Vec<RouteConfig>,
+    /// What a `worker.reset` call needs in order to find a pool.
+    ///
+    /// **Weak handles to the pools, and the weakness is the point.** The handler for `worker.reset`
+    /// lives inside each worker's channel, which is owned by that worker's pool — so a strong handle
+    /// here would be the cycle pool → registry → directory → pool. The cycle would be invisible in every
+    /// test, and what it costs is that the pools never drop, so [`WorkerPool::shutdown`] never runs and
+    /// every worker process is leaked at exit, because `Drop` is what reaps them.
+    ///
+    /// Filled in at the end of [`Dispatcher::from_config`], from the pools that function has just
+    /// started — no self-reference, no deferred initialisation a caller could forget.
+    directory: Arc<PoolDirectory>,
+}
+
+/// What `worker.reset` reaches the pools through, without holding one alive.
+///
+/// # Why weak, and why the list is filled in last
+///
+/// The handler for `worker.reset` lives inside each worker's channel, which is owned by that worker's
+/// pool — so a strong handle from here back to a pool would be the cycle
+/// pool → registry → directory → pool. The cycle would be invisible in every test, and what it costs is
+/// that the pools never drop, so [`WorkerPool::shutdown`] never runs and every worker process is leaked
+/// at exit, because `Drop` is what reaps them.
+///
+/// So the pools are held weakly, and the list is filled in by [`Dispatcher::from_config`] once the pools
+/// exist. The consequence is worth stating: a call that arrives *during startup* sees a list that is not
+/// populated yet, and `workers.list` answers with the pools that are already up rather than with all of
+/// them. That is the honest answer — a pool that has not finished booting its workers is not a pool an
+/// operator can act on — and the window closes the moment the last backend is up.
+pub struct PoolDirectory {
+    /// Pools by backend name, in the configuration's order.
+    pools: OnceLock<Vec<(String, Weak<crate::WorkerPool>)>>,
+}
+
+impl std::fmt::Debug for PoolDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolDirectory")
+            .field(
+                "pools",
+                &self
+                    .pools
+                    .get()
+                    .map(|pools| pools.iter().map(|(name, _)| name).collect::<Vec<_>>()),
+            )
+            .finish()
+    }
+}
+
+impl Default for PoolDirectory {
+    fn default() -> Self {
+        PoolDirectory {
+            pools: OnceLock::new(),
+        }
+    }
+}
+
+/// The one place that knows how `workers.list` enumerates pools.
+///
+/// **The order is the backend map's, and it must not change.** `worker.reset` takes an index into this
+/// list, so an enumeration that reordered itself between two calls would make "restart worker 2" mean
+/// two different workers depending on when it was sent. The `BTreeMap` the backends live in gives that
+/// for free, which is the same reason [`MethodRegistry`]'s namespaces are one.
+impl PoolDirectory {
+    /// Record the pools, once.
+    ///
+    /// Called by [`Dispatcher::from_config`] after the backends are built. The second call is ignored
+    /// rather than panicking, because the only caller is that one function and a panic there would be a
+    /// startup crash for a condition that cannot occur.
+    fn install(&self, pools: Vec<(String, Weak<crate::WorkerPool>)>) {
+        let _ = self.pools.set(pools);
+    }
+
+    /// Every live pool, by backend name, in configuration order.
+    ///
+    /// A pool whose strong handle has gone is skipped rather than resurrected: the `Weak` upgrade is a
+    /// *borrow* that fails once the last strong reference goes, which is exactly the moment the pools
+    /// are being torn down.
+    fn visit<T>(&self, mut f: impl FnMut(&str, &crate::WorkerPool) -> T) -> Vec<T> {
+        match self.pools.get() {
+            Some(pools) => pools
+                .iter()
+                .filter_map(|(backend, pool)| pool.upgrade().map(|pool| f(backend.as_str(), &pool)))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Build one worker backend's method registry from its `services` list.
+///
+/// # Why the `config.describe` document is assembled here
+///
+/// The value a worker is told about its deployment can only be decided in one place if it is decided
+/// *once*, at startup, rather than assembled per call from live state. Assembling it here also means the
+/// redaction in [`ConfigNamespace::new`] runs once, and that the answer cannot drift as the server changes
+/// underneath it — a worker that asks twice gets the same document, which is what makes it safe to
+/// cache the answer at all.
+///
+/// # Why an unknown name cannot reach this function
+///
+/// It is checked by [`Config::validate`](volucer_core::config::Config::validate) against
+/// [`CALL_NAMESPACES`](volucer_core::config::CALL_NAMESPACES) before a configuration is ever served, so
+/// the fall-through arm here is unreachable in a running server. It exists because this function is also
+/// reachable from a `Config` built in a test and never validated, and a silently ignored name would make
+/// that test lie.
+fn worker_registry(
+    services: &[String],
+    config: &Config,
+    directory: &Arc<PoolDirectory>,
+) -> MethodRegistry {
+    let mut registry = MethodRegistry::new();
+    for service in services {
+        registry = match service.as_str() {
+            "config" => registry.with(ConfigNamespace::new(config)),
+            "workers" => registry.with(WorkersNamespace::new(
+                Arc::clone(directory) as Arc<dyn PoolLookup>
+            )),
+            other => {
+                tracing::warn!(
+                    service = %other,
+                    "a configured service has no implementation and is ignored; this should have \
+                     been refused when the configuration was validated"
+                );
+                registry
+            }
+        };
+    }
+    if !registry.is_empty() {
+        tracing::debug!(
+            namespaces = ?registry.names(),
+            "installing a call handler on this backend's workers"
+        );
+    }
+    registry
+}
+
+impl PoolLookup for PoolDirectory {
+    fn workers(&self) -> Vec<WorkerStatus> {
+        self.visit(|backend, pool| {
+            pool.worker_status()
+                .into_iter()
+                .map(|mut status| {
+                    status.backend = backend.to_string();
+                    status
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    fn restart(&self, index: usize) -> std::result::Result<(), String> {
+        // One walk, counting slots as it goes, because the index is global across pools and the pools
+        // are the only thing that knows how many workers each holds. The count is finished even when
+        // the index is not found, so the refusal can say how many there are.
+        let mut seen = 0usize;
+        let mut found = None;
+        self.visit(|_, pool| {
+            let len = pool.len();
+            if found.is_none() && index >= seen && index < seen + len {
+                found = Some(pool.restart(index - seen));
+            }
+            seen += len;
+        });
+        match found {
+            Some(Ok(())) => Ok(()),
+            Some(Err(err)) => Err(err.to_string()),
+            None => Err(format!(
+                "worker index {index} does not exist; there are {seen} workers, and \
+                 workers.list gives the index to use"
+            )),
+        }
+    }
 }
 
 impl Dispatcher {
@@ -33,10 +208,48 @@ impl Dispatcher {
     /// reported at startup instead of on the first request that happens to hit
     /// the broken one.
     pub fn from_config(config: &Config, routing: cgi::Routing) -> Result<Self> {
+        // The directory is built first and installed on every worker channel as its pool boots, because
+        // a channel needs its handler before the handshake and the handshake is inside
+        // `WorkerPool::start`. It reaches the pools through a `Weak` filled in at the end of this
+        // function, which is what keeps the reference out of both directions at once.
+        //
+        // A registry is built **per worker backend**, from that backend's own `services` list, so a
+        // worker facing the public gets one that cannot restart its siblings. That is
+        // `docs/plugins.md` §4.5, and building it once for the whole process would be the shape it
+        // refuses.
+        let directory = Arc::new(PoolDirectory::default());
         let mut backends = BTreeMap::new();
+        let mut registries: BTreeMap<String, Arc<MethodRegistry>> = BTreeMap::new();
         for (name, backend_config) in &config.backends {
-            backends.insert(name.clone(), Backend::from_config(name, backend_config)?);
+            let registry = match backend_config {
+                BackendConfig::Worker(worker) => {
+                    let registry = Arc::new(worker_registry(&worker.services, config, &directory));
+                    registries.insert(name.clone(), Arc::clone(&registry));
+                    Some(registry)
+                }
+                // The other three kinds have no channel, so there is nothing to install a handler
+                // on and nothing that can call. Not an oversight: `spawn_cgi` and `external` speak
+                // FastCGI to PHP, which has no call surface at all, and an upstream is somebody
+                // else's process.
+                _ => None,
+            };
+            backends.insert(
+                name.clone(),
+                Backend::from_config_with(name, backend_config, registry)?,
+            );
         }
+
+        // The pools are recorded now that they are all up, and recorded *weakly*: see
+        // `PoolDirectory` for why a strong handle here would leak every worker process.
+        directory.install(
+            backends
+                .iter()
+                .filter_map(|(name, backend)| match backend {
+                    Backend::Worker { pool, .. } => Some((name.clone(), Arc::downgrade(pool))),
+                    _ => None,
+                })
+                .collect(),
+        );
 
         // No backends at all is a legitimate deployment rather than a mistake: a
         // listener with nothing to dispatch to is how static files are served
@@ -69,6 +282,21 @@ impl Dispatcher {
             default,
             routing,
             routes: config.routes.clone(),
+            directory,
+        })
+    }
+
+    /// The pools this backend's workers may address through a call, or `None` if they may not.
+    ///
+    /// The one accessor that answers a question about the *deployment* rather than about a request, and it
+    /// exists because the dispatcher itself has to answer a call: `volucer workers` and `volucer reset`
+    /// on the command line are clients of this same machinery (`docs/plugins.md` §4.6), and a CLI
+    /// that re-derived "which pool is worker 3 in" would be a second implementation of the one rule
+    /// `worker.reset` exists to get right.
+    pub fn pools(&self) -> Option<Arc<PoolDirectory>> {
+        self.backends.values().find_map(|backend| match backend {
+            Backend::Worker { .. } => Some(Arc::clone(&self.directory)),
+            _ => None,
         })
     }
 
@@ -464,7 +692,42 @@ mod tests {
         assert!(err.to_string().contains("default_backend"), "{err}");
     }
 
-    /// An external backend with an unusable socket must be reported now.
+    /// A misspelled namespace in `services` is refused at validation, and a *valid* one builds a
+    /// registry — the two halves of the same rule.
+    ///
+    /// The second half is what this asserts, because the first half lives in `volucer-core`'s own
+    /// tests. What matters here is that the allow-list and the implementations agree: a name that
+    /// validates but that [`worker_registry`] does not know would be a worker granted a capability it
+    /// silently does not have, which is exactly the failure the allow-list exists to prevent.
+    #[test]
+    fn a_granted_namespace_reaches_the_registry_and_nothing_else_does() {
+        let config = config_with(&[("app", unreachable_backend())], "app");
+        let directory = Arc::new(PoolDirectory::default());
+        assert!(
+            worker_registry(&[], &config, &directory).is_empty(),
+            "no services must mean no namespaces"
+        );
+
+        let granted = worker_registry(&["config".to_string()], &config, &directory);
+        assert_eq!(granted.names(), vec!["config"]);
+        assert!(
+            !granted.names().contains(&"workers"),
+            "granting config must not grant workers"
+        );
+
+        // Every name the validator allows has an implementation here. Asserted as a loop rather than
+        // one case so that adding a name to `CALL_NAMESPACES` without an arm fails *this* test rather
+        // than a deployment.
+        for name in volucer_core::config::CALL_NAMESPACES {
+            let registry = worker_registry(&[name.to_string()], &config, &directory);
+            assert_eq!(
+                registry.names(),
+                vec![*name],
+                "{name} is allowed by the configuration and must have an implementation"
+            );
+        }
+    }
+
     #[test]
     fn startup_fails_on_a_misconfigured_backend_rather_than_on_first_request() {
         #[cfg(not(unix))]

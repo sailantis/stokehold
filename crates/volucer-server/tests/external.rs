@@ -157,6 +157,7 @@ fn dispatcher_for(socket: &str, root: &Path) -> Dispatcher {
         default_backend: Some("fpm".to_string()),
         routes: Vec::new(),
         sites: BTreeMap::new(),
+        ..volucer_core::config::Config::default()
     };
     config.validate().expect("the config is valid");
 

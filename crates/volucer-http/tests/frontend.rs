@@ -141,6 +141,7 @@ fn worker_config(workers: u32) -> Config {
         default_backend: Some("app".to_string()),
         routes: Vec::new(),
         sites: BTreeMap::new(),
+        ..volucer_core::config::Config::default()
     }
 }
 
@@ -496,6 +497,7 @@ fn unreachable_config() -> Config {
         default_backend: Some("fpm".to_string()),
         routes: Vec::new(),
         sites: BTreeMap::new(),
+        ..volucer_core::config::Config::default()
     }
 }
 
@@ -1701,6 +1703,7 @@ fn upstream_config(origin: &Origin) -> Config {
         default_backend: Some("node".to_string()),
         routes: Vec::new(),
         sites: BTreeMap::new(),
+        ..volucer_core::config::Config::default()
     }
 }
 

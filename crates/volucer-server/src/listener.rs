@@ -581,6 +581,7 @@ mod tests {
             default_backend: Some("fpm".to_string()),
             routes: Vec::new(),
             sites: BTreeMap::new(),
+            ..volucer_core::config::Config::default()
         };
         let dispatcher =
             Dispatcher::from_config(&config, volucer_fcgi::Routing::default()).expect("dispatcher");

@@ -368,6 +368,10 @@ mod tests {
             default_backend: Some(default.to_string()),
             routes: Vec::new(),
             sites: BTreeMap::new(),
+            // Named rather than `..Default::default()` would be shorter, but listing every field
+            // is what made adding one a compile error in four test files. A test that asserts on
+            // routing has nothing to say about metrics, so it takes the rest as it comes.
+            ..Config::default()
         }
     }
 

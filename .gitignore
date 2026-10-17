@@ -24,3 +24,4 @@ rustc-ice-*.txt
 .idea/
 .vscode/
 temp/
+.git-commit-msg.tmp

@@ -128,6 +128,7 @@ fn chain(root: &Path, binary: &Path, base_port: u16) -> Dispatcher {
         default_backend: Some("cgi".to_string()),
         routes: Vec::new(),
         sites: BTreeMap::new(),
+        ..volucer_core::config::Config::default()
     };
     config.validate().expect("the config is valid");
 
@@ -280,6 +281,7 @@ fn a_route_selects_the_backend_for_a_fastcgi_request_too() {
             backend: "api_pool".to_string(),
         }],
         sites: BTreeMap::new(),
+        ..volucer_core::config::Config::default()
     };
     config.validate().expect("valid config");
     let dispatcher =
@@ -512,6 +514,7 @@ fn a_backend_failure_becomes_a_502_rather_than_a_broken_connection() {
         default_backend: Some("dead".to_string()),
         routes: Vec::new(),
         sites: BTreeMap::new(),
+        ..volucer_core::config::Config::default()
     };
     config.validate().expect("valid config");
     let dispatcher =

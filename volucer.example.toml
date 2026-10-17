@@ -321,3 +321,57 @@ base_port = 19001
 # this is a PREFIX — slot 0 becomes \\.\pipe\volucer-cgi.0 and slot 1 the next.
 # `bind_host`/`base_port` are then unused.
 # socket = '\\.\pipe\volucer-cgi'
+
+# ---------------------------------------------------------------------------
+# Metrics, in the Prometheus text format. The presence of this table is what
+# turns the endpoint on -- there is no `enabled` flag, because a flag and an
+# address are two statements about one thing and two statements can disagree.
+#
+# It listens on its OWN address rather than becoming a route on [server]. The
+# HTTP listener may be TLS-only, may redirect to HTTPS, and faces the public;
+# a scrape endpoint inheriting any of that would be one misconfiguration away
+# from being unreachable, or public. Loopback plus a firewall rule is the shape
+# this is meant to have.
+#
+# The names are RoadRunner's (`rr_http_request_total` and friends), kept
+# deliberately so an existing dashboard works unchanged. `prefix` is prepended
+# at render time, so `prefix = "myapp_"` yields `myapp_rr_http_request_total`.
+# `path` exists because a deployment may already reverse-proxy `/metrics` for
+# something else, and a fixed path would make that a routing conflict rather
+# than a naming choice.
+#
+# Worker pools are described by rr_http_total_workers, rr_http_workers_ready,
+# rr_http_workers_working, rr_http_workers_invalid, rr_http_worker_state{pid,
+# state}, rr_http_worker_memory_bytes{pid}, rr_http_workers_memory_bytes,
+# rr_http_request_total{status}, rr_http_request_duration_seconds{status},
+# rr_http_requests_queue, rr_http_no_free_workers_total and
+# rr_http_uptime_seconds. No label is taken from the request, so the number of
+# series depends on the deployment rather than on what clients ask for.
+#
+# A worker may also publish its own sample: the PHP SDK's Worker::emitMetric
+# sends a METRIC frame that this server already decodes, and the sample lands
+# in this registry under the name the application chose. Those are the only
+# metrics whose cardinality is the application's business.
+# ---------------------------------------------------------------------------
+# [metrics]
+# address = "127.0.0.1:2112"
+# prefix = "myapp_"
+# path = "/metrics"
+
+# ---------------------------------------------------------------------------
+# Health and readiness. Two endpoints on one listener, because they answer
+# different questions and the difference is the one a container orchestrator
+# acts on:
+#
+#   GET /health  -- the process is alive and should not be restarted. 200 while
+#                   the server is running, even if no worker is ready yet.
+#   GET /ready   -- it can serve traffic now and should be sent some. Answers
+#                   `unavailable_status_code` until every configured service
+#                   reports ready, and 200 afterwards.
+#
+# A readiness probe that returned 200 while the pools were still booting is how
+# a rolling deploy sends traffic to a server that answers 502.
+# ---------------------------------------------------------------------------
+# [status]
+# address = "127.0.0.1:2114"
+# unavailable_status_code = 503   # some load balancers expect 503 specifically

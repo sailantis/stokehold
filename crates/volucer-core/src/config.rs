@@ -46,6 +46,90 @@ pub struct Config {
     /// the decision made earlier, and that is what this table is for.
     #[serde(default)]
     pub sites: BTreeMap<String, SiteConfig>,
+
+    /// The Prometheus endpoint. Absent means no metrics endpoint at all.
+    ///
+    /// **The presence of this table is what turns it on**, matching `[server.tls]`: an `enabled`
+    /// flag and an address are two statements about one thing, and two statements can disagree — a
+    /// table with `enabled = true` and no address has to be reported as a mistake, which is a
+    /// question nobody would have asked without the flag.
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
+
+    /// The health and readiness endpoint. Absent means no status endpoint.
+    ///
+    /// The same convention as [`Config::metrics`], and separate from it on purpose: a deployment
+    /// that wants a container orchestrator to poll readiness may well not want a second port
+    /// exposing every counter in the process.
+    #[serde(default)]
+    pub status: Option<StatusConfig>,
+}
+
+/// The Prometheus endpoint.
+///
+/// Its own listener rather than a route on `[server]`, and that is not a style choice. The HTTP
+/// listener may be TLS-only, may be behind a redirect to HTTPS, and faces the public; a scrape
+/// endpoint that inherited any of those would be one misconfiguration away from being either
+/// unreachable or public. A separate address on loopback is the shape every other server in this
+/// space uses, and it is the one an operator can firewall as a single line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Where to listen, e.g. `127.0.0.1:2112` or `unix:/run/volucer/metrics.sock`.
+    ///
+    /// Required. There is no default, because a default of `0.0.0.0:2112` would expose every
+    /// counter in the process to whoever can reach the host, and a default of `127.0.0.1:2112`
+    /// would silently collide with a Prometheus already listening there.
+    pub address: String,
+
+    /// A prefix prepended to every metric this server provides, e.g. `myapp_`.
+    ///
+    /// Applied at render time, so the metric names in the code stay the ones RoadRunner's
+    /// documentation and other people's dashboards use. `prefix = "myapp_"` therefore yields
+    /// `myapp_rr_http_request_total`, which is what RoadRunner's own `prefix` does.
+    #[serde(default)]
+    pub prefix: Option<String>,
+
+    /// The path the exposition is served at. Defaults to `/metrics`.
+    ///
+    /// Configurable because a deployment may already reverse-proxy `/metrics` for something else,
+    /// and a fixed path would make that a routing conflict rather than a naming choice. Anything
+    /// other than this path answers 404, so the endpoint does not become a second way to ask
+    /// whether the server is up.
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+
+/// The health and readiness endpoint.
+///
+/// Two endpoints on one listener, because they answer genuinely different questions and the
+/// difference is the one a container orchestrator acts on: `/health` says the process is alive and
+/// should not be restarted, and `/ready` says it can serve traffic now and should be sent some.
+/// A readiness probe that returned 200 while every worker was still booting is how a rolling deploy
+/// sends traffic to a server that answers 502.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusConfig {
+    /// Where to listen, e.g. `127.0.0.1:2114`.
+    ///
+    /// Required, for the same reason [`MetricsConfig::address`] is.
+    pub address: String,
+
+    /// What to answer when the server is not ready. Defaults to 503.
+    ///
+    /// Configurable because the convention is not universal: Kubernetes reads any non-2xx as "do
+    /// not send traffic", while some load balancers are configured to expect 503 specifically and
+    /// treat anything else as a failed probe of the probe itself.
+    #[serde(default = "default_unavailable_status")]
+    pub unavailable_status_code: u16,
+}
+
+fn default_unavailable_status() -> u16 {
+    503
 }
 
 /// One site: a document root, and optionally its own routing and static layer.
@@ -2008,6 +2092,42 @@ impl Config {
             parse_listener(https).map_err(|e| Error::Config(format!("server.https: {e}")))?;
         }
 
+        // The metrics and status listeners are validated here even though they are not `server.*`,
+        // because a *typo* in an address is a configuration mistake and belongs in the same message
+        // as every other one — `volucer check` reports it before anything tries to bind, rather than
+        // the server failing to start with a bind error after the worker pools are already up.
+        //
+        // Note that neither counts towards the "no listener configured" refusal above: a deployment
+        // with only `[metrics]` would be a process that serves nothing and reports on it.
+        if let Some(metrics) = &self.metrics {
+            parse_listener(&metrics.address)
+                .map_err(|e| Error::Config(format!("metrics.address: {e}")))?;
+            if !metrics.path.starts_with('/') {
+                return Err(Error::Config(format!(
+                    "metrics.path {:?} must start with '/', e.g. \"/metrics\"",
+                    metrics.path
+                )));
+            }
+            if let Some(prefix) = &metrics.prefix {
+                if !is_metric_name_prefix(prefix) {
+                    return Err(Error::Config(format!(
+                        "metrics.prefix {prefix:?} is not a valid metric name prefix; letters, \
+                         digits and underscores only, e.g. \"myapp_\""
+                    )));
+                }
+            }
+        }
+        if let Some(status) = &self.status {
+            parse_listener(&status.address)
+                .map_err(|e| Error::Config(format!("status.address: {e}")))?;
+            if !(100..=599).contains(&status.unavailable_status_code) {
+                return Err(Error::Config(format!(
+                    "status.unavailable_status_code {} is not an HTTP status code",
+                    status.unavailable_status_code
+                )));
+            }
+        }
+
         self.validate_tls()?;
 
         // The access log's header must be a usable header name, and the check is here rather than
@@ -2710,6 +2830,26 @@ fn is_header_name(name: &str) -> bool {
                         | b'~'
                 )
         })
+}
+
+/// Whether `prefix` may be prepended to the metrics this server provides.
+///
+/// A Prometheus metric name is `[a-zA-Z_:][a-zA-Z0-9_:]*`, so a *prefix* must be a (possibly empty)
+/// run of those characters that is also a valid start — which means it may not begin with a digit.
+/// Colons are deliberately not offered: they are reserved for recording rules, and a deployment
+/// that used one would find its metrics rewritten out from under it by whatever rule happened to
+/// match. An empty prefix is legal and means "no prefix", which is what an absent key already means
+/// — so the two spellings agree rather than one being an error.
+fn is_metric_name_prefix(prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    if prefix.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn is_dns_name(name: &str) -> bool {
@@ -3924,6 +4064,188 @@ backend = "app"
         let config = Config::from_toml(text).expect("config parses");
         let err = config.validate().expect_err("must fail");
         assert!(err.to_string().contains("must start with"), "{err}");
+    }
+
+    /// The metrics table is off unless written, and its presence is what turns it on — there is no
+    /// `enabled` flag, for the reason `[server.tls]` has none either.
+    #[test]
+    fn metrics_is_absent_unless_the_table_is_written() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        assert!(config.metrics.is_none());
+        assert!(config.status.is_none());
+    }
+
+    #[test]
+    fn metrics_defaults_its_path_and_accepts_a_prefix() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "127.0.0.1:2112"
+prefix = "myapp_"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("valid");
+        let metrics = config.metrics.expect("present");
+        assert_eq!(metrics.path, "/metrics");
+        assert_eq!(metrics.prefix.as_deref(), Some("myapp_"));
+    }
+
+    #[test]
+    fn rejects_a_metrics_address_that_is_not_an_endpoint() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "2112"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("metrics.address"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_metrics_path_without_a_leading_slash() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "127.0.0.1:2112"
+path = "metrics"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("must start with"), "{err}");
+    }
+
+    /// A prefix is prepended to a name, so it has to be a valid name start. A leading digit would
+    /// produce `9foo_rr_http_request_total`, which Prometheus refuses to parse — and it would refuse
+    /// the whole scrape, not just that line.
+    #[test]
+    fn rejects_a_metrics_prefix_that_is_not_a_name_start() {
+        for bad in ["9app_", "app-dash", "app dot", "app:colon"] {
+            let text = format!(
+                "[server]\nhttp = \"127.0.0.1:8080\"\n[metrics]\naddress = \"127.0.0.1:2112\"\n\
+                 prefix = \"{bad}\"\n"
+            );
+            let config = Config::from_toml(&text).expect("config parses");
+            let err = config.validate().expect_err("must fail");
+            assert!(err.to_string().contains("metrics.prefix"), "{bad}: {err}");
+        }
+    }
+
+    /// An empty prefix is the same statement as an absent one, so the two spellings agree rather
+    /// than one of them being an error.
+    #[test]
+    fn an_empty_metrics_prefix_is_accepted() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "127.0.0.1:2112"
+prefix = ""
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("valid");
+    }
+
+    #[test]
+    fn status_defaults_its_unavailable_code() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[status]
+address = "127.0.0.1:2114"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        config.validate().expect("valid");
+        assert_eq!(config.status.expect("present").unavailable_status_code, 503);
+    }
+
+    /// A status *and* a metrics endpoint is a legal deployment: a container orchestrator polls
+    /// readiness while something else scrapes. Neither is a listener in the request path, so neither
+    /// satisfies the "no listener configured" refusal on its own.
+    #[test]
+    fn a_metrics_listener_alone_is_not_a_listener() {
+        let text = r#"
+[metrics]
+address = "127.0.0.1:2112"
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("no listener configured"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_unavailable_status_that_is_not_an_http_code() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[status]
+address = "127.0.0.1:2114"
+unavailable_status_code = 99
+"#;
+        let config = Config::from_toml(text).expect("config parses");
+        let err = config.validate().expect_err("must fail");
+        assert!(err.to_string().contains("not an HTTP status code"), "{err}");
+    }
+
+    /// A typo in a key inside either table is refused, like every other table in this model.
+    #[test]
+    fn rejects_an_unknown_key_in_the_metrics_table() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[metrics]
+address = "127.0.0.1:2112"
+addres = "typo"
+"#;
+        let err = Config::from_toml(text).expect_err("must fail");
+        assert!(err.to_string().contains("addres"), "{err}");
+    }
+
+    /// `volucer.example.toml` parses and validates.
+    ///
+    /// It is documentation, and a documentation file that does not parse is documentation that
+    /// lies: an operator copies a block out of it, gets a message about a key that does not exist,
+    /// and has no way to tell whether the file is wrong or they are. **Nothing else in the tree
+    /// opens this file** — no test, no CI job — so before this, every edit to it was unverified,
+    /// including the `[metrics]` and `[status]` tables added alongside it.
+    ///
+    /// It is deliberately *not* checked for being complete: a table that the example documents but
+    /// nothing else uses would still parse, and asserting on the contents of a comments-heavy file
+    /// is a test that fails whenever someone improves the prose. What is asserted is the one
+    /// property a reader depends on — that the file is a valid configuration — plus that the two
+    /// new tables are in it at all, since a deleted block is the failure mode a parse check alone
+    /// would not notice.
+    #[test]
+    fn the_example_configuration_parses_and_validates() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("volucer.example.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{} is not readable: {err}", path.display()));
+
+        let config = Config::from_toml(&text)
+            .unwrap_or_else(|err| panic!("{} does not parse: {err}", path.display()));
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("{} does not validate: {err}", path.display()));
+
+        // The example documents these two as commented-out defaults, so the check is that the
+        // documentation of them survives an edit rather than that they are enabled in it.
+        for table in ["# [metrics]", "# [status]"] {
+            assert!(
+                text.contains(table),
+                "{} no longer documents {table}",
+                path.display()
+            );
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ members = [
     "crates/volucer-observe",
     "crates/volucer-metrics",
     "crates/volucer-kv",
+    "crates/volucer-lock",
     "crates/volucer-acme",
     "crates/volucer-upstream",
     "crates/volucer",
@@ -43,6 +44,7 @@ volucer-watch = { version = "0.1.0", path = "crates/volucer-watch" }
 volucer-observe = { version = "0.1.0", path = "crates/volucer-observe" }
 volucer-metrics = { version = "0.1.0", path = "crates/volucer-metrics" }
 volucer-kv = { version = "0.1.0", path = "crates/volucer-kv" }
+volucer-lock = { version = "0.1.0", path = "crates/volucer-lock" }
 # The Redis client, **optional** and behind a feature. A deployment using the in-memory store must not
 # link a Redis to get it, which is the rule `docs/plugins.md` §5 states for every driver. Default
 # features are off — they pull in `num-bigint` and `sha1_smol` for script and big-number support a KV

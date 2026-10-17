@@ -987,11 +987,20 @@ exporter layer on top of the above — `tracing-opentelemetry` plus `opentelemet
 and RoadRunner defaults to the same transport for the same reason). Doing it in that order is what
 makes it a layer rather than a rewrite.
 
-There is also **no control plane and no external services**: no KV, no distributed locks, no job
-queue, no gRPC, and no way to ask a running server anything or tell it anything other than a
-signal. [docs/plugins.md](./docs/plugins.md) is the design for all of it — a native relay socket
-carrying the existing frame, services registered against it, and a separate, cheaper track for
-running Django and Rails as supervised HTTP origins. It is a plan, not a description of the code.
+There is also **no external services yet beyond KV and locks**: no job queue, no gRPC, and no way to
+tell a running server anything other than a signal. A worker can now reach a **key-value storage**
+(`[kv.<name>]`, memory or Redis) and a **lock backend** (`[lock]`, memory) through the call plane,
+which is the `CALL`/`RETURN` pair on the worker channel — a frame a worker writes *unprompted*,
+mid-request, and the server answers. Both are off until a backend's `services` list names them, so
+the default deployment's workers can reach nothing.
+[docs/plugins.md](./docs/plugins.md) is the design for the rest — jobs, metrics, gRPC, and a
+separate, cheaper track for running Django and Rails as supervised HTTP origins — and its step table
+records what is built.
+
+**Locks are not a correctness primitive**, and the API is shaped so that an application can be
+correct about that rather than only warned: a TTL lock has no fencing token, so a worker that stalls
+past its lease can be writing while somebody else holds it. Use a lock to avoid duplicated work;
+where a real invariant is at stake, use the storage's own conditional write.
 
 ### Build prerequisites
 

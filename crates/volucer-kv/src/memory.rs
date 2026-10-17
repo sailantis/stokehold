@@ -578,8 +578,8 @@ mod tests {
         store
             .set_many(
                 &[
-                    (b"x".as_slice(), b"24".to_vec()),
-                    (b"y".as_slice(), b"25".to_vec()),
+                    (b"x".to_vec(), b"24".to_vec()),
+                    (b"y".to_vec(), b"25".to_vec()),
                 ],
                 None,
             )

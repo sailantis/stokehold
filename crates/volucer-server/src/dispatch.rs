@@ -7,11 +7,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, Weak};
 
-use volucer_core::config::{BackendConfig, Config, RouteConfig};
+use volucer_core::config::{BackendConfig, Config, KvStorageConfig, RouteConfig};
 use volucer_fcgi::{cgi, Request, Response};
 
 use crate::backend::{Backend, UpstreamBody};
-use crate::calls::{ConfigNamespace, MethodRegistry, PoolLookup, WorkerStatus, WorkersNamespace};
+use crate::calls::{
+    ConfigNamespace, KvNamespace, MethodRegistry, PoolLookup, WorkerStatus, WorkersNamespace,
+};
 use crate::error::{Result, ServerError};
 
 /// Routes requests to backends.
@@ -113,6 +115,33 @@ impl PoolDirectory {
     }
 }
 
+/// Build every configured storage, once.
+///
+/// The name in the map is the name a call uses — `kv.<name>` — and the `Arc` is what lets two backends
+/// granted the same storage share one map. A per-backend copy would be a cache that is correct and
+/// useless: both backends would work perfectly and see nothing of each other's writes.
+///
+/// An unknown driver cannot reach here — `Config::validate` refuses it — so the match is total over the
+/// enum rather than over strings, and a driver added to the configuration without an arm here is a
+/// compile error rather than a warning at runtime.
+fn build_stores(config: &Config) -> BTreeMap<String, Arc<dyn volucer_kv::Store>> {
+    let mut stores: BTreeMap<String, Arc<dyn volucer_kv::Store>> = BTreeMap::new();
+    for (name, storage) in &config.kv {
+        let store: Arc<dyn volucer_kv::Store> = match storage {
+            KvStorageConfig::Memory(memory) => {
+                Arc::new(volucer_kv::MemoryStore::with_max_bytes(memory.max_bytes))
+            }
+        };
+        tracing::info!(
+            storage = %name,
+            driver = %storage.driver(),
+            "kv storage ready"
+        );
+        stores.insert(name.clone(), store);
+    }
+    stores
+}
+
 /// Build one worker backend's method registry from its `services` list.
 ///
 /// # Why the `config.describe` document is assembled here
@@ -134,23 +163,51 @@ fn worker_registry(
     services: &[String],
     config: &Config,
     directory: &Arc<PoolDirectory>,
+    stores: &BTreeMap<String, Arc<dyn volucer_kv::Store>>,
 ) -> MethodRegistry {
     let mut registry = MethodRegistry::new();
+    // Collected rather than installed per entry, because there is **one** `kv` namespace per registry and
+    // a second `with` call for it would replace the first. A backend granted two storages must find both
+    // in the one namespace, so the map is built first and installed once below.
+    let mut granted: BTreeMap<String, Arc<dyn volucer_kv::Store>> = BTreeMap::new();
+
     for service in services {
-        registry = match service.as_str() {
-            "config" => registry.with(ConfigNamespace::new(config)),
-            "workers" => registry.with(WorkersNamespace::new(
-                Arc::clone(directory) as Arc<dyn PoolLookup>
-            )),
-            other => {
-                tracing::warn!(
-                    service = %other,
-                    "a configured service has no implementation and is ignored; this should have \
-                     been refused when the configuration was validated"
-                );
-                registry
+        match service.as_str() {
+            "config" => registry = registry.with(ConfigNamespace::new(config)),
+            "workers" => {
+                registry = registry.with(WorkersNamespace::new(
+                    Arc::clone(directory) as Arc<dyn PoolLookup>
+                ))
             }
-        };
+            other => match other.strip_prefix("kv.") {
+                // A name checked against the `[kv.*]` tables when the configuration was validated, so a
+                // miss here is a store that was not built rather than a name never checked. Skipping is
+                // right: installing an empty `kv` namespace would make `services = ["kv.sessions"]` look
+                // granted while every call was refused with "no kv storage configured", which reads like
+                // a configuration mistake rather than the internal one it is.
+                Some(storage) => match stores.get(storage) {
+                    Some(store) => {
+                        granted.insert(storage.to_string(), Arc::clone(store));
+                    }
+                    None => tracing::error!(
+                        storage = %storage,
+                        "a configured kv service has no store built for it; a worker asking for it \
+                         will be refused, which should have been impossible"
+                    ),
+                },
+                None => {
+                    tracing::warn!(
+                        service = %other,
+                        "a configured service has no implementation and is ignored; this should \
+                         have been refused when the configuration was validated"
+                    );
+                }
+            },
+        }
+    }
+
+    if !granted.is_empty() {
+        registry = registry.with(KvNamespace::new(granted));
     }
     if !registry.is_empty() {
         tracing::debug!(
@@ -217,13 +274,24 @@ impl Dispatcher {
         // worker facing the public gets one that cannot restart its siblings. That is
         // `docs/plugins.md` §4.5, and building it once for the whole process would be the shape it
         // refuses.
+        // The stores are built before any backend, because a backend's registry needs them: a worker
+        // granted `kv.sessions` has to find the store already there. Built once and shared, so two
+        // backends granted the same storage share one map rather than getting a private copy that
+        // silently diverges — which would be the worst possible bug in a cache, since both would work.
+        let stores = build_stores(config);
+
         let directory = Arc::new(PoolDirectory::default());
         let mut backends = BTreeMap::new();
         let mut registries: BTreeMap<String, Arc<MethodRegistry>> = BTreeMap::new();
         for (name, backend_config) in &config.backends {
             let registry = match backend_config {
                 BackendConfig::Worker(worker) => {
-                    let registry = Arc::new(worker_registry(&worker.services, config, &directory));
+                    let registry = Arc::new(worker_registry(
+                        &worker.services,
+                        config,
+                        &directory,
+                        &stores,
+                    ));
                     registries.insert(name.clone(), Arc::clone(&registry));
                     Some(registry)
                 }
@@ -607,7 +675,18 @@ fn strip_query(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use volucer_core::config::{BackendConfig, Config, ExternalConfig, ServerConfig};
+    use volucer_core::config::{
+        BackendConfig, Config, ExternalConfig, MemoryKvConfig, ServerConfig,
+    };
+
+    /// A call with parameters, for the registry tests.
+    fn call_with(name: &str, params: serde_json::Value) -> volucer_worker::Call {
+        volucer_worker::Call {
+            name: name.to_string(),
+            params,
+            traceparent: None,
+        }
+    }
 
     /// A backend that can be *built* without starting anything, but cannot serve:
     /// an `external` backend pointing at a loopback port nothing listens on.
@@ -703,12 +782,13 @@ mod tests {
     fn a_granted_namespace_reaches_the_registry_and_nothing_else_does() {
         let config = config_with(&[("app", unreachable_backend())], "app");
         let directory = Arc::new(PoolDirectory::default());
+        let stores = build_stores(&config);
         assert!(
-            worker_registry(&[], &config, &directory).is_empty(),
+            worker_registry(&[], &config, &directory, &stores).is_empty(),
             "no services must mean no namespaces"
         );
 
-        let granted = worker_registry(&["config".to_string()], &config, &directory);
+        let granted = worker_registry(&["config".to_string()], &config, &directory, &stores);
         assert_eq!(granted.names(), vec!["config"]);
         assert!(
             !granted.names().contains(&"workers"),
@@ -719,13 +799,163 @@ mod tests {
         // one case so that adding a name to `CALL_NAMESPACES` without an arm fails *this* test rather
         // than a deployment.
         for name in volucer_core::config::CALL_NAMESPACES {
-            let registry = worker_registry(&[name.to_string()], &config, &directory);
+            let registry = worker_registry(&[name.to_string()], &config, &directory, &stores);
             assert_eq!(
                 registry.names(),
                 vec![*name],
                 "{name} is allowed by the configuration and must have an implementation"
             );
         }
+    }
+
+    /// Two storages granted to one backend arrive in **one** `kv` namespace.
+    ///
+    /// The shape that makes this easy to get wrong: the registry routes on the text before the first dot,
+    /// so both `kv.sessions` and `kv.cache` route to the namespace named `kv`. Installing one `with` call
+    /// per granted storage would therefore have the second replace the first, and the symptom would be
+    /// that only one of a backend's two storages worked — which a test with one storage cannot see.
+    #[test]
+    fn two_granted_storages_share_one_kv_namespace() {
+        let mut config = config_with(&[("app", unreachable_backend())], "app");
+        config.kv.insert(
+            "sessions".to_string(),
+            KvStorageConfig::Memory(MemoryKvConfig { max_bytes: 1024 }),
+        );
+        config.kv.insert(
+            "cache".to_string(),
+            KvStorageConfig::Memory(MemoryKvConfig { max_bytes: 1024 }),
+        );
+
+        let directory = Arc::new(PoolDirectory::default());
+        let stores = build_stores(&config);
+        let registry = worker_registry(
+            &["kv.sessions".to_string(), "kv.cache".to_string()],
+            &config,
+            &directory,
+            &stores,
+        );
+
+        assert_eq!(
+            registry.names(),
+            vec!["kv"],
+            "two storages are one namespace, because that is what the router keys on"
+        );
+
+        // And both are reachable through it. A call that reaches the namespace is answered for each,
+        // which is the property the merge exists for; `store.set` then `store.get` is the one round trip
+        // that proves the namespace found a real store rather than an empty map.
+        for storage in ["sessions", "cache"] {
+            let answer = registry.serve(&call_with(
+                &format!("kv.{storage}.set"),
+                serde_json::json!({
+                    "key": crate::params::encode_base64(b"k"),
+                    "value": crate::params::encode_base64(b"v"),
+                }),
+            ));
+            assert!(answer.ok, "{storage} should accept a value: {answer:?}");
+
+            let answer = registry.serve(&call_with(
+                &format!("kv.{storage}.get"),
+                serde_json::json!({ "key": crate::params::encode_base64(b"k") }),
+            ));
+            assert_eq!(
+                answer.result.as_ref().and_then(|r| r["value"].as_str()),
+                Some("dg=="),
+                "{storage} should return what it stored: {answer:?}"
+            );
+        }
+    }
+
+    /// The two storages are separate maps, so writing one does not write the other.
+    ///
+    /// The other half of sharing a namespace: they share the *namespace*, not the store. A merge that got
+    /// this wrong would make two named caches one, and the difference would only show as a key appearing
+    /// in a place nobody put it.
+    #[test]
+    fn two_storages_in_one_namespace_do_not_share_their_map() {
+        let mut config = config_with(&[("app", unreachable_backend())], "app");
+        for name in ["sessions", "cache"] {
+            config.kv.insert(
+                name.to_string(),
+                KvStorageConfig::Memory(MemoryKvConfig { max_bytes: 1024 }),
+            );
+        }
+
+        let directory = Arc::new(PoolDirectory::default());
+        let stores = build_stores(&config);
+        let registry = worker_registry(
+            &["kv.sessions".to_string(), "kv.cache".to_string()],
+            &config,
+            &directory,
+            &stores,
+        );
+
+        let key = crate::params::encode_base64(b"shared-key");
+        registry.serve(&call_with(
+            "kv.sessions.set",
+            serde_json::json!({ "key": key, "value": crate::params::encode_base64(b"from-sessions") }),
+        ));
+        let answer = registry.serve(&call_with(
+            "kv.cache.get",
+            serde_json::json!({ "key": key }),
+        ));
+
+        assert_eq!(
+            answer.result.as_ref().and_then(|r| r["value"].as_str()),
+            None,
+            "a key written to one storage must not appear in another: {answer:?}"
+        );
+    }
+
+    /// A storage a backend was not granted is refused by name, and the refusal says what it *may* reach.
+    ///
+    /// This is §4.5 as a test. The distinction worth checking is between a storage the deployment has and
+    /// this backend lacks — a `services` list to edit — and a storage that does not exist at all, because
+    /// an operator reading one message and acting on it as though it were the other wastes their time.
+    #[test]
+    fn a_storage_outside_a_backends_grant_is_refused_by_name() {
+        let mut config = config_with(&[("app", unreachable_backend())], "app");
+        for name in ["sessions", "secrets"] {
+            config.kv.insert(
+                name.to_string(),
+                KvStorageConfig::Memory(MemoryKvConfig { max_bytes: 1024 }),
+            );
+        }
+
+        let directory = Arc::new(PoolDirectory::default());
+        let stores = build_stores(&config);
+        let registry = worker_registry(&["kv.sessions".to_string()], &config, &directory, &stores);
+
+        let refused = registry.serve(&call_with(
+            "kv.secrets.get",
+            serde_json::json!({ "key": crate::params::encode_base64(b"k") }),
+        ));
+        assert!(!refused.ok);
+        let message = refused.error.clone().unwrap_or_default();
+        assert!(
+            message.contains("secrets"),
+            "the refusal must name what was asked for: {message}"
+        );
+        assert!(
+            message.contains("sessions"),
+            "and what may be reached, or the operator has to read the config file to find out: {message}"
+        );
+
+        // A storage that does not exist anywhere reads differently — it is refused as ungranted too, since
+        // from this backend's side the two are the same question, but the message names the one it may
+        // reach so the difference is visible to whoever reads it.
+        let unknown = registry.serve(&call_with(
+            "kv.typo.get",
+            serde_json::json!({ "key": crate::params::encode_base64(b"k") }),
+        ));
+        assert!(!unknown.ok);
+        assert!(
+            unknown
+                .error
+                .as_deref()
+                .is_some_and(|m| m.contains("typo") && m.contains("sessions")),
+            "{unknown:?}"
+        );
     }
 
     #[test]

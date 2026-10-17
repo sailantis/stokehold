@@ -104,9 +104,14 @@ pub trait Store: Send + Sync + std::fmt::Debug {
 
     /// Store several values at once, all with the same TTL.
     ///
-    /// One TTL for the batch rather than one each, because that is what PSR-16's `setMultiple`
-    /// takes and because the alternative is a second vector whose length must agree with the first.
-    fn set_many(&self, keys: &[(&[u8], Vec<u8>)], ttl: Option<Duration>) -> Result<()> {
+    /// One TTL for the batch rather than one each, because that is what PSR-16's `setMultiple` takes and
+    /// because the alternative is a second vector whose length must agree with the first.
+    ///
+    /// Takes `&[(Vec<u8>, Vec<u8>)]` rather than a slice of borrowed pairs, which is a departure from
+    /// [`Store::get_many`]'s `&[&[u8]]` and worth stating: a caller assembling a batch out of JSON has
+    /// owned keys already, and asking it to build a parallel vector of borrows to satisfy a signature
+    /// would be ceremony that the implementation immediately clones away regardless.
+    fn set_many(&self, keys: &[(Vec<u8>, Vec<u8>)], ttl: Option<Duration>) -> Result<()> {
         for (key, value) in keys {
             self.set(key, value.clone(), ttl)?;
         }

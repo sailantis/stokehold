@@ -11,13 +11,15 @@ pub mod error;
 pub mod frontend;
 pub mod lifecycle;
 pub mod listener;
+pub mod params;
 pub mod pool;
 pub mod worker_pool;
 
 pub use backend::{Backend, Contention};
 pub use build::{MINIMUM_PHP_VERSION, WORKER_PROTOCOL_VERSION};
 pub use calls::{
-    ConfigNamespace, MethodRegistry, Namespace, PoolLookup, WorkerStatus, WorkersNamespace,
+    ConfigNamespace, KvNamespace, MethodRegistry, Namespace, PoolLookup, WorkerStatus,
+    WorkersNamespace,
 };
 pub use dispatch::Dispatcher;
 pub use dispatch::PoolDirectory;
@@ -25,5 +27,6 @@ pub use error::{Result, ServerError};
 pub use frontend::fastcgi::{self, IncomingRequest};
 pub use lifecycle::LifecycleGuard;
 pub use listener::{FastCgiListener, Limits, ShutdownHandle, Stats};
+pub use params::{decode_base64, encode_base64, Params};
 pub use pool::CgiPool;
 pub use worker_pool::WorkerPool;

@@ -28,8 +28,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use volucer_worker::{Call, Return};
+
+use crate::params::{decode_base64, encode_base64, Params};
 
 /// Serves one namespace's calls.
 ///
@@ -423,6 +426,422 @@ fn is_sensitive(key: &str) -> bool {
         .split(['_', '-', '.', ' ', '/'])
         .filter(|segment| !segment.is_empty())
         .any(|segment| ELIDED_KEY_PARTS.contains(&segment))
+}
+
+/// The `kv` namespace: key-value storage, holding only the storages *this backend* was granted.
+///
+/// # One namespace holding a map, and why that is the right shape
+///
+/// The registry routes on the text before the **first** dot, so `kv.sessions.get` is the `kv` namespace
+/// with the verb `sessions.get`. There is therefore one `kv` namespace per registry, and which storages
+/// are in it is decided by the `services` list of the backend whose workers it was built for. That is
+/// exactly §4.5's capability boundary: a worker cannot reach a storage it was not granted, even though
+/// every storage in the process shares one namespace prefix, and the refusal names both what it asked
+/// for and what it may have.
+///
+/// # Verbs are the PSR-16 method set, and the wire carries bytes
+///
+/// `kv.<storage>.get`, `.set`, `.has`, `.delete`, `.clear`, `.ttl`, `.getMultiple`, `.setMultiple`.
+/// Keys and values are **base64** on the wire, because a JSON string cannot carry a byte above `0x7f`
+/// and an application that compresses or encrypts what it caches has such bytes constantly. See
+/// `volucer-kv`'s module documentation for why the value is opaque in the first place.
+///
+/// Results are objects rather than bare values — `{"value": …}`, `{"present": true}` — so a field can be
+/// added later without breaking a client that reads one key.
+pub struct KvNamespace {
+    /// The storages these workers may reach, by the name they use in a call.
+    ///
+    /// A `BTreeMap` for the same reason [`MethodRegistry`] holds one: a refusal that lists the available
+    /// storages must be stable between two runs, or an operator comparing two log lines sees a difference
+    /// that is not there.
+    storages: BTreeMap<String, Arc<dyn volucer_kv::Store>>,
+}
+
+/// A call's storage and verb, or the reason there is nothing to serve.
+///
+/// A type rather than a `Return` at each call site so that *routing* is decided in one function. Every
+/// method below then begins with a store and a key, or with a refusal, and there is no path on which the
+/// two disagree.
+enum Resolved<'a> {
+    Ready {
+        store: &'a Arc<dyn volucer_kv::Store>,
+        params: Params,
+        /// The verb, without the storage component: `"get"` for `kv.sessions.get`.
+        verb: &'a str,
+    },
+    Refused(Return),
+}
+
+impl KvNamespace {
+    /// A namespace over the storages one backend may reach.
+    pub fn new(storages: BTreeMap<String, Arc<dyn volucer_kv::Store>>) -> Self {
+        KvNamespace { storages }
+    }
+
+    /// A namespace with no storages, which refuses every call by name.
+    pub fn empty() -> Self {
+        KvNamespace {
+            storages: BTreeMap::new(),
+        }
+    }
+
+    /// The storages these workers may reach, for a diagnostic or a test.
+    pub fn storages(&self) -> Vec<&str> {
+        self.storages.keys().map(String::as_str).collect()
+    }
+
+    /// Split `kv.<storage>.<verb>` and find the store, or say which part was wrong.
+    ///
+    /// The refusals are deliberately distinct, because they are different mistakes with different fixes:
+    /// a name that is not a `kv` call at all, a storage this backend was not granted, and a verb no
+    /// storage has. An operator reading one of them should not have to guess which of the three it is.
+    fn resolve<'a>(&'a self, call: &'a Call) -> Resolved<'a> {
+        let params = match Params::from_value(&call.params, &call.name) {
+            Ok(params) => params,
+            Err(err) => {
+                return Resolved::Refused(Return::refused(format!(
+                    "the {} method was called with {err}",
+                    call.name
+                )))
+            }
+        };
+
+        let Some((storage, verb)) = split_storage_verb(&call.name) else {
+            return Resolved::Refused(Return::refused(format!(
+                "{} is not \"kv.<storage>.<verb>\", so there is nothing to route it to; {}",
+                call.name,
+                self.available()
+            )));
+        };
+        if verb.is_empty() {
+            return Resolved::Refused(Return::refused(format!(
+                "{} names a storage but no method; {}",
+                call.name,
+                self.available()
+            )));
+        }
+
+        match self.storages.get(storage) {
+            Some(store) => Resolved::Ready {
+                store,
+                params,
+                verb,
+            },
+            None => Resolved::Refused(Return::refused(format!(
+                "this backend's workers may not reach the {storage:?} storage; {}",
+                self.available()
+            ))),
+        }
+    }
+
+    /// A phrase naming the storages that are reachable, for a refusal.
+    fn available(&self) -> String {
+        if self.storages.is_empty() {
+            // The honest answer, and a different one from "there is a storage and you may not use it":
+            // this backend was granted no `kv.<name>` at all, which is a `services` list to write rather
+            // than a name to correct.
+            "this backend has no kv storage configured".to_string()
+        } else {
+            format!(
+                "it may reach {}",
+                self.storages
+                    .keys()
+                    .map(|name| format!("{name:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+
+    /// The TTL a call asked for, in the units PSR-16 gives it in.
+    ///
+    /// `None` means "no expiry", an explicit `0` becomes [`Some(Duration::ZERO)`] — which the store turns
+    /// into a delete — and anything else is seconds. The distinction is preserved all the way down rather
+    /// than collapsed here, because collapsing it is how a client that asked for "delete this" gets an
+    /// immortal key.
+    ///
+    /// A TTL beyond `volucer-kv`'s ten-year bound is **clamped by the store rather than refused here**,
+    /// deliberately: an application passing `PHP_INT_MAX` means "for ever", and refusing it would turn a
+    /// working cache into an error after an unrelated upgrade. See `clamp_ttl`.
+    fn ttl_from(params: &Params, method: &str) -> std::result::Result<Option<Duration>, Return> {
+        match params.unsigned("ttl") {
+            Ok(None) => Ok(None),
+            Ok(Some(0)) => Ok(Some(Duration::ZERO)),
+            Ok(Some(seconds)) => Ok(Some(Duration::from_secs(seconds))),
+            Err(err) => Err(Return::refused(format!("the ttl for {method} {err}"))),
+        }
+    }
+
+    /// Run a store operation, turning any failure into a refusal.
+    ///
+    /// One place, so no method can forget: a store error that reached a caller as `ok: true` with no value
+    /// would be indistinguishable from a cache miss, and a cache miss is what an application is least
+    /// able to notice.
+    fn attempt<T>(
+        method: &str,
+        op: impl FnOnce() -> volucer_kv::Result<T>,
+        success: impl FnOnce(T) -> Return,
+    ) -> Return {
+        match op() {
+            Ok(value) => success(value),
+            Err(err) => {
+                // Logged as well as returned, because the two audiences differ: the worker sees a refusal
+                // it can act on, and the operator sees why the cache is not working. A store failure that
+                // only reached the application would be a log entry nobody has.
+                tracing::warn!(method, %err, "a kv call failed");
+                Return::refused(format!("the store refused {method}: {err}"))
+            }
+        }
+    }
+}
+
+/// Split `kv.<storage>.<verb>`, or `None` when the name is not a `kv` call at all.
+///
+/// A name with no second dot becomes the storage with an empty verb, which `KvNamespace::resolve`
+/// reports as "names a storage but no method" — a distinct message from "no such storage", because for
+/// `kv.sessions.` and `kv.sessions` the storage may well exist and the mistake is the verb.
+fn split_storage_verb(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("kv.")?;
+    Some(match rest.split_once('.') {
+        Some((storage, verb)) => (storage, verb),
+        None => (rest, ""),
+    })
+}
+
+impl Namespace for KvNamespace {
+    fn name(&self) -> &'static str {
+        // `kv` and not `kv.<something>`: the registry routes on the text before the first dot, so this is
+        // the *only* key under which a storage can be reached, and it is one namespace per backend rather
+        // than one per storage — see the type's documentation for why.
+        "kv"
+    }
+
+    fn serve(&self, call: &Call) -> Return {
+        let (store, params, verb) = match self.resolve(call) {
+            Resolved::Ready {
+                store,
+                params,
+                verb,
+            } => (store, params, verb),
+            Resolved::Refused(refusal) => return refusal,
+        };
+
+        match verb {
+            "get" => Self::get(store, &params),
+            "set" => Self::set(store, &params, call),
+            "has" => Self::has(store, &params),
+            "delete" => Self::delete(store, &params),
+            "clear" => Self::clear(store),
+            "ttl" => Self::ttl(store, &params),
+            "getMultiple" => Self::get_multiple(store, &params),
+            "setMultiple" => Self::set_multiple(store, &params, call),
+            other => Return::refused(format!(
+                "no kv storage serves {other:?}; the methods are get, set, has, delete, clear, ttl, \
+                 getMultiple and setMultiple"
+            )),
+        }
+    }
+}
+
+impl KvNamespace {
+    /// The key a call names, or the refusal that says what was wrong with it.
+    ///
+    /// One helper because every method but `clear` and the batches begins the same way, and a method that
+    /// read the key itself would be a method that could disagree about whether an empty key is a key.
+    fn key_of(params: &Params, method: &str) -> std::result::Result<Vec<u8>, Return> {
+        match params.base64("key") {
+            Ok(Some(key)) if !key.is_empty() => Ok(key),
+            Ok(Some(_)) => Err(Return::refused(format!(
+                "{method} was given an empty key, which cannot be stored"
+            ))),
+            Ok(None) => Err(Return::refused(format!(
+                "{method} needs a \"key\" parameter, base64-encoded"
+            ))),
+            Err(err) => Err(Return::refused(format!("{method} was called with {err}"))),
+        }
+    }
+
+    fn get(store: &Arc<dyn volucer_kv::Store>, params: &Params) -> Return {
+        let key = match Self::key_of(params, "kv.get") {
+            Ok(key) => key,
+            Err(refusal) => return refusal,
+        };
+        Self::attempt(
+            "get",
+            || store.get(&key),
+            |value| match value {
+                Some(bytes) => Return::ok(serde_json::json!({ "value": encode_base64(&bytes) })),
+                // An explicit `null` rather than an absent field, so a client can tell "there is no value"
+                // from "the server sent something this client's version does not understand".
+                None => Return::ok(serde_json::json!({ "value": null })),
+            },
+        )
+    }
+
+    fn set(store: &Arc<dyn volucer_kv::Store>, params: &Params, call: &Call) -> Return {
+        let key = match Self::key_of(params, "kv.set") {
+            Ok(key) => key,
+            Err(refusal) => return refusal,
+        };
+        let value = match params.base64("value") {
+            Ok(Some(value)) => value,
+            // An empty *value* is a value: caching `""` is an ordinary thing to do, and refusing it would
+            // be this method inventing a rule PSR-16 does not have.
+            Ok(None) => {
+                return Return::refused("kv.set needs a \"value\" parameter, base64-encoded")
+            }
+            Err(err) => return Return::refused(format!("kv.set was called with {err}")),
+        };
+        let ttl = match Self::ttl_from(params, &call.name) {
+            Ok(ttl) => ttl,
+            Err(refusal) => return refusal,
+        };
+
+        Self::attempt(
+            "set",
+            || store.set(&key, value, ttl),
+            |()| Return::ok(serde_json::json!({ "stored": true })),
+        )
+    }
+
+    fn has(store: &Arc<dyn volucer_kv::Store>, params: &Params) -> Return {
+        let key = match Self::key_of(params, "kv.has") {
+            Ok(key) => key,
+            Err(refusal) => return refusal,
+        };
+        // Answered through `ttl` rather than `get`, so that `has` does not copy a value that may be a
+        // megabyte out of the store to find out whether it is there. The three-state answer is what makes
+        // that possible, and it is the reason `Ttl` exists rather than `Option<Duration>`.
+        Self::attempt(
+            "has",
+            || store.ttl(&key),
+            |ttl| Return::ok(serde_json::json!({ "present": ttl.is_present() })),
+        )
+    }
+
+    fn delete(store: &Arc<dyn volucer_kv::Store>, params: &Params) -> Return {
+        let key = match Self::key_of(params, "kv.delete") {
+            Ok(key) => key,
+            Err(refusal) => return refusal,
+        };
+        Self::attempt(
+            "delete",
+            || store.delete(&key),
+            |deleted| Return::ok(serde_json::json!({ "deleted": deleted })),
+        )
+    }
+
+    fn clear(store: &Arc<dyn volucer_kv::Store>) -> Return {
+        // Takes no parameters and ignores any it is given, which is deliberate rather than an omission: a
+        // client sending `{}` and one sending nothing mean the same thing, and there is no key here whose
+        // typo could be mistaken for a default.
+        Self::attempt(
+            "clear",
+            || store.clear(),
+            |()| Return::ok(serde_json::json!({ "cleared": true })),
+        )
+    }
+
+    fn ttl(store: &Arc<dyn volucer_kv::Store>, params: &Params) -> Return {
+        let key = match Self::key_of(params, "kv.ttl") {
+            Ok(key) => key,
+            Err(refusal) => return refusal,
+        };
+        Self::attempt(
+            "ttl",
+            || store.ttl(&key),
+            |ttl| match ttl {
+                // A word rather than a number, because the three states are not a range: a client checking
+                // `seconds > 0` would read "never expires" as "expired".
+                volucer_kv::Ttl::Missing => Return::ok(serde_json::json!({ "ttl": "missing" })),
+                volucer_kv::Ttl::Forever => Return::ok(serde_json::json!({ "ttl": "forever" })),
+                volucer_kv::Ttl::In(left) => Return::ok(serde_json::json!({
+                    // Rounded *up*, so a client checking `remaining >= 1` does not see zero for a key that
+                    // is still there for another 900 microseconds.
+                    "ttl": left.as_secs_f64().ceil() as u64,
+                })),
+            },
+        )
+    }
+
+    fn get_multiple(store: &Arc<dyn volucer_kv::Store>, params: &Params) -> Return {
+        let keys = match Self::keys_of(params, "kv.getMultiple") {
+            Ok(keys) => keys,
+            Err(refusal) => return refusal,
+        };
+        let borrowed: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        Self::attempt(
+            "getMultiple",
+            || store.get_many(&borrowed),
+            |values| {
+                // Positional on the wire too, and the same length as the request: a client pairing keys
+                // with values by index is what a batch is for, so the answer must not be shorter.
+                let encoded: Vec<serde_json::Value> = values
+                    .into_iter()
+                    .map(|value| match value {
+                        Some(bytes) => serde_json::Value::String(encode_base64(&bytes)),
+                        None => serde_json::Value::Null,
+                    })
+                    .collect();
+                Return::ok(serde_json::json!({ "values": encoded }))
+            },
+        )
+    }
+
+    fn set_multiple(store: &Arc<dyn volucer_kv::Store>, params: &Params, call: &Call) -> Return {
+        let ttl = match Self::ttl_from(params, &call.name) {
+            Ok(ttl) => ttl,
+            Err(refusal) => return refusal,
+        };
+
+        // An object rather than a list of pairs: JSON has no pair type, and `{"<base64 key>": "<base64
+        // value>"}` is what a PHP caller builds from an array with no work at all.
+        let Some(entries) = params.raw("values").and_then(serde_json::Value::as_object) else {
+            return Return::refused(
+                "kv.setMultiple needs a \"values\" object mapping base64 keys to base64 values",
+            );
+        };
+
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for (encoded_key, encoded_value) in entries {
+            let key = match decode_base64(encoded_key) {
+                Ok(key) => key,
+                Err(reason) => return Return::refused(format!("a key in the batch {reason}")),
+            };
+            let Some(encoded_value) = encoded_value.as_str() else {
+                return Return::refused(
+                    "the value for a key in the batch is not a string, so it cannot be base64; every \
+                     value must be a base64-encoded string",
+                );
+            };
+            let value = match decode_base64(encoded_value) {
+                Ok(value) => value,
+                Err(reason) => return Return::refused(format!("a value in the batch {reason}")),
+            };
+            pairs.push((key, value));
+        }
+
+        let count = pairs.len();
+        Self::attempt(
+            "setMultiple",
+            || store.set_many(&pairs, ttl),
+            move |()| Return::ok(serde_json::json!({ "stored": count })),
+        )
+    }
+
+    /// The keys of a batch call, refusing a parameter that is not a list of non-empty strings.
+    fn keys_of(params: &Params, method: &str) -> std::result::Result<Vec<Vec<u8>>, Return> {
+        match params.string_list("keys") {
+            Ok(Some(keys)) if keys.iter().any(String::is_empty) => Err(Return::refused(format!(
+                "{method} was given an empty key, which cannot be stored"
+            ))),
+            Ok(Some(keys)) => Ok(keys.into_iter().map(String::into_bytes).collect()),
+            Ok(None) => Err(Return::refused(format!(
+                "{method} needs a \"keys\" list of base64-encoded keys"
+            ))),
+            Err(err) => Err(Return::refused(format!("{method} was called with {err}"))),
+        }
+    }
 }
 
 /// The `workers` namespace: what the pools look like, and how to restart one worker.

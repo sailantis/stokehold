@@ -20,6 +20,10 @@ volucer-observe.workspace = true
 # The metric registry the worker pools and the front-ends publish into, and the `rr_http_*` names.
 # A leaf crate; see its manifest for why the exposition encoder is written by hand.
 volucer-metrics.workspace = true
+# The store trait and the in-memory driver, for the `kv` namespace. A leaf crate with one dependency,
+# so a deployment using only the memory driver does not link a Redis to serve it — which is the whole
+# argument of `docs/plugins.md` §5 about features being grouped per driver.
+volucer-kv.workspace = true
 # The fourth backend kind. This crate already held hyper's *server* types indirectly through
 # `volucer-http`, but the client is what a pooled origin connection needs, and a backend is the
 # thing that owns a connection pool — so it belongs here rather than in the listener, which only

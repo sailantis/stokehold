@@ -1,0 +1,16 @@
+[package]
+name = "volucer-kv"
+description = "Key-value storage for volucer: the store trait and the in-memory driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The only dependency, and only for the refusals a store reports. A leaf crate that linked a client
+# for every driver would make `cargo install volucer` pull in a Redis and a Memcached for a
+# deployment using the in-memory one, which is the mistake `docs/plugins.md` §5 names: features
+# grouped per driver, with `memory` in the default set.
+tracing.workspace = true
+thiserror.workspace = true

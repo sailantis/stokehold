@@ -90,6 +90,13 @@ pub struct Config {
     /// namespace in `services`, and there is exactly one name to write.
     #[serde(default)]
     pub lock: Option<LockConfig>,
+
+    /// The queues: which pipelines exist, and which of them this server consumes.
+    ///
+    /// Absent means no queues at all, and then a worker calling `jobs.*` is refused — the same rule every
+    /// other service follows.
+    #[serde(default)]
+    pub jobs: Option<JobsConfig>,
 }
 
 /// One `[kv.<name>]` storage: which driver, and that driver's own settings.
@@ -267,6 +274,155 @@ impl LockConfig {
     }
 }
 
+/// `[jobs]`: the queues, and which of them are consumed here.
+///
+/// # Why a table of pipelines where `[kv.*]` had to be named and `[lock]` had to be one
+///
+/// All three shapes are in this file and the difference is what the *thing* is. A KV storage is named
+/// because a worker has to say which cache it means. A lock is not, because a lock is named by its
+/// resource and two lock backends would not see each other. A queue **is** named, and for a reason
+/// neither of the others has: a job's pipeline is part of what the job *is* — it is the choice of which
+/// consumer runs it — so a producer selects one by name on every push.
+///
+/// # The `consume` list, and why it is not "consume everything"
+///
+/// A pipeline absent from `consume` is **producer-only**: it is configured, can be pushed to, and is not
+/// polled by this server. That is RoadRunner's rule and the reason is a deployment one — a web node that
+/// pushes mail jobs and a worker node that consumes them run the same configuration file, and the only
+/// difference between them is one line here. Consuming by default would make every web node also a
+/// consumer, which is how a job gets handled twice by two servers that both meant to be producers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsConfig {
+    /// Pipelines this server **polls**. Empty means it consumes nothing and only produces.
+    ///
+    /// Checked against `pipelines` at validation: a name here that is not a pipeline is a typo, and the
+    /// symptom without that check is a consumer that starts, finds nothing, and reports no error — the
+    /// same silent failure the `services` allow-list exists to prevent, one layer up.
+    #[serde(default)]
+    pub consume: Vec<String>,
+
+    /// The pipelines, by name, each with its own driver.
+    #[serde(default)]
+    pub pipelines: BTreeMap<String, PipelineConfig>,
+
+    /// The consumers' worker pool: command, worker count, recycling — every knob a backend has.
+    ///
+    /// **Required when `consume` is non-empty**, and refused rather than defaulted when it is: there is no
+    /// sensible command to default to, and a consumer configured without one would be a server that
+    /// started, could not start a worker, and reported a pool of zero.
+    ///
+    /// It is a [`JobsPoolConfig`] rather than a [`WorkerConfig`] because two of that type's fields mean
+    /// something different here — see that type's own documentation — and one is absent entirely.
+    #[serde(default)]
+    pub pool: Option<JobsPoolConfig>,
+}
+
+/// One `[jobs.pipelines.<name>]`: which driver, and that driver's own settings.
+///
+/// A tagged enum, like [`KvStorageConfig`] and [`LockConfig`], so that a misspelled key is a parse error
+/// naming it rather than a key that parses, is ignored, and leaves an operator with a queue on the wrong
+/// driver and nothing in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "driver", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PipelineConfig {
+    /// Jobs in this process's memory. Lost on restart — see the driver's documentation.
+    Memory(MemoryPipelineConfig),
+}
+
+/// `[jobs.pipelines.<name>] driver = "memory"`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryPipelineConfig {}
+
+impl PipelineConfig {
+    /// The driver's name, as it is written in configuration.
+    pub fn driver(&self) -> &'static str {
+        match self {
+            PipelineConfig::Memory(_) => "memory",
+        }
+    }
+}
+
+/// `[jobs.pool]`: the consumers' worker settings.
+///
+/// # Why this is not a [`WorkerConfig`]
+///
+/// It has that type's shape and three deliberate differences, each of which would be a silent
+/// misconfiguration if the field were inherited:
+///
+/// - **`services` is absent.** A consumer's channel carries `JOB`, `ACK` and `NACK`, not `CALL`, so there
+///   is nothing for a `services` list to grant. Accepting the key would advertise a call surface a
+///   consumer does not have — the shape `BackendConfig::External` refuses for the same reason.
+/// - **`max_requests` is absent**, which is a *renaming* rather than an omission: RoadRunner's jobs pool
+///   calls this `max_jobs`, and it means "recycle a worker after this many jobs". `max_requests` on this
+///   table would be a request count on a pool that serves no requests, and copying it across would make
+///   an operator's `max_requests` mean something it does not.
+/// - **`command` is required**, where a backend's is too — but the failure without it is different here,
+///   because a jobs pool with no command is a server that consumes a queue with nobody to hand jobs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsPoolConfig {
+    /// Command line that starts a consumer, e.g. `php consumer.php`.
+    pub command: String,
+
+    /// How many consumers to keep. `0` means one per logical CPU, matching [`WorkerConfig::workers`].
+    #[serde(default = "default_workers")]
+    pub workers: u32,
+
+    /// Recycle a consumer once its resident set exceeds this many megabytes.
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
+
+    /// Recycle a consumer after this many **jobs**.
+    ///
+    /// `0` means never, the same rule [`WorkerConfig::max_requests`] documents at length. Named `max_jobs`
+    /// because that is what RoadRunner's jobs pool calls it and because a request count is not a thing
+    /// this pool has.
+    #[serde(default)]
+    pub max_jobs: Option<u64>,
+
+    /// How long a consumer's reservation of a job lasts, in seconds.
+    ///
+    /// **The one setting that must be longer than a job takes**, and the reason it is configuration rather
+    /// than a constant: a reservation that expires while a job is still running means a second consumer
+    /// picks it up and the work happens twice. RoadRunner's equivalent is the pipeline's `timeout` plus the
+    /// broker's own visibility timeout; here it is one number, and the documentation says plainly which
+    /// direction is safe to be wrong in.
+    ///
+    /// Defaults to 300 seconds. A deployment whose jobs take longer must raise it — there is no way to
+    /// auto-tune it, because the server cannot know how long an application's work takes.
+    #[serde(default = "default_job_lease_seconds")]
+    pub job_lease_seconds: u64,
+
+    /// How many jobs to ask a pipeline for at once.
+    ///
+    /// One is the honest default for a *worker* pool, because a consumer that reserves five jobs and then
+    /// handles them one at a time holds four of them idle — and their leases are running down while it
+    /// does. Raising it is worth doing only for a consumer that handles them concurrently, which this pool
+    /// does not: one consumer, one job at a time.
+    #[serde(default = "default_job_prefetch")]
+    pub prefetch: usize,
+}
+
+fn default_job_lease_seconds() -> u64 {
+    // Five minutes: long enough for anything an HTTP request would not have been allowed to do, short
+    // enough that a consumer which died does not leave work stuck for an hour. Deliberately *not* the
+    // request timeout, because the work is deliberately different work.
+    300
+}
+
+fn default_job_prefetch() -> usize {
+    1
+}
+
+impl JobsConfig {
+    /// Whether this server polls the named pipeline.
+    pub fn consumes(&self, pipeline: &str) -> bool {
+        self.consume.iter().any(|name| name == pipeline)
+    }
+}
+
 /// The Redis URL and pool rules, applied identically to every table that names a Redis.
 ///
 /// **One function, because there are now two tables and there will be three** (`docs/plugins.md` §6.4
@@ -330,6 +486,12 @@ impl Config {
         }
         if service == "lock" {
             return self.lock.is_some();
+        }
+        // `jobs` is a fixed name — a producer names the *pipeline* in the call, not the service — so it is
+        // checked against the table's presence for the same reason `lock` is: a worker granted a queue the
+        // deployment never configured would boot, serve traffic, and be unable to push anything.
+        if service == "jobs" {
+            return self.jobs.is_some();
         }
         match service.strip_prefix("kv.") {
             Some(storage) => self.kv.contains_key(storage),
@@ -2496,6 +2658,87 @@ impl Config {
 
         self.validate_tls()?;
 
+        // The queues, checked here for the reason the KV storages are: a typo in a pipeline name or a
+        // `consume` entry with no pipeline behind it is a configuration mistake, and `volucer check`
+        // should say so rather than a consumer that starts, finds nothing, and reports no error.
+        if let Some(jobs) = &self.jobs {
+            for (name, pipeline) in &jobs.pipelines {
+                if name.is_empty() {
+                    return Err(Error::Config(
+                        "a [jobs.pipelines.<name>] table has an empty name, so no producer could name it"
+                            .to_string(),
+                    ));
+                }
+                let _ = pipeline.driver();
+            }
+
+            let mut seen = std::collections::BTreeSet::new();
+            for name in &jobs.consume {
+                if !jobs.pipelines.contains_key(name) {
+                    return Err(Error::Config(format!(
+                        "jobs.consume names {name:?}, which is not a configured pipeline; {}",
+                        if jobs.pipelines.is_empty() {
+                            "this deployment configures no pipelines at all".to_string()
+                        } else {
+                            format!(
+                                "this deployment has {}",
+                                jobs.pipelines
+                                    .keys()
+                                    .map(|name| format!("{name:?}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        }
+                    )));
+                }
+                if !seen.insert(name) {
+                    return Err(Error::Config(format!(
+                        "jobs.consume names {name:?} twice, which means two lines disagree and only one \
+                         of them is read"
+                    )));
+                }
+            }
+
+            // A consumer needs a command, and the check is here rather than at startup because there is
+            // nothing to default to: a jobs pool without one is a server that consumes a queue with
+            // nobody to hand jobs to, which reports as a pool of zero rather than as a missing key.
+            match (&jobs.pool, jobs.consume.is_empty()) {
+                (None, false) => {
+                    return Err(Error::Config(
+                        "jobs.consume names pipelines to consume but there is no [jobs.pool] table, so \
+                         there is no command to start a consumer with"
+                            .to_string(),
+                    ))
+                }
+                (Some(pool), _) => {
+                    if pool.command.trim().is_empty() {
+                        return Err(Error::Config(
+                            "jobs.pool.command must not be empty".to_string(),
+                        ));
+                    }
+                    if pool.job_lease_seconds == 0 {
+                        // Zero would expire every reservation the instant it was handed out, which means
+                        // every job is handed to every consumer at once. An operator who wrote it meant
+                        // "no limit", and that is not a thing a lease can be.
+                        return Err(Error::Config(
+                            "jobs.pool.job_lease_seconds is 0, which would expire every reservation \
+                             immediately and hand the same job to every consumer; set a time longer than \
+                             the slowest job"
+                                .to_string(),
+                        ));
+                    }
+                    if pool.prefetch == 0 {
+                        return Err(Error::Config(
+                            "jobs.pool.prefetch is 0, so no consumer would ever reserve a job; remove the \
+                             key for the one-at-a-time default"
+                                .to_string(),
+                        ));
+                    }
+                }
+                (None, true) => {}
+            }
+        }
+
         // The access log's header must be a usable header name, and the check is here rather than
         // in the front-end because a bad name is a configuration mistake: `hyper`'s `HeaderName`
         // rejects a space or a colon, and a header that cannot be read or written would make the
@@ -3097,8 +3340,8 @@ impl Config {
                         return bad(format!(
                             "services contains {namespace:?}, which is not a namespace the server \
                              implements; known namespaces are {known}, a KV storage is named \
-                             \"kv.<name>\" — {storages} — and locks are reached as \"lock\", which \
-                             {lock}",
+                             \"kv.<name>\" — {storages} — locks are reached as \"lock\", which \
+                             {lock}, and the queues are reached as \"jobs\", which {jobs}",
                             known = CALL_NAMESPACES
                                 .iter()
                                 .map(|name| format!("\"{name}\""))
@@ -3120,6 +3363,11 @@ impl Config {
                                 "this deployment has a [lock] table"
                             } else {
                                 "needs a [lock] table to be configured"
+                            },
+                            jobs = if self.jobs.is_some() {
+                                "this deployment has a [jobs] table".to_string()
+                            } else {
+                                "needs a [jobs] table to be configured".to_string()
                             }
                         ));
                     }
@@ -4771,6 +5019,207 @@ services = ["kv"]
         );
     }
 
+    /// A `[jobs]` table is what makes `"jobs"` a name a backend may put in `services`.
+    ///
+    /// The fourth shape of the allow-list and, like `lock`, the one that needs the KV-style check rather
+    /// than the fixed half: the *name* is fixed — a producer names the pipeline in the call, not the
+    /// service — while what it needs is the presence of a `[jobs]` table. A worker granted `"jobs"` with
+    /// no queues behind it is a worker that serves traffic and cannot push anything.
+    #[test]
+    fn a_jobs_service_needs_a_jobs_table_and_a_jobs_table_is_enough() {
+        let with_table = r#"
+default_backend = "app"
+[server]
+http = "127.0.0.1:8080"
+[jobs]
+consume = ["emails"]
+[jobs.pipelines.emails]
+driver = "memory"
+[jobs.pool]
+command = "php consumer.php"
+[backends.app]
+kind = "worker"
+command = "php worker.php"
+services = ["jobs"]
+"#;
+        Config::from_toml(with_table)
+            .expect("the file parses")
+            .validate()
+            .expect("a [jobs] table is a jobs service that is honoured");
+
+        let without = with_table.replace(
+            "[jobs]\nconsume = [\"emails\"]\n[jobs.pipelines.emails]\ndriver = \"memory\"\n[jobs.pool]\ncommand = \"php consumer.php\"\n",
+            "",
+        );
+        assert!(
+            !without.contains("[jobs]"),
+            "the fixture must have been changed"
+        );
+        let err = Config::from_toml(&without)
+            .expect("the file still parses")
+            .validate()
+            .expect_err("must not validate");
+        let message = err.to_string();
+        assert!(message.contains("\"jobs\""), "{message}");
+        assert!(
+            message.contains("needs a [jobs] table"),
+            "and say what the deployment is missing: {message}"
+        );
+    }
+
+    /// A `consume` entry with no pipeline behind it is refused, and so is a duplicate.
+    ///
+    /// The failure this prevents is specific and silent: a consumer that starts, finds no such pipeline,
+    /// and reports no error — so the deployment looks healthy while its mail is never sent. It is the same
+    /// class of mistake the `services` allow-list catches, one layer up.
+    #[test]
+    fn jobs_consume_is_checked_against_the_pipelines_that_exist() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs]
+consume = ["emails"]
+[jobs.pipelines.emails]
+driver = "memory"
+[jobs.pool]
+command = "php consumer.php"
+"#;
+        Config::from_toml(text)
+            .expect("the file parses")
+            .validate()
+            .expect("a pipeline that exists is a pipeline that can be consumed");
+
+        let typo = text.replace("consume = [\"emails\"]", "consume = [\"emials\"]");
+        let err = Config::from_toml(&typo)
+            .expect("the file parses")
+            .validate()
+            .expect_err("must not validate");
+        let message = err.to_string();
+        assert!(message.contains("\"emials\""), "{message}");
+        assert!(
+            message.contains("\"emails\""),
+            "and name the pipelines there are, so the fix is a rename: {message}"
+        );
+
+        let twice = text.replace(
+            "consume = [\"emails\"]",
+            "consume = [\"emails\", \"emails\"]",
+        );
+        let err = Config::from_toml(&twice)
+            .expect("the file parses")
+            .validate()
+            .expect_err("must not validate");
+        assert!(err.to_string().contains("twice"), "{err}");
+    }
+
+    /// Consuming without a pool is refused, and so are the two values that would make the pool useless.
+    #[test]
+    fn a_consumer_without_a_command_or_with_an_impossible_pool_is_refused() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs]
+consume = ["emails"]
+[jobs.pipelines.emails]
+driver = "memory"
+"#;
+        // No `[jobs.pool]` at all, while consuming: there is nothing to default the command to, and a
+        // consumer with no command is a server that consumes a queue with nobody to hand jobs to.
+        let err = Config::from_toml(text)
+            .expect("the file parses")
+            .validate()
+            .expect_err("a consumer needs a command");
+        assert!(err.to_string().contains("[jobs.pool]"), "{err}");
+
+        // A pool, but no consumers: allowed, because that is a producer-only deployment which happens to
+        // share its configuration file with a consuming one.
+        let producer = text.replace("consume = [\"emails\"]\n", "");
+        Config::from_toml(&producer)
+            .expect("the file parses")
+            .validate()
+            .expect("a producer-only deployment needs no pool at all");
+
+        let with_pool = |extra: &str| {
+            let text = format!("{text}\n[jobs.pool]\ncommand = \"php consumer.php\"\n{extra}\n");
+            Config::from_toml(&text)
+                .expect("the file parses")
+                .validate()
+        };
+
+        with_pool("").expect("a command and nothing else is the whole configuration");
+
+        let err =
+            with_pool("job_lease_seconds = 0").expect_err("a zero lease is a job for everybody");
+        let message = err.to_string();
+        assert!(message.contains("job_lease_seconds"), "{message}");
+        assert!(
+            message.contains("every consumer"),
+            "and say what it would do rather than only that it is wrong: {message}"
+        );
+
+        let err = with_pool("prefetch = 0").expect_err("asking for nothing reserves nothing");
+        assert!(err.to_string().contains("prefetch"), "{err}");
+
+        let err = Config::from_toml(
+            "[server]\nhttp = \"127.0.0.1:8080\"\n[jobs.pool]\ncommand = \"  \"\n",
+        )
+        .expect("the file parses")
+        .validate()
+        .expect_err("a whitespace command is not a command");
+        assert!(err.to_string().contains("command"), "{err}");
+    }
+
+    /// A `[jobs.pool]` refuses the keys that would mean something different here than on a backend.
+    ///
+    /// `max_requests` is the interesting one: it is what RoadRunner calls `max_jobs` on a jobs pool, and
+    /// accepting it would let an operator set a *request* limit on a pool that serves no requests — so the
+    /// key is refused, and the refusal has to say what it is called here.
+    #[test]
+    fn a_jobs_pool_refuses_the_backend_keys_that_do_not_mean_what_they_say() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs]
+consume = ["emails"]
+[jobs.pipelines.emails]
+driver = "memory"
+[jobs.pool]
+command = "php consumer.php"
+max_requests = 100
+"#;
+        let err = Config::from_toml(text).expect_err("max_requests is not a jobs pool key");
+        let message = err.to_string();
+        assert!(message.contains("max_requests"), "{message}");
+        assert!(
+            message.contains("max_jobs"),
+            "and it must say what the key is called here, or the operator has to guess: {message}"
+        );
+
+        // `services` is refused too, and for a different reason: a consumer's channel carries jobs, not
+        // calls, so there is no call surface for a services list to grant.
+        let err = Config::from_toml(&text.replace("max_requests = 100", "services = [\"config\"]"))
+            .expect_err("a consumer has no call surface to grant");
+        assert!(err.to_string().contains("services"), "{err}");
+    }
+
+    /// The driver name matches the serde tag, so `config.describe` and the file cannot disagree.
+    #[test]
+    fn a_pipeline_driver_name_matches_its_tag() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[jobs.pipelines.emails]
+driver = "memory"
+"#;
+        let config = Config::from_toml(text).expect("the file parses");
+        let pipeline = config
+            .jobs
+            .as_ref()
+            .and_then(|jobs| jobs.pipelines.get("emails"))
+            .expect("emails is configured");
+        assert_eq!(pipeline.driver(), "memory");
+    }
+
     /// A `[kv.*]` table whose driver is misspelled is refused, naming the key it did not understand.
     #[test]
     fn an_unknown_kv_driver_is_refused_rather_than_ignored() {
@@ -5260,12 +5709,23 @@ driver = "memory"
             path.display()
         );
         assert!(
-            // Two single-line fragments rather than the whole sentence: the file is CRLF and this file
-            // is not, so a `contains` spanning a line boundary fails for a reason that has nothing to do
-            // with the documentation being there.
-            text.contains("NOT a correctness") && text.contains("no fencing token"),
+            text.contains("It is NOT a correctness\n# primitive")
+                || text.contains("NOT a correctness"),
             "{} no longer carries the warning that a lock is not a correctness primitive; that \
              warning is the reason this feature is safe to ship at all",
+            path.display()
+        );
+        // And for the queue, where two things have to be readable by the person configuring it: that a
+        // pipeline is only polled when `consume` names it, and that the memory driver loses everything on
+        // a restart. Both are sentences an operator must find *before* deploying, not after.
+        assert!(
+            text.contains("# [jobs]"),
+            "{} no longer documents the [jobs] table",
+            path.display()
+        );
+        assert!(
+            text.contains("a restart loses") || text.contains("restart loses"),
+            "{} no longer says that the memory queue loses everything on a restart",
             path.display()
         );
     }

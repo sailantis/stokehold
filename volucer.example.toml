@@ -477,3 +477,46 @@ base_port = 19001
 # kind = "worker"
 # command = "php bin/ops-worker.php"
 # services = ["config", "workers", "kv.sessions", "lock"]
+
+# ---------------------------------------------------------------------------
+# Queues. Absent means no queues, and then a worker calling `jobs.*` is refused.
+#
+# A job is a task name, an opaque payload and string headers -- the payload is
+# never parsed here, exactly as a KV value is never parsed here, so an
+# application's serialization and its encryption are its own business.
+#
+# `pipelines` are the queues; `consume` names the ones THIS server polls. A
+# pipeline not in `consume` is producer-only, which is what makes one
+# configuration file work for both a web node that pushes mail and a worker node
+# that sends it:
+#
+#     web node:     consume = []              (pushes, never polls)
+#     worker node:  consume = ["emails"]      (polls, and can also push)
+#
+# `driver = "memory"` keeps jobs in this process, and **a restart loses
+# everything** -- including jobs that were handed to a consumer and not yet
+# acknowledged. It is for work that can be regenerated. A queue that has to
+# survive a restart needs a driver with a server behind it.
+#
+# jobs.pool configures the consumers. `job_lease_seconds` is the one setting that
+# must be longer than a job takes: a lease that runs out while the work is still
+# running means a second consumer picks the job up and it happens twice. There is
+# no way to detect that from here, which is why it is a number an operator sets
+# rather than one the server guesses.
+# ---------------------------------------------------------------------------
+# [jobs]
+# consume = ["emails"]
+#
+# [jobs.pipelines.emails]
+# driver = "memory"
+#
+# [jobs.pipelines.reports]
+# driver = "memory"                  # configured, pushed to, never polled here
+#
+# [jobs.pool]
+# command = "php bin/consumer.php"
+# workers = 4                        # 0 means one per logical CPU
+# max_jobs = 0                       # recycle a consumer after this many *jobs*; 0 means never
+# memory_limit_mb = 128
+# job_lease_seconds = 300            # 5 minutes; must exceed the slowest job
+# prefetch = 1                       # one job at a time, which is what one consumer can do

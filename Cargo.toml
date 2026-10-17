@@ -43,6 +43,12 @@ volucer-watch = { version = "0.1.0", path = "crates/volucer-watch" }
 volucer-observe = { version = "0.1.0", path = "crates/volucer-observe" }
 volucer-metrics = { version = "0.1.0", path = "crates/volucer-metrics" }
 volucer-kv = { version = "0.1.0", path = "crates/volucer-kv" }
+# The Redis client, **optional** and behind a feature. A deployment using the in-memory store must not
+# link a Redis to get it, which is the rule `docs/plugins.md` §5 states for every driver. Default
+# features are off — they pull in `num-bigint` and `sha1_smol` for script and big-number support a KV
+# store does not use — and `connection-manager` is deliberately **not** enabled: it implies `aio` and
+# therefore a runtime, and this crate's store trait is synchronous on purpose.
+redis = { version = "1.7", default-features = false }
 volucer-acme = { version = "0.1.0", path = "crates/volucer-acme" }
 volucer-upstream = { version = "0.1.0", path = "crates/volucer-upstream" }
 bytes = "1"

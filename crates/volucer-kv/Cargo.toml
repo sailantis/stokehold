@@ -8,9 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# The only dependency, and only for the refusals a store reports. A leaf crate that linked a client
-# for every driver would make `cargo install volucer` pull in a Redis and a Memcached for a
-# deployment using the in-memory one, which is the mistake `docs/plugins.md` §5 names: features
-# grouped per driver, with `memory` in the default set.
+# The only mandatory dependency, and only for the refusals a store reports. A leaf crate that linked a
+# client for every driver would make `cargo install volucer` pull in a Redis and a Memcached for a
+# deployment using the in-memory one, which is the mistake `docs/plugins.md` §5 names — so every driver
+# past `memory` is behind a feature, and `memory` is always available.
 tracing.workspace = true
 thiserror.workspace = true
+redis = { workspace = true, optional = true }
+
+[features]
+default = []
+# The Redis driver. One dependency serves two features: KV here and locks in §6.3, which is why it is a
+# feature of this crate rather than a separate client crate.
+redis = ["dep:redis"]

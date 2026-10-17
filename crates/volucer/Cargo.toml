@@ -37,6 +37,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 x509-parser.workspace = true
 
+[features]
+default = []
+# Carries the KV drivers that need a client library up through the tree, so
+# `cargo install volucer --features redis` produces a server that can serve a `[kv.*]` table naming
+# Redis — and without it, `volucer check` refuses that table by name instead of starting a server whose
+# every `kv.*` call would fail. See `docs/plugins.md` §5.
+redis = ["volucer-server/redis", "volucer-core/redis"]
+
 # Signals are split by platform because the *mechanism* is, not the behaviour.
 #
 # On Unix, `signal-hook` is used rather than `ctrlc` even though `ctrlc` is already here for

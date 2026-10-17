@@ -121,15 +121,28 @@ impl PoolDirectory {
 /// granted the same storage share one map. A per-backend copy would be a cache that is correct and
 /// useless: both backends would work perfectly and see nothing of each other's writes.
 ///
-/// An unknown driver cannot reach here — `Config::validate` refuses it — so the match is total over the
-/// enum rather than over strings, and a driver added to the configuration without an arm here is a
-/// compile error rather than a warning at runtime.
-fn build_stores(config: &Config) -> BTreeMap<String, Arc<dyn volucer_kv::Store>> {
+/// **Fallible, and the one driver that can fail is why.** A Redis that cannot be reached is a startup
+/// failure, exactly as an unreachable worker command is, rather than a 500 on the first request that reads
+/// a cache. The worker pool follows the same rule for the same reason: a misconfiguration belongs where the
+/// configuration is read.
+fn build_stores(config: &Config) -> Result<BTreeMap<String, Arc<dyn volucer_kv::Store>>> {
     let mut stores: BTreeMap<String, Arc<dyn volucer_kv::Store>> = BTreeMap::new();
     for (name, storage) in &config.kv {
         let store: Arc<dyn volucer_kv::Store> = match storage {
             KvStorageConfig::Memory(memory) => {
                 Arc::new(volucer_kv::MemoryStore::with_max_bytes(memory.max_bytes))
+            }
+            #[cfg(feature = "redis")]
+            KvStorageConfig::Redis(redis) => {
+                // Built here rather than per backend, so two backends granted the same storage share one
+                // pool. A per-backend pool would be `pool_size` connections *per backend* — 160 sockets for
+                // ten backends — and would still be correct, which is why nothing else would notice.
+                let store = volucer_kv::RedisStore::connect(&redis.url, redis.pool_size, name)
+                    .map_err(|err| ServerError::Misconfigured {
+                        backend: format!("kv.{name}"),
+                        reason: err.to_string(),
+                    })?;
+                Arc::new(store)
             }
         };
         tracing::info!(
@@ -139,7 +152,7 @@ fn build_stores(config: &Config) -> BTreeMap<String, Arc<dyn volucer_kv::Store>>
         );
         stores.insert(name.clone(), store);
     }
-    stores
+    Ok(stores)
 }
 
 /// Build one worker backend's method registry from its `services` list.
@@ -278,7 +291,7 @@ impl Dispatcher {
         // granted `kv.sessions` has to find the store already there. Built once and shared, so two
         // backends granted the same storage share one map rather than getting a private copy that
         // silently diverges — which would be the worst possible bug in a cache, since both would work.
-        let stores = build_stores(config);
+        let stores = build_stores(config)?;
 
         let directory = Arc::new(PoolDirectory::default());
         let mut backends = BTreeMap::new();
@@ -782,7 +795,7 @@ mod tests {
     fn a_granted_namespace_reaches_the_registry_and_nothing_else_does() {
         let config = config_with(&[("app", unreachable_backend())], "app");
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config);
+        let stores = build_stores(&config).expect("no storage needs a server");
         assert!(
             worker_registry(&[], &config, &directory, &stores).is_empty(),
             "no services must mean no namespaces"
@@ -827,7 +840,7 @@ mod tests {
         );
 
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config);
+        let stores = build_stores(&config).expect("no storage needs a server");
         let registry = worker_registry(
             &["kv.sessions".to_string(), "kv.cache".to_string()],
             &config,
@@ -882,7 +895,7 @@ mod tests {
         }
 
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config);
+        let stores = build_stores(&config).expect("no storage needs a server");
         let registry = worker_registry(
             &["kv.sessions".to_string(), "kv.cache".to_string()],
             &config,
@@ -923,7 +936,7 @@ mod tests {
         }
 
         let directory = Arc::new(PoolDirectory::default());
-        let stores = build_stores(&config);
+        let stores = build_stores(&config).expect("no storage needs a server");
         let registry = worker_registry(&["kv.sessions".to_string()], &config, &directory, &stores);
 
         let refused = registry.serve(&call_with(

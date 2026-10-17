@@ -99,6 +99,42 @@ pub enum KvStorageConfig {
     /// The default for a single-node deployment, and the one that needs nothing installed. See
     /// `volucer-kv` for what the bound means and why it is bytes rather than entries.
     Memory(MemoryKvConfig),
+
+    /// In Redis. Shared between processes and survives a restart of this one.
+    ///
+    /// Behind the `redis` cargo feature, so a build without it refuses this driver at *parse* time rather
+    /// than accepting a table whose store cannot be built. See `RedisKvConfig` for why that is a feature
+    /// and not a plugin.
+    #[cfg(feature = "redis")]
+    Redis(RedisKvConfig),
+}
+
+/// `[kv.<name>] driver = "redis"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisKvConfig {
+    /// The server, as a URL: `redis://127.0.0.1:6379`, optionally with a username, password and database.
+    ///
+    /// **May carry a credential, which is why `config.describe` redacts it** — see the redaction's own
+    /// documentation for the rule. A URL rather than separate `host`/`port`/`password` keys because that is
+    /// what every other Redis client takes and what an operator has in their environment already.
+    ///
+    /// A `unix:` URL — `redis:///path/to/socket` or `unix:/run/redis.sock` — is not accepted here even where
+    /// the client supports it, because a socket path in a URL is spelled differently by every client and an
+    /// operator copying one would get a connection error rather than a message about the spelling.
+    pub url: String,
+
+    /// How many connections to keep.
+    ///
+    /// One per worker is the natural size, since a call blocks the worker that asked. Defaults to
+    /// [`volucer_kv::DEFAULT_POOL_SIZE`]'s value, written out here because this crate cannot depend on a
+    /// driver to name a default.
+    #[serde(default = "default_redis_pool_size")]
+    pub pool_size: usize,
+}
+
+fn default_redis_pool_size() -> usize {
+    16
 }
 
 /// `[kv.<name>] driver = "memory"`.
@@ -130,6 +166,8 @@ impl KvStorageConfig {
     pub fn driver(&self) -> &'static str {
         match self {
             KvStorageConfig::Memory(_) => "memory",
+            #[cfg(feature = "redis")]
+            KvStorageConfig::Redis(_) => "redis",
         }
     }
 }
@@ -2287,6 +2325,37 @@ impl Config {
                             "kv.{name}.max_bytes is 0, which would refuse every value; set a limit \
                              or remove the key for the {default} byte default",
                             default = default_kv_max_bytes()
+                        )));
+                    }
+                }
+                #[cfg(feature = "redis")]
+                KvStorageConfig::Redis(redis) => {
+                    // Checked for the shape a client will accept, not by connecting: `volucer check`
+                    // must not require the server to be up, and a URL that parses is all the
+                    // configuration can vouch for. A server that is not there is reported by `serve`
+                    // when it connects.
+                    if !redis.url.starts_with("redis://") && !redis.url.starts_with("rediss://") {
+                        return Err(Error::Config(format!(
+                            "kv.{name}.url {:?} is not a Redis URL; it must start with \
+                             \"redis://\" or \"rediss://\", e.g. \"redis://127.0.0.1:6379\"",
+                            redis.url
+                        )));
+                    }
+                    if redis.url.contains('@') && !redis.url.contains("rediss://") {
+                        // A password over a plaintext connection, warned about rather than refused:
+                        // a loopback or a same-host network is a legitimate deployment, and refusing
+                        // it would make the safe half of the configuration the one nobody can use.
+                        return Err(Error::Config(format!(
+                            "kv.{name}.url carries a credential (it has an \"@\") over a plaintext \
+                             connection; use \"rediss://\" to encrypt it, or accept that the password \
+                             crosses the network in the clear by making the connection local"
+                        )));
+                    }
+                    if redis.pool_size == 0 {
+                        return Err(Error::Config(format!(
+                            "kv.{name}.pool_size is 0, so no call could ever be served; remove the \
+                             key for the {default} default",
+                            default = default_redis_pool_size()
                         )));
                     }
                 }
@@ -4572,21 +4641,128 @@ default_backend = "app"
 [server]
 http = "127.0.0.1:8080"
 [kv.cache]
-driver = "redis"
-address = "redis://127.0.0.1:6379"
+driver = "redys"
+url = "redis://127.0.0.1:6379"
 "#;
-        // `redis` is not implemented yet, so this is also the record of what the error looks like for a
-        // driver that is planned and not built: `unknown variant`, not a silent no-op.
         let err = Config::from_toml(text).expect_err("must not be accepted");
         let message = err.to_string();
         assert!(
-            message.contains("unknown variant `redis`"),
+            message.contains("unknown variant `redys`"),
             "the error must name the variant: {message}"
         );
         assert!(
             message.contains("`memory`"),
             "and say what there is: {message}"
         );
+    }
+
+    /// `driver = "redis"` is refused when the build has no Redis, and accepted when it has.
+    ///
+    /// The two halves in one test because they are one question — what does a file naming a feature-gated
+    /// driver do — and the answer must differ by the *build* rather than by the file. A configuration that
+    /// named `redis` and silently got no store would be worse than either answer: `volucer check` would
+    /// pass and the deployment would refuse every `kv.*` call at run time, with nothing saying why.
+    ///
+    /// Note that `#[cfg]` decides which assertion runs, not which file is read, so a file that only works
+    /// in one build is impossible to write by accident.
+    #[test]
+    fn a_feature_gated_driver_is_refused_by_name_when_the_build_has_no_such_driver() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[kv.cache]
+driver = "redis"
+url = "redis://127.0.0.1:6379"
+"#;
+        let parsed = Config::from_toml(text);
+        #[cfg(feature = "redis")]
+        {
+            let config = parsed.expect("the redis driver is compiled in, so this must parse");
+            config
+                .validate()
+                .expect("a plaintext redis URL with no credential is a valid configuration");
+            let storage = config.kv.get("cache").expect("cache is configured");
+            assert_eq!(storage.driver(), "redis");
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            let err =
+                parsed.expect_err("the redis driver is not compiled in, so this must not parse");
+            let message = err.to_string();
+            assert!(
+                message.contains("unknown variant `redis`"),
+                "the refusal must name the variant, so the operator knows the driver is unknown rather \
+                 than misspelled: {message}"
+            );
+            assert!(
+                message.contains("`memory`"),
+                "and list what this build does have: {message}"
+            );
+        }
+    }
+
+    /// A Redis URL that is not a Redis URL is refused, and one carrying a credential over plaintext too.
+    ///
+    /// The second is the one worth having: `redis://user:password@host` puts a password on the wire in the
+    /// clear, and an operator who wrote it has almost certainly not noticed. It is an error rather than a
+    /// warning because a *configuration* is the one place where nobody is watching a log at the moment the
+    /// decision is made — and `rediss://` is the fix, which the message says.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_redis_url_is_checked_for_shape_and_for_a_credential_on_a_plaintext_connection() {
+        let with = |url: &str| {
+            let text = format!(
+                r#"
+[server]
+http = "127.0.0.1:8080"
+[kv.cache]
+driver = "redis"
+url = "{url}"
+"#
+            );
+            Config::from_toml(&text)
+                .expect("the file parses")
+                .validate()
+        };
+
+        with("redis://127.0.0.1:6379").expect("a plain loopback URL is the ordinary case");
+        with("rediss://user:secret@redis.example.com:6380").expect("a credential over TLS is fine");
+
+        let err = with("127.0.0.1:6379").expect_err("a bare host:port is not a URL this accepts");
+        assert!(err.to_string().contains("redis://"), "{err}");
+
+        let err = with("redis://user:secret@redis.example.com:6379")
+            .expect_err("a credential over plaintext must be refused");
+        let message = err.to_string();
+        assert!(
+            !message.contains("secret"),
+            "and the message must not repeat the password: {message}"
+        );
+        assert!(
+            message.contains("rediss://"),
+            "it must say what to do instead: {message}"
+        );
+    }
+
+    /// A zero connection pool is refused, because nothing could ever be served from it.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_zero_redis_pool_size_is_refused_with_the_default_quoted_back() {
+        let text = r#"
+[server]
+http = "127.0.0.1:8080"
+[kv.cache]
+driver = "redis"
+url = "redis://127.0.0.1:6379"
+pool_size = 0
+"#;
+        let err = Config::from_toml(text)
+            .expect("the file parses")
+            .validate()
+            .expect_err("must not validate");
+        let message = err.to_string();
+        assert!(message.contains("kv.cache.pool_size"), "{message}");
+        assert!(message.contains("16"), "and quote the default: {message}");
     }
 
     /// A key inside a `[kv.<name>]` table that the driver does not have is refused.

@@ -12,3 +12,11 @@ serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
+
+[features]
+default = []
+# Enables the `redis` KV driver *in the configuration model*: a build without it refuses
+# `driver = "redis"` at parse time, which is the honest answer, rather than accepting a table whose store
+# cannot be built. The feature carries no dependency of its own — the driver itself lives in
+# `volucer-kv` — so this only widens the enum.
+redis = []

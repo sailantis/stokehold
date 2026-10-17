@@ -39,10 +39,14 @@
 //! a cache miss that looks like the application's bug.
 
 pub mod memory;
+#[cfg(feature = "redis")]
+pub mod redis_store;
 
 use std::time::Duration;
 
 pub use memory::MemoryStore;
+#[cfg(feature = "redis")]
+pub use redis_store::RedisStore;
 
 /// What a key-value store can do.
 ///

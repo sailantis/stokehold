@@ -402,6 +402,23 @@ base_port = 19001
 # driver = "memory"
 # max_bytes = 67108864            # 64 MiB; the default
 
+# Redis, shared between processes and surviving a restart of this one. Needs a build with the
+# `redis` feature -- `cargo install volucer --features redis` -- or `volucer check` refuses this
+# table by name rather than starting a server whose calls would all fail. A URL rather than
+# separate host/port/password keys because that is what every other Redis client takes.
+#
+# `rediss://` for TLS. A password in a `redis://` URL is refused rather than warned about: an
+# operator who wrote one has probably not noticed that it crosses the network in the clear, and a
+# configuration file is the one place nobody is watching a log when the decision is made.
+#
+# Every key this storage writes is prefixed `volucer:kv:<name>:`, which is what lets two storages
+# share one server -- a `clear` on one cannot empty the other. That prefix is also what to search
+# for when clearing a stale cache by hand.
+# [kv.shared]
+# driver = "redis"
+# url = "redis://127.0.0.1:6379"
+# pool_size = 16                  # one per worker is the natural size; a call blocks the worker that asked
+
 # Grant a backend access to one of them by name. A bare "kv" is refused, because
 # a deployment that adds a second storage later would find the first worker's
 # calls quietly going somewhere else.

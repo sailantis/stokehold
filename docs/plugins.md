@@ -609,15 +609,22 @@ the server, because that is where the E2E-encryption case lives. `deleteMultiple
 `getMultiple` and `setMultiple` exist because they are one call where the loop is many, and a delete
 of n keys is n cheap calls whose batched form would buy a round trip and cost a wire format.
 
-**Drivers, in order.** `memory` (**done**) → `redis` (`redis-rs`, already the right shape for both KV
-and the lock in §6.3, so one dependency serves two features) → `file` (an embedded store; see the
-hazard below) → `memcached` (a small text-protocol client; the weakest of the four because RR's own
-memcached driver cannot report TTL, so it is last and optional).
+**Drivers, in order.** `memory` (**done**) → `redis` (**done**, behind the `redis` feature) → `file` (an
+embedded store; see the hazard below) → `memcached` (a small text-protocol client; the weakest of the four
+because RR's own memcached driver cannot report TTL, so it is last and optional).
 
 **Hazard.** RR's boltdb driver has a `permissions: 0755` default on a *database file*, which is
 world-readable where it should not be. If volucer ships a file-backed driver, the default is `0600`
 and the check is on the file rather than on the directory — the same rule plan.md hazard 73 settled
 for certificates.
+
+**What the `redis` feature costs, measured rather than assumed.** Thirty-one crates, almost all of them
+ICU through the `url` parser the client uses for its connection string — `icu_normalizer`, `zerotrie`,
+`yoke`, and their derive crates. That is a real cost and it is why the feature exists rather than the
+dependency being unconditional: `cargo tree -p volucer --no-default-features` contains no `redis` and no
+ICU at all, and a deployment using the in-memory driver pays none of it. Worth writing down because the
+alternative — "just depend on redis, it is one crate" — is wrong by a factor of thirty-one, and the
+measurement is the only way anybody would know.
 
 **Sizing.** S for `memory`, M for `redis` and the trait, S more per additional driver.
 
@@ -1028,7 +1035,7 @@ progress on something earlier look bigger.
 | --- | --- | --- | --- | --- |
 | 1 | **Metrics + status** | — | S–M | **Done.** No calls, no driver, no protocol change; makes everything after it observable |
 | 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
-| 3 | **KV: `memory`, then `redis`** | 2 | S, M | **`memory` done.** Smallest service on the call path; proves the registry shape. `redis` is next and shares its client with step 4 |
+| 3 | **KV: `memory`, then `redis`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4 |
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | Shares the Redis client; carries the fencing warning |
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | The layer plan.md §6 already designed |

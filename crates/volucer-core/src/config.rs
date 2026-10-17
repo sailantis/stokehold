@@ -4362,7 +4362,7 @@ command = "php worker.php"
     }
 
     /// `volucer.example.toml` parses and validates.
-
+    ///
     /// It is documentation, and a documentation file that does not parse is documentation that
     /// lies: an operator copies a block out of it, gets a message about a key that does not exist,
     /// and has no way to tell whether the file is wrong or they are. **Nothing else in the tree

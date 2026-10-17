@@ -1007,8 +1007,8 @@ progress on something earlier look bigger.
 
 | # | Step | Depends on | Size | Why here |
 | --- | --- | --- | --- | --- |
-| 1 | **Metrics + status** | — | S–M | No calls, no driver, no protocol change; makes everything after it observable |
-| 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | The branch on inbound frames (§4.2) and the method registry. Two message types, one match arm, one `catch_unwind`, one deadline policy — and a control plane exists from the first commit |
+| 1 | **Metrics + status** | — | S–M | **Done.** No calls, no driver, no protocol change; makes everything after it observable |
+| 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
 | 3 | **KV: `memory`, then `redis`** | 2 | S, M | Smallest service on the call path; proves the registry shape |
 | 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | Shares the Redis client; carries the fencing warning |
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | Biggest item; the consumer-side exchange is the interesting part |
@@ -1023,6 +1023,24 @@ Steps 1–2 are the ones worth doing regardless of how much of the rest is ever 
 endpoint and a control plane are what make a server operable, and neither requires believing
 anything in §6 or §7. Step 2 is also the whole of the "should it be a socket?" question, and its
 answer is now *no* — which means every later step is a registry entry rather than a transport.
+
+**1 and 2 are done**, and three things about them are worth more than the status line:
+
+- **The seam that mattered was the last one.** The registry, the message types and the read-loop arm were
+  each correct and independently tested, and a call still could not happen until the handler was installed
+  on a live channel — because *that* is the code that decides which workers have a capability. A test per
+  layer cannot see a missing `set_call_handler`; the end-to-end test did, in one run.
+- **That test then found a deadlock in the call path**, not in any layer of it: a call is served from
+  inside a request, so a handler that takes a slot lock waits for its own caller's. See the hazard in §4.2
+  — it is the one design rule in this document that could not have been derived by reading either side
+  alone.
+- **A capability is now visible in the file that grants it.** `services = ["config"]` on a backend is the
+  whole of what its workers may reach, checked against an allow-list at startup so a typo is a startup
+  failure rather than an application that silently cannot call anything.
+
+Step 3 (KV) is next: the first service to be a registry entry rather than machinery, and the one that
+tests whether the "capability is a namespace" shape holds up for a service that is not about the server
+itself.
 
 Note the shape of the end of the list. gRPC is **no longer one XL item behind a gate**: it is three
 items of S–M each, the first of which needs no schema, no worker and no new listener. The XL item

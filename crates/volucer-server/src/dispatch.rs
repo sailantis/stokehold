@@ -308,6 +308,44 @@ impl Dispatcher {
             .collect()
     }
 
+    /// Whether every worker pool can serve a request now.
+    ///
+    /// **Only worker pools count, and the asymmetry is the point.** A pool that volucer started
+    /// itself is the one that spends a measurable time booting — four PHP processes, each loading
+    /// an application — so it is the one a readiness probe should wait for. An `external` php-fpm is
+    /// already running and supervised by systemd, and an `upstream` origin is somebody else's
+    /// process; waiting for either would be this server reporting on a runtime it does not own.
+    ///
+    /// A dispatcher with no worker pools at all is ready, which is the honest answer for a
+    /// static-only deployment or one behind an already-running FPM.
+    pub fn is_ready(&self) -> bool {
+        self.backends.values().all(|backend| backend.is_ready())
+    }
+
+    /// One line per worker pool that cannot serve yet, for the body of a 503.
+    pub fn readiness_reasons(&self) -> Vec<String> {
+        self.backends
+            .values()
+            .filter_map(Backend::readiness_reason)
+            .collect()
+    }
+
+    /// Publish every worker pool's gauges into a metrics registry.
+    ///
+    /// `&self` and one call at one moment, so the numbers a scrape reads are one picture of the
+    /// pool rather than several: `workers_ready + workers_working + workers_invalid` equals
+    /// `total_workers` by construction, and a graph where the parts do not sum to the whole is a
+    /// graph nobody trusts when it matters.
+    ///
+    /// Called on the scrape rather than on a timer. A background timer would be a thread whose only
+    /// job is to be read by a metric nobody may ever fetch, and the cost here is a handful of atomic
+    /// stores per pool — measured against a scrape that already renders every family in the process.
+    pub fn publish_metrics(&self, registry: &volucer_metrics::Registry) {
+        for backend in self.backends.values() {
+            backend.publish_metrics(registry);
+        }
+    }
+
     /// Stop every backend.
     ///
     /// `&mut self`, and only reachable by the owner: `Drop` is what reaps the

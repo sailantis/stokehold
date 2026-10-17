@@ -318,6 +318,51 @@ impl Backend {
         }
     }
 
+    /// Whether this backend can serve a request right now.
+    ///
+    /// **False for a worker pool with no free slot, and true for everything else**, which is the
+    /// asymmetry a readiness probe needs rather than a general statement about health. A pool whose
+    /// workers are all busy is ready in the sense that matters — it will answer, possibly after a
+    /// wait — while a pool whose workers are still handshaking will not answer at all. The
+    /// distinction is drawn by the pool itself; see [`WorkerPool::is_ready`].
+    ///
+    /// The three CGI-shaped kinds that are not worker pools answer `true` unconditionally, because
+    /// volucer does not own their boot: an `external` php-fpm is already running and supervised by
+    /// systemd, and a `spawn_cgi` pool's `php-cgi` processes are up before the pool is built — the
+    /// constructor waits for the port. A server that made a readiness probe wait for a process it did
+    /// not start would be reporting on somebody else's runtime.
+    pub fn is_ready(&self) -> bool {
+        match self {
+            Backend::Worker { pool, .. } => pool.is_ready(),
+            Backend::External { .. } | Backend::SpawnCgi { .. } | Backend::Upstream { .. } => true,
+        }
+    }
+
+    /// Why this backend cannot serve yet, or `None` when it can.
+    pub fn readiness_reason(&self) -> Option<String> {
+        match self {
+            Backend::Worker { name, pool } if !pool.is_ready() => Some(format!(
+                "{name}: {} of {} workers ready",
+                pool.free_slots(),
+                pool.len()
+            )),
+            _ => None,
+        }
+    }
+
+    /// Publish this backend's gauges, when it has any to publish.
+    ///
+    /// Only a worker pool has numbers worth graphing: an `external` pool is somebody else's to
+    /// report on, and a `spawn_cgi` pool has no per-worker telemetry because `php-cgi` has no channel
+    /// to send any. A backend that published zeroes for those would make `rr_http_total_workers`
+    /// claim a number nobody counted.
+    pub fn publish_metrics(&self, registry: &volucer_metrics::Registry) {
+        match self {
+            Backend::Worker { pool, .. } => pool.publish_metrics(registry),
+            Backend::External { .. } | Backend::SpawnCgi { .. } | Backend::Upstream { .. } => {}
+        }
+    }
+
     /// Serve a request from an externally managed FastCGI server.
     ///
     /// A connection is taken from the pool for the duration of one request, so

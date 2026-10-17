@@ -953,6 +953,15 @@ fn serve(
         }
     };
 
+    // The metrics and status listener, when the configuration asks for one. Built here — after the
+    // dispatcher exists, because readiness reads it, and **before** the request listeners bind, so a
+    // bad address on a metrics table is reported before a serving port is taken.
+    //
+    // It is not one of the `http`/`https` listeners and deliberately shares none of their settings:
+    // those face the public and may be TLS-only, while this one is meant to be reachable by a
+    // scraper and an orchestrator and by nothing else.
+    let status = start_status(&config, &dispatcher)?;
+
     let http = match &http_address {
         Some(address) => {
             let running = RunningHttp::start_with_tls(
@@ -1080,6 +1089,14 @@ fn serve(
         report_tls(&stats);
     }
 
+    // Stopped last, after the request listeners have gone: a scraper that reads a pool count while
+    // the pools are being reaped would see it fall to zero for a reason that has nothing to do with
+    // the deployment's health, and the last scrape of a shutdown is exactly the one an operator
+    // looks at.
+    if let Some(status) = status {
+        status.stop();
+    }
+
     // Printed rather than traced: a load test wants this line in the same log as
     // the run it describes, and a filter that could silence it is the last thing a
     // diagnostic should depend on.
@@ -1124,6 +1141,156 @@ fn contention_line(contention: &Contention) -> String {
         contention.busiest,
         contention.busiest_us,
     )
+}
+
+/// Readiness, answered from the dispatcher.
+///
+/// A struct rather than a closure because the endpoint holds it for the process's life and both
+/// methods are needed; a pair of closures would be two things to keep in step.
+struct DispatcherReadiness {
+    dispatcher: Arc<Dispatcher>,
+}
+
+impl volucer_http::Readiness for DispatcherReadiness {
+    fn is_ready(&self) -> bool {
+        self.dispatcher.is_ready()
+    }
+
+    fn reasons(&self) -> Vec<String> {
+        self.dispatcher.readiness_reasons()
+    }
+}
+
+/// The exposition, read from the dispatcher's pools at the moment of the scrape.
+///
+/// This is where `/metrics` stops being a static page and starts describing the process. The
+/// registry is the process's one, the `refresh` walks every worker pool, and the render is what the
+/// registry already does — so the ordering that matters (read, then render) lives in one place
+/// instead of being a rule the listener has to remember.
+struct DispatcherMetrics {
+    dispatcher: Arc<Dispatcher>,
+    registry: &'static volucer_metrics::Registry,
+    path: String,
+    prefix: Option<String>,
+}
+
+impl volucer_http::MetricsSource for DispatcherMetrics {
+    fn refresh(&self) {
+        self.dispatcher.publish_metrics(self.registry);
+    }
+
+    fn render(&self) -> String {
+        self.registry.render()
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+}
+
+/// The process's metric registry, with the `rr_http_*` families already described in it.
+///
+/// **Process-wide, because one `/metrics` page has to describe the whole process.** Two registries
+/// would be two scrapes with half the numbers in each, and a worker pool that published into one
+/// while the listener rendered the other is exactly the class of bug this step exists to avoid.
+///
+/// It is initialised on first use, which is the first scrape — so a deployment with no `[metrics]`
+/// table never builds it at all, and the `describe` calls (idempotent) cost nothing.
+static METRICS: std::sync::LazyLock<volucer_metrics::Registry> = std::sync::LazyLock::new(|| {
+    let registry = volucer_metrics::Registry::new();
+    volucer_metrics::http::describe(&registry);
+    registry
+});
+
+/// Build the metrics and status listener, when the configuration asks for one.
+///
+/// **One listener for both tables**, because a deployment that wants a scraper and an orchestrator
+/// wants two paths on one port, and two ports would be two things to firewall. Which endpoints exist
+/// is decided by which tables are present: `[metrics]` without `[status]` serves the exposition and
+/// answers 404 to `/health`, and the reverse.
+///
+/// Where the two name different addresses it is a **refusal**, not a silent choice: two listeners
+/// would double the thread, the runtime and the shutdown path to serve two paths that no deployment
+/// needs on two ports, and quietly honouring one of the two settings would be a configuration that
+/// does not mean what it says.
+fn build_status(
+    config: &Config,
+    dispatcher: &Arc<Dispatcher>,
+) -> Result<Option<RunningStatus>, ServerError> {
+    if config.metrics.is_none() && config.status.is_none() {
+        return Ok(None);
+    }
+
+    let readiness = || -> Arc<dyn volucer_http::Readiness> {
+        Arc::new(DispatcherReadiness {
+            dispatcher: Arc::clone(dispatcher),
+        })
+    };
+
+    let address = match (&config.metrics, &config.status) {
+        (Some(metrics), Some(status)) => {
+            if metrics.address != status.address {
+                return Err(ServerError::Misconfigured {
+                    backend: "<status>".to_string(),
+                    reason: format!(
+                        "[metrics] listens on {} and [status] on {}; they share one listener, so \
+                         give them the same address or configure only one",
+                        metrics.address, status.address
+                    ),
+                });
+            }
+            status.address.clone()
+        }
+        (Some(metrics), None) => metrics.address.clone(),
+        (None, Some(status)) => status.address.clone(),
+        (None, None) => unreachable!("checked above"),
+    };
+
+    let metrics = config.metrics.as_ref().map(|metrics| {
+        let source: Arc<dyn volucer_http::MetricsSource> = Arc::new(DispatcherMetrics {
+            dispatcher: Arc::clone(dispatcher),
+            registry: &METRICS,
+            path: metrics.path.clone(),
+            prefix: metrics.prefix.clone(),
+        });
+        source
+    });
+
+    let services = volucer_http::StatusServices {
+        metrics,
+        readiness: config.status.as_ref().map(|_| readiness()),
+        unavailable_status: config
+            .status
+            .as_ref()
+            .map_or(503, |status| status.unavailable_status_code),
+    };
+
+    RunningStatus::start(&address, services)
+        .map(Some)
+        .map_err(|err| ServerError::Listener {
+            reason: err.to_string(),
+        })
+}
+
+/// Start the metrics and status listener, when the configuration asks for one, and say where it
+/// came up.
+///
+/// The address is printed rather than traced for the same reason the other listeners' are: an
+/// operator looking for the port a scraper should poll wants it in the same block as `http` and
+/// `fastcgi`, not behind a log filter.
+fn start_status(
+    config: &Config,
+    dispatcher: &Arc<Dispatcher>,
+) -> Result<Option<RunningStatus>, ServerError> {
+    let running = build_status(config, dispatcher)?;
+    if let Some(listener) = &running {
+        println!("  metrics:          {}", listener.local_addr());
+    }
+    Ok(running)
 }
 
 /// Wait until the shutdown flag is set.

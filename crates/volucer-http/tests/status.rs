@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyper::StatusCode;
 use volucer_http::status::{Readiness, RunningStatus, StatusServices};
 
 /// One HTTP/1.1 GET, returning the whole response as text.
@@ -64,17 +63,53 @@ impl Readiness for Flappable {
     }
 }
 
+/// A registry served as-is, with a path and an optional prefix.
+///
+/// What the tests need that the production code does not: a `MetricsSource` whose render is whatever
+/// the test put in the registry. `DispatcherMetrics` in the CLI is the other implementation, and it
+/// is tested where it lives — against a real pool — because its `refresh` reads live worker state
+/// that could not be faked here without the test asserting on its own fixture.
+struct FixedSource {
+    registry: volucer_metrics::Registry,
+    path: String,
+    prefix: Option<String>,
+}
+
+impl FixedSource {
+    fn at(path: &str) -> Self {
+        FixedSource {
+            registry: volucer_metrics::Registry::new(),
+            path: path.to_string(),
+            prefix: None,
+        }
+    }
+}
+
+impl volucer_http::MetricsSource for FixedSource {
+    fn render(&self) -> String {
+        self.registry.render()
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+}
+
 fn metrics_services() -> StatusServices {
-    let registry = volucer_metrics::Registry::new();
-    registry.describe("rr_test_total", volucer_metrics::Kind::Counter, "A counter");
-    registry.counter_add("rr_test_total", &[], 1);
+    let source = FixedSource::at("/metrics");
+    source
+        .registry
+        .describe("rr_test_total", volucer_metrics::Kind::Counter, "A counter");
+    source.registry.counter_add("rr_test_total", &[], 1);
 
     StatusServices {
-        metrics: Some(registry),
-        metrics_path: "/metrics".to_string(),
-        metrics_prefix: None,
+        metrics: Some(Arc::new(source)),
         readiness: None,
-        unavailable_status: StatusCode::SERVICE_UNAVAILABLE,
+        unavailable_status: 503,
     }
 }
 
@@ -119,11 +154,13 @@ fn a_prefix_is_applied_to_every_name_including_a_histograms_suffixes() {
     let running = RunningStatus::start(
         "127.0.0.1:0",
         StatusServices {
-            metrics: Some(registry),
-            metrics_path: "/metrics".to_string(),
-            metrics_prefix: Some("myapp_".to_string()),
+            metrics: Some(Arc::new(FixedSource {
+                registry,
+                path: "/metrics".to_string(),
+                prefix: Some("myapp_".to_string()),
+            })),
             readiness: None,
-            unavailable_status: StatusCode::SERVICE_UNAVAILABLE,
+            unavailable_status: 503,
         },
     )
     .expect("start");
@@ -153,10 +190,8 @@ fn health_answers_while_the_process_is_alive_even_if_it_is_not_ready() {
         "127.0.0.1:0",
         StatusServices {
             metrics: None,
-            metrics_path: "/metrics".to_string(),
-            metrics_prefix: None,
             readiness: Some(readiness),
-            unavailable_status: StatusCode::SERVICE_UNAVAILABLE,
+            unavailable_status: 503,
         },
     )
     .expect("start");
@@ -180,10 +215,8 @@ fn ready_answers_the_configured_status_and_says_why_it_is_not() {
         "127.0.0.1:0",
         StatusServices {
             metrics: None,
-            metrics_path: "/metrics".to_string(),
-            metrics_prefix: None,
             readiness: Some(readiness.clone()),
-            unavailable_status: StatusCode::SERVICE_UNAVAILABLE,
+            unavailable_status: 503,
         },
     )
     .expect("start");
@@ -216,10 +249,8 @@ fn the_unavailable_status_is_the_configured_one() {
         "127.0.0.1:0",
         StatusServices {
             metrics: None,
-            metrics_path: "/metrics".to_string(),
-            metrics_prefix: None,
             readiness: Some(readiness),
-            unavailable_status: StatusCode::INTERNAL_SERVER_ERROR,
+            unavailable_status: 500,
         },
     )
     .expect("start");
@@ -270,9 +301,21 @@ fn readiness_endpoints_are_absent_when_no_readiness_is_configured() {
 /// move it. A fixed path would make that a routing conflict rather than a naming choice.
 #[test]
 fn the_metrics_path_is_configurable() {
-    let mut services = metrics_services();
-    services.metrics_path = "/internal/counters".to_string();
-    let running = RunningStatus::start("127.0.0.1:0", services).expect("start");
+    let source = FixedSource::at("/internal/counters");
+    source
+        .registry
+        .describe("rr_test_total", volucer_metrics::Kind::Counter, "A counter");
+    source.registry.counter_add("rr_test_total", &[], 1);
+
+    let running = RunningStatus::start(
+        "127.0.0.1:0",
+        StatusServices {
+            metrics: Some(Arc::new(source)),
+            readiness: None,
+            unavailable_status: 503,
+        },
+    )
+    .expect("start");
 
     let (head, body) = get(running.local_addr(), "/internal/counters");
     assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
@@ -330,10 +373,8 @@ fn an_empty_configuration_answers_404_rather_than_failing() {
         "127.0.0.1:0",
         StatusServices {
             metrics: None,
-            metrics_path: "/metrics".to_string(),
-            metrics_prefix: None,
             readiness: None,
-            unavailable_status: StatusCode::SERVICE_UNAVAILABLE,
+            unavailable_status: 503,
         },
     )
     .expect("start");

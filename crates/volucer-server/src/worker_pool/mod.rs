@@ -529,6 +529,88 @@ impl WorkerPool {
             .collect()
     }
 
+    /// Whether this pool has at least one worker able to take a request.
+    ///
+    /// **A pool is ready when a slot is free, not when every worker is idle.** The distinction
+    /// matters because a worker pool is built by starting every process and waiting for each to
+    /// finish its handshake, and that takes as long as the application takes to boot — hundreds of
+    /// milliseconds for a framework, more for one that opens database connections at boot. So a
+    /// readiness probe that waited for all of them would hold traffic back long after the first
+    /// worker could have answered, while one that answered immediately would send traffic to a pool
+    /// that has nothing to serve it with.
+    ///
+    /// A free slot is exactly the condition the request path needs, which is why this asks it that
+    /// way rather than counting handshakes: `free_slots` is already what `pick_slot` waits on, and a
+    /// second, subtly different notion of "available" is how a readiness probe and a dispatcher come
+    /// to disagree about whether a deployment is up.
+    pub fn is_ready(&self) -> bool {
+        self.free_slots() > 0
+    }
+
+    /// Publish this pool's gauges into a metrics registry.
+    ///
+    /// One call at one moment, so the numbers a scrape reads are one picture of the pool: the parts
+    /// sum to the whole by construction. `total_workers` is written even when a pool has no workers
+    /// yet, because "zero workers" is the answer a graph needs rather than a missing series.
+    ///
+    /// The per-worker figures come from the slots, which is why this holds every lock in turn — the
+    /// same thing `pids` and `peak_memory_bytes` do, and safe for the same reason: no lock is held
+    /// across a request.
+    pub fn publish_metrics(&self, registry: &volucer_metrics::Registry) {
+        // The free list is the pool's own answer to "which slots are available", so both the count
+        // and the per-worker state are read from it rather than inferred from a second flag that
+        // could disagree with it. Taken and released immediately: this is a reading, not a lease.
+        //
+        // A `HashSet` rather than a `Vec::contains`, because this runs once per scrape and the
+        // membership test is inside a per-slot loop — quadratic on a pool large enough that the
+        // numbers matter.
+        let free_ids: std::collections::HashSet<usize> = {
+            let free = self
+                .free
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            free.ids.iter().copied().collect()
+        };
+        let idle = free_ids.len();
+
+        let slots = self.locked_slots();
+        let total = slots.len();
+        let working = total.saturating_sub(idle);
+        let mut workers = Vec::with_capacity(total);
+        for (index, slot) in slots.iter().enumerate() {
+            // A slot is either in the free list or leased by a request. There is no third state,
+            // because a worker that fails is replaced rather than parked.
+            let state = if free_ids.contains(&index) {
+                volucer_metrics::http::state::READY
+            } else {
+                volucer_metrics::http::state::WORKING
+            };
+            workers.push(volucer_metrics::http::WorkerSnapshot {
+                pid: slot.child.id(),
+                state,
+                // From the worker's own `END` frame, so it is the peak it reported and zero until it
+                // has served something. Reporting the pool's own resident set instead would be a
+                // different number wearing the same name.
+                memory_bytes: slot.peak_memory_bytes,
+            });
+        }
+
+        volucer_metrics::http::set_pool(
+            registry,
+            &volucer_metrics::http::PoolSnapshot {
+                total_workers: total,
+                workers_ready: idle,
+                workers_working: working,
+                // Nothing here can be "invalid": the pool replaces a worker that fails rather than
+                // keeping it in the rotation, so a slot in the list is one that is expected to serve.
+                // Reported as zero rather than omitted, because a dashboard that queries this wants a
+                // line, and the absence of a line is indistinguishable from a broken exporter.
+                workers_invalid: 0,
+                workers,
+            },
+        );
+    }
+
     /// Serve one request on the next worker in rotation.
     ///
     /// Takes `&self`, so the same pool can be serving other requests on other

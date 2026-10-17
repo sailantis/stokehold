@@ -48,7 +48,9 @@ pub use listener::{
     to_cgi, to_cgi_routed, HttpLimits, HttpListener, HttpShutdown, HttpStats, ListenerSettings,
     ReloadHandle, ReloadHandles, Reloaded, Resolved, RunningHttp, TlsSettings,
 };
-pub use status::{AlwaysReady, Readiness, RunningStatus, StatusServices, StatusShutdown};
+pub use status::{
+    AlwaysReady, MetricsSource, Readiness, RunningStatus, StatusServices, StatusShutdown,
+};
 pub use tls::{
     CertificateSet, Certs, ServerCertificate, SiteCertificate, SiteCertificatePair, SniResolver,
     TlsError,

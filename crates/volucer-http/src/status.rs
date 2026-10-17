@@ -79,29 +79,72 @@ impl Readiness for AlwaysReady {
     }
 }
 
+/// Something a scrape can read.
+///
+/// A trait rather than a bare [`Registry`], because a scrape has to *produce* the numbers it renders:
+/// the pool gauges are a reading of live state, so something has to take that reading at the moment
+/// of the request. Handing the listener a `Registry` alone would render whatever happened to be in it
+/// — which, with no background timer, is nothing.
+///
+/// Implemented for [`Registry`] itself so a test can serve one directly, and by the CLI over the
+/// dispatcher, which is the implementation that publishes before it renders.
+pub trait MetricsSource: Send + Sync {
+    /// Take a fresh reading, before the render below.
+    ///
+    /// Called on every scrape and expected to be cheap: the CLI's implementation walks the worker
+    /// pools and does a handful of atomic stores each. A slow implementation here is a slow scrape,
+    /// which is why it is a separate method rather than something the caller cannot see.
+    fn refresh(&self) {}
+
+    /// Render the exposition.
+    fn render(&self) -> String;
+
+    /// The path this is served at.
+    fn path(&self) -> &str;
+
+    /// A prefix prepended to every metric name, or `None`.
+    fn prefix(&self) -> Option<&str>;
+}
+
+/// A plain registry, served as it stands.
+///
+/// What a test uses, and what `refresh` being a no-op means for anything that has no live state to
+/// read: every series it has was written by whoever wrote it, and there is nothing more to collect.
+impl MetricsSource for Registry {
+    fn render(&self) -> String {
+        Registry::render(self)
+    }
+
+    fn path(&self) -> &str {
+        "/metrics"
+    }
+
+    fn prefix(&self) -> Option<&str> {
+        None
+    }
+}
+
 /// What the listener needs that is not configuration.
 pub struct StatusServices {
-    /// The metric registry behind `/metrics`, or `None` to serve no metrics endpoint.
-    pub metrics: Option<Registry>,
-    /// The path the exposition is served at.
-    pub metrics_path: String,
-    /// A prefix prepended to every metric name at render time.
-    pub metrics_prefix: Option<String>,
+    /// The exposition behind the metrics path, or `None` to serve no metrics endpoint.
+    pub metrics: Option<Arc<dyn MetricsSource>>,
     /// Readiness, behind `/health` and `/ready`, or `None` to serve neither.
     pub readiness: Option<Arc<dyn Readiness>>,
     /// What to answer when not ready.
-    pub unavailable_status: StatusCode,
+    ///
+    /// A `u16` rather than a `hyper::StatusCode`, so that a caller which only *configures* this
+    /// listener does not have to depend on `hyper` to say a number. Validation has already refused
+    /// anything outside `100..=599`, and the conversion below is where that promise is spent.
+    pub unavailable_status: u16,
 }
 
 impl std::fmt::Debug for StatusServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Hand-written because `Arc<dyn Readiness>` is not `Debug`, and every other struct in this
-        // crate is. A derived one would force the trait to carry a `Debug` bound it has no other
+        // crate is. A derived one would force the traits to carry a `Debug` bound they have no other
         // use for.
         f.debug_struct("StatusServices")
             .field("metrics", &self.metrics.is_some())
-            .field("metrics_path", &self.metrics_path)
-            .field("metrics_prefix", &self.metrics_prefix)
             .field("readiness", &self.readiness.is_some())
             .field("unavailable_status", &self.unavailable_status)
             .finish()
@@ -262,11 +305,16 @@ fn answer(
     // cache-buster, and treating it as a different path would answer 404 to a legitimate scrape.
     let path = request.uri().path();
 
-    if let Some(registry) = &services.metrics {
-        if path == services.metrics_path {
-            let body = match &services.metrics_prefix {
-                Some(prefix) => prefix_metrics(&registry.render(), prefix),
-                None => registry.render(),
+    if let Some(metrics) = &services.metrics {
+        if path == metrics.path() {
+            // Taken *before* the render, and that ordering is the whole reason this is a trait:
+            // the pool gauges are a reading of live state, so a scrape that rendered first would
+            // report whatever the previous scrape left behind — or nothing at all, on the first one.
+            metrics.refresh();
+            let rendered = metrics.render();
+            let body = match metrics.prefix() {
+                Some(prefix) => prefix_metrics(&rendered, prefix),
+                None => rendered,
             };
             return text(
                 StatusCode::OK,
@@ -296,7 +344,12 @@ fn answer(
                     body.push('\n');
                 }
                 text(
-                    services.unavailable_status,
+                    // The configured code, and `SERVICE_UNAVAILABLE` if the number is somehow not one
+                    // — validation refuses anything outside `100..=599`, so the fallback is unreachable
+                    // from configuration and exists because a `StatusCode` cannot be built from an
+                    // arbitrary `u16` without a decision being made somewhere.
+                    StatusCode::from_u16(services.unavailable_status)
+                        .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
                     body,
                     "text/plain; charset=utf-8",
                 )

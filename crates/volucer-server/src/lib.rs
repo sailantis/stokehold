@@ -5,6 +5,7 @@
 
 pub mod backend;
 pub mod build;
+pub mod calls;
 pub mod dispatch;
 pub mod error;
 pub mod frontend;
@@ -15,6 +16,9 @@ pub mod worker_pool;
 
 pub use backend::{Backend, Contention};
 pub use build::{MINIMUM_PHP_VERSION, WORKER_PROTOCOL_VERSION};
+pub use calls::{
+    ConfigNamespace, MethodRegistry, Namespace, PoolLookup, WorkerStatus, WorkersNamespace,
+};
 pub use dispatch::Dispatcher;
 pub use error::{Result, ServerError};
 pub use frontend::fastcgi::{self, IncomingRequest};

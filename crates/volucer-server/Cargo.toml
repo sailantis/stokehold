@@ -35,6 +35,10 @@ tokio.workspace = true
 # the CGI environment, so it implements `Serialize` for its own borrowed header type rather
 # than collecting owned pairs for the worker crate to serialize.
 serde.workspace = true
+# For the call registry's payloads: `Call::params` and a `Return`'s result are JSON, and the
+# `config.describe` answer is a redacted `serde_json::Value`. Already in the graph — `volucer-worker`
+# and `volucer-core` both use it — so naming it here adds no crate.
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

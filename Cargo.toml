@@ -8,6 +8,7 @@ members = [
     "crates/volucer-http",
     "crates/volucer-watch",
     "crates/volucer-observe",
+    "crates/volucer-metrics",
     "crates/volucer-acme",
     "crates/volucer-upstream",
     "crates/volucer",
@@ -39,6 +40,7 @@ volucer-server = { version = "0.1.0", path = "crates/volucer-server" }
 volucer-http = { version = "0.1.0", path = "crates/volucer-http" }
 volucer-watch = { version = "0.1.0", path = "crates/volucer-watch" }
 volucer-observe = { version = "0.1.0", path = "crates/volucer-observe" }
+volucer-metrics = { version = "0.1.0", path = "crates/volucer-metrics" }
 volucer-acme = { version = "0.1.0", path = "crates/volucer-acme" }
 volucer-upstream = { version = "0.1.0", path = "crates/volucer-upstream" }
 bytes = "1"

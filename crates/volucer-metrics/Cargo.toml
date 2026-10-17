@@ -1,0 +1,11 @@
+[package]
+name = "volucer-metrics"
+description = "A metric registry and a hand-written Prometheus exposition encoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tracing.workspace = true

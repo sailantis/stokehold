@@ -704,7 +704,7 @@ Five facts, all read from source rather than from documentation, and together th
    `outgoing.body(answer.body)`, with the comment *"`UnsyncBoxBody` is the reason this needs no
    conversion: an origin's body is exactly what the response type is now"*
    (`crates/volucer-http/src/listener.rs:1323`). `UpstreamBody` and `ResponseBody` are the same
-   type alias.
+   type alias. **This one was a reading and is now a measurement** — see below.
 5. **A gRPC endpoint is the same listener, not a new one.** `serve_connection` is generic over the
    stream and builds a `hyper_util` auto builder with ALPN-aware protocol detection
    (`crates/volucer-http/src/listener.rs:990`), so HTTP/2 with prior knowledge — which the project
@@ -712,15 +712,37 @@ Five facts, all read from source rather than from documentation, and together th
    `/pkg.Service/Method`, which `path_prefix` already expresses
    (`crates/volucer-core/src/config.rs:333`).
 
-**This corrects `plan.md` §6, and the correction matters.** That section says *"every call would
-look failed"* because trailers are absent. That is **true as a statement about code volucer wrote**
-— nothing constructs trailers; the three `grep -i trailer` hits really are a strip list — and it is
-**too pessimistic as a statement about what is achievable**, because finding 4 means a gRPC
-response arriving from a `unix:` origin through the `upstream` backend may *already* reach the
-client with its trailers intact. Whether it does is a test, not a rewrite: the risk in a
-header-only strip list is never the status, which is constructed separately, but a `Trailer:`
-header naming a field that is then not delivered, which RFC 9110 permits. Either way the work is
-"confirm and pin with a test, then add the construction side", not "build framing from scratch".
+#### The trailers claim, measured
+
+Finding 4 was the load-bearing one — `plan.md` §6 says gRPC is gated because trailers are absent,
+and the whole "Tier A is small" argument is that they are *not*. So it was tested rather than
+argued, in `crates/volucer-upstream/tests/trailers.rs`: a plaintext origin answers with a chunked
+response whose trailer section carries `grpc-status: 0` and `grpc-message: OK`, and the test
+asserts the fields reach the caller **with the body intact**.
+
+It passes. Three things about the test are worth carrying into the design:
+
+- **The `Trailer` declaration and the fields are asserted separately**, because "the declaration
+  was stripped" and "the fields were lost with it" are the two readings that a single assertion
+  cannot tell apart. `Trailer` is in `NEVER_FORWARDED`, so it is stripped on purpose, and the
+  fields arrive anyway — which is correct, since they travel as frames and not as headers.
+- **A control asserts that a response with no trailers reports none.** Without it, a `trailers()`
+  that returned `Some` for any reason would pass the main test — hazard 67's shape.
+- **The claim is falsified by handing back an empty body**, which fails the trailer assertion
+  specifically. So the test can fail, and fails for the reason it exists.
+
+**So the correction to `plan.md` §6 is now measured, not argued.** That section's finding is right
+about the *code* — nothing here constructs a trailer, and the three `grep -i trailer` hits really
+are a strip list — and wrong about the *effort*: carrying one already works, and what is missing is
+the construction side alone.
+
+**And the measurement found something the reading did not.** The connector speaks HTTP/2 **only
+over TLS**: `negotiated_h2` is set from the ALPN result and nothing else ever sets it
+(`crates/volucer-upstream/src/client/connect.rs:264`, and `TlsIo`'s `Connection` impl at `:338`),
+so a plaintext or `unix:` origin is pinned to HTTP/1.1. gRPC's transport is HTTP/2, so tier A needs
+either TLS with ALPN or an explicit h2c path that does not exist yet. This is a decision for tier A
+rather than a defect in the proxy — the h1 path carries the trailers correctly today — but it is
+invisible until something needs h2c, which is exactly why it is written down here.
 
 #### What the server actually has to do, and what needs a schema
 
@@ -749,6 +771,15 @@ Route `content-type: application/grpc*` to a Unix-socket origin and relay the ca
 is the **construction** side of trailers — a small `Body` that yields `Frame::trailers` for the two
 status headers — which is a shape this codebase already hand-writes at
 `crates/volucer-http/src/static_files.rs:806`. That is roughly a forty-line type plus tests.
+
+The one thing tier A must settle first is the **transport**, and the measurement above is why:
+an h2c path does not exist, so a gRPC origin is reached either over TLS with ALPN (which works
+today, because ALPN is what sets `negotiated_h2`) or by adding h2c for `http://` and `unix:`
+origins. The second is the one a deployment wants — gRPC over a loopback unix socket is the
+ordinary shape — and it is a real addition rather than a configuration flag. Two candidate
+mechanisms, to be settled by whichever is testable first: hyper's `client::conn::http2::handshake`
+for prior-knowledge h2, or teaching `connect.rs` to answer `Connected::negotiated_h2()` for a
+plaintext origin the configuration has explicitly marked as h2. The decision is §10's.
 
 This is what makes volucer a gRPC *server* for runtimes that already speak it — Node's
 `@grpc/grpc-js`, Go, Python's `grpcio` — **using the same `upstream` backend §7.1 is adding anyway**.
@@ -802,9 +833,11 @@ Replace *"static or dynamic `.proto`"* with:
   fact worth noting: this server does not *construct* frames, hyper does, so the exposure is the
   construction side of trailers and the status mapping rather than a hand-written h2 state machine.
 
-**Sizing.** Tier A: **S–M**. Tier B: **M** (a config surface, an SDK contract, tests). Tier C: **M**
-(`protox` + a reflection service). The worker-as-work question: **L** on its own, and no longer on
-the critical path for either A or B.
+**Sizing.** Tier A: **S–M plus one transport decision** — the trailer construction is small and
+measured, but an h2c path for a plaintext gRPC origin does not exist and is the real cost (§10
+item 3). Tier B: **M** (a config surface, an SDK contract, tests). Tier C: **M** (`protox` + a
+reflection service). The worker-as-work question: **L** on its own, and no longer on the critical
+path for either A or B.
 
 ### 6.7 OTLP export
 
@@ -1047,29 +1080,37 @@ actually live. §6.6 carries the citations.
    `grpcurl` user supplies their own `.proto`, which is what they already do against every
    non-reflective server. Deciding "not yet" is a legitimate outcome and removes the only
    protobuf crate from the graph.
-3. **Streaming responses in the worker protocol.** `RESPONSE` declares `body_len` up front, so an
+3. **How a plaintext gRPC origin is reached.** §6.6's measurement found that `negotiated_h2` is set
+   from ALPN alone, so `http://` and `unix:` origins speak HTTP/1.1 and gRPC needs HTTP/2. TLS with
+   ALPN works today and is not what a loopback unix socket wants. So: hyper's
+   `client::conn::http2::handshake` for prior-knowledge h2 on a marked origin, or an
+   `Connected::negotiated_h2()` answer in `connect.rs` for a plaintext origin the configuration has
+   explicitly declared as h2? The second is smaller and the first is the one hyper supports
+   directly; both need a way to *say* "this origin speaks h2", which is a new configuration key
+   either way.
+4. **Streaming responses in the worker protocol.** `RESPONSE` declares `body_len` up front, so an
    application must buffer. That is fine for HTML and wrong for a large download or a
    Server-Sent Events endpoint. Is a chunked response (unknown length, terminated by `LAST`) a v2
    feature, and does it land before or after a work-delivery exchange?
-4. **ASGI/Django Channels.** Multiplexed requests per worker is a protocol change, not an SDK
+5. **ASGI/Django Channels.** Multiplexed requests per worker is a protocol change, not an SDK
    feature, and it is the same change a gRPC call as *work* needs. Do they share one design?
-5. **Redis as one dependency for three features.** KV, locks and jobs all want a Redis client, and
+6. **Redis as one dependency for three features.** KV, locks and jobs all want a Redis client, and
    three drivers sharing one connection pool is better than three pools — but it also couples their
    feature flags. Is `redis` one feature that enables all three drivers, or three features over one
    crate?
-6. **`jobs.pool.command` vs the server's command.** RR lets the jobs pool override the server
+7. **`jobs.pool.command` vs the server's command.** RR lets the jobs pool override the server
    command so consumers are a different script from request workers. volucer's `[server]` has no
    single command — backends carry their own — so the question is whether `[jobs.pool]` is a
    `WorkerConfig` (a fifth backend, effectively) or a distinct table.
-7. **Which runtime gets Tier 2 first.** Django's adapter needs more explicit cleanup than Rails'
+8. **Which runtime gets Tier 2 first.** Django's adapter needs more explicit cleanup than Rails'
    (Rails' `executor.wrap` does the connection work for you), so if the answer is "the harder one
    proves the protocol", it is Django; if it is "the easier one ships", it is Rails.
-8. **Second unit of work, or multiplexing?** A gRPC call as work (§6.6) and ASGI (item 4) both need
+9. **Second unit of work, or multiplexing?** A gRPC call as work (§6.6) and ASGI (item 5) both need
    a worker to be handed something while it is busy. The cheapest shape is a second *exchange* —
    the same `CALL`/`RETURN` discipline pointed the other way, work in and answer out — and the
    expensive one is genuine stream multiplexing with per-stream ids. Which, and does it land once
    for both? Note this is the *only* thing left that contradicts one request in flight, and it is
    off the critical path for every gRPC tier in §6.6.
-9. **Whose deadline is a kill?** §4.2 item 3 and its hazard: a call blocking past the request's
-   deadline currently means the worker is killed. The policy (report the call as *unknown state* and
-   keep the worker, versus kill) is a decision, not a detail, and §6.3's error variant depends on it.
+10. **Whose deadline is a kill?** §4.2 item 3 and its hazard: a call blocking past the request's
+    deadline currently means the worker is killed. The policy (report the call as *unknown state* and
+    keep the worker, versus kill) is a decision, not a detail, and §6.3's error variant depends on it.

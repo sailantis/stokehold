@@ -2233,16 +2233,19 @@ big":
    `{status, headers, body, version}` (`translate.rs:152`), so `grpc-status` would be dropped and
    **every call would look failed**. This is shared work: it unlocks gRPC-to-an-origin too. It is the
    first deliverable, not a detail.
-   — **Sharply qualified by [plugins.md](./plugins.md) §6.6.** Read that before acting on this item.
+   — **Sharply qualified by [plugins.md](./plugins.md) §6.6, and now measured rather than argued.**
    The finding is correct about *this code* — nothing here constructs a trailer — but wrong about
-   *the effort*, because the ability to carry one is already present and unused: hyper 1.12 surfaces
-   trailers on ingress for both protocols (`hyper-1.12.0/src/body/incoming.rs:176`, `:209`),
-   `volucer_upstream::incoming_body` preserves frames (`client.rs:248`), and the front-end hands an
-   origin's body to the client without conversion (`listener.rs:1323`), since `UpstreamBody` and
-   `ResponseBody` are one type. What is missing is a small `Body` impl that *yields*
-   `Frame::trailers` — the same shape as the hand-written `FileBody` at `static_files.rs:806` — plus
-   the status mapping. The two claims that survive unqualified are the shared-work point and the
-   need for its own tests.
+   *the effort*: carrying one already works, and `crates/volucer-upstream/tests/trailers.rs` proves
+   it. A plaintext origin's chunked trailer section carries `grpc-status: 0` and `grpc-message: OK`,
+   and an assertion confirms both reach the caller **with the body intact**, in the order the
+   front-end runs (`prepare_request`, `request`, `translate_response`). The claim is falsified by
+   handing back an empty body, which fails the trailer assertion specifically. What is missing is
+   therefore a small `Body` impl that *yields* `Frame::trailers` — the shape already hand-written
+   for `FileBody` at `static_files.rs:806` — plus the status mapping. The two claims that survive
+   unqualified are the shared-work point and the need for its own tests. The same test also found
+   something the reading had missed: `negotiated_h2` is set from ALPN alone
+   (`client/connect.rs:264`, `:338`), so `http://` and `unix:` origins are pinned to HTTP/1.1 and a
+   gRPC origin needs either TLS or a new h2c path — a decision for the first gRPC tier.
 2. **nginx's record in exactly this code path.** nginx only gained HTTP/2 to an origin in **1.29.4
    (09 Dec 2025)** — `CHANGES:233` — and has since shipped **two memory-safety CVEs in it**:
    CVE-2026-42055 (heap buffer overflow proxying a crafted request to an HTTP/2 **or gRPC** backend,
@@ -2270,19 +2273,21 @@ and is now the cheapest gRPC work available, and that a runtime which already sp
 Go, Python — is reached through the same `upstream` backend that §7.1 adds for Django and Rails.
 Recorded so the answer is "here is the design", not silence.
 
-**Extended by [plugins.md](./plugins.md) §6.6, which corrects two things above.** The trailers
-finding is right about the *code* and too pessimistic about the *effort*: hyper 1.12 surfaces
-trailers on ingress for h1 and h2, `volucer_upstream::incoming_body` preserves frames, and the
-front-end hands an origin's body to the client without conversion — so what is actually missing is
-only the code that **constructs** a trailer, not the ability to carry one. And the `.proto`
-question turned out to be a false choice: the server can route, frame and answer a gRPC call
-without parsing any schema, because gRPC's inner framing is length-delimited and therefore
-schema-independent; descriptors are needed only by an optional reflection service. That re-cuts
-the work into three S–M steps rather than one XL one, the first of which is a pass-through to a
-Unix-socket origin and involves no worker at all. The section also covers the *rest* of the
-RoadRunner surface — metrics, a control-plane `CALL`/`RETURN` pair on the worker channel, KV, locks,
-jobs, OTLP export, the Python/Ruby question — and §9 of it lists what is deliberately **not**
-copied from RoadRunner.
+**Extended by [plugins.md](./plugins.md) §6.6, which corrects two things above and confirms one.**
+The trailers finding was right about the *code* and too pessimistic about the *effort*, and that is
+now **measured rather than argued**: `crates/volucer-upstream/tests/trailers.rs` drives a plaintext
+origin whose chunked trailer section carries `grpc-status` and `grpc-message`, and asserts they
+reach the caller with the body intact. So what is missing is only the code that **constructs** a
+trailer, not the ability to carry one. The same test found what the reading had not: the connector
+sets `negotiated_h2` from ALPN alone, so `http://` and `unix:` origins are pinned to HTTP/1.1 and
+reaching a gRPC origin needs either TLS or a new h2c path — a tier-A decision, and §10 item 3. And
+the `.proto` question turned out to be a false choice: the server can route, frame and answer a gRPC
+call without parsing any schema, because gRPC's inner framing is length-delimited and therefore
+schema-independent; descriptors are needed only by an optional reflection service. That re-cuts the
+work into three steps rather than one XL one, the first of which involves no worker at all. The
+section also covers the *rest* of the RoadRunner surface — metrics, a control-plane `CALL`/`RETURN`
+pair on the worker channel, KV, locks, jobs, OTLP export, the Python/Ruby question — and §9 of it
+lists what is deliberately **not** copied from RoadRunner.
 
 ### Observability — **done**, in six commits
 

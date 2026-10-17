@@ -4946,10 +4946,9 @@ services = ["lock"]
 
         // And the other direction: with the table present, a refusal that lists what *is* available must
         // not claim there is no lock backend.
-        let err = Config::from_toml(&with_table.replace(
-            "services = [\"lock\"]",
-            "services = [\"lock\", \"workes\"]",
-        ))
+        let err = Config::from_toml(
+            &with_table.replace("services = [\"lock\"]", "services = [\"lock\", \"workes\"]"),
+        )
         .expect("the file parses")
         .validate()
         .expect_err("`workes` is a typo for a fixed namespace");
@@ -5056,7 +5055,8 @@ driver = "redis"
                 .validate()
         };
 
-        with("url = \"redis://127.0.0.1:6379\"").expect("a plain loopback URL is the ordinary case");
+        with("url = \"redis://127.0.0.1:6379\"")
+            .expect("a plain loopback URL is the ordinary case");
 
         let err = with("url = \"127.0.0.1:6379\"").expect_err("a bare host:port is not a URL");
         assert!(err.to_string().contains("lock.url"), "{err}");
@@ -5102,7 +5102,8 @@ url = "redis://127.0.0.1:6379"
         let lock = config.lock.as_ref().expect("the table is there");
         let LockConfig::Redis(redis) = lock else {
             panic!("the driver is redis");
-        };        assert_eq!(redis.read_timeout_ms, 5000);
+        };
+        assert_eq!(redis.read_timeout_ms, 5000);
         assert_eq!(
             redis.pool_size,
             default_redis_pool_size(),

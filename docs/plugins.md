@@ -666,6 +666,27 @@ tokens**, which means they cannot stop a late writer — the classic Kleppmann o
 
 **Sizing.** S for `memory`, M for the Redis script and its tests, S for the call methods.
 
+**Built (`memory`), and it sharpened the argument rather than confirming it.** The sentence above —
+"lock state unknown, not not-held" — is a type now, and one this document had already argued for twice
+without either argument reaching code. Three things worth keeping:
+
+- **`Return::unknown_state` had no producer until this step**, and the temptation when writing the
+  first one was to use it too widely. Reporting a *refused resource name* as unknown — the caller's
+  mistake, refused locally, nothing sent anywhere — is worse than reporting a real unknown as
+  not-held, because a flag that is set on failures that are perfectly well known is a flag callers
+  learn to ignore, and then the one real unknown is invisible among them. The code classifies three
+  ways: `Unknown` is undetermined by construction; a rejected name is decided because nothing was
+  touched; and a *backend* failure is undetermined during an acquisition only.
+- **`ttl = 0` means held until released, and that is the opposite of KV's zero.** A lock that copied
+  the KV accessor would be granted and released inside one call — which does not fail loudly, it never
+  contends, so everything is allowed through and the exclusion is simply absent.
+- **The wait slice is 5 ms, not RoadRunner's 1 ms.** A memory lease can expire because another process
+  stopped existing, so nothing can be signalled and a wait is a poll; but a call is answered on the
+  worker's own exchange thread, where a tight poll costs a core rather than a task.
+
+What is still open, and stated as such: the `redis` driver, whose Lua script is the interesting part
+and whose `SET NX`-with-owner-check is what makes release safe against a late writer.
+
 ### 6.4 Jobs
 
 The largest item, and the one to be most careful about promising. Split by *driver*, which is where
@@ -1036,7 +1057,7 @@ progress on something earlier look bigger.
 | 1 | **Metrics + status** | — | S–M | **Done.** No calls, no driver, no protocol change; makes everything after it observable |
 | 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
 | 3 | **KV: `memory`, then `redis`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4 |
-| 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | Shares the Redis client; carries the fencing warning |
+| 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **`memory` done.** Shares the Redis client; carries the fencing warning |
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | The layer plan.md §6 already designed |
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | No protobuf crate, no worker involved, no new listener — hyper already speaks h2 here |
@@ -1081,8 +1102,41 @@ anticipate and the code settled:
   tested and none of them could see its absence; the end-to-end test found it in one run. That is the
   second time this document has been corrected by a seam rather than by a design argument, and it is
   worth noticing as a pattern: **the wiring between two tested things is where the untested bug lives.**
+  Step 4 then produced a **third** instance of the same shape (`build_locks`, and a lock plane the
+  configuration granted while nothing built it), which is enough for the pattern to be a rule: an
+  end-to-end test that goes through the entry point a *deployment* uses is not optional for a service
+  added to the registry.
 
 `redis` remains, and it is wanted before locks because §6.3's implementation shares its client.
+
+**Step 4's `memory` half is done, and it produced the API this project will not walk back.** The
+sentence in §6.3 that was a warning in prose is now a type: an acquisition has three answers, not two,
+and the third — *the lock state is unknown* — is a distinct variant all the way from the backend to the
+PHP client. `Return::unknown_state` was added with the call plane in step 2 for exactly this case and had
+never been reached, so step 4 is the first code to exercise the shape; §6.3's argument is that a
+caller told "not held" when the answer is "unknown" walks into the critical section, and that is now
+enforced rather than documented.
+
+Three things the code settled that the design did not:
+
+- **An acquisition is not the only thing that can be undetermined, and it is not always.** The first
+  implementation reported *any* failure during an acquisition as unknown — including a resource name
+  the backend refused locally, which never reached a network. That is worse than the bug it guards
+  against, because a flag set on failures that are perfectly well known is a flag callers learn to
+  ignore. The rule the code now encodes: `Unknown` is undetermined by construction; a *rejected name*
+  is decided because nothing was touched; and a backend failure is undetermined during an acquisition
+  only.
+- **`build_locks` was the seam, for the third time.** `set_call_handler`, then `build_stores`, now
+  this: a function between two tested things, with six layers of tests that could not see its absence.
+  It is recorded as a pattern rather than an anecdote because three instances is not a coincidence.
+- **`ttl = 0` means "held until released" and it is the opposite of what a zero TTL means to KV.**
+  Copying the KV TTL accessor would have produced a lock released the instant it was granted, which
+  does not fail loudly — it never contends, so everything is allowed through.
+
+Sizing, as revised by building it: S was right for the trait and the memory driver, and the call
+methods cost more than S because of the third answer — every verb now has to decide which kind of
+failure it is reporting, and `update_lease` returning `false` is a second "no" that means the opposite
+of contention.
 
 Note the shape of the end of the list. gRPC is **no longer one XL item behind a gate**: it is three
 items of S–M each, the first of which needs no schema, no worker and no new listener. The XL item
@@ -1110,6 +1164,15 @@ calling that a distributed lock without qualification is how an application acqu
 corruption bug. volucer will ship locks, document exactly what they are for, expose
 `set_if_absent` on KV as the primitive that *does* protect an invariant, and put the warning in the
 README rather than only in the design document.
+
+**The warning is now in four places, in this order of who reads it first:** `Lock.php`'s class
+documentation, where an application author actually is; `volucer.example.toml`, where a deployment
+copies from; the README; and here. That is not belt-and-braces — the argument for shipping locks at
+all rests on the warning arriving *before* the call, and the plan is the place it arrives last.
+
+`set_if_absent` on KV remains **not built**, and that is worth saying plainly rather than leaving the
+sentence above to imply otherwise: the primitive that protects an invariant is the one an application
+needs when it discovers a lock cannot, and it is still a sentence in a design document.
 
 ### 9.3 Metrics are on when configured, not when a middleware is listed
 

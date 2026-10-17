@@ -687,6 +687,28 @@ without either argument reaching code. Three things worth keeping:
 What is still open, and stated as such: the `redis` driver, whose Lua script is the interesting part
 and whose `SET NX`-with-owner-check is what makes release safe against a late writer.
 
+**The `redis` driver is built, and that paragraph was half right.** `SET NX` is not what makes release
+safe; the *owner check* is, and `SET NX` cannot express it because a set is one field and a resource
+needs a set of readers. So a resource is a **hash** — one field per holder plus a `<id>:deadline`
+sibling — and the scripts are what make the check-and-write one operation. Three of them, and each
+exists for a race that a single-threaded test cannot see:
+
+- `ACQUIRE` sweeps the resource's expired holders, refuses if the id already holds it, refuses on a
+  conflict, and writes both fields — one operation, because two holders reaching a check-then-write in
+  the same millisecond both conclude they won.
+- `RELEASE` and `UPDATE` are scripts for a subtler reason than that one: a `HEXISTS` followed by an
+  `HDEL` can have a *new* holder's write in between, and the `HDEL` would then remove the field a live
+  holder had just created — a lock taken and silently thrown away.
+- The expiry sweep rides on the way into `ACQUIRE` rather than on a timer, the same shape the memory
+  driver uses and reached independently: a resource nobody writes to again keeps a few stale bytes,
+  where a sweeper needs a connection, a timer and a lock to avoid racing the scripts that matter.
+
+**And this is the first code that produces an unknown state**, which is what §6.3 was written for. The
+classification is by error *kind*, and getting it wrong in either direction is expensive: a
+`Client(_)` error is `redis-rs` refusing to send, so nothing is undetermined and the first version's
+reporting it as unknown was over-reporting; a `Server(_)` error is Redis answering, however alarming,
+and is a decision. Only `Io` — dropped or timed out — leaves an acquisition undetermined.
+
 ### 6.4 Jobs
 
 The largest item, and the one to be most careful about promising. Split by *driver*, which is where
@@ -1057,7 +1079,7 @@ progress on something earlier look bigger.
 | 1 | **Metrics + status** | — | S–M | **Done.** No calls, no driver, no protocol change; makes everything after it observable |
 | 2 | **`CALL`/`RETURN` on the worker channel + `workers.list` / `worker.reset`** | 1 | M | **Done.** The branch on inbound frames (§4.2), the method registry, and the per-backend `services` allow-list. A control plane exists from the first commit that installs a handler |
 | 3 | **KV: `memory`, then `redis`** | 2 | S, M | **Done.** Smallest service on the call path; proves the registry shape. `redis` is behind a feature and shares its client with step 4 |
-| 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **`memory` done.** Shares the Redis client; carries the fencing warning |
+| 4 | **Locks: `memory`, then `redis`** | 2, 3 (Redis client) | S, M | **Done.** Shares the Redis client; carries the fencing warning |
 | 5 | **Jobs: engine + `memory` + `redis`** | 2 | L | Biggest item; the consumer-side exchange is the interesting part |
 | 6 | **OTLP export** | 1, 5 (spans across a push) | M | The layer plan.md §6 already designed |
 | 7 | **gRPC Tier A** (trailers constructed, pass-through to a Unix-socket origin) | §7.1's `upstream` supervision | S–M | No protobuf crate, no worker involved, no new listener — hyper already speaks h2 here |
@@ -1109,15 +1131,14 @@ anticipate and the code settled:
 
 `redis` remains, and it is wanted before locks because §6.3's implementation shares its client.
 
-**Step 4's `memory` half is done, and it produced the API this project will not walk back.** The
-sentence in §6.3 that was a warning in prose is now a type: an acquisition has three answers, not two,
-and the third — *the lock state is unknown* — is a distinct variant all the way from the backend to the
-PHP client. `Return::unknown_state` was added with the call plane in step 2 for exactly this case and had
-never been reached, so step 4 is the first code to exercise the shape; §6.3's argument is that a
-caller told "not held" when the answer is "unknown" walks into the critical section, and that is now
-enforced rather than documented.
+**Step 4 is done, `memory` and `redis`, and it is the step that made §6.3's argument into code.** The
+sentence that was a warning in prose — *a lock whose state is unknown must not be reported as not-held* —
+is a distinct error variant all the way from a Lua script to the PHP client, and the first code to
+produce it. It also produced the third instance of the seam pattern (`build_locks`) and the first two
+drivers to share a client, which is the shape §10 item 6 asks about: one `redis` crate, one feature, and
+two — soon three — sets of semantics over it.
 
-Three things the code settled that the design did not:
+Three more things the code settled that the design did not:
 
 - **An acquisition is not the only thing that can be undetermined, and it is not always.** The first
   implementation reported *any* failure during an acquisition as unknown — including a resource name

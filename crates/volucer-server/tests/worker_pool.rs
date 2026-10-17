@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use volucer_core::config::{BackendConfig, Config, WorkerConfig};
+use volucer_core::config::{BackendConfig, Config, KvStorageConfig, MemoryKvConfig, WorkerConfig};
 use volucer_fcgi::{build_params, Request, RequestInfo, Routing};
 use volucer_server::{Dispatcher, WorkerPool};
 
@@ -1501,4 +1501,233 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     // frame in an exchange, not a second exchange.
     let again = dispatcher.dispatch(&get("/")).expect("a second request");
     assert_eq!(again.parse_status_headers().0, 200);
+}
+
+/// A live worker stores a value and the next request finds it, through the real store.
+///
+/// The first test in the tree where the *whole* path is real: a PHP application calls `Kv::set` inside a
+/// request handler, the call crosses the worker's channel to the exchange thread, the registry routes it
+/// into the `kv` namespace, a real `MemoryStore` holds the bytes, and the `get` that follows comes back
+/// with them. Every layer of §4 and §6.2 is in this one run, and no test per layer can see a missing
+/// `build_stores` — which is the same class of seam the call-plane test above found for the call path
+/// itself.
+///
+/// It also pins what a store is easiest to get wrong: **two requests reach the same store**. A
+/// per-request or per-connection store would pass everything else here and be useless, because the point
+/// of a shared cache is that the next request finds what the last one left.
+#[test]
+fn a_worker_stores_a_value_and_the_next_request_finds_it() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-kv-worker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("kv-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    $kv = $worker->kv('sessions');
+    $path = (string) parse_url($request->uri, PHP_URL_PATH);
+
+    if ($path === '/write') {{
+        $kv->set('greeting', ['hello' => 'world'], 60);
+        $kv->set('transient', 'gone soon', 1);
+        $found = null;
+        $kv->get('never-written', $found);
+
+        return Response::json([
+            'stored' => true,
+            'missing_was_found' => $found,
+            'ttl' => $kv->ttl('greeting'),
+        ]);
+    }}
+
+    // A different request, and possibly a different worker process.
+    $found = null;
+    $value = $kv->get('greeting', $found);
+    $transient = $kv->get('transient', $transient_found);
+
+    return Response::json([
+        'value' => $value,
+        'found' => $found,
+        'has' => $kv->has('greeting'),
+        'transient' => $transient,
+        'transient_found' => $transient_found,
+    ]);
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers: 2,
+        // The one line this test exists to check is honoured: without it the registry has no `kv` and
+        // every call is refused, which is the default and the right default.
+        services: vec!["kv.sessions".to_string()],
+        ..config(2)
+    });
+    let mut configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        default_backend: Some("app".to_string()),
+        ..Config::default()
+    };
+    configured.kv.insert(
+        "sessions".to_string(),
+        KvStorageConfig::Memory(MemoryKvConfig { max_bytes: 1 << 20 }),
+    );
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+
+    let written = json_body(
+        &dispatcher
+            .dispatch(&get("/write"))
+            .expect("the write is served"),
+    );
+    assert_eq!(written["stored"], true, "{written}");
+    assert_eq!(
+        written["missing_was_found"], false,
+        "a key nobody wrote is reported absent, so `get`'s found flag is not always true: {written}"
+    );
+    assert_eq!(
+        written["ttl"], 60,
+        "and the TTL went in as seconds and came back as seconds: {written}"
+    );
+
+    let read = json_body(
+        &dispatcher
+            .dispatch(&get("/read"))
+            .expect("the read is served"),
+    );
+    assert_eq!(
+        read["value"],
+        serde_json::json!({ "hello": "world" }),
+        "the next request — possibly on the other worker — finds what the first one stored: {read}"
+    );
+    assert_eq!(read["found"], true, "{read}");
+    assert_eq!(
+        read["has"], true,
+        "and `has` answers without the value having to be copied out to find out: {read}"
+    );
+
+    // A one-second TTL that has expired is *gone*. The sleep is the only way to test expiry at all, and
+    // what it proves is that the deadline the client sent reached the store — which a store that ignored
+    // TTLs entirely would pass every other assertion here without.
+    std::thread::sleep(Duration::from_millis(1100));
+    let after = json_body(
+        &dispatcher
+            .dispatch(&get("/read"))
+            .expect("the read is served"),
+    );
+    assert_eq!(
+        after["transient"],
+        serde_json::Value::Null,
+        "a key stored with a one-second TTL is gone after one: {after}"
+    );
+    assert_eq!(
+        after["transient_found"], false,
+        "and is reported absent rather than as a value of null: {after}"
+    );
+    assert_eq!(
+        after["value"],
+        serde_json::json!({ "hello": "world" }),
+        "while the key with a sixty-second TTL is untouched: {after}"
+    );
+}
+
+/// A call naming a storage the backend was not granted is refused, by name, over a real channel.
+///
+/// §4.5 as one request: the deployment has two storages, the backend was granted one, and the other is
+/// unreachable — with a message naming what it *may* reach, so the fix is a configuration line rather
+/// than an hour with a debugger.
+#[test]
+fn a_storage_outside_the_grant_is_refused_over_a_real_channel() {
+    let _serial = serial();
+    require_sdk!();
+
+    let dir = std::env::temp_dir().join(format!("volucer-kv-denied-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the fixture directory");
+    let script = dir.join("denied-worker.php");
+    let autoload = sdk_dir().join("autoload.php").display().to_string();
+    std::fs::write(
+        &script,
+        format!(
+            r#"<?php
+require '{autoload}';
+use Volucer\Request;
+use Volucer\Response;
+use Volucer\Worker;
+$worker = Worker::connect();
+$worker->run(static function (Request $request, Worker $worker): Response|null {{
+    try {{
+        $worker->kv('secrets')->get('key');
+        return Response::json(['reached' => true]);
+    }} catch (Throwable $e) {{
+        // The refusal arrives as an exception from `call`, which is the point: an application can see it
+        // and log it rather than being handed a value that is a lie.
+        return Response::json(['reached' => false, 'message' => $e->getMessage()]);
+    }}
+}});
+"#
+        ),
+    )
+    .expect("write the worker");
+
+    let backend = BackendConfig::Worker(WorkerConfig {
+        command: format!("php \"{}\"", script.display()),
+        workers: 1,
+        // `sessions` only. `secrets` exists in the deployment and is not granted.
+        services: vec!["kv.sessions".to_string()],
+        ..config(1)
+    });
+    let mut configured = Config {
+        backends: [("app".to_string(), backend)].into_iter().collect(),
+        default_backend: Some("app".to_string()),
+        ..Config::default()
+    };
+    for name in ["sessions", "secrets"] {
+        configured.kv.insert(
+            name.to_string(),
+            KvStorageConfig::Memory(MemoryKvConfig { max_bytes: 1 << 20 }),
+        );
+    }
+
+    let dispatcher =
+        Dispatcher::from_config(&configured, Routing::default()).expect("the pool starts");
+    let answer = json_body(
+        &dispatcher
+            .dispatch(&get("/"))
+            .expect("the request is served"),
+    );
+
+    assert_eq!(
+        answer["reached"], false,
+        "a storage this backend was not granted must be unreachable: {answer}"
+    );
+    let message = answer["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("secrets"),
+        "the refusal names what was asked for: {message}"
+    );
+    assert!(
+        message.contains("sessions"),
+        "and what may be reached, so the fix is a configuration line: {message}"
+    );
+}
+
+/// The JSON body of a response, as the fixtures write it.
+fn json_body(response: &volucer_fcgi::Response) -> serde_json::Value {
+    let body = body_of(response);
+    serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("the worker answered with JSON: {err}\n{body}"))
 }

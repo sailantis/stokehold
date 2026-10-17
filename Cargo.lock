@@ -2058,6 +2058,7 @@ dependencies = [
  "tracing",
  "volucer-core",
  "volucer-fcgi",
+ "volucer-jobs",
  "volucer-kv",
  "volucer-lock",
  "volucer-metrics",

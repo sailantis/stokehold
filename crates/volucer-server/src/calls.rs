@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use volucer_jobs::Pushed;
 use volucer_lock::{Lease, Mode};
 use volucer_worker::{Call, Return};
 
@@ -191,8 +192,362 @@ mod tests {
         }
     }
 
-    /// A lock namespace over a real memory backend, and the backend itself for assertions.
+    /// A jobs namespace over two real memory pipelines, and the drivers behind it.
     ///
+    /// **The real driver rather than a stub**, for the reason the lock tests give: the properties worth
+    /// pinning are at the boundary between the wire format and the queue — an opaque payload, headers that
+    /// are strings — and a stub would have to reimplement what a driver does with them to be asked.
+    fn queues() -> (
+        JobsNamespace,
+        BTreeMap<String, Arc<volucer_jobs::MemoryDriver>>,
+    ) {
+        let mut drivers: BTreeMap<String, Arc<volucer_jobs::MemoryDriver>> = BTreeMap::new();
+        for name in ["emails", "reports"] {
+            drivers.insert(
+                name.to_string(),
+                Arc::new(volucer_jobs::MemoryDriver::single(name)),
+            );
+        }
+        let namespace = JobsNamespace::new(
+            drivers
+                .iter()
+                .map(|(name, driver)| {
+                    (
+                        name.clone(),
+                        Arc::clone(driver) as Arc<dyn volucer_jobs::Driver>,
+                    )
+                })
+                .collect(),
+        );
+        (namespace, drivers)
+    }
+
+    /// A push names the pipeline, the task and the payload, and the driver stores all three.
+    #[test]
+    fn a_push_reaches_the_named_pipeline_with_an_opaque_payload() {
+        let (namespace, drivers) = queues();
+
+        // Bytes above `0x7f`, because that is the whole reason the payload is base64: an application that
+        // compresses or encrypts what it queues has such bytes constantly, and a JSON string cannot carry
+        // one.
+        let payload: Vec<u8> = vec![0x00, 0xff, 0x10, b'{', b'}'];
+        let answer = namespace.serve(&call_with(
+            "jobs.push",
+            serde_json::json!({
+                "pipeline": "emails",
+                "task": "App\\Jobs\\SendEmail",
+                "payload": crate::params::encode_base64(&payload),
+                "headers": { "traceparent": "00-abc-def-01", "attempt": "1" },
+            }),
+        ));
+        assert!(answer.ok, "{answer:?}");
+        let result = answer.result.expect("a result");
+        assert_eq!(result["pushed"], serde_json::json!(true));
+        assert!(
+            result["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "the push answers with the id the driver assigned: {result}"
+        );
+
+        let reserved = volucer_jobs::Driver::reserve(
+            &*drivers["emails"],
+            "emails",
+            1,
+            Duration::from_secs(60),
+        )
+        .expect("reserved");
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].job.task, "App\\Jobs\\SendEmail");
+        assert_eq!(
+            reserved[0].job.payload, payload,
+            "the payload arrived byte for byte, which is the property base64 is there for"
+        );
+        assert_eq!(reserved[0].job.header("traceparent"), Some("00-abc-def-01"));
+        assert_eq!(reserved[0].job.header("attempt"), Some("1"));
+
+        // And the *other* pipeline is untouched, which is what makes the name meaningful.
+        assert!(volucer_jobs::Driver::reserve(
+            &*drivers["reports"],
+            "reports",
+            1,
+            Duration::from_secs(60)
+        )
+        .expect("reserved")
+        .is_empty());
+    }
+
+    /// A payload may be absent, and an empty one is a job with no arguments rather than a mistake.
+    #[test]
+    fn a_push_needs_no_payload_and_an_empty_one_is_a_payload() {
+        let (namespace, drivers) = queues();
+
+        for params in [
+            serde_json::json!({ "pipeline": "emails", "task": "App\\Jobs\\Ping" }),
+            serde_json::json!({
+                "pipeline": "emails",
+                "task": "App\\Jobs\\Ping",
+                "payload": ""
+            }),
+        ] {
+            let answer = namespace.serve(&call_with("jobs.push", params));
+            assert!(answer.ok, "{answer:?}");
+        }
+
+        let reserved = volucer_jobs::Driver::reserve(
+            &*drivers["emails"],
+            "emails",
+            10,
+            Duration::from_secs(60),
+        )
+        .expect("reserved");
+        assert_eq!(reserved.len(), 2);
+        assert!(reserved.iter().all(|held| held.job.payload.is_empty()));
+    }
+
+    /// A header that is not a string is refused, naming the header and saying where the value belongs.
+    ///
+    /// Coercing it would make the queue a place where types go to die: the value would come back as a
+    /// string to a consumer that pushed an integer, and the failure would surface in application code far
+    /// from the line that caused it.
+    #[test]
+    fn a_header_that_is_not_a_string_is_refused_by_name() {
+        let (namespace, _drivers) = queues();
+
+        let answer = namespace.serve(&call_with(
+            "jobs.push",
+            serde_json::json!({
+                "pipeline": "emails",
+                "task": "t",
+                "headers": { "attempts": 3 },
+            }),
+        ));
+        assert!(!answer.ok, "{answer:?}");
+        let message = answer.error.expect("a reason");
+        assert!(
+            message.contains("attempts"),
+            "it names the header: {message}"
+        );
+        assert!(
+            message.contains("payload"),
+            "and says where a structured value belongs: {message}"
+        );
+
+        // A headers value that is not an object at all is a different message, because it is a different
+        // mistake.
+        let answer = namespace.serve(&call_with(
+            "jobs.push",
+            serde_json::json!({ "pipeline": "emails", "task": "t", "headers": ["a"] }),
+        ));
+        assert!(!answer.ok);
+        assert!(
+            answer.error.expect("a reason").contains("object"),
+            "headers that are an array must be refused as an array"
+        );
+    }
+
+    /// Pushing to a pipeline that does not exist is refused with the names that do.
+    #[test]
+    fn a_push_to_an_unknown_pipeline_is_refused_with_the_ones_that_exist() {
+        let (namespace, _drivers) = queues();
+
+        let answer = namespace.serve(&call_with(
+            "jobs.push",
+            serde_json::json!({ "pipeline": "emials", "task": "t" }),
+        ));
+        assert!(!answer.ok, "{answer:?}");
+        let message = answer.error.expect("a reason");
+        assert!(message.contains("emials"), "{message}");
+        assert!(
+            message.contains("\"emails\""),
+            "and what there is: {message}"
+        );
+
+        // A namespace with no pipelines at all says something different on purpose: there is nothing to
+        // rename *to*.
+        let empty = JobsNamespace::new(BTreeMap::new());
+        let answer = empty.serve(&call_with(
+            "jobs.push",
+            serde_json::json!({ "pipeline": "emails", "task": "t" }),
+        ));
+        assert!(answer
+            .error
+            .expect("a reason")
+            .contains("no pipelines at all"));
+    }
+
+    /// A batch is **partially** applied rather than atomic, and says where it stopped.
+    ///
+    /// The alternative — pretending the batch is one unit — would make a caller's retry duplicate the
+    /// pushes that already succeeded. So a batch that fails halfway answers with the ids that made it and
+    /// the index that did not, and the caller decides what to do about it.
+    #[test]
+    fn a_batch_that_fails_halfway_reports_what_it_pushed_rather_than_pretending_to_be_atomic() {
+        let (namespace, drivers) = queues();
+
+        let answer = namespace.serve(&call_with(
+            "jobs.push_batch",
+            serde_json::json!({
+                "jobs": [
+                    { "pipeline": "emails", "task": "first" },
+                    { "pipeline": "emails", "task": "second" },
+                    // The third names a pipeline that does not exist, which is the failure a batch has to
+                    // survive without lying about.
+                    { "pipeline": "emials", "task": "third" },
+                    { "pipeline": "emails", "task": "fourth" },
+                ]
+            }),
+        ));
+        assert!(answer.ok, "{answer:?}");
+        let result = answer.result.expect("a result");
+        assert_eq!(result["pushed"], serde_json::json!(2), "{result}");
+        assert_eq!(
+            result["failed_index"],
+            serde_json::json!(2),
+            "and the index that failed, so a caller knows what to retry: {result}"
+        );
+        assert_eq!(
+            result["ids"].as_array().map(Vec::len),
+            Some(2),
+            "with the ids that made it: {result}"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("emials")),
+            "and a reason naming the pipeline: {result}"
+        );
+
+        // The two that succeeded are really there, and the fourth — which came after the failure — is not.
+        let reserved = volucer_jobs::Driver::reserve(
+            &*drivers["emails"],
+            "emails",
+            10,
+            Duration::from_secs(60),
+        )
+        .expect("reserved");
+        assert_eq!(
+            reserved
+                .iter()
+                .map(|held| held.job.task.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"],
+            "a batch stops at the failure rather than skipping it, so the caller's retry is the whole tail"
+        );
+    }
+
+    /// A batch that succeeds in full answers with its ids and no failure index.
+    #[test]
+    fn a_batch_that_succeeds_reports_every_id() {
+        let (namespace, drivers) = queues();
+
+        let answer = namespace.serve(&call_with(
+            "jobs.push_batch",
+            serde_json::json!({
+                "jobs": [
+                    { "pipeline": "emails", "task": "a" },
+                    { "pipeline": "reports", "task": "b" },
+                ]
+            }),
+        ));
+        assert!(answer.ok, "{answer:?}");
+        let result = answer.result.expect("a result");
+        assert_eq!(result["pushed"], serde_json::json!(2));
+        assert_eq!(result["failed_index"], serde_json::json!(null));
+        assert_eq!(result["ids"].as_array().map(Vec::len), Some(2));
+
+        // One to each pipeline, which is the property a batch across pipelines needs.
+        for pipeline in ["emails", "reports"] {
+            assert_eq!(
+                volucer_jobs::Driver::size(&*drivers[pipeline], pipeline).expect("size"),
+                1
+            );
+        }
+    }
+
+    /// `size` answers both numbers, because the pair is what an operator reads.
+    #[test]
+    fn size_answers_the_ready_count_and_the_in_flight_count_together() {
+        let (namespace, drivers) = queues();
+
+        for task in ["a", "b", "c"] {
+            namespace.serve(&call_with(
+                "jobs.push",
+                serde_json::json!({ "pipeline": "emails", "task": task }),
+            ));
+        }
+        // One of them reserved, so the two numbers are different — which is the case a single number
+        // cannot express and the reason both are reported.
+        volucer_jobs::Driver::reserve(&*drivers["emails"], "emails", 1, Duration::from_secs(60))
+            .expect("reserved");
+
+        let answer = namespace.serve(&call_with(
+            "jobs.size",
+            serde_json::json!({ "pipeline": "emails" }),
+        ));
+        assert!(answer.ok, "{answer:?}");
+        let result = answer.result.expect("a result");
+        assert_eq!(result["size"], serde_json::json!(2));
+        assert_eq!(result["in_flight"], serde_json::json!(1));
+
+        // An unknown pipeline is refused by the namespace, before any driver is consulted.
+        let answer = namespace.serve(&call_with(
+            "jobs.size",
+            serde_json::json!({ "pipeline": "emials" }),
+        ));
+        assert!(!answer.ok);
+        assert!(answer.error.expect("a reason").contains("emials"));
+    }
+
+    /// `pipelines` lists the names and their drivers, which is what `config.describe` cannot say.
+    #[test]
+    fn pipelines_lists_each_pipeline_with_its_driver() {
+        let (namespace, _drivers) = queues();
+
+        let answer = namespace.serve(&call_with("jobs.pipelines", serde_json::json!({})));
+        assert!(answer.ok, "{answer:?}");
+        let pipelines = answer.result.expect("a result")["pipelines"]
+            .as_array()
+            .expect("an array")
+            .clone();
+        assert_eq!(pipelines.len(), 2);
+        assert_eq!(pipelines[0]["name"], serde_json::json!("emails"));
+        assert_eq!(pipelines[0]["driver"], serde_json::json!("memory"));
+        assert_eq!(pipelines[1]["name"], serde_json::json!("reports"));
+    }
+
+    /// A missing `pipeline` or `task`, and a verb that does not exist, are each refused by name.
+    #[test]
+    fn a_jobs_call_that_cannot_be_understood_is_refused_by_name() {
+        let (namespace, _drivers) = queues();
+
+        let missing = namespace.serve(&call_with("jobs.push", serde_json::json!({ "task": "t" })));
+        assert!(!missing.ok);
+        assert!(missing.error.expect("a reason").contains("pipeline"));
+
+        let missing = namespace.serve(&call_with(
+            "jobs.push",
+            serde_json::json!({ "pipeline": "emails" }),
+        ));
+        assert!(!missing.ok);
+        assert!(missing.error.expect("a reason").contains("task"));
+
+        let unknown = namespace.serve(&call_with("jobs.reserve", serde_json::json!({})));
+        assert!(!unknown.ok);
+        let message = unknown.error.expect("a reason");
+        assert!(message.contains("reserve"), "{message}");
+        assert!(
+            message.contains("push_batch"),
+            "and lists what does exist, because a typo and a missing feature read the same otherwise: \
+             {message}"
+        );
+
+        for name in ["jobs", "jobs."] {
+            let answer = namespace.serve(&call(name));
+            assert!(!answer.ok, "{name} must be refused");
+            assert!(answer.error.expect("a reason").contains("jobs method"));
+        }
+    }
+
+    /// A lock namespace over a real memory backend, and the backend itself for assertions.    ///
     /// **The real driver rather than a stub**, because the properties worth pinning here are the ones at
     /// the boundary between the wire format and the semantics — `ttl = 0` meaning for ever, an absent id
     /// being generated — and a stub would have to reimplement the meaning of a TTL to be asked about it.
@@ -202,8 +557,11 @@ mod tests {
         (namespace, backend)
     }
 
-    /// A lock call with `params`.
-    fn lock_call(name: &str, params: serde_json::Value) -> Call {
+    /// A call with `params`, which is what most of these tests need.
+    ///
+    /// Named `call_with` rather than per-service, because the envelope is the same for every namespace and
+    /// a `lock_call`/`jobs_call` pair would be the same four lines twice.
+    fn call_with(name: &str, params: serde_json::Value) -> Call {
         Call {
             name: name.to_string(),
             params,
@@ -238,7 +596,7 @@ mod tests {
     fn an_acquisition_without_an_id_is_given_one_and_the_answer_carries_it() {
         let (namespace, _backend) = locks();
 
-        let answer = namespace.serve(&lock_call(
+        let answer = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -251,7 +609,7 @@ mod tests {
         assert_eq!(id.len(), 32, "a generated id is sixteen bytes of hex: {id}");
 
         // And the id it gave out is the one that releases it.
-        let released = namespace.serve(&lock_call(
+        let released = namespace.serve(&call_with(
             "lock.release",
             serde_json::json!({ "resource": "pdf:create", "id": id }),
         ));
@@ -272,7 +630,7 @@ mod tests {
         let (namespace, backend) = locks();
 
         for ttl in [serde_json::json!(0), serde_json::json!(null)] {
-            let answer = namespace.serve(&lock_call(
+            let answer = namespace.serve(&call_with(
                 "lock.acquire",
                 serde_json::json!({ "resource": "pdf:create", "ttl": ttl, "mode": "shared" }),
             ));
@@ -293,7 +651,7 @@ mod tests {
         assert!(holders.iter().all(|holder| holder.remaining.is_none()));
 
         // A non-zero TTL is a real deadline, which is the other half of the same accessor.
-        let answer = namespace.serve(&lock_call(
+        let answer = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({
                 "resource": "other",
@@ -318,7 +676,7 @@ mod tests {
     fn contention_is_an_answer_with_acquired_false_rather_than_a_refusal() {
         let (namespace, _backend) = locks();
 
-        let first = namespace.serve(&lock_call(
+        let first = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create", "id": an_id() }),
         ));
@@ -327,7 +685,7 @@ mod tests {
             serde_json::json!(true)
         );
 
-        let second = namespace.serve(&lock_call(
+        let second = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create", "id": an_id() }),
         ));
@@ -342,7 +700,7 @@ mod tests {
         );
 
         // A reader is excluded by the writer too, in the same shape.
-        let reader = namespace.serve(&lock_call(
+        let reader = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create", "mode": "shared", "id": an_id() }),
         ));
@@ -362,7 +720,7 @@ mod tests {
     fn neither_try_acquire_nor_an_absent_wait_waits_for_anything() {
         let (namespace, _backend) = locks();
         let held = an_id();
-        let acquired = namespace.serve(&lock_call(
+        let acquired = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create", "id": held }),
         ));
@@ -373,7 +731,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         for method in ["lock.try_acquire", "lock.acquire"] {
-            let answer = namespace.serve(&lock_call(
+            let answer = namespace.serve(&call_with(
                 method,
                 serde_json::json!({ "resource": "pdf:create", "id": an_id() }),
             ));
@@ -392,7 +750,7 @@ mod tests {
         // And `try_acquire` ignores a `wait` it is sent, rather than waiting for it: the method name is
         // the statement, and a client that sends both means the one it called.
         let started = std::time::Instant::now();
-        namespace.serve(&lock_call(
+        namespace.serve(&call_with(
             "lock.try_acquire",
             serde_json::json!({ "resource": "pdf:create", "id": an_id(), "wait": 10_000_000 }),
         ));
@@ -484,7 +842,7 @@ mod tests {
         }));
         let namespace = LockNamespace::new(backend as Arc<dyn volucer_lock::Locks>);
 
-        let answer = namespace.serve(&lock_call(
+        let answer = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -545,7 +903,7 @@ mod tests {
             }
         }
         let refusing = LockNamespace::new(Arc::new(Refusing) as Arc<dyn volucer_lock::Locks>);
-        let answer = refusing.serve(&lock_call(
+        let answer = refusing.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -558,7 +916,7 @@ mod tests {
 
         // The other direction, and it is what makes the flag mean anything: a failure that *is* decided —
         // a read — is a refusal, so a caller can retry it without wondering.
-        let answer = namespace.serve(&lock_call(
+        let answer = namespace.serve(&call_with(
             "lock.exists",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -578,12 +936,12 @@ mod tests {
     fn update_ttl_replaces_the_lease_and_tells_a_caller_when_it_renewed_nothing() {
         let (namespace, _backend) = locks();
         let id = an_id();
-        namespace.serve(&lock_call(
+        namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create", "id": serde_json::json!(id) }),
         ));
 
-        let renewed = namespace.serve(&lock_call(
+        let renewed = namespace.serve(&call_with(
             "lock.update_ttl",
             serde_json::json!({
                 "resource": "pdf:create",
@@ -596,7 +954,7 @@ mod tests {
             serde_json::json!(true)
         );
 
-        let holders = namespace.serve(&lock_call(
+        let holders = namespace.serve(&call_with(
             "lock.holders",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -608,7 +966,7 @@ mod tests {
             "two seconds, from now, rather than added to whatever was left: {remaining}"
         );
 
-        let nobody = namespace.serve(&lock_call(
+        let nobody = namespace.serve(&call_with(
             "lock.update_ttl",
             serde_json::json!({ "resource": "pdf:create", "id": an_id(), "ttl": 1_000_000 }),
         ));
@@ -627,7 +985,7 @@ mod tests {
     fn a_lock_call_that_cannot_be_understood_is_refused_by_name() {
         let (namespace, _backend) = locks();
 
-        let missing = namespace.serve(&lock_call("lock.acquire", serde_json::json!({})));
+        let missing = namespace.serve(&call_with("lock.acquire", serde_json::json!({})));
         assert!(!missing.ok);
         let message = missing.error.expect("a reason");
         assert!(message.contains("\"resource\""), "{message}");
@@ -636,7 +994,7 @@ mod tests {
             "a missing parameter must not be reported as a bad one: {message}"
         );
 
-        let bad_mode = namespace.serve(&lock_call(
+        let bad_mode = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf", "mode": "readonly" }),
         ));
@@ -647,7 +1005,7 @@ mod tests {
             "and say what is accepted: {message}"
         );
 
-        let unknown = namespace.serve(&lock_call(
+        let unknown = namespace.serve(&call_with(
             "lock.steal",
             serde_json::json!({ "resource": "pdf" }),
         ));
@@ -672,7 +1030,7 @@ mod tests {
     fn releasing_what_is_not_held_is_an_answer_rather_than_a_failure() {
         let (namespace, _backend) = locks();
 
-        let nothing = namespace.serve(&lock_call(
+        let nothing = namespace.serve(&call_with(
             "lock.release",
             serde_json::json!({ "resource": "pdf:create", "id": an_id() }),
         ));
@@ -682,7 +1040,7 @@ mod tests {
             serde_json::json!(false)
         );
 
-        let all = namespace.serve(&lock_call(
+        let all = namespace.serve(&call_with(
             "lock.release_all",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -692,7 +1050,7 @@ mod tests {
             serde_json::json!(false)
         );
 
-        let exists = namespace.serve(&lock_call(
+        let exists = namespace.serve(&call_with(
             "lock.exists",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -703,16 +1061,16 @@ mod tests {
 
         // Now hold it with two readers and a writer's view, to see the list work.
         let held = an_id();
-        namespace.serve(&lock_call(
+        namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create", "id": held, "mode": "shared" }),
         ));
-        namespace.serve(&lock_call(
+        namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create", "id": an_id(), "mode": "shared" }),
         ));
 
-        let holders = namespace.serve(&lock_call(
+        let holders = namespace.serve(&call_with(
             "lock.holders",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -723,7 +1081,7 @@ mod tests {
         assert_eq!(holders.len(), 2, "{holders:?}");
         assert!(holders.iter().all(|holder| holder["mode"] == "shared"));
 
-        let exists = namespace.serve(&lock_call(
+        let exists = namespace.serve(&call_with(
             "lock.exists",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -733,7 +1091,7 @@ mod tests {
         );
 
         // And the writer's view: `release_all` takes both readers, whatever ids they chose.
-        let all = namespace.serve(&lock_call(
+        let all = namespace.serve(&call_with(
             "lock.release_all",
             serde_json::json!({ "resource": "pdf:create" }),
         ));
@@ -743,7 +1101,7 @@ mod tests {
         );
         assert_eq!(
             namespace
-                .serve(&lock_call(
+                .serve(&call_with(
                     "lock.exists",
                     serde_json::json!({ "resource": "pdf:create" })
                 ))
@@ -758,7 +1116,7 @@ mod tests {
     fn an_id_the_backend_refuses_is_refused_over_the_wire_by_name() {
         let (namespace, backend) = locks();
 
-        let answer = namespace.serve(&lock_call(
+        let answer = namespace.serve(&call_with(
             "lock.acquire",
             serde_json::json!({ "resource": "pdf:create", "id": "bad\u{1}id" }),
         ));
@@ -1800,6 +2158,298 @@ impl Namespace for LockNamespace {
 const METHODS: &str =
     "the lock methods are acquire, try_acquire, release, release_all, exists, holders \
                        and update_ttl";
+
+/// The `jobs` namespace: the **producer** side of a pipeline.
+///
+/// # Only pushes, and that is the whole of it
+///
+/// `jobs.push`, `jobs.push_batch`, `jobs.size` and `jobs.pipelines`. A worker cannot *reserve* a job
+/// through the call plane, and the reason is the design rather than an omission: a reservation is what a
+/// consumer's own channel is for (`docs/plugins.md` §6.4), because a reserved job's lease starts ticking
+/// the moment it is handed out — and a job handed into a *request* would be held by a worker that is
+/// already busy with something else, with its lease running down while it finishes.
+///
+/// So the split is: an HTTP worker pushes (a request that needs work done later), a consumer process
+/// reserves and acks (which is what it exists for). Both reach the same pipeline; neither can do the
+/// other's half.
+///
+/// # A refused push is a refusal, never an unknown
+///
+/// There is no `unknown` here and there is deliberately no room for one: a push either put the job in the
+/// pipeline or it did not, and a driver that could not tell would be one whose caller has to reconcile.
+/// The one thing a caller must be told is *which* pipeline it did not go into, which is why the refusals
+/// name it.
+pub struct JobsNamespace {
+    /// The pipelines this backend may push to, by name.
+    ///
+    /// A map rather than one driver, because a queue **is** named: unlike a KV storage there is no
+    /// per-name capability here — the `jobs` service grants pushing to every pipeline in the deployment —
+    /// but the name still has to be resolved to a driver on every call, and this is where that happens.
+    pipelines: BTreeMap<String, Arc<dyn volucer_jobs::Driver>>,
+}
+
+impl JobsNamespace {
+    /// A namespace over the deployment's pipelines.
+    pub fn new(pipelines: BTreeMap<String, Arc<dyn volucer_jobs::Driver>>) -> Self {
+        JobsNamespace { pipelines }
+    }
+
+    /// The driver for a pipeline, or a refusal naming the ones there are.
+    ///
+    /// `Driver`'s own methods refuse an unknown pipeline too, and this is not a duplicate of that: the
+    /// *namespace* has to know which pipelines exist before it can even choose a driver, and a caller
+    /// that asked for a pipeline the deployment does not have should be told so by this side rather than by
+    /// whichever driver happened to answer.
+    fn driver(&self, name: &str) -> std::result::Result<&Arc<dyn volucer_jobs::Driver>, Return> {
+        self.pipelines.get(name).ok_or_else(|| {
+            Return::refused(format!(
+                "there is no pipeline named {name:?}; {}",
+                self.available()
+            ))
+        })
+    }
+
+    fn available(&self) -> String {
+        if self.pipelines.is_empty() {
+            "this deployment configures no pipelines at all".to_string()
+        } else {
+            format!(
+                "this deployment has {}",
+                self.pipelines
+                    .keys()
+                    .map(|name| format!("{name:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+
+    /// One pushed job, from a call's params.
+    ///
+    /// The headers are read as a JSON object of **strings**, refused otherwise rather than stringified:
+    /// a header whose value is a number is a caller that meant to put it in the payload, and coercing it
+    /// would make the queue a place where types go to die. It is the same rule `Params` enforces for a
+    /// typed parameter, applied to a map.
+    fn pushed(params: &Params, method: &str) -> std::result::Result<(String, Pushed), Return> {
+        let pipeline = match params.required_string("pipeline") {
+            Ok(pipeline) => pipeline,
+            Err(err) => return Err(Return::refused(format!("{method} was called with {err}"))),
+        };
+
+        let task = match params.required_string("task") {
+            Ok(task) => task,
+            Err(err) => return Err(Return::refused(format!("{method} was called with {err}"))),
+        };
+
+        // **Base64, like a KV value and like the lock's resource.** A job payload is the application's
+        // own bytes — a serialized object, a compressed blob, an encrypted message — and a JSON string
+        // cannot carry a byte above `0x7f`. This is the same decision as §6.2's, and for the same reason.
+        let payload = match params.base64("payload") {
+            Ok(payload) => payload.unwrap_or_default(),
+            Err(err) => return Err(Return::refused(format!("{method} was called with {err}"))),
+        };
+
+        let mut job = Pushed::new(task).with_payload(payload);
+        if let Some(raw) = params.raw("headers") {
+            match raw {
+                serde_json::Value::Null => {}
+                serde_json::Value::Object(headers) => {
+                    for (name, value) in headers {
+                        match value.as_str() {
+                            Some(value) => {
+                                job = job.with_header(name.clone(), value);
+                            }
+                            None => {
+                                return Err(Return::refused(format!(
+                                    "{method} was given a header {name:?} that is a {}, and headers are \
+                                     strings — put a structured value in the payload instead",
+                                    json_type_name(value)
+                                )))
+                            }
+                        }
+                    }
+                }
+                other => {
+                    return Err(Return::refused(format!(
+                        "{method} was given headers that are a {}, and they must be an object of strings",
+                        json_type_name(other)
+                    )))
+                }
+            }
+        }
+
+        Ok((pipeline, job))
+    }
+
+    /// The answer shape a push uses.
+    fn pushed_answer(id: &str) -> Return {
+        Return::ok(serde_json::json!({ "pushed": true, "id": id }))
+    }
+}
+
+impl Namespace for JobsNamespace {
+    fn name(&self) -> &'static str {
+        "jobs"
+    }
+
+    fn serve(&self, call: &Call) -> Return {
+        let params = match Params::from_value(&call.params, &call.name) {
+            Ok(params) => params,
+            Err(err) => {
+                return Return::refused(format!("the {} method was called with {err}", call.name))
+            }
+        };
+
+        let verb = match call.name.strip_prefix("jobs.") {
+            Some(verb) if !verb.is_empty() => verb,
+            _ => {
+                return Return::refused(format!(
+                    "{} does not name a jobs method; {}",
+                    call.name, METHODS_JOBS
+                ))
+            }
+        };
+
+        match verb {
+            "push" => {
+                let (pipeline, job) = match Self::pushed(&params, &call.name) {
+                    Ok(pair) => pair,
+                    Err(refusal) => return refusal,
+                };
+                let driver = match self.driver(&pipeline) {
+                    Ok(driver) => driver,
+                    Err(refusal) => return refusal,
+                };
+                match driver.push(&pipeline, job) {
+                    Ok(id) => Self::pushed_answer(&id),
+                    Err(err) => {
+                        tracing::warn!(pipeline, %err, "a job push failed");
+                        Return::refused(format!("the push to {pipeline:?} failed: {err}"))
+                    }
+                }
+            }
+            "push_batch" => {
+                // The batch is one call where the loop is many, which is what a batch is *for* — and it is
+                // deliberately **not atomic**: a batch whose third push fails has already pushed two, and
+                // claiming otherwise would make the caller's retry duplicate them. So a partial batch is
+                // reported as a partial batch, with the ids that made it.
+                let Some(jobs) = params.raw("jobs").and_then(serde_json::Value::as_array) else {
+                    return Return::refused(
+                        "jobs.push_batch needs a \"jobs\" array of {pipeline, task, payload, headers} \
+                         objects",
+                    );
+                };
+
+                let mut ids: Vec<String> = Vec::with_capacity(jobs.len());
+                for (index, entry) in jobs.iter().enumerate() {
+                    let nested = match Params::from_value(entry, &call.name) {
+                        Ok(nested) => nested,
+                        Err(err) => {
+                            return Return::ok(serde_json::json!({
+                                "pushed": ids.len(),
+                                "ids": ids,
+                                "failed_index": index,
+                                "error": format!("the entry at index {index} was called with {err}"),
+                            }))
+                        }
+                    };
+                    let (pipeline, job) = match Self::pushed(&nested, &call.name) {
+                        Ok(pair) => pair,
+                        Err(refusal) => {
+                            return Return::ok(serde_json::json!({
+                                "pushed": ids.len(),
+                                "ids": ids,
+                                "failed_index": index,
+                                "error": refusal.error,
+                            }))
+                        }
+                    };
+                    let driver = match self.driver(&pipeline) {
+                        Ok(driver) => driver,
+                        Err(refusal) => {
+                            return Return::ok(serde_json::json!({
+                                "pushed": ids.len(),
+                                "ids": ids,
+                                "failed_index": index,
+                                "error": refusal.error,
+                            }))
+                        }
+                    };
+                    match driver.push(&pipeline, job) {
+                        Ok(id) => ids.push(id),
+                        Err(err) => {
+                            return Return::ok(serde_json::json!({
+                                "pushed": ids.len(),
+                                "ids": ids,
+                                "failed_index": index,
+                                "error": format!("the push to {pipeline:?} failed: {err}"),
+                            }))
+                        }
+                    }
+                }
+                Return::ok(
+                    serde_json::json!({ "pushed": ids.len(), "ids": ids, "failed_index": null }),
+                )
+            }
+            "size" => {
+                let pipeline = match params.required_string("pipeline") {
+                    Ok(pipeline) => pipeline,
+                    Err(err) => return Return::refused(format!("jobs.size was called with {err}")),
+                };
+                let driver = match self.driver(&pipeline) {
+                    Ok(driver) => driver,
+                    Err(refusal) => return refusal,
+                };
+                match (driver.size(&pipeline), driver.in_flight(&pipeline)) {
+                    (Ok(size), Ok(in_flight)) => Return::ok(serde_json::json!({
+                        // Both numbers, in one answer, because the pair is what an operator reads: a queue
+                        // whose `size` grows and whose `in_flight` stays flat is a consumer that is stuck,
+                        // and neither number says that alone.
+                        "size": size,
+                        "in_flight": in_flight,
+                    })),
+                    (Err(err), _) | (_, Err(err)) => Return::refused(format!("{err}")),
+                }
+            }
+            "pipelines" => {
+                // The namespace's own list rather than a driver's, because a deployment may have several
+                // drivers and the question is which *pipelines* exist. A driver's own `pipelines()` would
+                // answer for the pipelines it was given, which is the same set today and would stop being
+                // so the moment a second driver arrives.
+                let pipelines: Vec<serde_json::Value> = self
+                    .pipelines
+                    .iter()
+                    .map(|(name, driver)| {
+                        serde_json::json!({ "name": name, "driver": driver.name() })
+                    })
+                    .collect();
+                Return::ok(serde_json::json!({ "pipelines": pipelines }))
+            }
+            other => Return::refused(format!(
+                "the jobs namespace does not serve {other:?}; {METHODS_JOBS}"
+            )),
+        }
+    }
+}
+
+/// The jobs method list, written once so a refusal and the documentation cannot disagree.
+const METHODS_JOBS: &str = "the jobs methods are push, push_batch, size and pipelines";
+
+/// The JSON type a value is, for a refusal.
+///
+/// A free function rather than a method, because the one message that needs it is about a header value
+/// inside a map and has no `Params` to ask.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// The `workers` namespace: what the pools look like, and how to restart one worker.
 ///
 /// # Why this needs no new machinery

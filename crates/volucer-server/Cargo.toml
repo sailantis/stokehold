@@ -28,6 +28,9 @@ volucer-kv.workspace = true
 # for the same reason, plus one of its own: a lock is named by its *resource*, so there is one lock
 # backend and `services = ["lock"]` is the whole name.
 volucer-lock.workspace = true
+# The queue trait and the in-memory driver, for the `jobs` namespace. A leaf crate like the other two:
+# the producer side of a queue is a registry entry, and the consumer side is the pool's own exchange.
+volucer-jobs.workspace = true
 # The fourth backend kind. This crate already held hyper's *server* types indirectly through
 # `volucer-http`, but the client is what a pooled origin connection needs, and a backend is the
 # thing that owns a connection pool — so it belongs here rather than in the listener, which only

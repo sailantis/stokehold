@@ -7,13 +7,15 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, Weak};
 
-use volucer_core::config::{BackendConfig, Config, KvStorageConfig, LockConfig, RouteConfig};
+use volucer_core::config::{
+    BackendConfig, Config, KvStorageConfig, LockConfig, PipelineConfig, RouteConfig,
+};
 use volucer_fcgi::{cgi, Request, Response};
 
 use crate::backend::{Backend, UpstreamBody};
 use crate::calls::{
-    ConfigNamespace, KvNamespace, LockNamespace, MethodRegistry, PoolLookup, WorkerStatus,
-    WorkersNamespace,
+    ConfigNamespace, JobsNamespace, KvNamespace, LockNamespace, MethodRegistry, PoolLookup,
+    WorkerStatus, WorkersNamespace,
 };
 use crate::error::{Result, ServerError};
 
@@ -198,6 +200,81 @@ fn build_locks(config: &Config) -> Result<Option<Arc<dyn volucer_lock::Locks>>> 
     Ok(Some(locks))
 }
 
+/// Build the queues, once.
+///
+/// # Why this is one object rather than a map the registry holds
+///
+/// The drivers are per-pipeline and the *namespace* is one, because a push names the pipeline and the
+/// namespace resolves it. So the map is built here and handed over whole — which is also what lets the
+/// consumer side of step 5's second half be added without changing this shape: the same drivers will be
+/// polled by pools, and a driver behind an `Arc<dyn Driver>` can be both.
+///
+/// # Why a pipeline's driver is chosen per table
+///
+/// Unlike `[lock]`, where a second backend would be a second namespace that does not see the first, two
+/// pipelines with different drivers is the *normal* case: a Redis-backed mail queue and an in-memory
+/// report queue in one deployment is what the configuration is for. So each `[jobs.pipelines.<name>]`
+/// names its own driver, and `build_queues` builds each.
+fn build_queues(config: &Config) -> Result<Option<Arc<JobsPlane>>> {
+    let Some(jobs) = &config.jobs else {
+        return Ok(None);
+    };
+
+    let mut pipelines: BTreeMap<String, Arc<dyn volucer_jobs::Driver>> = BTreeMap::new();
+    for (name, pipeline) in &jobs.pipelines {
+        let driver: Arc<dyn volucer_jobs::Driver> = match pipeline {
+            // Built per pipeline rather than per deployment, because a driver here *is* a pipeline's
+            // storage: two memory pipelines are two independent queues, and sharing one driver between
+            // them would make a push to either appear in both.
+            PipelineConfig::Memory(_) => Arc::new(volucer_jobs::MemoryDriver::single(name.clone())),
+        };
+        tracing::info!(pipeline = %name, driver = %pipeline.driver(), "queue ready");
+        pipelines.insert(name.clone(), driver);
+    }
+
+    Ok(Some(Arc::new(JobsPlane { pipelines })))
+}
+
+/// The pipelines, and which of them this server consumes.
+///
+/// One object rather than the two halves being passed separately, because the consumer side of step 5 will
+/// need the same drivers the producer namespace holds — and threading two maps through three signatures
+/// to avoid one struct is how a seam gets missed.
+pub struct JobsPlane {
+    pipelines: BTreeMap<String, Arc<dyn volucer_jobs::Driver>>,
+}
+
+impl JobsPlane {
+    /// The pipelines the producer namespace pushes to.
+    ///
+    /// A clone of the map, not a `&`: [`JobsNamespace`] owns what it is given, and the `Arc`s it copies
+    /// point at the same drivers — so a push through the namespace and a poll by a consumer are talking to
+    /// one queue, which is the property that matters.
+    fn pipelines(&self) -> BTreeMap<String, Arc<dyn volucer_jobs::Driver>> {
+        self.pipelines.clone()
+    }
+
+    /// The names this deployment consumes, in the order the configuration wrote them.
+    ///
+    /// For the consumer side, and it is here rather than read from `Config` at the point of use so that a
+    /// name which is consumed but has no pipeline cannot reach this far — `Config::validate` refuses it.
+    pub fn consumed(&self) -> Vec<(&str, Arc<dyn volucer_jobs::Driver>)> {
+        self.pipelines
+            .iter()
+            .map(|(name, driver)| (name.as_str(), Arc::clone(driver)))
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for JobsPlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written because `dyn Driver` is not `Debug`, and the names are more useful anyway.
+        f.debug_struct("JobsPlane")
+            .field("pipelines", &self.pipelines.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// Build one worker backend's method registry from its `services` list.
 ///
 /// # Why the `config.describe` document is assembled here
@@ -221,6 +298,7 @@ fn worker_registry(
     directory: &Arc<PoolDirectory>,
     stores: &BTreeMap<String, Arc<dyn volucer_kv::Store>>,
     locks: &Option<Arc<dyn volucer_lock::Locks>>,
+    jobs: &Option<Arc<JobsPlane>>,
 ) -> MethodRegistry {
     let mut registry = MethodRegistry::new();
     // Collected rather than installed per entry, because there is **one** `kv` namespace per registry and
@@ -247,6 +325,13 @@ fn worker_registry(
                 None => tracing::error!(
                     "a worker is granted the `lock` service but no lock backend was built; its calls \
                      will be refused, which should have been impossible"
+                ),
+            },
+            "jobs" => match jobs {
+                Some(jobs) => registry = registry.with(JobsNamespace::new(jobs.pipelines())),
+                None => tracing::error!(
+                    "a worker is granted the `jobs` service but no queue was built; its calls will be \
+                     refused, which should have been impossible"
                 ),
             },
             other => match other.strip_prefix("kv.") {
@@ -352,6 +437,9 @@ impl Dispatcher {
         // And the lock backend, for the same reason: a worker granted `lock` has to find it already
         // there, and the registry is built per backend while the backend itself is built once.
         let locks = build_locks(config)?;
+        // And the queues, for the same reason again: the registry is built per backend and the pipelines
+        // are built once, so a worker granted `jobs` finds the drivers already there.
+        let jobs = build_queues(config)?;
 
         let directory = Arc::new(PoolDirectory::default());
         let mut backends = BTreeMap::new();
@@ -365,6 +453,7 @@ impl Dispatcher {
                         &directory,
                         &stores,
                         &locks,
+                        &jobs,
                     ));
                     registries.insert(name.clone(), Arc::clone(&registry));
                     Some(registry)
@@ -858,11 +947,18 @@ mod tests {
         let directory = Arc::new(PoolDirectory::default());
         let stores = build_stores(&config).expect("no storage needs a server");
         assert!(
-            worker_registry(&[], &config, &directory, &stores, &None).is_empty(),
+            worker_registry(&[], &config, &directory, &stores, &None, &None).is_empty(),
             "no services must mean no namespaces"
         );
 
-        let granted = worker_registry(&["config".to_string()], &config, &directory, &stores, &None);
+        let granted = worker_registry(
+            &["config".to_string()],
+            &config,
+            &directory,
+            &stores,
+            &None,
+            &None,
+        );
         assert_eq!(granted.names(), vec!["config"]);
         assert!(
             !granted.names().contains(&"workers"),
@@ -873,8 +969,14 @@ mod tests {
         // one case so that adding a name to `CALL_NAMESPACES` without an arm fails *this* test rather
         // than a deployment.
         for name in volucer_core::config::CALL_NAMESPACES {
-            let registry =
-                worker_registry(&[name.to_string()], &config, &directory, &stores, &None);
+            let registry = worker_registry(
+                &[name.to_string()],
+                &config,
+                &directory,
+                &stores,
+                &None,
+                &None,
+            );
             assert_eq!(
                 registry.names(),
                 vec![*name],
@@ -909,6 +1011,7 @@ mod tests {
             &directory,
             &stores,
             &Some(locks),
+            &None,
         );
         assert_eq!(registry.names(), vec!["lock"]);
 
@@ -953,7 +1056,14 @@ mod tests {
             "an absent [lock] table must not produce a backend"
         );
 
-        let registry = worker_registry(&["lock".to_string()], &config, &directory, &stores, &None);
+        let registry = worker_registry(
+            &["lock".to_string()],
+            &config,
+            &directory,
+            &stores,
+            &None,
+            &None,
+        );
         assert!(
             registry.is_empty(),
             "a granted service with nothing behind it must be refused by name rather than answered \
@@ -1016,6 +1126,7 @@ url = "redis://127.0.0.1:6379"
             &directory,
             &stores,
             &None,
+            &None,
         );
 
         assert_eq!(
@@ -1072,6 +1183,7 @@ url = "redis://127.0.0.1:6379"
             &directory,
             &stores,
             &None,
+            &None,
         );
 
         let key = crate::params::encode_base64(b"shared-key");
@@ -1113,6 +1225,7 @@ url = "redis://127.0.0.1:6379"
             &config,
             &directory,
             &stores,
+            &None,
             &None,
         );
 

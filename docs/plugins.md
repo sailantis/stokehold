@@ -772,14 +772,20 @@ is the **construction** side of trailers — a small `Body` that yields `Frame::
 status headers — which is a shape this codebase already hand-writes at
 `crates/volucer-http/src/static_files.rs:806`. That is roughly a forty-line type plus tests.
 
-The one thing tier A must settle first is the **transport**, and the measurement above is why:
-an h2c path does not exist, so a gRPC origin is reached either over TLS with ALPN (which works
-today, because ALPN is what sets `negotiated_h2`) or by adding h2c for `http://` and `unix:`
-origins. The second is the one a deployment wants — gRPC over a loopback unix socket is the
-ordinary shape — and it is a real addition rather than a configuration flag. Two candidate
-mechanisms, to be settled by whichever is testable first: hyper's `client::conn::http2::handshake`
-for prior-knowledge h2, or teaching `connect.rs` to answer `Connected::negotiated_h2()` for a
-plaintext origin the configuration has explicitly marked as h2. The decision is §10's.
+The one thing tier A must settle first is the **transport**, and this is now measured rather than
+open: `crates/volucer-upstream/tests/h2c.rs` shows that **`Connected::negotiated_h2()` is the whole
+mechanism**. `client-legacy` reads that answer off the connector's response and dispatches to its
+HTTP/2 client instead of its HTTP/1.1 one, and `ConnIo` already forwards `connected()` to whatever
+`Io` it wraps — so an h2c path for a plaintext origin is a decision about *when* to answer
+`negotiated_h2`, not new machinery. The probe asserts both halves, because only the negative case
+makes the positive one mean anything: with the claim, hyper opens with the HTTP/2 connection preface;
+without it, the same client sends `POST … HTTP/1.1`. Falsified by making the claim a no-op, which fails
+the positive case and leaves the control passing.
+
+What tier A needs, then, is the *policy* rather than a mechanism: a configuration key saying "this
+origin speaks h2", and `connect.rs` answering `negotiated_h2` for the plaintext and unix origins so
+marked. That is a handful of lines and one new key — see §10 item 3, which is now a decision about
+vocabulary rather than about feasibility. TLS with ALPN already works and needs nothing.
 
 This is what makes volucer a gRPC *server* for runtimes that already speak it — Node's
 `@grpc/grpc-js`, Go, Python's `grpcio` — **using the same `upstream` backend §7.1 is adding anyway**.
@@ -1080,14 +1086,14 @@ actually live. §6.6 carries the citations.
    `grpcurl` user supplies their own `.proto`, which is what they already do against every
    non-reflective server. Deciding "not yet" is a legitimate outcome and removes the only
    protobuf crate from the graph.
-3. **How a plaintext gRPC origin is reached.** §6.6's measurement found that `negotiated_h2` is set
-   from ALPN alone, so `http://` and `unix:` origins speak HTTP/1.1 and gRPC needs HTTP/2. TLS with
-   ALPN works today and is not what a loopback unix socket wants. So: hyper's
-   `client::conn::http2::handshake` for prior-knowledge h2 on a marked origin, or an
-   `Connected::negotiated_h2()` answer in `connect.rs` for a plaintext origin the configuration has
-   explicitly declared as h2? The second is smaller and the first is the one hyper supports
-   directly; both need a way to *say* "this origin speaks h2", which is a new configuration key
-   either way.
+3. **How a plaintext gRPC origin says it speaks h2.** The mechanism is settled by measurement —
+   `Connected::negotiated_h2()` is what makes hyper use its HTTP/2 client, and the connector already
+   forwards that answer, so the code is a handful of lines. What is left is the *vocabulary*: a new
+   configuration key on an `http://` or `unix:` origin declaring it speaks h2 with prior knowledge. The
+   candidates are a `protocol` field beside `origin` (`protocol = "h2c"`), or inferring it from the
+   route that selected the backend. The first is explicit and the second needs no key but makes an
+   origin's protocol depend on where a request came from, which is the kind of implicit coupling this
+   project has refused elsewhere. **One deployment decision, not an open technical question.**
 4. **Streaming responses in the worker protocol.** `RESPONSE` declares `body_len` up front, so an
    application must buffer. That is fine for HTML and wrong for a large download or a
    Server-Sent Events endpoint. Is a chunked response (unknown length, terminated by `LAST`) a v2

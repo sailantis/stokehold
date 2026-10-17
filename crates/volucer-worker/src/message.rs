@@ -246,6 +246,95 @@ pub enum Control {
     Report,
 }
 
+/// A call the server makes to a running worker.
+///
+/// **The request is the method and its parameters, and the server never interprets either.** A call
+/// is `"<namespace>.<verb>"` — `kv.get`, `lock.acquire`, `metrics.observe` — and the params are JSON
+/// the namespace's handler understands. Keeping the payload opaque here is what lets the frame layer
+/// stay ignorant of what a KV store is: the exchange thread hands the call to a handler and writes
+/// back whatever comes out.
+///
+/// `name` rather than `method` because `method` is already the HTTP verb on [`RequestHeader`], and two
+/// fields called `method` in one protocol is how a reader comes to believe a call carries an HTTP
+/// request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Call {
+    /// `"<namespace>.<verb>"`, e.g. `kv.get`.
+    pub name: String,
+    /// The parameters, as the namespace's handler expects them. JSON, and opaque here.
+    #[serde(default)]
+    pub params: serde_json::Value,
+    /// The `traceparent` this call belongs to, so a span can continue across the call.
+    ///
+    /// Carried from the start rather than added later, because it costs a field now and is a protocol
+    /// change once anything is deployed. `docs/plugins.md` §6.5 is where that argument lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+}
+
+/// The worker's answer to a [`Call`].
+///
+/// **An error is a successful `Return` with `ok: false`**, not an `ERROR` frame. The distinction
+/// matters: an `ERROR` frame describes a protocol failure and can be unrecoverable, while a call that
+/// could not be served — an unknown method, a backend that timed out, a lock whose state is unknown —
+/// is an ordinary answer to an ordinary question. Sending `ERROR` for those would make a missing KV
+/// entry look like a broken worker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Return {
+    /// Whether the call was served.
+    pub ok: bool,
+    /// The result, when `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Why it was not, when not `ok`. Free-form, and read by a human.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Whether the failure left the call's effect in an unknown state.
+    ///
+    /// **A third answer, not a boolean pair.** `ok: false` with `unknown: false` means nothing
+    /// happened — an unknown method, a value that is not there. `ok: false` with `unknown: true` means
+    /// the call may or may not have taken effect: a lock acquired before the reply was lost, a write
+    /// that was sent and not acknowledged. The caller must resolve that by asking, and an API that
+    /// collapsed the two would make "the write failed" and "the write may have happened" the same
+    /// answer — which is how a retry duplicates a side effect. This is the ambiguity `docs/plugins.md`
+    /// §6.3 records RoadRunner's own lock implementation as having, modelled explicitly rather than
+    /// left to a comment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unknown: bool,
+}
+
+impl Return {
+    /// A served call.
+    pub fn ok(result: serde_json::Value) -> Self {
+        Return {
+            ok: true,
+            result: Some(result),
+            error: None,
+            unknown: false,
+        }
+    }
+
+    /// A call that did not happen.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Return {
+            ok: false,
+            result: None,
+            error: Some(reason.into()),
+            unknown: false,
+        }
+    }
+
+    /// A call whose effect cannot be determined.
+    pub fn unknown_state(reason: impl Into<String>) -> Self {
+        Return {
+            ok: false,
+            result: None,
+            error: Some(reason.into()),
+            unknown: true,
+        }
+    }
+}
+
 /// A description of a failure, used in `Error` frames.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorReport {

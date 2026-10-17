@@ -21,8 +21,8 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use crate::error::{Result, WorkerError};
 use crate::header::{flags, write_frame, Checksum, Header, MessageType};
 use crate::message::{
-    Codec, Control, ErrorReport, Hello, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
-    RequestHeader, ResponseHead,
+    Call, Codec, Control, ErrorReport, Hello, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
+    RequestHeader, ResponseHead, Return,
 };
 
 /// The largest body slice sent in one frame.
@@ -299,8 +299,22 @@ impl WorkerResponse {
     }
 }
 
+/// A handler is not `Debug`, so the impl is written out and says so rather than deriving a bound the
+/// channel does not otherwise need.
+impl<W: Write, R: Read> std::fmt::Debug for WorkerChannel<W, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerChannel")
+            .field("next_request_id", &self.next_request_id)
+            .field("logs", &self.logs.len())
+            .field("metrics", &self.metrics.len())
+            .field("checksum", &self.checksum)
+            .field("offer_no_checksum", &self.offer_no_checksum)
+            .field("call_handler", &self.call_handler.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Both directions of a worker's pipe.
-#[derive(Debug)]
 pub struct WorkerChannel<W: Write, R: Read> {
     writer: W,
     reader: R,
@@ -333,7 +347,32 @@ pub struct WorkerChannel<W: Write, R: Read> {
     /// cannot be confused: offering does not change a single byte of any frame until the
     /// worker has answered with the same offer accepted.
     offer_no_checksum: bool,
+    /// What answers a `CALL` that arrives while a request is in flight.
+    ///
+    /// **A callback rather than a service registry, and that is the layering.** The read loop is where
+    /// a call is *seen*, but it is not where one is *served*: whether `kv.get` means anything is a
+    /// question about the process's configuration, and this crate is the frame layer. So the channel
+    /// hands the call to whoever built it and writes back the answer — which keeps "the frame layer
+    /// does not know what a KV store is" true while still letting a call be answered from the one place
+    /// that can read the stream.
+    ///
+    /// `Box<dyn Fn>` rather than a generic parameter, because that would put the handler's type into
+    /// [`WorkerChannel`]'s signature and therefore into every function that touches a channel — the
+    /// handshake, the pool, the tests — for a callback only the read loop calls. One allocation per
+    /// worker, at boot.
+    ///
+    /// Absent means a `CALL` is answered with a refusal rather than ignored, which is what a worker
+    /// built by a caller that registered no methods should get: a dropped call leaves the server
+    /// waiting until its deadline, and a deadline is a kill.
+    call_handler: Option<Box<CallHandler>>,
 }
+
+/// Answers a [`Call`] that arrived while a request was in flight.
+///
+/// `Send` because a channel is moved to the exchange thread, and `Fn` rather than `FnMut` because the
+/// handler is shared by every call in the worker's life and has no per-call state of its own — anything
+/// it accumulates belongs behind its own lock.
+pub type CallHandler = dyn Fn(&Call) -> Return + Send;
 
 impl<W: Write, R: Read> WorkerChannel<W, R> {
     /// Wrap a writer (the worker's stdin) and a reader (its stdout).
@@ -348,7 +387,16 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
             scratch: Vec::new(),
             checksum: Checksum::Required,
             offer_no_checksum: false,
+            call_handler: None,
         }
+    }
+
+    /// Install what answers a `CALL` that arrives while a request is in flight.
+    ///
+    /// Set once, by whoever built the channel, before the first request. See
+    /// [`WorkerChannel::call_handler`] for why this is a callback rather than a registry.
+    pub fn set_call_handler(&mut self, handler: Box<CallHandler>) {
+        self.call_handler = Some(handler);
     }
 
     /// The checksum policy in force, which is [`Checksum::Required`] until the handshake.
@@ -720,6 +768,49 @@ impl<W: Write, R: Read> WorkerChannel<W, R> {
                 MessageType::Metric => self.absorb_metric(payload),
                 MessageType::Event => {
                     tracing::trace!(request_id = header.request_id, "worker sent an event");
+                }
+                MessageType::Call => {
+                    // Handled *before* the catch-all below, which treats an unexpected type as fatal.
+                    // A call is not an unexpected frame: it is the application asking for something
+                    // while its request is in flight, and it is answered rather than failed.
+                    //
+                    // The server allocated this id from the far end of the range (see
+                    // `FIRST_CALL_ID`), so a call arriving under a request's id is a bug on the wire
+                    // rather than something to serve — answered with an error rather than dropped,
+                    // because a dropped call leaves the worker waiting until its own deadline.
+                    let call: Call = Json::decode(payload)?;
+                    let answer = match &self.call_handler {
+                        Some(handler) if header.request_id >= crate::FIRST_CALL_ID_HALF => {
+                            // `catch_unwind` because the handler runs *here*, on the exchange thread
+                            // that owns this worker's pipes for its whole life: an escaping panic would
+                            // poison the channel and take the worker with it, and the failure mode
+                            // would be a request path that dies with no log line saying why. A panic is
+                            // a bug in a handler, and the right answer is a refused call.
+                            //
+                            // `AssertUnwindSafe` because the closure captures `&Call` and a `&dyn Fn`;
+                            // neither is mutated, and the whole point is that a panicking handler must
+                            // not be allowed to leave the channel in a state we then trust.
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handler(&call)
+                            }))
+                            .unwrap_or_else(|_| {
+                                tracing::error!(
+                                    call = %call.name,
+                                    "a call handler panicked; the call is refused"
+                                );
+                                Return::refused("the call handler panicked")
+                            })
+                        }
+                        Some(_) => Return::refused(format!(
+                            "call {} arrived with request id {}, which is a request's range",
+                            call.name, header.request_id
+                        )),
+                        None => Return::refused(format!(
+                            "no call handler is installed, so {} cannot be served",
+                            call.name
+                        )),
+                    };
+                    self.send_json(MessageType::Return, header.request_id, &answer, 0)?;
                 }
                 MessageType::Error => {
                     let report: ErrorReport = Json::decode(payload)?;

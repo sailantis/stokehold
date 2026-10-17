@@ -114,6 +114,18 @@ pub enum MessageType {
     Pong = 13,
     /// Either direction: something went wrong; the payload is a description.
     Error = 14,
+    /// Server → worker: a call the application answers, asked while a request is in flight.
+    ///
+    /// **Not a second kind of request.** A `REQUEST` is work the server has for the application; a
+    /// `CALL` is the application asking the server for something — a cache lookup, a lock, a metric —
+    /// on the channel that is already open. The distinction is what keeps "a worker serves one request
+    /// at a time" true: a call changes nothing about the response exchange it arrives during.
+    Call = 15,
+    /// Worker → server: the answer to a [`MessageType::Call`].
+    ///
+    /// Correlated by the call's own id, which comes from the opposite end of the range to request ids
+    /// — see [`crate::FIRST_CALL_ID`].
+    Return = 16,
 }
 
 impl MessageType {
@@ -134,6 +146,8 @@ impl MessageType {
             12 => MessageType::Ping,
             13 => MessageType::Pong,
             14 => MessageType::Error,
+            15 => MessageType::Call,
+            16 => MessageType::Return,
             other => return Err(WorkerError::UnknownMessageType(other)),
         })
     }
@@ -159,6 +173,8 @@ impl MessageType {
             MessageType::Ping => "PING",
             MessageType::Pong => "PONG",
             MessageType::Error => "ERROR",
+            MessageType::Call => "CALL",
+            MessageType::Return => "RETURN",
         }
     }
 

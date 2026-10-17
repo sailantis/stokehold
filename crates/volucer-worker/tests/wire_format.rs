@@ -13,8 +13,9 @@
 use volucer_worker::codec::write_hello_ack;
 use volucer_worker::header::{crc32c, flags, write_frame, Checksum, HEADER_LEN, PROTOCOL_VERSION};
 use volucer_worker::{
-    Codec, Header, Hello, HelloAck, Json, MessageType, RequestEnd, ResponseHead, MAX_BODY_CHUNK,
-    MAX_PAYLOAD_LEN, UNSOLICITED,
+    Call, Codec, Header, Hello, HelloAck, Json, MessageType, RequestEnd, ResponseHead, Return,
+    FIRST_CALL_ID, FIRST_CALL_ID_HALF, FIRST_REQUEST_ID, MAX_BODY_CHUNK, MAX_PAYLOAD_LEN,
+    UNSOLICITED,
 };
 
 fn hex(data: &[u8]) -> String {
@@ -117,6 +118,8 @@ fn every_message_type_encodes_to_its_frozen_wire_number() {
         (MessageType::Ping, 12),
         (MessageType::Pong, 13),
         (MessageType::Error, 14),
+        (MessageType::Call, 15),
+        (MessageType::Return, 16),
     ];
 
     for (message_type, number) in frozen {
@@ -131,10 +134,88 @@ fn every_message_type_encodes_to_its_frozen_wire_number() {
         );
     }
 
-    // The table is 1..=14 with no gaps, so "type + 1" is the next type.
-    assert_eq!(frozen.len(), 14);
+    // The table is 1..=16 with no gaps, so "type + 1" is the next type.
+    assert_eq!(frozen.len(), 16);
     assert!(MessageType::from_u8(0).is_err(), "0 is not a message type");
-    assert!(MessageType::from_u8(15).is_err(), "15 is not defined in v1");
+    assert!(MessageType::from_u8(17).is_err(), "17 is not defined");
+}
+
+/// A call and its answer round-trip through the codec, and the answer says which of the three
+/// outcomes it is.
+///
+/// The third field is the one this exists for. `ok: false` with `unknown: false` means nothing
+/// happened; `unknown: true` means the call may or may not have taken effect. Collapsing them is how
+/// a retry duplicates a side effect, so each is asserted separately rather than by a `!ok`.
+#[test]
+fn a_call_and_its_three_outcomes_round_trip() {
+    let call = Call {
+        name: "kv.get".to_string(),
+        params: serde_json::json!({ "storage": "default", "key": "session:1" }),
+        traceparent: Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string()),
+    };
+    let encoded = Json::encode(&call).expect("encode");
+    let decoded: Call = Json::decode(&encoded).expect("decode");
+    assert_eq!(decoded, call, "the call survives the codec");
+
+    // A served call.
+    let served = Return::ok(serde_json::json!({ "value": "abc" }));
+    let round: Return = Json::decode(&Json::encode(&served).expect("encode")).expect("decode");
+    assert!(round.ok);
+    assert!(!round.unknown, "a served call is not ambiguous");
+    assert_eq!(round.result, Some(serde_json::json!({ "value": "abc" })));
+
+    // A refusal: nothing happened.
+    let refused = Return::refused("no such method");
+    let round: Return = Json::decode(&Json::encode(&refused).expect("encode")).expect("decode");
+    assert!(!round.ok);
+    assert!(
+        !round.unknown,
+        "a refusal is a definite answer: nothing happened"
+    );
+
+    // An unknown state: the one that must not be mistaken for a refusal.
+    let ambiguous = Return::unknown_state("the lock backend timed out");
+    let round: Return = Json::decode(&Json::encode(&ambiguous).expect("encode")).expect("decode");
+    assert!(!round.ok);
+    assert!(
+        round.unknown,
+        "a call that may have taken effect must say so, or a retry duplicates it"
+    );
+}
+
+/// The `unknown` field is omitted when false and present when true, so the common case costs nothing
+/// on the wire and the rare one is never invisible.
+#[test]
+fn the_unknown_field_is_absent_unless_it_is_true() {
+    let definite = Json::encode(&Return::refused("nope")).expect("encode");
+    let text = String::from_utf8(definite).expect("utf-8");
+    assert!(
+        !text.contains("unknown"),
+        "a definite answer should not carry the field: {text}"
+    );
+
+    let ambiguous = Json::encode(&Return::unknown_state("timeout")).expect("encode");
+    let text = String::from_utf8(ambiguous).expect("utf-8");
+    assert!(text.contains("\"unknown\":true"), "{text}");
+}
+
+/// Request ids and call ids occupy disjoint halves of the id space, which is what makes a mix-up
+/// between them a visible correlation failure rather than a silent match.
+#[test]
+fn request_ids_and_call_ids_are_in_different_halves() {
+    assert_eq!(FIRST_REQUEST_ID, 1);
+    assert_eq!(FIRST_CALL_ID, u32::MAX);
+    assert!(
+        FIRST_REQUEST_ID < FIRST_CALL_ID_HALF,
+        "requests count up from below the midpoint"
+    );
+    assert!(
+        FIRST_CALL_ID >= FIRST_CALL_ID_HALF,
+        "and calls count down from above it"
+    );
+    // What the read loop actually tests, so the two agree by construction rather than by a comment.
+    assert!(!(FIRST_REQUEST_ID >= FIRST_CALL_ID_HALF));
+    assert!(FIRST_CALL_ID >= FIRST_CALL_ID_HALF);
 }
 
 #[test]

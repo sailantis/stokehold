@@ -45,8 +45,8 @@ pub use header::{
     PROTOCOL_VERSION,
 };
 pub use message::{
-    Codec, Control, ErrorReport, Hello, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
-    RequestHeader, ResponseHead,
+    Call, Codec, Control, ErrorReport, Hello, HelloAck, Json, LogRecord, MetricRecord, RequestEnd,
+    RequestHeader, ResponseHead, Return,
 };
 
 /// The request id a worker uses for unsolicited frames.
@@ -57,3 +57,19 @@ pub const UNSOLICITED: u32 = 0;
 /// Starting at 1 rather than 0 keeps `0` unambiguously "not a request", which is
 /// what makes a stray correlation bug visible instead of silently matching.
 pub const FIRST_REQUEST_ID: u32 = 1;
+
+/// The first call id the server allocates, counting **down** from `u32::MAX`.
+///
+/// The opposite end of the range from request ids, for the same reason `0` is reserved: a call
+/// mistaken for a request — or the reverse — is then a visible correlation failure rather than a
+/// silent match. The two ranges meet only after four billion of one or the other, which is a
+/// collision a running process will not see.
+pub const FIRST_CALL_ID: u32 = u32::MAX;
+
+/// The midpoint of the id space: at or above this, an id is a call's rather than a request's.
+///
+/// A *threshold* rather than a comparison against [`FIRST_CALL_ID`], because that would only recognise
+/// the first call and refuse the rest. Requests count up from 1 and calls count down from `u32::MAX`, so
+/// the half each owns is decided by which side of the midpoint an id falls on — and the two are
+/// disjoint for four billion of either, which is longer than a process runs.
+pub const FIRST_CALL_ID_HALF: u32 = u32::MAX / 2;
